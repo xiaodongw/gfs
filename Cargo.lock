@@ -2638,6 +2638,7 @@ name = "xvfs-test"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "sha1",
  "tempfile",
  "xvfs-types",
 ]

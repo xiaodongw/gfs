@@ -126,7 +126,21 @@ pub fn fixture(name: &str) -> &'static Fixture {
 /// conformance checks see, and every one of these results has to be reproducible
 /// elsewhere. Fixed author and committer dates keep object IDs stable across
 /// runs, which is what lets a test assert on a specific OID at all.
+///
+/// **Returns a lossy `String`.** Fine for the fixture builders, whose output is
+/// ASCII, and *not* fine for anything that reads a path back out: a Git path is
+/// bytes, and `from_utf8_lossy` replaces an invalid sequence with U+FFFD, which
+/// silently corrupts the name. Use [`git_bytes`] when the output contains paths.
 pub fn git_raw(dir: &Path, args: &[&OsStr]) -> Result<String> {
+  Ok(String::from_utf8_lossy(&git_bytes(dir, args)?).into_owned())
+}
+
+/// Run git with the same hermetic environment, returning raw stdout.
+///
+/// The byte-exact form. `git ls-tree -z` emits unquoted path bytes, and the
+/// oracle in [`crate::oracle`] must reproduce them exactly or it reports a
+/// difference that only exists in the oracle.
+pub fn git_bytes(dir: &Path, args: &[&OsStr]) -> Result<Vec<u8>> {
   let out = Command::new("git")
     .current_dir(dir)
     .args(args)
@@ -148,7 +162,7 @@ pub fn git_raw(dir: &Path, args: &[&OsStr]) -> Result<String> {
       String::from_utf8_lossy(&out.stderr).trim()
     );
   }
-  Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+  Ok(out.stdout)
 }
 
 /// Run git with string arguments.

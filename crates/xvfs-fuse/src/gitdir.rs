@@ -41,7 +41,8 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use xvfs_types::{BytePath, MountId, ObjectId, RepositoryId, Timestamp};
+use xvfs_types::path::b64url_encode;
+use xvfs_types::{BytePath, CommitMeta, MountId, ObjectId, RepositoryId, Timestamp};
 
 /// The directory name, and the reason there is no configuration for it: a
 /// different name would not be found by any of the tooling this exists for.
@@ -80,6 +81,15 @@ pub struct GitDirFacts {
   pub http_endpoint: String,
   /// The mount generation `xvfs refresh` produced this surface for.
   pub generation: u64,
+  /// The pinned commit's metadata, fetched once at mount time.
+  ///
+  /// Embedded rather than fetched on demand so that the `git` shim's bounded
+  /// `log -1` needs no network and no credential: DESIGN.md section 8.6 says
+  /// `GetCommit` supplies "the one commit of metadata" the shim needs, and one
+  /// commit's worth is small enough to carry in the surface itself. A shim that
+  /// had to call the server would need the mount capability, which would put a
+  /// credential in a `PATH`-installed convenience wrapper.
+  pub commit_meta: Option<CommitMeta>,
 }
 
 #[derive(Debug)]
@@ -194,6 +204,33 @@ fn config(facts: &GitDirFacts) -> Vec<u8> {
   .into_bytes()
 }
 
+/// A commit's identity lines, with the byte-exact fields base64url-encoded.
+///
+/// Git does not constrain author names, emails, or commit messages to UTF-8, and
+/// JSON strings must be. Encoding them keeps the bytes exact; the `_text` fields
+/// alongside are a lossy convenience for a human reading the file and are never
+/// what the shim prints.
+fn signature_json(signature: &xvfs_types::Signature) -> serde_json::Value {
+  serde_json::json!({
+    "name_b64url": b64url_encode(&signature.name),
+    "name_text": String::from_utf8_lossy(&signature.name),
+    "email_b64url": b64url_encode(&signature.email),
+    "email_text": String::from_utf8_lossy(&signature.email),
+    "time": { "secs": signature.time.secs, "nanos": signature.time.nanos },
+    "tz_offset_minutes": signature.tz_offset_minutes,
+  })
+}
+
+fn commit_json(meta: &CommitMeta) -> serde_json::Value {
+  serde_json::json!({
+    "parents": meta.parents.iter().map(ObjectId::to_qualified).collect::<Vec<_>>(),
+    "author": signature_json(&meta.author),
+    "committer": signature_json(&meta.committer),
+    "message_b64url": b64url_encode(&meta.message),
+    "message_text": String::from_utf8_lossy(&meta.message),
+  })
+}
+
 /// `xvfs.json`: the machine-readable description DESIGN.md section 8.6 asks for.
 fn xvfs_json(facts: &GitDirFacts) -> Vec<u8> {
   let value = serde_json::json!({
@@ -211,6 +248,7 @@ fn xvfs_json(facts: &GitDirFacts) -> Vec<u8> {
     "read_only": true,
     "surface": "synthesized",
     "adr": "docs/adr/0005-git-command-surface.md",
+    "commit_meta": facts.commit_meta.as_ref().map(commit_json),
   });
   let mut bytes = serde_json::to_vec_pretty(&value).unwrap_or_else(|_| b"{}".to_vec());
   bytes.push(b'\n');
@@ -233,6 +271,7 @@ mod tests {
       grpc_endpoint: "http://127.0.0.1:8431".to_owned(),
       http_endpoint: "http://127.0.0.1:8430".to_owned(),
       generation: 1,
+      commit_meta: None,
     }
   }
 

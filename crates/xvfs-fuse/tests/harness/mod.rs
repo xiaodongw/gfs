@@ -193,6 +193,9 @@ impl Mount {
       grpc_endpoint: backend.grpc.clone(),
       http_endpoint: backend.http.clone(),
       generation: 1,
+      // Fetched the way the daemon fetches it, so the shim's `log -1` is
+      // exercised against real metadata rather than a hand-built value.
+      commit_meta: client.get_commit().await.ok(),
     }));
 
     let fs = Xvfs::new(client, cache, gitdir, xvfs_fuse::root_entry(tree), config);

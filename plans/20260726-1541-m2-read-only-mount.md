@@ -169,6 +169,30 @@ deleted: `scripts/dev-stack.sh` uses it to demonstrate M1's lease machine
 without a filesystem, and an orchestrator debugging a lease should not have to
 mount to do it.
 
+### The shim answers from the mount, never from the server
+
+`log -1` needs one commit's metadata, and DESIGN.md section 8.6 says `GetCommit`
+supplies it. The daemon calls `GetCommit` once at mount time and embeds the
+result in `.git/xvfs.json`, so the shim needs no network and — more importantly
+— no credential. A shim that called the server would have to carry the mount
+capability, and putting a credential in a `PATH`-installed wrapper that any
+process in the job can invoke is a worse trade than one JSON read.
+
+That also decides where the binary lives: `xvfs-fuse`, not `xvfs-cli`, because
+it touches only the mount and the synthesized surface.
+
+### The shim refuses outside an XVFS workspace
+
+Installed early in `PATH`, it is invoked everywhere. Answering for an ordinary
+Git repository would replace a working `git` with a crippled one, so it walks up
+looking for `.git/xvfs.json` specifically and fails with "not an XVFS workspace"
+when it finds none.
+
+### Refusals exit 2, not 1
+
+`git diff --quiet` uses exit 1 to mean "there were differences". A refusal that
+exited 1 would be read by a script as a successful non-empty diff.
+
 ## Details
 
 - **`unsafe` appears twice, both with a recorded reason.** The workspace denies
@@ -197,6 +221,17 @@ mount to do it.
   workspace sees `<state-dir>/generations/N`. Correct, and worth knowing: a bind
   mount would report the workspace path instead, so the two publishers differ
   observably here. M6.1 owns whether that matters to the pilot's tooling.
+- **A second bug the oracle caught, in the oracle.** `xvfs_test::git_raw`
+  returns `String::from_utf8_lossy` of stdout, so reading `git ls-tree -z`
+  through it mangled the two non-UTF-8 fixture names into U+FFFD — and the
+  *mount*, which had the bytes right, looked wrong. `git_bytes` is the
+  byte-exact form and the oracle uses it; `git_raw` keeps a warning in its docs.
+- **`pjdfstest` and `xfstests` were not run.** Neither is installed here and
+  neither is packaged as a Rust dependency. `compat.rs` covers a hand-written
+  subset of the same ground — errno for the wrong object kind, `NAME_MAX`,
+  reads past EOF, permission enforcement — and says in its own module docs that
+  it is a subset rather than the suites. This is a real gap in M2.4's first
+  bullet and is recorded as one in the report.
 - **`rm -rf` over a live mount is a trap.** The dev stack originally cleaned up
   with it and spent minutes failing against a read-only base left by an earlier
   run. The script now unmounts first, then `fusermount3 -u -z` each generation,

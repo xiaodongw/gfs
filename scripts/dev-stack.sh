@@ -200,6 +200,20 @@ if [ -c /dev/fuse ] && command -v fusermount3 >/dev/null 2>&1; then
   say "git finds the repository root through the synthesized surface"
   ( cd "$WS" && git rev-parse --show-toplevel && git rev-parse --abbrev-ref HEAD )
 
+  say "the git shim answers what the raw surface gets wrong (ADR 0005)"
+  SHIM_BIN=$($XVFS install-shim --workspace "$WS" 2>/dev/null)
+  printf '  stock git ls-files:  %s entries, exit 0 -- silently wrong\n' \
+    "$( (cd "$WS" && git ls-files | wc -l) )"
+  printf '  shim  git ls-files:  %s entries\n' \
+    "$( (cd "$WS" && PATH="$SHIM_BIN:$PATH" git ls-files | wc -l) )"
+  printf '  shim  git log -1:    %s\n' \
+    "$( (cd "$WS" && PATH="$SHIM_BIN:$PATH" git log -1 --format='%h %s') )"
+  if (cd "$WS" && PATH="$SHIM_BIN:$PATH" git checkout main) 2>/dev/null; then
+    echo "FAILED: the shim accepted an unsupported subcommand" >&2
+    exit 1
+  fi
+  echo "  unsupported subcommands are refused, not approximated"
+
   say "hydration accounting"
   $XVFS inspect --workspace "$WS" | grep -E 'hydration|generation|lease'
 

@@ -572,6 +572,17 @@ async fn mount_generation(
   )
   .await?;
 
+  // One call, at mount time, so the `git` shim's `log -1` needs neither a
+  // network round trip nor a credential. A failure here degrades `log -1` and
+  // nothing else, so it must not fail the mount.
+  let commit_meta = match client.get_commit().await {
+    Ok(meta) => Some(meta),
+    Err(e) => {
+      tracing::warn!(error = %e.message, "commit metadata unavailable; `git log -1` will be unsupported");
+      None
+    }
+  };
+
   let gitdir = Arc::new(GitDir::new(&GitDirFacts {
     repository_id: config.repository_id.clone(),
     commit: commit.clone(),
@@ -582,6 +593,7 @@ async fn mount_generation(
     grpc_endpoint: config.grpc_endpoint.clone(),
     http_endpoint: config.http_endpoint.clone(),
     generation: number,
+    commit_meta,
   }));
 
   let fs = Xvfs::new(

@@ -11,6 +11,13 @@ description = "FUSE filesystem adapter and the xvfsd mount daemon"
 name = "xvfsd"
 path = "src/bin/xvfsd.rs"
 
+# The `git` shim. It lives here rather than in `xvfs-cli` because it answers
+# entirely from the mount and the synthesized `.git` surface -- no server client,
+# no credential -- so it belongs with the filesystem, not with the API client.
+[[bin]]
+name = "xvfs-git-shim"
+path = "src/bin/xvfs-git-shim.rs"
+
 [dependencies]
 xvfs-types = { workspace = true }
 xvfs-proto = { workspace = true }

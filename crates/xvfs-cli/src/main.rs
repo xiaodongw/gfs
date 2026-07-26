@@ -159,6 +159,23 @@ enum Command {
     state_dir: Option<PathBuf>,
   },
 
+  /// Install the `git` shim as `git` in a directory, and print that directory.
+  ///
+  /// The shim is a `PATH` measure, not a security boundary (DESIGN.md section
+  /// 8.6): a tool that invokes Git by absolute path bypasses it and sees the
+  /// documented limitations of the raw synthesized surface. Prepending the
+  /// printed directory to `PATH` is what makes it effective, and M6.1 verifies
+  /// that precedence inside the real agent image.
+  InstallShim {
+    #[arg(long)]
+    workspace: PathBuf,
+    #[arg(long)]
+    state_dir: Option<PathBuf>,
+    /// Defaults to `<state-dir>/bin`.
+    #[arg(long)]
+    bin_dir: Option<PathBuf>,
+  },
+
   /// Retention leases, without a mount. Used by the development stack.
   #[command(subcommand)]
   Lease(LeaseCommand),
@@ -256,17 +273,25 @@ fn default_cache_dir() -> PathBuf {
 /// put the two together, and picking up a *different* daemon from `PATH` than the
 /// CLI it shipped with is a version-skew bug that only appears at runtime.
 fn daemon_binary() -> PathBuf {
-  if let Some(explicit) = std::env::var_os("XVFS_DAEMON") {
+  sibling_binary("xvfsd", "XVFS_DAEMON")
+}
+
+fn shim_binary() -> PathBuf {
+  sibling_binary("xvfs-git-shim", "XVFS_GIT_SHIM")
+}
+
+fn sibling_binary(name: &str, override_var: &str) -> PathBuf {
+  if let Some(explicit) = std::env::var_os(override_var) {
     return PathBuf::from(explicit);
   }
   if let Ok(current) = std::env::current_exe() {
-    if let Some(sibling) = current.parent().map(|d| d.join("xvfsd")) {
+    if let Some(sibling) = current.parent().map(|d| d.join(name)) {
       if sibling.is_file() {
         return sibling;
       }
     }
   }
-  PathBuf::from("xvfsd")
+  PathBuf::from(name)
 }
 
 fn call(state_dir: &Path, request: &Request) -> Result<Response> {
@@ -634,6 +659,39 @@ async fn main() -> Result<()> {
       if report.unchanged {
         println!("           (unchanged; the selector still resolves to the same commit)");
       }
+    }
+
+    Command::InstallShim {
+      workspace,
+      state_dir,
+      bin_dir,
+    } => {
+      let state_dir = state_dir_for(workspace, state_dir);
+      let bin_dir = bin_dir.clone().unwrap_or_else(|| state_dir.join("bin"));
+      std::fs::create_dir_all(&bin_dir)
+        .with_context(|| format!("creating {}", bin_dir.display()))?;
+      // Absolute, because the printed directory is meant to be prepended to
+      // `PATH`, and a relative entry stops resolving the moment anything changes
+      // directory -- which an agent does constantly.
+      let bin_dir = std::path::absolute(&bin_dir).unwrap_or(bin_dir);
+
+      let shim = shim_binary();
+      if !shim.is_file() {
+        bail!(
+          "cannot find {} (set XVFS_GIT_SHIM to its path)",
+          shim.display()
+        );
+      }
+      let shim = std::path::absolute(&shim).unwrap_or(shim);
+      let link = bin_dir.join("git");
+      // Replaced rather than skipped when it exists: an upgraded package must
+      // not leave the previous release's shim in place.
+      let _ = std::fs::remove_file(&link);
+      std::os::unix::fs::symlink(&shim, &link)
+        .with_context(|| format!("linking {}", link.display()))?;
+
+      println!("{}", bin_dir.display());
+      eprintln!("prepend that directory to PATH so `git` resolves to the shim first");
     }
 
     Command::Lease(LeaseCommand::Create { repo, rev }) => {
