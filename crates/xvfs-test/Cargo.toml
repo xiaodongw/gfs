@@ -9,6 +9,8 @@ description = "Fixture matrix, fake server, and fault injection"
 
 [dependencies]
 xvfs-types = { workspace = true }
+anyhow = { workspace = true }
+tempfile = { workspace = true }
 
 [lints]
 workspace = true

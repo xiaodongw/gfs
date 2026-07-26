@@ -16,9 +16,13 @@ xvfs-types = { workspace = true }
 # scripts/check-licenses.sh must find the statically linked GPL-2.0 libgit2 that
 # crate metadata does not report, and it cannot find what is not there.
 git2 = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+xvfs-test = { workspace = true }
+tokio = { workspace = true }
 
 [lints]
 workspace = true
