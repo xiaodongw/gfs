@@ -80,6 +80,16 @@ pub trait GitRepository: Send + Sync + std::fmt::Debug {
   /// Every ref a caller may see. Excludes the reserved internal namespace.
   fn visible_refs(&self) -> Result<Vec<(String, ObjectId)>, XvfsError>;
 
+  /// Every ref *inside* the reserved internal namespace.
+  ///
+  /// Separated from [`Self::visible_refs`] rather than offered as a flag, because
+  /// the two have opposite audiences. `visible_refs` answers a request; this
+  /// answers a reconciliation or maintenance pass, and nothing on a request path
+  /// should be able to enumerate lease anchors -- ADR 0002 records that hiding
+  /// them prevents discovery, and a `list_refs(include_internal: bool)` would put
+  /// the difference one mistaken argument away.
+  fn reserved_refs(&self) -> Result<Vec<String>, XvfsError>;
+
   /// Whether a commit is reachable from any currently visible ref.
   ///
   /// This is the predicate M1.5's object-authorization rule turns on: a commit

@@ -1,3 +1,29 @@
-//! Repository catalog, snapshot and blob APIs, and the Git gateway.
+//! The XVFS server: repository catalog, mount retention leases, and the snapshot
+//! and blob APIs.
 //!
-//! Filled in by M1.2/M1.4/M1.5. This phase (M1.1a) creates the workspace shape only.
+//! Three durable systems have to agree, and the ordering between them is the
+//! substance of this crate:
+//!
+//! * the **catalog** ([`catalog`]) records repositories, refs, cataloged commit
+//!   times, and leases;
+//! * the **Git ref anchor** under `refs/xvfs/` is what actually keeps a pinned
+//!   commit reachable through `git gc`;
+//! * the **repository lock** ([`locks`]) makes the two consistent, by ensuring
+//!   nothing moves a repository's refs between resolving a selector and anchoring
+//!   the resulting commit.
+//!
+//! [`mounts`] is the only place all three are sequenced. Its ordering argument --
+//! why `PREPARING` exists, and why a crash at each step is recoverable -- is
+//! written out there rather than distributed across handlers.
+
+pub mod catalog;
+pub mod locks;
+pub mod mirror;
+pub mod mounts;
+pub mod registry;
+pub mod util;
+
+pub use catalog::Catalog;
+pub use locks::RepositoryLocks;
+pub use mounts::{MountManager, ReconcileOutcome};
+pub use registry::Registry;

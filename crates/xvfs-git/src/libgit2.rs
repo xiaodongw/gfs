@@ -555,6 +555,28 @@ impl GitRepository for Libgit2Repository {
     Ok(out)
   }
 
+  fn reserved_refs(&self) -> Result<Vec<String>, XvfsError> {
+    let pooled = self.checkout()?;
+    let mut out = Vec::new();
+    {
+      let repo: &git2::Repository = &pooled;
+      let refs = repo
+        .references_glob(&format!("{}**", revision::RESERVED_REF_PREFIX))
+        .map_err(|e| XvfsError::new(ErrorCode::Internal, e.message().to_owned()))?;
+      for r in refs {
+        let Ok(r) = r else { continue };
+        let Some(name) = r.name() else { continue };
+        // The glob is the fast path; the predicate is the correctness check, so a
+        // glob that ever matches more than intended cannot widen the result.
+        if revision::is_reserved_ref(name) {
+          out.push(name.to_owned());
+        }
+      }
+    }
+    out.sort();
+    Ok(out)
+  }
+
   fn is_visible(&self, commit: &ObjectId) -> Result<bool, XvfsError> {
     let pooled = self.checkout()?;
     let visible = {

@@ -9,6 +9,17 @@ description = "Repository catalog, snapshot and blob APIs, and the Git gateway"
 
 [dependencies]
 xvfs-types = { workspace = true }
+xvfs-git = { workspace = true }
+xvfs-proto = { workspace = true }
+rusqlite = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+xvfs-test = { workspace = true }
+tempfile = { workspace = true }
 
 [lints]
 workspace = true
