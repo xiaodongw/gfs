@@ -4,6 +4,11 @@
 //! libgit2 build actually do with the repository shapes XVFS intends to host,
 //! and does it agree with stock Git.
 
+// The `GitRepository` trait and the algorithm-generic types are a proof of
+// concept for M1.1's `xvfs-types`/`xvfs-git`, so parts of their surface are
+// deliberately built out ahead of a caller in this probe.
+#![allow(dead_code)]
+
 mod checks;
 mod fixtures;
 mod gitrepo;

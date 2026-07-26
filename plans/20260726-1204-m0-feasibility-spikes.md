@@ -120,7 +120,47 @@ is written to be maintained, and mixing them makes the second one worse.
 
 ## Decisions
 
-_Filled in as the spikes produce evidence._
+Each is an ADR under `docs/adr/`; the reasoning and rejected alternatives live
+there. This is the index and the one-line "why".
+
+| ADR | Decision | Decided by |
+| --- | --- | --- |
+| [0001](../docs/adr/0001-git-integration.md) | libgit2 1.9.6 vendored + stock Git 2.53 upload-pack; `files`/SHA-1 only | libgit2 agreed with stock Git on every check; `reftable` and SHA-256 provably unopenable |
+| [0002](../docs/adr/0002-git-object-authorization-boundary.md) | One bare repository is one authorization domain | protocol v2 serves any ODB object by OID regardless of `allowAnySHA1InWant` |
+| [0003](../docs/adr/0003-fuse-deployment-model.md) | Host daemon, not in-container mounting | unprivileged host mount works; in-container needs `CAP_SYS_ADMIN` |
+| [0004](../docs/adr/0004-search-representation.md) | Blob-key + trigram + snapshot bitmap; no token search in MVP | 1.99 MiB manifest per snapshot vs 52 MiB for per-snapshot Tantivy |
+| [0005](../docs/adr/0005-git-command-surface.md) | Synthesized `.git` + mandatory shim; M2→M5 does not invert | `git status` on a partial clone = 101,180 stats over 94,850 entries |
+| [0006](../docs/adr/0006-mvp-boundary-and-policies.md) | MVP boundary, versioning, lease and timestamp policy, threat model | closes DESIGN.md section 14 |
+
+Go/no-go: **conditional go**, in
+[`spikes/reports/m0-go-no-go.md`](../spikes/reports/m0-go-no-go.md).
+
+### Findings that contradicted the design
+
+Worth listing separately, because these are the milestone's actual yield —
+confirmations cost nothing to be wrong about, contradictions do:
+
+1. SHA-256 is unreachable through `git2-rs`, not merely experimental.
+2. Hiding `refs/xvfs/` prevents discovery but not access; a documented security
+   claim in DESIGN.md 7.1 was false for the Git gateway path.
+3. The synthesized `.git` contents specified in DESIGN.md 8.6 do not form a
+   repository at all — `objects/` and `refs/` are also required.
+4. `git ls-files` and `git diff` against that surface return **empty with exit
+   0** rather than failing visibly, which promotes the shim from a convenience
+   to a correctness requirement.
+
+### Probe bugs worth remembering
+
+Three measurement errors were caught and are recorded in the reports, because
+each produced a plausible-looking wrong number rather than an obvious failure:
+
+- The FUSE concurrency benchmark held one origin connection behind a mutex, so
+  threads blocked on the lock counted as concurrent fetches. Peak concurrency
+  read 16 while wall time stayed exactly serial.
+- The search probe counted one match per line where `rg --count-matches` counts
+  every occurrence. Five of seven patterns disagreed with the oracle.
+- `rg` in this environment is a shell function, not a binary, so every clone
+  benchmark's search timing silently reported 0 hits in 0.05 s.
 
 ## Details
 

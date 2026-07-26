@@ -24,8 +24,10 @@ use std::time::Instant;
 pub enum Exclusion {
     Binary,
     Oversized,
-    /// Valid UTF-8 is not required, but a blob that is mostly invalid UTF-8 is
-    /// treated as binary; this records the ones that are decodable but unusual.
+    /// Reserved: not produced by the current classifier, which follows
+    /// ripgrep's NUL-byte rule. Kept because the coverage contract must be able
+    /// to name this reason if a future classifier adds it.
+    #[allow(dead_code)]
     InvalidUtf8,
 }
 

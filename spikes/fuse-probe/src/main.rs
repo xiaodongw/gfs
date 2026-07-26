@@ -125,6 +125,10 @@ fn base_config(n_threads: usize) -> Config {
 }
 
 struct Mounted {
+    /// Never read, and must not be removed: dropping the session is what
+    /// unmounts the filesystem. Deleting this "unused" field would leave every
+    /// probe mount live until the process exits.
+    #[allow(dead_code)]
     session: fuser::BackgroundSession,
     shared: Arc<Shared>,
     origin: Arc<OriginStats>,

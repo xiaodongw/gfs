@@ -70,10 +70,10 @@ fn serve_one(
             Some(data) => {
                 stats.blob_requests.fetch_add(1, Ordering::Relaxed);
                 stats.bytes_served.fetch_add(data.len() as u64, Ordering::Relaxed);
-                write!(stream, "{}\n", data.len())?;
+                writeln!(stream, "{}", data.len())?;
                 stream.write_all(data)?;
             }
-            None => write!(stream, "-1\n")?,
+            None => writeln!(stream, "-1")?,
         }
         stream.flush()?;
     }

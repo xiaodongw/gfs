@@ -78,6 +78,12 @@ pub struct SearchResult {
 pub enum SearchOutcome {
     Completed(SearchResult),
     /// EOF, transport reset, or backend failure before the terminal message.
+    ///
+    /// Never constructed by this probe's happy path, and deliberately kept: the
+    /// design says a missing terminal message is an error, and a type that
+    /// cannot express that state would let the rule lapse silently. Exercised
+    /// in the tests below.
+    #[allow(dead_code)]
     FailedBeforeCompletion(String),
 }
 
@@ -277,7 +283,7 @@ pub fn search(
         // identifier appearing twice in one call).
         let mut line_no = 1u64;
         let mut line_start = 0usize;
-        let mut emit = |line: &[u8], line_no: u64, matches: &mut Vec<Match>| -> bool {
+        let emit = |line: &[u8], line_no: u64, matches: &mut Vec<Match>| -> bool {
             for m in re.find_iter(line) {
                 matches.push(Match {
                     path: String::from_utf8_lossy(path).into_owned(),
