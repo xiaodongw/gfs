@@ -32,11 +32,15 @@ fetch_one() {
 
     # Server-side policy the gateway will later set explicitly. Set here so
     # local file:// benchmarks exercise the same filter policy as the gateway.
+    # Deny by default, then allow exactly the one filter XVFS policy permits.
+    # Key names are Git's config names per filter family: `blob:none` and
+    # `blob:limit` keep their colons, but the `tree:<depth>` family is `tree`.
     git --git-dir="$dest" config uploadpack.allowFilter true
-    git --git-dir="$dest" config uploadpackfilter.blob.none.allow true
-    git --git-dir="$dest" config uploadpackfilter.blob.limit.allow false
+    git --git-dir="$dest" config uploadpackfilter.allow false
+    git --git-dir="$dest" config 'uploadpackfilter.blob:none.allow' true
+    git --git-dir="$dest" config 'uploadpackfilter.blob:limit.allow' false
     git --git-dir="$dest" config uploadpackfilter.tree.allow false
-    git --git-dir="$dest" config uploadpackfilter.sparse.oid.allow false
+    git --git-dir="$dest" config 'uploadpackfilter.sparse:oid.allow' false
     git --git-dir="$dest" config uploadpack.allowAnySHA1InWant false
     git --git-dir="$dest" config uploadpack.allowReachableSHA1InWant false
     git --git-dir="$dest" config core.logAllRefUpdates false

@@ -121,10 +121,16 @@ pub fn protected_config(policy: &UploadPackPolicy) -> Vec<String> {
             // Deny by default, then allow exactly one filter.
             push("uploadpackfilter.allow", "false");
             push("uploadpackfilter.blob:none.allow", "true");
-            // Named explicitly rather than left to the default, so that a future
-            // change to `uploadpackfilter.allow` cannot quietly enable them.
+            // Named explicitly rather than left to the default, so that a
+            // future change to `uploadpackfilter.allow` cannot quietly enable
+            // them. The names are Git's internal config names for each filter
+            // family, which are NOT always the filter's wire spelling: the
+            // `tree:<depth>` family is configured as `tree`, so
+            // `uploadpackfilter.tree:depth.allow` is an ignored no-op that
+            // looks like a denial. Measured, not assumed — see
+            // spikes/reports/m01-baseline.md.
             push("uploadpackfilter.blob:limit.allow", "false");
-            push("uploadpackfilter.tree:depth.allow", "false");
+            push("uploadpackfilter.tree.allow", "false");
             push("uploadpackfilter.sparse:oid.allow", "false");
             push("uploadpackfilter.object:type.allow", "false");
             push("uploadpackfilter.combine.allow", "false");
@@ -410,7 +416,12 @@ mod tests {
         // Colon-bearing subsection names; see the comment in protected_config.
         assert!(cfg.contains("uploadpackfilter.blob:none.allow=true"));
         assert!(cfg.contains("uploadpackfilter.blob:limit.allow=false"));
-        assert!(cfg.contains("uploadpackfilter.tree:depth.allow=false"));
+        // `tree`, not `tree:depth`: Git's config name for the family differs
+        // from the filter's wire spelling, and the wrong name denies nothing.
+        assert!(cfg.contains("uploadpackfilter.tree.allow=false"));
+        assert!(!cfg.contains("uploadpackfilter.tree:depth"));
+        // Deny-by-default is the mechanism that actually enforces the policy;
+        // the per-family lines above are defence in depth against it changing.
         assert!(cfg.contains("uploadpackfilter.allow=false"));
     }
 
