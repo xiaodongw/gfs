@@ -1,0 +1,22 @@
+# Line endings are pinned, not left to the developer's Git configuration.
+#
+# This host has `core.autocrlf=true` globally, which converts LF to CRLF in the
+# working tree on checkout. On a Linux target that is not a cosmetic difference:
+# a `#!/usr/bin/env bash` line ending in CR fails with "bad interpreter", so a
+# fresh clone would have a broken `scripts/check.sh` before anyone ran a test.
+# XVFS is a Linux-only service (DESIGN.md section 12), so LF is the correct
+# working-tree form everywhere and this file makes that independent of who cloned
+# it.
+* text=auto eol=lf
+
+# Fixtures that must reach the test byte-for-byte. XVFS serves *raw* blob bytes
+# with no `.gitattributes` conversion (DESIGN.md section 12), and the CRLF and
+# non-UTF-8 fixtures exist specifically to prove that. Letting Git normalize them
+# would make the fixture agree with a conversion the product does not perform,
+# and the test would pass for the wrong reason.
+crates/xvfs-test/fixtures/** -text
+spikes/corpus/** -text
+
+*.png binary
+*.pack binary
+*.idx binary

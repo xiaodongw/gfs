@@ -1,0 +1,66 @@
+## cargo-deny configuration.
+##
+## This file covers what crate metadata *can* express: advisories, source
+## provenance, duplicate versions, and the licenses of Rust crates. It
+## deliberately does not carry the whole license story.
+##
+## ADR 0001 measured that crate metadata is misleading for this stack:
+## `libgit2-sys` declares `MIT OR Apache-2.0`, which covers the Rust wrapper,
+## while the vendored C library it statically links is GPL-2.0-only with the
+## libgit2 linking exception. cargo-deny reads the metadata and therefore reports
+## this workspace as fully permissive. `scripts/check-licenses.sh` asserts the
+## ADR 0001 table itself, including that row. Run both.
+
+[graph]
+targets = ["x86_64-unknown-linux-gnu"]
+all-features = true
+
+[advisories]
+version = 2
+yanked = "deny"
+ignore = []
+
+[licenses]
+version = 2
+# The set ADR 0001 measured across the dependency tree. Adding to this list is a
+# licensing decision: it belongs in the ADR first and here second.
+allow = [
+  "Apache-2.0",
+  "Apache-2.0 WITH LLVM-exception",
+  "MIT",
+  "MIT-0",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "ISC",
+  "Zlib",
+  "Unicode-3.0",
+  "Unlicense",
+  "CC0-1.0",
+  "MPL-2.0",
+  "OpenSSL",
+  "BSL-1.0",
+]
+confidence-threshold = 0.9
+
+# ADR 0001: one crate offers `MIT OR Apache-2.0 OR LGPL-2.1-or-later`. Select a
+# permissive arm explicitly so no LGPL obligation is inherited by default.
+[[licenses.clarify]]
+crate = "notify"
+expression = "MIT"
+license-files = []
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+# The server must never link a Git wire-protocol implementation. ADR 0001 keeps
+# stock Git's GPL-2.0 off the XVFS binary specifically by executing it as a
+# child process, and that property is worth enforcing mechanically rather than
+# remembering.
+deny = [
+  { crate = "libgit2-sys", wrappers = ["git2"] },
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

@@ -1,0 +1,63 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  # Vendored libgit2 is a C build. Without this, a warning in the vendored
+  # sources is invisible in the log.
+  CARGO_NET_RETRY: 3
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # ADR 0001 pins stock Git 2.53.0 for server-side upload-pack. The runner's
+      # default Git is whatever the image ships, so the version is asserted
+      # rather than assumed: the M5 protocol matrix is only meaningful against
+      # the pinned server binary.
+      - name: Record Git version
+        run: git --version
+
+      # rust-toolchain.toml pins the channel; this action honours it.
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install gate tooling
+        run: |
+          cargo install --locked cargo-deny || true
+          cargo install --locked cargo-cyclonedx || true
+
+      # One entry point, shared with local development, so a green local run
+      # means a green CI run.
+      - name: Run the gate
+        run: scripts/check.sh
+
+      - name: Upload SBOM
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom
+          path: target/sbom/
+          if-no-files-found: warn
+
+  reproducible-release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The build pins SOURCE_DATE_EPOCH to the commit date, which needs the
+          # commit to be present rather than a shallow synthetic one.
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build twice and compare digests
+        run: scripts/build-release.sh --verify

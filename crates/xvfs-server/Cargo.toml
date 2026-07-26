@@ -1,0 +1,14 @@
+[package]
+name = "xvfs-server"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+description = "Repository catalog, snapshot and blob APIs, and the Git gateway"
+
+[dependencies]
+xvfs-types = { workspace = true }
+
+[lints]
+workspace = true

@@ -1,0 +1,21 @@
+[package]
+name = "xvfs-types"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+description = "Algorithm-generic Git value types, revision selectors, error codes, and limits"
+
+# Deliberately near-dependency-free. Every other crate depends on this one, so a
+# dependency added here is a dependency added to the FUSE client, the server, and
+# the CLI at once. Base64url and hex are hand-rolled and tested rather than
+# pulled in for the same reason.
+[dependencies]
+serde = { workspace = true }
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+serde_json = { workspace = true }

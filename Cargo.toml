@@ -1,0 +1,107 @@
+[workspace]
+resolver = "2"
+members = [
+  "crates/xvfs-types",
+  "crates/xvfs-proto",
+  "crates/xvfs-git",
+  "crates/xvfs-server",
+  "crates/xvfs-search",
+  "crates/xvfs-overlay",
+  "crates/xvfs-fuse",
+  "crates/xvfs-cli",
+  "crates/xvfs-test",
+]
+
+# `spikes/` is its own workspace on purpose. Those crates exist to produce M0
+# measurements and are expected to be deleted, not maintained, so they must not
+# share this workspace's dependency resolution or lint policy.
+exclude = ["spikes"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+# Matches rust-toolchain.toml. The MSRV is the pinned toolchain rather than an
+# older floor: XVFS ships as a service, not a library, so supporting an older
+# compiler buys nothing and costs CI time.
+rust-version = "1.97"
+publish = false
+license = "Apache-2.0"
+
+[workspace.lints.rust]
+# Deny rather than forbid: a crate that genuinely needs FFI can opt out with a
+# documented reason, which a `forbid` would make impossible.
+unsafe_code = "deny"
+missing_debug_implementations = "warn"
+
+[workspace.lints.clippy]
+# The lints that catch the mistakes this codebase is actually exposed to:
+# byte-path handling that assumes UTF-8, and silent truncation of object IDs.
+str_to_string = "warn"
+string_slice = "warn"
+
+[workspace.dependencies]
+xvfs-types = { path = "crates/xvfs-types" }
+xvfs-proto = { path = "crates/xvfs-proto" }
+xvfs-git = { path = "crates/xvfs-git" }
+xvfs-search = { path = "crates/xvfs-search" }
+xvfs-overlay = { path = "crates/xvfs-overlay" }
+xvfs-fuse = { path = "crates/xvfs-fuse" }
+xvfs-test = { path = "crates/xvfs-test" }
+
+# Git objects. Versions pinned by ADR 0001; `vendored-libgit2` is load-bearing,
+# not a convenience, because the supported-repository-format boundary is a
+# property of the exact libgit2 build XVFS ships.
+#
+# `default-features = false` drops git2's `https` and `ssh` features. The server
+# never uses libgit2 as a network client -- fetching is stock Git's job and
+# serving is the gateway's -- so linking OpenSSL and libssh2 into the object
+# path would add attack surface for no capability.
+#
+# There is deliberately no `experimental-sha256` feature: enabling
+# libgit2-sys's `unstable-sha256` makes git2 itself fail to compile. See
+# spikes/git-probe/sha256-support-check.sh and ADR 0001.
+git2 = { version = "0.20.4", default-features = false, features = ["vendored-libgit2"] }
+
+# Runtime and RPC (DESIGN.md section 7.7).
+tokio = { version = "1", features = ["full"] }
+tokio-stream = "0.1"
+tonic = "0.14"
+tonic-prost = "0.14"
+tonic-prost-build = "0.14"
+prost = "0.14"
+prost-types = "0.14"
+# protoc is supplied through Cargo rather than required on the host, for the
+# same reason libgit2 is vendored: M1.1 exists partly to stop local and CI
+# environments drifting, and a host-installed protoc is exactly such a drift.
+protoc-bin-vendored = "3"
+
+# HTTP surface: the immutable blob endpoint, the file-by-revision convenience
+# endpoint, ingestion webhooks, and health/metrics.
+axum = "0.8"
+tower = "0.5"
+tower-http = { version = "0.6", features = ["limit", "timeout", "trace"] }
+http = "1"
+http-body-util = "0.1"
+hyper = "1"
+
+# Prototype catalog. `bundled` so the supported SQLite version is ours, on the
+# same reasoning as vendored libgit2.
+rusqlite = { version = "0.37", features = ["bundled"] }
+
+# Observability.
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+metrics = "0.24"
+metrics-exporter-prometheus = "0.17"
+
+# Mount capability tokens: HMAC over a canonical encoding, not a JWT library.
+hmac = "0.12"
+sha2 = "0.10"
+subtle = "2"
+
+anyhow = "1"
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+clap = { version = "4", features = ["derive", "env"] }
+tempfile = "3"

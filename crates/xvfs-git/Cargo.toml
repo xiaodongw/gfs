@@ -1,0 +1,24 @@
+[package]
+name = "xvfs-git"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+description = "GitRepository abstraction and its libgit2-backed implementation"
+
+[dependencies]
+xvfs-types = { workspace = true }
+
+# Declared in M1.1a, used in M1.3. The dependency lands with the workspace rather
+# than with the code that calls it because ADR 0001's licensing assertion is only
+# meaningful once git2 is actually in the dependency graph:
+# scripts/check-licenses.sh must find the statically linked GPL-2.0 libgit2 that
+# crate metadata does not report, and it cannot find what is not there.
+git2 = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[lints]
+workspace = true
