@@ -27,6 +27,7 @@ pub mod oid;
 pub mod path;
 pub mod redact;
 pub mod revision;
+pub mod snapshot;
 pub mod time;
 
 pub use entry::{mode, EntryKind};
@@ -36,6 +37,9 @@ pub use limits::LeasePolicy;
 pub use oid::{HashAlgorithm, ObjectId, OidError};
 pub use path::BytePath;
 pub use revision::{RevisionSelector, RESERVED_REF_PREFIX};
+pub use snapshot::{
+  CommitMeta, LeaseState, MountGrant, ResolvedRevision, Signature, SnapshotState, TreeEntryInfo,
+};
 pub use time::Timestamp;
 
 /// The API version this build speaks.

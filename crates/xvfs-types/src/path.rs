@@ -190,6 +190,52 @@ impl serde::Serialize for BytePath {
   }
 }
 
+impl<'de> serde::Deserialize<'de> for BytePath {
+  /// Reads back the form [`BytePath`]'s `Serialize` writes.
+  ///
+  /// `b64url` is authoritative and `escaped` is ignored. The escaped form is for
+  /// humans and is deliberately not round-trippable through this path: two
+  /// different byte strings can have escaped forms that a careless reader would
+  /// treat as equal, so decoding from it would reintroduce exactly the ambiguity
+  /// the two-field representation exists to avoid.
+  ///
+  /// A bare string is also accepted and read as base64url, because that is what a
+  /// hand-written config or a `path_b64url` query parameter carries.
+  fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+    struct V;
+
+    impl<'de> serde::de::Visitor<'de> for V {
+      type Value = BytePath;
+
+      fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("a base64url string or a map containing a `b64url` field")
+      }
+
+      fn visit_str<E: serde::de::Error>(self, s: &str) -> Result<BytePath, E> {
+        BytePath::from_b64url(s).map_err(serde::de::Error::custom)
+      }
+
+      fn visit_map<A: serde::de::MapAccess<'de>>(self, mut m: A) -> Result<BytePath, A::Error> {
+        let mut b64: Option<String> = None;
+        while let Some(key) = m.next_key::<std::borrow::Cow<'de, str>>()? {
+          match key.as_ref() {
+            "b64url" => b64 = Some(m.next_value()?),
+            // Skipped rather than rejected so an added display field does not
+            // break older readers.
+            _ => {
+              m.next_value::<serde::de::IgnoredAny>()?;
+            }
+          }
+        }
+        let b64 = b64.ok_or_else(|| serde::de::Error::missing_field("b64url"))?;
+        BytePath::from_b64url(&b64).map_err(serde::de::Error::custom)
+      }
+    }
+
+    d.deserialize_any(V)
+  }
+}
+
 const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
 
 /// Unpadded base64url, per RFC 4648 section 5. Unpadded because the value
@@ -331,6 +377,31 @@ mod tests {
     // `..` is only rejected as a whole component. A name that merely contains
     // dots is ordinary.
     BytePath::new(b"a/..b/c...d".to_vec()).validate().unwrap();
+  }
+
+  #[test]
+  fn serde_round_trips_a_non_utf8_path_losslessly() {
+    let p = BytePath::new(b"drivers/\xff\xfe/x.c".to_vec());
+    let json = serde_json::to_string(&p).unwrap();
+    // Both forms are present: one for a human reading a log, one for a machine.
+    assert!(json.contains("\"escaped\""));
+    assert!(json.contains("\"b64url\""));
+    assert_eq!(serde_json::from_str::<BytePath>(&json).unwrap(), p);
+    // And a bare base64url string is accepted, which is the query-parameter form.
+    let bare = format!("\"{}\"", p.to_b64url());
+    assert_eq!(serde_json::from_str::<BytePath>(&bare).unwrap(), p);
+  }
+
+  #[test]
+  fn deserialization_ignores_the_escaped_form_even_when_it_disagrees() {
+    // `escaped` is for humans and is not round-trippable: two different byte
+    // strings can escape to forms a careless reader treats as equal. `b64url` is
+    // therefore authoritative, and a mismatched `escaped` must not win.
+    let json = r#"{"escaped":"totally/different","b64url":"Zm9v"}"#;
+    assert_eq!(
+      serde_json::from_str::<BytePath>(json).unwrap(),
+      BytePath::new("foo")
+    );
   }
 
   #[test]
