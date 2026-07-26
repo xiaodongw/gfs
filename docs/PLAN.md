@@ -248,7 +248,10 @@ Duration: 3 weeks
   - `xvfs-test`: fixtures, fake server, and fault injection.
 - Pin a stable Rust toolchain and minimum supported Rust version.
 - Add formatting, Clippy, unit/doc tests, dependency audit, license checks, SBOM,
-  secret scanning, and reproducible release builds.
+  secret scanning, and reproducible release builds. The license check must assert
+  the dependency table in [ADR 0001](adr/0001-git-integration.md) directly:
+  scanning crate metadata alone reports this stack as fully permissive and misses
+  the statically linked GPL-2.0 libgit2 entirely.
 - Establish structured error codes, request IDs, tracing, metrics, and redaction.
 - Ship a one-command local development stack: server, seeded fixture repositories of
   several sizes, and a mount, runnable on a laptop without hosted infrastructure.
@@ -314,9 +317,17 @@ and every uncached read fails permanently mid-task.
 - Integrate the chosen OIDC/workload identity.
 - Enforce repository permissions uniformly across Git, RPC, file, and search APIs.
 - Add short-lived mount credentials or host-daemon delegation.
-- Require the mount capability when an API accesses a pinned commit no longer
-  reachable from a currently visible ref; another repository reader must not gain
-  access merely because an internal lease retains the object.
+- Require the mount capability when a **snapshot, blob, or search** API accesses
+  a pinned commit no longer reachable from a currently visible ref. Within those
+  APIs, repository access alone must not reach a commit retained for another
+  subject's mount.
+  This requirement is **scoped to the XVFS APIs and does not extend to the Git
+  gateway**. M0.3 measured that stock `upload-pack` serves any object in the
+  repository's object database by object ID over protocol v2, regardless of
+  `uploadpack.allowAnySHA1InWant`, so a repository reader can always reach a
+  lease-retained commit through Git. One bare repository is one authorization
+  domain; see [ADR 0002](adr/0002-git-object-authorization-boundary.md). Do not
+  write an acceptance test that expects the Git path to deny it.
 - Add audit records without logging source content, tokens, or unsafe paths.
 - Test confused-deputy, path traversal, unauthorized OID, and stale credential cases.
 
@@ -874,7 +885,11 @@ done when:
   empty answer;
 - server search produces zero client hydration;
 - overlay data survives tested crashes and exports reproducibly;
-- authorization is uniform across Git, file, blob, and search paths;
+- **repository** authorization is uniform across Git, file, blob, and search
+  paths, and **object** authorization — the mount capability for an unreachable
+  pinned commit — holds on the snapshot, blob, and search APIs. It is not
+  claimed for the Git gateway, where one bare repository is one authorization
+  domain ([ADR 0002](adr/0002-git-object-authorization-boundary.md));
 - caches are verified, bounded, isolated, and collectible;
 - hosted FUSE privilege and lifecycle are operationally safe;
 - real agent tasks preserve correctness while reducing measured clone cost;

@@ -40,6 +40,55 @@ never uses libgit2 as a network client — fetching is stock Git's job and servi
 is the gateway's — so linking OpenSSL and libssh2 into the object path would add
 attack surface for no capability.
 
+### Licensing and packaging
+
+The crate metadata is **misleading for this stack** and must not be used on its
+own. `libgit2-sys` declares `MIT OR Apache-2.0`, but that covers the Rust
+wrapper; the vendored C library it compiles and statically links is GPL-2.0.
+
+| Component | License | How it is combined |
+| --- | --- | --- |
+| **libgit2 1.9.6** (vendored C) | **GPL-2.0-only WITH the libgit2 linking exception** | statically linked into the server binary |
+| ├ bundled zlib | Zlib | linked |
+| ├ bundled PCRE2 | BSD-3-Clause | linked |
+| └ bundled Clar | ISC | test-only, not shipped |
+| `libgit2-sys` 0.18.7 | MIT OR Apache-2.0 | Rust wrapper only |
+| `git2` 0.20.4 | MIT OR Apache-2.0 | |
+| `fuser` 0.18.0 | MIT | |
+| `tantivy` 0.25.0 | MIT | |
+| **stock Git 2.53.0** | **GPL-2.0** (mixed: GPL-2+, GPL-2, LGPL-2.1+, Expat, ISC) | **separate process, never linked** |
+| remaining 215 crates | MIT / Apache-2.0 / Unicode-3.0 / BSD / Zlib / Unlicense | permissive |
+
+Two facts carry the packaging decision:
+
+1. **libgit2's linking exception is what makes static linking safe.** Its
+   `COPYING` grants "unlimited permission to link the compiled version of this
+   library into combinations with other programs, and to distribute those
+   combinations without any restriction coming from the use of this file." So
+   linking libgit2 into an XVFS binary under a different license is permitted.
+   Modifying libgit2 itself is still governed by GPL-2.0, so **the vendored
+   libgit2 must not be patched** without accepting that obligation. If a patch
+   ever becomes necessary, that is a licensing decision, not a build decision.
+
+2. **Stock Git is executed, never linked.** DESIGN.md section 7.2's choice to
+   run `upload-pack` as a sandboxed child process is, in addition to its
+   security rationale, what keeps Git's GPL-2.0 off the XVFS binary: process
+   invocation is not a derived work. This is a further reason not to
+   reimplement upload-pack by linking Git's internals.
+
+Packaging obligations:
+
+- ship libgit2's `COPYING` (including the linking exception and the bundled
+  zlib/PCRE2 notices) with any binary distribution;
+- distribute stock Git as its own package or container layer with its own
+  license text and a source offer, not vendored into the XVFS binary;
+- one crate offers `MIT OR Apache-2.0 OR LGPL-2.1-or-later` — select MIT or
+  Apache-2.0 explicitly in the SBOM so no LGPL obligation is inherited by
+  default;
+- M1.1's license-check and SBOM tooling must assert the libgit2 row above
+  directly, because scanning crate metadata alone reports this stack as fully
+  permissive and misses the GPL-2.0 C library entirely.
+
 ### Supported repository formats
 
 | Format | Verdict | Basis |
