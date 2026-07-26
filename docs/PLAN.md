@@ -18,14 +18,36 @@ filesystem, and stock `git upload-pack` behind the Rust smart-HTTP gateway for
 clone/fetch compatibility. The direct snapshot/blob API, not `upload-pack`, serves
 FUSE file reads.
 
+Two things that look like polish are on the critical path and are treated as such
+below. A mounted commit must survive upstream ref churn, so retention leases land in
+M1 rather than with the rest of garbage collection in M7. And a workspace with no
+usable `.git` is not a workspace an agent can work in, so the Git-command surface is
+an M0 decision with an M2 implementation, not a late compatibility chore.
+
 Suggested staffing:
 
 - two Rust systems engineers for the server/client path;
-- one search/storage engineer from Milestone 2 onward;
+- one search/storage engineer, joining at M0 to own the M0.4 spike and continuing
+  through M4;
 - part-time infrastructure, security, and agent-platform support.
 
-Expected elapsed time is roughly 14–18 weeks for a controlled pilot with three
-engineers, followed by another 8–16 weeks of hardening for production. The range
+Expected elapsed time is roughly 14–18 weeks to a controlled pilot with three
+engineers, followed by another 8–16 weeks of hardening for production.
+
+That figure assumes overlap, and the milestone durations below do not sum to it.
+Run sequentially, M0 through M6 is 19–26 weeks. The 14–18 week path requires:
+
+- the two systems engineers on the critical path M0 → M1 → M2 → M3 → M6;
+- the search engineer on M0.4 and then M4 in parallel with M2 and M3, integrating
+  with the client during M3;
+- M5 (Git smart HTTP) overlapping M3/M4 when M0.5 selects the synthesized `.git`,
+  because that client path does not depend on the gateway;
+- no serialization on the M0 decisions, which is why M0 is staffed with everyone.
+
+If M0.5 selects the partial-clone `.git`, the minimum M5 upload-pack/promisor scope
+becomes a predecessor of M2 and the milestone graph changes to M0 → M1 → M5-minimum
+→ M2. That path is not described as parallel and should use the sequential estimate.
+The sequential estimate also applies if the search engineer joins late. The range
 depends heavily on FUSE deployment, push support, search-index scale, and the POSIX
 behavior required by real builds.
 
@@ -34,10 +56,10 @@ behavior required by real builds.
 | Milestone | Outcome | Exit gate |
 | --- | --- | --- |
 | M0: feasibility | Highest-risk assumptions measured | Go/no-go architecture review |
-| M1: repository API | Exact revision/tree/file access | API conformance and auth tests pass |
-| M2: read-only mount | Lazy snapshot is usable as files | Representative read/build smoke tests pass |
+| M1: repository API | Exact revision/tree/file access, retained for the life of a mount | API conformance, auth, and retention tests pass |
+| M2: read-only mount | Lazy snapshot is usable as a workspace, `.git` surface included | Representative read/build smoke tests pass |
 | M3: writable workspace | Crash-safe overlay and patch export | Mutation model and recovery tests pass |
-| M4: agent search | Search does not hydrate base and sees edits | Results match materialized `rg` corpus |
+| M4: agent search | Search does not hydrate base, sees edits, and separates execution status from scoped coverage | Results match the supported materialized `rg` corpus |
 | M5: Git compatibility | Stock Git clone/fetch works | Version/protocol matrix passes |
 | M6: hosted pilot | End-to-end jobs run safely | Performance and reliability gates met |
 | M7: production | Scaled, operable, supportable service | SLO/security/DR review passes |
@@ -48,7 +70,7 @@ export keeps the critical path smaller.
 
 ## 3. M0 — Feasibility and architecture spikes
 
-Duration: 2 weeks
+Duration: 2–3 weeks, run concurrently across the whole team
 
 ### M0.1 Workload and baseline
 
@@ -79,11 +101,24 @@ Exit: a documented deployment path works in the actual hosted environment.
 - Audit `git2-rs`/libgit2 behavior for bare repositories, object lookup, ref
   resolution, byte paths, tree diff, pack generation, object creation, transactions,
   repository formats, and SHA-256.
+- Establish the supported-repository-format boundary explicitly: confirm that
+  libgit2 cannot read `reftable` repositories, determine the state of its
+  experimental SHA-256 support and what build configuration it needs, and decide
+  whether unsupported formats are rejected at ingest or converted. Record the
+  consequence for the pre-production SHA-256 commitment.
+- Implement format detection so an unsupported mirror fails at creation rather than
+  serving a partial view.
 - Build the `GitRepository` trait and a libgit2-backed proof of concept.
 - Define the blocking-worker and request-local handle model around libgit2.
 - Proxy smart HTTP v2 to sandboxed stock `git upload-pack` and run clone/fetch,
   shallow-clone, and partial-clone smoke tests.
-- Validate the exact GET advertisement and POST stateless-RPC subprocess contracts.
+- Validate the exact GET advertisement and POST stateless-RPC subprocess contracts,
+  including the v0/v1 service preamble and the preamble-free v2 advertisement.
+- Determine and freeze the partial-clone filter policy. Confirm that
+  `uploadpack.allowFilter` and explicit `uploadpackfilter.<filter>.allow` controls
+  expose only the required filter families, while gateway request validation
+  restricts the exact initial form to `blob:none` and unadvertised-object wants
+  remain disabled.
 - Pin supported libgit2, `git2-rs`, and stock Git versions and record their licenses
   and packaging requirements.
 - Record the accepted integration in an architecture decision record.
@@ -100,19 +135,68 @@ matrix, and their deployment/runtime boundary is documented.
   repeated blobs, generated/minified files, and binary detection.
 - Prototype segment-local bitmap filtering if Tantivy token search is required.
 - Measure full and first-parent incremental manifest construction.
+- Measure steady-state manifest storage, not just build cost: manifest bytes per
+  snapshot multiplied by the number of concurrently retained snapshots under a
+  plausible branch and arbitrary-commit workload. This number, not index build time,
+  decides whether on-demand search for arbitrary commits is affordable.
+- Measure how much of the index and manifest set is binary or oversized and
+  therefore excluded, so the completeness contract has real numbers behind it.
+- Prototype the two-dimensional terminal result: execution status versus coverage
+  exclusions within the requested path scope. Measure how often a strict exhaustive
+  mode would be needed and ensure ordinary repositories containing binaries do not
+  make every normal query fail.
 
-Exit: demonstrate correct results and acceptable projected storage/query cost.
+Exit: demonstrate correct results and acceptable projected storage/query cost, with
+retained-snapshot storage projected over the pilot's expected commit churn.
 
-### M0.5 Product decisions
+### M0.5 Git-command surface inside the mount
+
+The design's default is a synthesized read-only `.git` plus a `git` shim. This spike
+tests the alternative with numbers instead of intuition.
+
+- Inventory what the pilot's agents and build tooling actually invoke: capture
+  `git` command frequency and argument shapes from real agent transcripts, and grep
+  the target repositories' build and CI configuration for repository-root detection
+  and `git` invocations.
+- Freeze the exact shim grammar—global options, subcommands, flags, pathspecs, output
+  modes, and exit codes. The candidate synthesized scope is `status`, `diff`,
+  selected `rev-parse`, `ls-files`, `show HEAD:<path>`, and bounded `log -1`, not
+  arbitrary forms of those subcommands.
+- Build a shallow, blobless partial clone of the worst-case repository against a
+  mounted or simulated tree and measure first and subsequent `git status`: wall
+  time, FUSE metadata operations, bytes transferred, and index size on disk.
+- Measure the same for `git diff` with a small edit set, and record what
+  `git checkout`/`git reset --hard` would hydrate.
+- Prototype the synthesized `.git` and confirm which tools it satisfies and which
+  fail, and that they fail visibly rather than reporting a wrong tree state.
+- Verify ownership and `safe.directory` behavior for a bind-mounted workspace.
+- Decide: synthesized only, partial clone, or synthesized with partial clone behind
+  a mount option. Record it in an architecture decision record.
+- If partial clone wins, record the hard dependency from its M2 implementation to
+  the minimum M5 smart-HTTP/promisor milestone.
+
+Exit: a decision backed by measured `git status` cost on the worst-case repository,
+and a list of tools that the chosen option does not satisfy.
+
+### M0.6 Product decisions
 
 - Answer the open questions in the design.
 - Freeze MVP compatibility boundaries and performance gates.
 - Define the server/client API versioning policy and repository path semantics.
 - Threat-model the proposed host cache and FUSE privilege boundary.
 - Create an initial failure-mode and data-retention policy.
+- Fix the mount retention-lease policy: lease lifetime, orphan expiry, and the
+  interaction with repository garbage collection. Include heartbeat frequency,
+  renewal grace, mount-capability authorization, hiding of `refs/xvfs/`, and
+  exclusion of that namespace from mirror/prune refspecs.
+- Fix the timestamp policy using a server-cataloged sanitized snapshot time and a
+  client-side monotonic overlay clock; include future-dated commits and host clock
+  skew in its acceptance cases.
 
 Go/no-go gate: proceed only if lazy mount works on the target platform, search index
-storage is viable, and projected task savings are meaningful over partial clone.
+storage is viable at steady state, a Git-command surface that the pilot's tooling
+accepts has been identified and costed, and projected task savings are meaningful
+over partial clone.
 
 ## 4. M1 — Repository and snapshot API
 
@@ -134,6 +218,11 @@ Duration: 3 weeks
 - Add formatting, Clippy, unit/doc tests, dependency audit, license checks, SBOM,
   secret scanning, and reproducible release builds.
 - Establish structured error codes, request IDs, tracing, metrics, and redaction.
+- Ship a one-command local development stack: server, seeded fixture repositories of
+  several sizes, and a mount, runnable on a laptop without hosted infrastructure.
+  Every later milestone depends on this, so it is a deliverable rather than a
+  convenience. Include the libgit2 and stock Git version pinning from M0.3 so local
+  and CI environments cannot drift.
 
 ### M1.2 Repository catalog and lifecycle
 
@@ -143,10 +232,32 @@ Duration: 3 weeks
 - Store upstream configuration and credential references, not raw secrets.
 - Implement webhook and polling ingestion with idempotent ref events.
 - Add per-repository locking and reconciliation after partial failure.
+- Validate repository format on import and reject what libgit2 cannot serve.
+- Implement mount retention leases as a crash-consistent state machine: under the
+  repository lock, resolve and authorize the revision, persist `PREPARING`, create
+  the reserved ref anchor, persist `ACTIVE`, and only then issue the mount. Reconcile
+  partial states after restart, and release on unmount, job cleanup, or expiry. Make
+  Git maintenance and garbage collection treat live leases as reachability roots.
+- Implement authenticated idempotent renewal, expiry grace, restart recovery, and
+  alerts for a live daemon that cannot renew.
+- Hide `refs/xvfs/` from upload-pack and ordinary ref enumeration, reject it as a
+  user revision, and exclude it from every upstream fetch/prune refspec. Do not use
+  unrestricted mirror pruning over internal refs.
+- Test that a force push, branch deletion, upstream rebase, or `git gc` cannot make
+  a mounted commit unreadable, that an orphaned lease expires, that a live renewed
+  lease does not expire, that `ls-remote` cannot see lease refs, and that upstream
+  fetch/prune cannot remove them.
+
+Retention leases are in M1 rather than M7 on purpose. Without them, a routine
+upstream force push during a pilot job prunes objects out from under a live mount
+and every uncached read fails permanently mid-task.
 
 ### M1.3 Git object service
 
 - Implement algorithm-generic OID parsing and canonical verification.
+- Record a stable sanitized `snapshot_time` when a commit is first cataloged; never
+  use an unbounded future committer timestamp as a filesystem clock. Return the
+  stored value from revision, mount, and commit metadata APIs.
 - Resolve branch, tag, full commit OID, and allowed abbreviation safely.
 - Read commits, annotated tags, trees, blobs, modes, and object sizes.
 - Implement byte-safe tree traversal, directory pagination, and batch stat.
@@ -156,7 +267,10 @@ Duration: 3 weeks
 ### M1.4 Snapshot and blob APIs
 
 - Define and implement `ResolveRevision`, `GetEntry`, `ListDirectory`,
-  `BatchGetEntry`, and `PrepareSnapshot`.
+  `BatchGetEntry`, `GetCommit`, and `PrepareSnapshot`.
+- Define and implement atomic `CreateMount`, idempotent `RenewMount`, and
+  `ReleaseMount`; return a capability binding subject, repository, commit, mount ID,
+  and expiry.
 - Implement file-by-revision and immutable blob HTTP endpoints.
 - Add ETag, range handling, cancellation, deadlines, response limits, and
   backpressure.
@@ -168,6 +282,9 @@ Duration: 3 weeks
 - Integrate the chosen OIDC/workload identity.
 - Enforce repository permissions uniformly across Git, RPC, file, and search APIs.
 - Add short-lived mount credentials or host-daemon delegation.
+- Require the mount capability when an API accesses a pinned commit no longer
+  reachable from a currently visible ref; another repository reader must not gain
+  access merely because an internal lease retains the object.
 - Add audit records without logging source content, tokens, or unsafe paths.
 - Test confused-deputy, path traversal, unauthorized OID, and stale credential cases.
 
@@ -176,6 +293,11 @@ Exit criteria:
 - A test can resolve a revision, list a million-entry snapshot one directory at a
   time, and fetch an individual file without cloning.
 - Concurrent ref movement cannot produce mixed-commit responses.
+- A leased commit survives a force push, a branch deletion, and a full `git gc`, and
+  an expired lease stops protecting it. Revision resolution and lease creation have
+  no race window, and a renewed live lease survives past its original TTL.
+- Lease refs are absent from all Git advertisements and survive upstream
+  fetch/prune operations.
 - Unauthorized users cannot infer blob existence through status, timing within a
   defined tolerance, cache, or error differences.
 
@@ -186,10 +308,24 @@ Duration: 3–4 weeks
 ### M2.1 Mount lifecycle
 
 - Implement `xvfs mount`, `unmount`, `inspect`, and daemon health commands.
-- Persist mount identity, repository, pinned commit, API version, and format version.
-- Resolve branch once and show the pinned commit in CLI output.
+- Persist mount identity, repository, pinned commit, snapshot time, lease state, API
+  version, and format version.
+- Call atomic `CreateMount` so revision resolution, authorization, lease catalog
+  write, and ref anchoring complete before the client receives the pinned commit.
+  Show that commit in CLI output.
 - Handle signals, forced teardown, stale mounts, daemon restart, and job cleanup.
+- Renew the retention lease on a heartbeat, recover renewal after daemon restart,
+  surface renewal failure before grace expires, and release it on unmount or cleanup.
 - Implement the chosen host-daemon/CSI integration skeleton.
+- Implement the `.git` surface selected in M0.5. For the default option that means
+  a synthesized read-only `HEAD`, `packed-refs`, `config`, and `xvfs.json`, excluded
+  from search, status, diff, export, and hydration accounting; verify mount
+  ownership and `safe.directory` behavior under the bind-mount.
+- Implement `xvfs refresh` for a clean workspace only by creating a second mount
+  generation and atomically replacing the bind mount. Do not mutate the pinned base
+  under existing long-lived kernel dentries. Keep the old generation and its lease
+  until old file and directory handles close, then tear it down. Refuse with a clear
+  error when the overlay is non-empty; three-way refresh stays out of scope.
 
 ### M2.2 Metadata and inode model
 
@@ -197,7 +333,14 @@ Duration: 3–4 weeks
 - Implement `lookup`, `getattr`, `opendir`, `readdirplus`, `releasedir`, `readlink`,
   `access`, and `statfs`.
 - Preserve byte paths and Git modes.
-- Define base timestamps and nanosecond behavior.
+- Implement the timestamp rule from the design: base entries report the server's
+  stable sanitized snapshot time, and overlay mutations use a monotonic logical
+  clock no earlier than the base plus one tick. Test that future-dated commits,
+  equal-tick writes, and skewed host clocks still leave every acknowledged local
+  edit newer than the base, and that base timestamps are identical across remounts
+  and hosts. Clamp explicit overlay timestamp requests to the overlay floor and
+  document that exact restoration of an older mtime is outside MVP compatibility.
+- Implement `statfs` against the overlay quota rather than the host filesystem.
 - Add positive/negative cache TTL and invalidation rules.
 - Represent gitlinks and unsupported object modes predictably.
 
@@ -206,8 +349,10 @@ Duration: 3–4 weeks
 - Implement whole-blob download, temporary-file verification, atomic publication,
   open-handle pinning, and LRU eviction.
 - Verify `blob <size>\0<content>` with the repository hash algorithm.
-- Implement `open`, `read`, `lseek`, `flush`, `release`, and read-only `mmap`
-  behavior as supported by FUSE/kernel.
+- Implement `open`, `read`, `lseek`, `flush`, `release`, and `mmap` behavior as
+  supported by FUSE/kernel. Determine whether writable `MAP_SHARED` is available in
+  the target deployment and whether enabling the writeback cache to get it is
+  acceptable; record the answer as a compatibility boundary either way.
 - Deduplicate concurrent misses for the same OID.
 - Add retry policy, timeouts, cancellation, offline cached reads, and clear errno
   mapping.
@@ -220,13 +365,26 @@ Duration: 3–4 weeks
   systems selected in M0.
 - Test huge directories, deep paths, non-UTF-8 names, symlink loops, branch races,
   server loss, slow responses, corrupt blobs, and cache eviction.
-- Compare visible snapshot metadata and file bytes to a materialized Git checkout.
+- Compare visible snapshot metadata and file bytes to a raw-tree materializer built
+  from `git ls-tree` and `git cat-file`, since the mount serves raw blob bytes and a
+  normal checkout can still apply built-in `.gitattributes` conversion. Then
+  run the same comparison with filters enabled on a repository that uses
+  `.gitattributes` and LFS, and record the divergence as documented expected
+  behavior rather than a test failure.
+- Exercise the `.git` surface and `git` shim: repository-root detection, branch and
+  commit reporting, the supported read-only subcommands, and confirmation that
+  unsupported subcommands fail with an actionable message instead of a wrong answer.
 
 Exit criteria:
 
 - Cold mount meets the startup/download target.
 - Reading selected files transfers only required metadata and blobs.
-- The chosen representative read-only build or analysis tasks succeed.
+- The chosen representative read-only build or analysis tasks succeed, with the
+  tooling that probes for a repository root working against the `.git` surface.
+- Base timestamps are stable across remounts and hosts and do not confuse the
+  selected build systems, including with future-dated commits and clock skew.
+- Refresh exposes only the old or new mount generation; open old-generation handles
+  remain valid until close and no kernel-cached path mixes generations.
 - Daemon or server failure does not corrupt the shared cache.
 
 ## 6. M3 — Writable overlay and export
@@ -263,6 +421,12 @@ Duration: 3–4 weeks
 - Add deterministic JSON and Git-patch exports with base commit metadata.
 - Implement atomic export bundles and checksums.
 - Build a verifier that applies an export to a clean checkout and compares trees.
+- Back only the exact `git` shim grammar frozen in M0.5: `status`, `diff`, the
+  selected `rev-parse` and `ls-files` forms, `show HEAD:<path>`, and bounded
+  `log -1` metadata obtained through `GetCommit`. Test every supported flag
+  combination against real Git over a materialized checkout, and test that all
+  other commands and flags fail with an actionable message rather than hydrating or
+  returning an approximation.
 
 ### M3.4 Crash and concurrency testing
 
@@ -287,7 +451,8 @@ Duration: 3–4 weeks
 
 - Assign stable, repository-scoped blob keys transactionally.
 - Detect binary, UTF-8, oversized, generated, and vendored content with recorded,
-  configurable policy.
+  configurable policy. Generated and vendored files are classifications, not
+  default exclusions; any exclusion must be declared in coverage metadata.
 - Decode line boundaries without normalizing returned byte offsets.
 - Index each OID once and make ingestion idempotent.
 - Rate-limit and sandbox parsing/tokenization.
@@ -311,6 +476,13 @@ Duration: 3–4 weeks
   deterministic ordering.
 - Use bounded regex automata and reject or budget broad scans.
 - Add result, time, candidate, bytes-read, and concurrency quotas.
+- Implement the completion contract: every successful stream ends with exactly one
+  terminal message that separately reports execution status (`COMPLETE` or
+  `TRUNCATED`) and policy/index coverage, including eligible-path count, exclusions
+  grouped by reason and scope, stop budget, and index generation. Treat EOF, RPC
+  failure, or cancellation before that terminal message as a failed search. Test
+  that budget exhaustion, policy exclusion, index gaps, and partial backend failure
+  cannot reach the client as a plain empty result.
 
 ### M4.4 Optional token search
 
@@ -325,7 +497,19 @@ Duration: 3–4 weeks
 - Query the exact pinned commit, never the original branch name.
 - Exclude changed, deleted, renamed-from, and type-changed paths from base results.
 - Search created, copied-up, and modified local files without contacting the server.
+- Bound the local half of the search the same way the server bounds its own: honor
+  `.gitignore` and `.git/info/exclude` from the merged workspace, apply the server's
+  binary and size classification, and enforce a local time and bytes-read budget.
+  Benchmark against an overlay containing a full build tree; `xvfs search` must not
+  become slower than the `rg` invocation it replaces. Provide an explicit flag to
+  search ignored files.
 - Merge context, ordering, limits, and exit codes predictably.
+- Surface execution status and coverage separately end to end. Merge server and
+  local exclusions into one scoped coverage report, print it on stderr in text mode,
+  and expose it as fields in `--json`. Execution truncation, a missing terminal
+  message, and transport/backend failure use non-success exit codes. Declared
+  coverage exclusions warn by default; `--require-exhaustive` turns any coverage gap
+  into failure. Cover this contract in the agent instructions and MCP tool schema.
 - Add `--json` and ripgrep-like text output.
 - Implement `xvfs-rg` for the selected safe flag subset and fail closed on
   unsupported flags unless explicit hydration is requested.
@@ -334,17 +518,23 @@ Duration: 3–4 weeks
 ### M4.6 Search correctness and performance
 
 - Materialize the same commit and compare XVFS results to `rg` for a large generated
-  query corpus.
+  query corpus within the declared supported corpus and matching semantics.
 - Cover CRLF, files without final newline, Unicode, invalid UTF-8 paths, repeated
   blobs, symlinks, binary files, huge lines, regex corner cases, and overlay edits.
 - Verify a server search fetches zero blobs into the client cache.
 - Benchmark cold/warm branch and arbitrary-commit preparation.
+- Fault-inject budget exhaustion, binary/oversized/policy exclusions, index gaps,
+  transport loss before the terminal message, and partial backend failure. Assert
+  that execution truncation/failure and coverage gaps remain distinguishable and
+  that default and `--require-exhaustive` exit behavior matches the contract.
 
 Exit criteria:
 
 - Supported literal/regex results match the documented `rg` semantics.
 - Search after edits returns the merged logical workspace.
 - Warm search meets the performance target and causes zero base hydration.
+- No tested failure or limit produces a result that is indistinguishable from
+  "no matches".
 
 ## 8. M5 — Git smart HTTP compatibility
 
@@ -353,7 +543,22 @@ Duration: 2–4 weeks
 ### M5.1 Smart HTTP gateway
 
 - Implement info/refs and upload-pack routes with streaming and backpressure.
+- Reproduce `git-http-backend`'s version-dependent framing exactly. For protocol
+  v0/v1 info/refs, prepend the `# service=git-upload-pack` pkt-line and flush packet
+  because `upload-pack --http-backend-info-refs` does not emit them. For protocol
+  v2, do not add that preamble; the response starts with the `version 2` pkt-line
+  emitted by upload-pack. Return
+  `application/x-git-upload-pack-advertisement` with `Cache-Control: no-cache` for
+  the advertisement and `application/x-git-upload-pack-result` for the RPC.
+- Accept `Content-Encoding: gzip` request bodies and decompress them under explicit
+  output-size and ratio limits before forwarding to the subprocess.
 - Pass `Git-Protocol` v2 negotiation correctly.
+- Start upload-pack with protected configuration that enables filtering explicitly
+  (`uploadpack.allowFilter=true`), disables unselected filter families with
+  `uploadpackfilter.<filter>.allow`, hides `refs/xvfs/*`, and leaves arbitrary
+  unadvertised object wants disabled. Validate the exact requested filter in the
+  gateway, initially allowing only `blob:none`, because Git's configuration can
+  permit a filter family more broadly than XVFS policy.
 - Disable hooks and unsafe repository/path/environment behavior.
 - Add authentication, authorization, request-size, CPU, memory, time, and process
   limits.
@@ -361,11 +566,20 @@ Duration: 2–4 weeks
 
 ### M5.2 Protocol feature matrix
 
-- Test protocol v0/v1 fallback as required and v2 `ls-refs`/`fetch`.
-- Test thin packs, sideband, shallow fetch, partial-clone filters, ref-in-want, and
-  cancellation according to supported scope.
+- Test byte-exact v0/v1 advertisements with the service preamble and v2
+  advertisements beginning with `version 2`, plus v2 `ls-refs`/`fetch`.
+- Test thin packs, sideband, shallow fetch, the allow-listed partial-clone filters,
+  ref-in-want if selected, and cancellation according to supported scope. Verify
+  that filtering is not advertised when disabled, is advertised when the protected
+  configuration enables it, and unsupported filters fail closed.
 - Test empty, corrupt, alternates-based, SHA-1, and later SHA-256 repositories.
 - Test multiple maintained Git client versions on Linux and at least one other OS.
+- Verify every clone and fetch result independently, since the server's protocol
+  engine is stock Git and cannot serve as its own oracle: run `git fsck` on the
+  received repository and compare its resolved trees against the libgit2-backed
+  snapshot API and a direct filesystem clone of the bare repository.
+- If M0.5 selected the partial-clone `.git`, verify that the gateway works as a
+  promisor remote for on-demand blob fetches from inside a mounted workspace.
 - Fuzz HTTP routing, headers, repository selection, subprocess setup, and response
   streaming at the Rust trust boundary; send malformed pkt-line inputs through the
   sandbox to verify resource limits and safe failure.
@@ -377,6 +591,10 @@ Duration: 2–4 weeks
 - Validate and allow-list `Git-Protocol` values before setting `GIT_PROTOCOL`.
 - Disable hooks and unsafe configuration and make the repository read-only to the
   upload-pack process.
+- Build the protected upload-pack configuration independently of repository and
+  user configuration. Test that `refs/xvfs/*` is absent from v0/v1 advertisements
+  and v2 `ls-refs`, and that repository configuration cannot re-enable hidden refs,
+  hooks, arbitrary unadvertised wants, or disallowed filters.
 - Apply process count, CPU, memory, output, inactivity, and wall-clock limits.
 - Propagate cancellation, reap every child, and test disconnects during
   advertisement, negotiation, and pack streaming.
@@ -401,10 +619,18 @@ Duration: 3–4 weeks
 - Create/mount before the job and unmount/archive after the job.
 - Pass repository, revision, job identity, limits, and credentials securely.
 - Bind-mount into an unprivileged container with the expected ownership.
-- Install CLI, `xvfs-rg`, agent instructions, and optional MCP tool.
+- Install CLI, `xvfs-rg`, the `git` shim, agent instructions, and optional MCP tool,
+  and verify shim precedence in `PATH` inside the real agent image.
 - Collect patch/export as a job artifact and feed it into the existing review/commit
   pipeline.
-- Handle cancellation, timeout, node drain, orphan mounts, and cleanup retries.
+- Handle cancellation, timeout, node drain, orphan mounts, and cleanup retries,
+  including heartbeat renewal, warning before the renewal grace deadline, and
+  retention-lease release on every teardown path.
+- Resolve `xvfs materialize`: if M0.2 found a target environment that cannot mount,
+  implement selective materialization of an explicit path set into a plain directory
+  here; if every target environment can mount, remove it from the design rather than
+  leaving an unimplemented fallback in the document. Note that this is distinct from
+  the pilot's clone fallback in M6.5, which abandons XVFS for the job entirely.
 
 ### M6.2 Hydration controls
 
@@ -441,9 +667,17 @@ Duration: 3–4 weeks
 - Define rollback and automatically fall back to clone on safe, recognized startup
   failures.
 
+On the statistics: a 20–50 task corpus can only detect large correctness
+differences. Treat correctness as a per-task gate rather than a statistical test —
+every XVFS failure that the clone workflow did not also produce must be root-caused
+and either fixed or accepted explicitly. Compute a confidence interval on the
+difference and report it honestly as wide. Reserve statistical claims for the
+resource metrics, where per-task measurements are paired and the effect sizes are
+large.
+
 Pilot gate:
 
-- no statistically meaningful correctness regression;
+- zero unexplained correctness regressions, each XVFS-only failure root-caused;
 - meaningful median and tail improvement on startup bytes/disk;
 - acceptable end-to-end task latency;
 - no unresolved high-severity security findings;
@@ -464,7 +698,9 @@ Duration: 8–16 weeks, driven by scale and compliance
 
 ### M7.2 Retention and garbage collection
 
-- Define reachability roots: refs, active mounts, retained commits, and exports.
+- Extend the M1 mount-lease mechanism to the full reachability-root set: refs,
+  active mounts, retained commits, exports, and prepared snapshots, now coordinated
+  across nodes rather than within one.
 - Expire snapshot manifests and unused decoded blobs without racing readers.
 - Coordinate Git maintenance with object readers and active upload-pack processes.
 - Report reclaimed bytes, failed deletions, and legal-hold exceptions.
@@ -540,40 +776,53 @@ Every milestone adds cases to the same automated matrix:
 
 | Axis | Cases |
 | --- | --- |
-| Git | client versions, protocol versions, SHA-1/SHA-256, shallow/partial, packed/loose |
+| Git | client versions, protocol versions, SHA-1/SHA-256, shallow/partial, packed/loose, `files` vs rejected `reftable` backend, gzip-encoded request bodies |
 | Trees | empty, million files, deep, huge directory, non-UTF-8, mode changes, submodule |
 | Files | empty, text, binary, CRLF, huge line, huge blob, symlink, executable |
-| Network | latency, loss, retry, timeout, reset, truncated/corrupt response |
+| Network | latency, loss, retry, timeout, reset, truncated/corrupt response, search EOF before terminal completion |
 | Storage | disk full, read-only, inode full, corruption, eviction, restart |
 | Concurrency | duplicate fetch, parallel readers/writers, rename/unlink while open |
 | Security | unauthorized repo/OID, path traversal, symlink escape, regex abuse, token expiry |
-| Lifecycle | crash, forced unmount, orphan cleanup, upgrade, downgrade, GC race |
-| Agent | raw `rg`, XVFS search, edit-then-search, build, test, diff/export |
+| Lifecycle | crash, forced unmount, orphan cleanup, upgrade, downgrade, GC race, force push and branch deletion under a live mount, lease renewal, grace, expiry, and hidden-ref pruning |
+| Agent | raw `rg`, XVFS search, edit-then-search, execution-truncated and coverage-excluded search, strict exhaustive search, build, test, diff/export, exact `git` shim grammar and `.git` probing, ignored-file overlay search |
 
 Correctness oracles:
 
-- stock Git checkout/tree/object output;
-- `ripgrep` over a fully materialized pinned checkout;
+- a raw-tree materializer built from `git ls-tree` and `git cat-file`, which avoids
+  checkout-time `.gitattributes`, `core.autocrlf`, clean/smudge, and LFS conversion;
+- `ripgrep` over that raw materialization for the supported searchable corpus, with
+  binary, oversized, ignored, and other declared exclusions compared to coverage
+  metadata rather than silently omitted;
 - an in-memory overlay state model;
 - `git apply`/tree comparison for exported patches;
-- C Git upload-pack for protocol behavior.
+- for protocol behavior, stock Git *clients* across the supported version matrix,
+  plus `git fsck` and tree comparison on the cloned result, and a direct filesystem
+  clone of the bare repository. The server's `upload-pack` is the implementation and
+  cannot be its own oracle;
+- real `git status`/`diff` over a materialized checkout with the same edits, for the
+  `git` shim.
 
 ## 13. Initial backlog ordering
 
 The first executable backlog should be:
 
-1. M0.1–M0.4 spikes in parallel where staffing permits.
-2. Architecture review and frozen MVP boundary.
-3. Workspace/types/protocol foundation.
-4. Exact revision and file API.
-5. Minimal read-only remote mount.
+1. M0.1–M0.5 spikes in parallel where staffing permits.
+2. Architecture review and frozen MVP boundary, including the `.git` decision.
+3. Workspace/types/protocol foundation and the local development stack.
+4. Exact revision and file API, with mount retention leases.
+5. Minimal read-only remote mount, including the chosen `.git` surface.
 6. Verified shared blob cache.
 7. Overlay state model, then mutations and export.
-8. Literal search index and snapshot manifest.
-9. Overlay-aware `xvfs search` and agent tool integration.
+8. Literal search index, snapshot manifest, and the terminal execution/coverage
+   contract.
+9. Overlay-aware `xvfs search`, the `git` shim, and agent tool integration.
 10. Smart HTTP compatibility matrix.
 11. Hosted orchestrator integration and controlled pilot.
 12. Production and push milestones only after pilot evidence.
+
+This ordering assumes the synthesized `.git` decision. If M0.5 selects a real
+partial clone, move the minimum upload-pack/promisor portion of item 10 ahead of
+item 5; the rest of M5 may remain later.
 
 ## 14. Definition of done
 
@@ -581,8 +830,16 @@ The project is not done merely when a filesystem mounts. A production release is
 done when:
 
 - a branch selector is pinned and all APIs are snapshot-consistent;
-- supported POSIX and Git behaviors have conformance tests;
-- search matches documented semantics and includes overlay changes;
+- a mounted commit stays readable for the life of the job regardless of upstream ref
+  changes or garbage collection, using an atomically issued and heartbeat-renewed
+  lease whose internal ref is neither advertised nor pruned;
+- supported POSIX and Git behaviors have conformance tests, including the documented
+  divergences: raw blob bytes, sanitized stable base timestamps, and the exact
+  `.git`/shim surface;
+- search matches documented semantics, includes overlay changes, reports execution
+  status separately from scoped coverage, and never presents truncation, missing
+  terminal status, backend failure, or a policy/index exclusion as an exhaustive
+  empty answer;
 - server search produces zero client hydration;
 - overlay data survives tested crashes and exports reproducibly;
 - authorization is uniform across Git, file, blob, and search paths;

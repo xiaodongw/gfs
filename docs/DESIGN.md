@@ -88,7 +88,13 @@ xvfs diff --format git
 `xvfs search` combines server results for the pinned base commit with a local search
 of modified and newly created overlay files. Deleted or replaced base paths are
 removed from server results. This is necessary for search to remain correct after
-the agent starts editing.
+the agent starts editing. A result set that was cut short by a budget, or that could
+not cover part of the workspace, says so; it never looks like an empty result.
+
+Familiar commands keep working where it is cheap to make them work. The mount
+carries a synthesized read-only `.git`, and a `git` shim answers `status`, `diff`,
+`rev-parse`, `ls-files`, `show`, and pinned-commit `log` from the overlay journal and
+the snapshot API. Section 8.6 covers the boundary and what happens outside it.
 
 At job completion the orchestrator runs `xvfs diff` or `xvfs export`. A later phase
 adds `xvfs commit` and compare-and-swap branch updates.
@@ -127,12 +133,21 @@ The prototype will use the following implementation:
   smart-HTTP gateway for clone/fetch compatibility;
 - the Linux filesystem uses `cberner/fuser`;
 - the FUSE client reads individual files through the XVFS snapshot/blob API, not
-  through `upload-pack`.
+  through `upload-pack`;
+- the mount presents a synthesized read-only `.git` plus a `git` shim, with a real
+  partial-clone `.git` as a measured alternative (section 8.6).
 
 Using libgit2 and `upload-pack` means the deployable server includes C components,
 but application control flow, APIs, authorization, search, orchestration, and
 filesystem behavior remain implemented in Rust. A native Rust Git wire-protocol
 engine is not in the planned scope.
+
+This choice constrains the repositories XVFS can host. libgit2 cannot read the
+`reftable` ref backend that stock Git 2.45 and later can create, and its SHA-256
+support is experimental and requires a non-default build. Server-side bare
+repositories are therefore created and maintained with the `files` ref backend, and
+the repository catalog rejects a mirror whose format libgit2 cannot open rather than
+serving a partial view of it. Section 12 records the consequence for SHA-256.
 
 ## 6. Core design decisions
 
@@ -150,15 +165,23 @@ conformance details do not leak into HTTP, search, or FUSE code. Repository and
 pack-builder handles are not shared concurrently; blocking libgit2 operations run
 in bounded worker pools.
 
+The trait boundary also exists because libgit2 does not cover every repository
+format stock Git can produce. Supported repository formats are an explicit,
+validated property of a mirror, not an assumption.
+
 ### 6.2 Pin every workspace to an immutable commit
 
-A branch name is only a selector. `Mount` or `ResolveRevision` returns a commit OID,
-and all later tree, blob, and search requests name that OID. Responses repeat the
-resolved commit. This prevents a file from one branch generation being combined with
-search results or metadata from another generation.
+A branch name is only a selector. `CreateMount` or `ResolveRevision` returns a
+commit OID, and all later tree, blob, and search requests name that OID. Responses
+repeat the resolved commit. This prevents a file from one branch generation being
+combined with search results or metadata from another generation.
 
-An explicit `xvfs refresh` may move a clean workspace to a new commit. Refresh with
-local changes requires a three-way rebase operation and is not part of the MVP.
+An explicit `xvfs refresh` may move a clean workspace to a new commit, but it does
+so by creating a new mount generation and replacing the old bind mount rather than
+mutating a live FUSE namespace in place. This preserves the immutable-base
+assumption, avoids stale kernel dentries under long TTLs, and gives open handles
+well-defined old-generation behavior. Refresh with local changes requires a
+three-way rebase operation and is not part of the MVP.
 
 ### 6.3 Keep extensions outside the Git wire protocol initially
 
@@ -228,11 +251,48 @@ of an upstream Git host.
 Responsibilities:
 
 - create, fetch, repack, verify, and remove mirrors;
+- validate that a mirror's repository format is supported before serving it;
 - resolve refs, tags, and abbreviated object IDs under an authorization context;
 - serialize ref mutations per repository;
 - emit a durable ref-change event after a successful update;
 - reconcile catalog state with refs after a crash or missed webhook;
+- keep commits pinned by live mounts reachable;
 - enforce repository quotas and run Git maintenance.
+
+The retention rule is not deferrable. A mounted commit can become unreachable at any
+time — a force push, a deleted branch, or an upstream rebase — and the next
+`git gc` would then prune objects out from under a running job, turning every
+uncached read into a permanent error mid-task.
+
+Mount creation is therefore one server-side operation under the repository's
+ref/maintenance lock: resolve the selector, authorize the resolved commit, write a
+durable `PREPARING` lease record, create its reachability anchor, mark the lease
+`ACTIVE`, and only then return the mount capability. The catalog and Git ref cannot
+share one storage transaction, so restart reconciliation removes abandoned
+`PREPARING` anchors or completes a provably safe transition. An `ACTIVE` lease is
+never returned before its anchor is durable. There is no client-visible gap between
+revision resolution and lease activation.
+
+The anchor is a ref under a reserved namespace such as
+`refs/xvfs/mounts/{mount_id}`. The namespace is hidden from upload-pack and ordinary
+ref enumeration, excluded from upstream mirror and prune refspecs, and rejected as a
+user-supplied revision. It is an implementation reachability root, not a published
+repository ref or an authorization mechanism. Maintenance and garbage collection
+treat live leases as roots.
+
+Leases have a bounded TTL and must be renewed by an authenticated daemon heartbeat.
+Renewal is idempotent, extends the catalog expiry, and verifies or repairs the
+durable anchor while holding the repository lock; the anchor itself has no TTL.
+Unmount and job cleanup release the lease eagerly; expiry is the crash fallback.
+The server keeps a grace interval between expiry and pruning so a transient renewal
+failure can be reported and recovered without immediately destroying a live
+workspace.
+
+Every mount receives an unforgeable capability binding subject, repository, commit,
+mount ID, and expiry. Snapshot calls for a commit that is no longer reachable from a
+public ref must present that capability; repository access alone does not grant
+access to every commit retained for another mount. Section 7.6 and the production
+milestone extend the same lease mechanism to derived data.
 
 For a proxy deployment, ingestion uses webhooks plus polling. For an authoritative
 deployment, receive-pack creates the ref-change event. Ref events are idempotent and
@@ -245,7 +305,7 @@ Required initial compatibility is read-only Git smart HTTP:
 - `GET .../info/refs?service=git-upload-pack`;
 - `POST .../git-upload-pack`;
 - protocol v2 `ls-refs` and `fetch`;
-- shallow and partial-clone filters supported by the deployed stock Git version.
+- shallow clone and an explicitly configured partial-clone filter subset.
 
 Push/`git-receive-pack`, SSH transport, and unauthenticated `git://` are later
 milestones. Smart HTTP is the best first transport for hosted jobs because it works
@@ -266,16 +326,34 @@ For smart HTTP, the gateway maps the two request phases as follows:
 
 1. `GET .../info/refs?service=git-upload-pack` runs
    `git upload-pack --http-backend-info-refs <bare-repository>` and returns the
-   capability/ref advertisement.
+   capability/ref advertisement as `application/x-git-upload-pack-advertisement`
+   with `Cache-Control: no-cache`. The subprocess emits only the protocol
+   advertisement body. For protocol v0/v1, the gateway first writes the
+   `# service=git-upload-pack` pkt-line and a flush packet, exactly as
+   `git-http-backend` does. For protocol v2 it must not write that preamble; the
+   response begins directly with the subprocess's `version 2` pkt-line.
 2. `POST .../git-upload-pack` runs
    `git upload-pack --stateless-rpc <bare-repository>`, streams the request to
-   stdin, and streams stdout as `application/x-git-upload-pack-result`.
+   stdin, and streams stdout as `application/x-git-upload-pack-result`. Git clients
+   may send the request body with `Content-Encoding: gzip`; the gateway decompresses
+   it under an explicit output-size and ratio bound before forwarding.
 
 For protocol v2, the gateway validates the `Git-Protocol` header and passes the
 negotiated value in `GIT_PROTOCOL`. The subprocess implements pkt-line framing,
 `ls-refs`, want/have negotiation, shallow behavior, partial-clone filters, pack
 deltas, and sideband output. XVFS still owns authentication, repository selection,
 HTTP validation, deadlines, cancellation, concurrency limits, and auditing.
+
+Partial-clone support is controlled configuration, not merely a property of the Git
+binary. The gateway enables `uploadpack.allowFilter` only when repository policy
+allows it, disables unselected filter families with
+`uploadpackfilter.<filter>.allow`, and validates the exact requested filter before
+starting the subprocess. That gateway validation matters because Git's per-filter
+configuration can allow a family more broadly than XVFS intends. The initial target
+is exactly `blob:none`; `blob:limit` and bounded `tree:<depth>` are enabled only if
+M0 measurements require them. Broad or future filter forms are denied by default.
+Unadvertised-object features such as `allowAnySHA1InWant` remain disabled. The same
+protected configuration hides `refs/xvfs/` from advertisement and fetch.
 
 libgit2's pack builder is useful for XVFS-created objects and later commit/export
 features, but libgit2 does not provide a drop-in server-side upload-pack state
@@ -295,26 +373,66 @@ Proposed RPCs:
 
 ```text
 ResolveRevision(repo, revision_selector)
-  -> { commit_oid, tree_oid, ref_name?, ref_version }
+  -> { commit_oid, tree_oid, ref_name?, ref_version, snapshot_time }
 
-GetEntry(repo, commit_oid, path_bytes)
-  -> { kind, mode, oid, size, symlink_target? }
+CreateMount(repo, revision_selector, requested_ttl)
+  -> { mount_id, commit_oid, tree_oid, ref_name?, snapshot_time,
+       mount_capability, lease_expiry }
 
-ListDirectory(repo, commit_oid, path_bytes, page_token, page_size)
+RenewMount(mount_id, mount_capability)
+  -> { mount_capability, lease_expiry }
+
+ReleaseMount(mount_id, mount_capability)
+  -> {}
+
+GetCommit(repo, commit_oid, snapshot_authorization?)
+  -> { commit_oid, tree_oid, parent_oids[], author, committer, message,
+       snapshot_time }
+
+GetEntry(repo, commit_oid, path_bytes, snapshot_authorization?)
+  -> { kind, mode, oid, size, symlink_target?, blob_ticket? }
+
+ListDirectory(repo, commit_oid, path_bytes, page_token, page_size,
+              snapshot_authorization?)
   -> { entries[], next_page_token }
 
-BatchGetEntry(repo, commit_oid, path_bytes[])
+BatchGetEntry(repo, commit_oid, path_bytes[], snapshot_authorization?)
   -> { results[] }
 
-PrepareSnapshot(repo, commit_oid)
-  -> { state: READY | BUILDING, operation_id? }
+PrepareSnapshot(repo, commit_oid, snapshot_authorization?)
+  -> { state: READY | BUILDING | FAILED, operation_id?, failure_reason? }
 
-Search(repo, commit_oid, query, mode, path_globs, limits)
-  -> stream { path_bytes, line, column, snippet, blob_oid, commit_oid }
+Search(repo, commit_oid, query, mode, path_globs, limits,
+       snapshot_authorization?)
+  -> stream {
+       match { path_bytes, line, column, snippet, blob_oid, commit_oid }
+       | completion {
+           execution_status: COMPLETE | TRUNCATED,
+           truncation?,
+           coverage {
+             eligible_paths,
+             excluded_paths_by_reason[],
+             requested_scope
+           },
+           index_generation
+         }
+     }
 ```
 
 Paths are bytes in the protocol, not assumed UTF-8. CLI JSON includes a lossless
 escaped representation.
+
+`snapshot_authorization` is either normal proof that the commit is reachable from a
+currently allowed ref or the mount capability returned by `CreateMount`. This is
+what lets one subject keep using its force-pushed-away pinned commit without making
+that retained commit available to every repository reader.
+
+`blob_ticket` is the short-lived blob authorization described below.
+`PrepareSnapshot` reports the three lifecycle states used everywhere in the system;
+`NOT_INDEXABLE` and `RESOURCE_LIMIT` are request error codes, not snapshot states.
+A successful `Search` RPC ends with exactly one completion message. EOF, transport
+reset, cancellation, or RPC error before that terminal message is a failed search,
+never a complete partial result.
 
 The convenience file endpoint is:
 
@@ -368,10 +486,33 @@ The index pipeline for a ref update is:
 A first snapshot or unrelated commit is built by a parallel tree walk. Repeated
 blobs are deduplicated by OID. Binary files and blobs over a configurable limit
 (suggested default: 8 MiB) are excluded from content search but remain available
-through file APIs. Index state records the exclusion reason.
+through file APIs. Index state records the exclusion reason. Generated and vendored
+tracked text is classified for observability and optional policy, but is not
+excluded by default because `xvfs-rg` would otherwise silently diverge from ordinary
+`rg`.
 
 Search responses carry the exact commit OID and index generation. Time, result,
 candidate-byte, and regex-complexity limits are enforced server-side.
+
+Silence must never be ambiguous. An agent that receives an empty or short result set
+will conclude the symbol does not exist, so execution status and corpus coverage are
+separate parts of the response contract:
+
+- **Execution status** says whether the query finished evaluating the declared
+  searchable corpus. Result, time, candidate-byte, regex, cancellation, and backend
+  limits produce `TRUNCATED` or an RPC failure and a non-success CLI exit.
+- **Coverage** describes files outside that corpus, grouped by reason, within the
+  requested path-glob scope rather than across the entire repository. A normal
+  indexed query can be execution-complete while reporting binary or oversized
+  exclusions.
+
+The CLI renders both dimensions on stderr in text mode and as explicit fields in
+`--json`. Policy coverage gaps are warnings under the normal mode; a
+`--require-exhaustive` mode treats any relevant coverage gap as failure and may use
+a separately budgeted server-side fallback scan where policy permits. A missing
+terminal completion message is always an error. This makes a budget-truncated query
+impossible to mistake for absence without making every search in a repository that
+contains one binary file permanently fail.
 
 ### 7.6 Storage
 
@@ -454,13 +595,49 @@ deadlines.
 | `unlink`, `rmdir` | Remove overlay entry or create base whiteout |
 | `rename` | Atomic overlay journal transaction; copy-up metadata as needed |
 | `readlink`, `symlink` | Preserve Git symlink semantics with safety policy |
-| `setattr` | Support size, executable bit, and timestamps; reject unsupported modes |
+| `setattr` | Support size, executable bit, and timestamps subject to the overlay time floor; reject unsupported modes |
+| `flush`, `fsync`, `fsyncdir` | No-op on base entries; durable through the overlay journal for local files |
+| `statfs` | Report overlay quota and free space, not the host filesystem totals |
+| `link` | `EPERM` in the MVP; Git has no hard links and the overlay does not model them |
+| `fallocate`, `copy_file_range` | Optional overlay passthrough; fall back to a documented error |
+| `mmap` | `MAP_PRIVATE` and read-only `MAP_SHARED` supported; writable `MAP_SHARED` depends on the FUSE writeback cache and is a measured decision, not an assumption |
 | xattrs, device nodes | Return a documented unsupported error in the MVP |
 
 Base inodes are stable for the life of the mount and derived from the mount identity
 plus entry identity. Overlay inodes are allocated persistently. Kernel attribute and
 entry TTLs are long because the base commit is immutable; overlay mutations issue
 the necessary invalidations.
+
+Timestamps and inode numbers are load-bearing for build systems, so they are
+specified rather than incidental. A raw Git committer timestamp cannot be used
+directly because Git accepts future-dated commits and job hosts can have clock skew.
+When the server first catalogs a commit it durably records a stable sanitized time:
+
+```text
+snapshot_time = clamp(committer_time, minimum_supported_time,
+                      authoritative_first_seen_time - one_tick)
+```
+
+The catalog writer supplies the authoritative first-seen time, and replicas reuse
+the stored value rather than recomputing it from their clocks. Every base entry
+reports `snapshot_time` for `mtime` and `ctime`.
+
+Overlay timestamp assignment uses a logical clock:
+
+```text
+new_time = max(host_wall_clock, snapshot_time + one_tick, prior_entry_time + one_tick)
+```
+
+This keeps base times stable across remounts and hosts while guaranteeing that an
+acknowledged local mutation is newer even for a future-dated commit or a skewed host
+clock. `one_tick` is the timestamp resolution reported by the mount. An explicit
+overlay timestamp request is clamped to at least `snapshot_time + one_tick`, and
+`ctime` still advances on the logical clock; exact restoration of an older mtime is
+a documented MVP incompatibility. Base inode numbers are stable within one mount
+generation but not across mounts; tooling that caches build state keyed on
+`(device, inode)` between jobs will therefore miss rather than produce a stale hit,
+which is the safe direction. Both properties are stated in the compatibility
+boundary because a workload that requires the opposite needs a different design.
 
 Git modes supported initially are regular non-executable, regular executable,
 symlink, directory, and gitlink. A gitlink appears as an empty, read-only directory
@@ -472,7 +649,7 @@ Each job has:
 
 ```text
 state/
-  mount.json              pinned repo, commit, format version
+  mount.json              pinned repo, commit, snapshot time, lease, format version
   overlay.sqlite          path/inode journal and transactions
   files/                  created and copy-up file data
   locks/
@@ -540,14 +717,107 @@ new_oid = created commit
 The server performs a compare-and-swap ref transaction. A mismatch never silently
 overwrites another writer.
 
+### 8.6 The `.git` directory and Git commands inside the mount
+
+A mounted workspace that contains no `.git` directory is not a usable agent
+workspace. Coding agents run `git status`, `git diff`, and `git log` as a matter of
+habit, and a large amount of ordinary tooling — build scripts, version stamping,
+linters, formatters, language servers, and workspace-root detection in Cargo, Bazel,
+and Node tooling — probes for a repository root before doing anything else. If
+nothing answers, tools fail in confusing ways and an agent's most likely repair is
+`git init`, which produces a second, wrong source of truth inside the job.
+
+The MVP therefore presents a synthesized, read-only `.git` directory at the mount
+root containing `HEAD`, a `packed-refs` entry for the pinned revision, a minimal
+`config`, and an `xvfs.json` describing the repository, the pinned commit, and the
+API endpoint. It contains no object database and no index. This is deliberate about
+what it does and does not do:
+
+- repository-root discovery, `git rev-parse --show-toplevel`, `git rev-parse HEAD`,
+  and branch-name detection work, which is what most non-Git tooling actually needs;
+- commands that require object content fail immediately and visibly rather than
+  returning a wrong answer, because a synthesized `.git` with an empty index would
+  otherwise report every tracked file as deleted;
+- the directory is outside the overlay's change tracking. It is not searchable, does
+  not appear in `xvfs status`, and cannot be committed or exported.
+
+Alongside it, a `git` front-end shim — the same pattern as `xvfs-rg`, installed
+early in `PATH` in hosted agent images — serves the high-frequency read-only
+subcommands from the overlay journal and the snapshot API: `status`, `diff`,
+`rev-parse`, `ls-files`, `show HEAD:<path>`, and `log -1` for the pinned commit. The
+M0 command inventory freezes an explicit grammar of supported global options,
+subcommands, flags, pathspecs, output formats, and exit codes; the shim does not
+claim compatibility for an entire subcommand name. `GetCommit` supplies the one
+commit of metadata needed by the bounded `log -1` implementation.
+
+For the supported grammar, the shim is both cheaper and more accurate than real Git
+would be, because `xvfs status` is derived from the journal and touches no base
+metadata. Every other form fails with an actionable message. Under the synthesized
+`.git` option there is no generic `--hydrate` escape hatch: no real object database
+or index exists to delegate to. If M0 selects the real partial-clone option, an
+explicit hydration flag may delegate to stock Git under the mount's hydration
+budget. As with `xvfs-rg`, the shim is a usability and hydration-control measure,
+not a security boundary; tools that bypass `PATH` are expected to see the
+documented limitations of the synthesized `.git`.
+
+The full-fidelity alternative is a real Git repository: a shallow, blobless clone
+whose promisor remote is the XVFS smart-HTTP gateway, with the mount serving as its
+working tree. It would make substantially more of Git work, but integration is not
+assumed to be a small step: index population, checkout suppression, promisor fetch,
+working-tree configuration, and reconciliation with the overlay journal all need
+testing. Its costs also land exactly where XVFS is trying to save: `git status`
+stats every index entry, so each invocation sweeps the metadata of the entire
+monorepo; the index for a million-file repository is itself on the order of a
+hundred megabytes per job; the required current-tree metadata can exceed the
+cold-start download budget; and Git's index becomes a second view of "what changed"
+that can disagree with the overlay journal. Commands such as `git checkout` and
+`git reset --hard` would also trigger bulk hydration and copy-up.
+
+The decision between the two is a measurement, not a preference, so the plan spikes
+it in M0. If the partial-clone option wins, the minimum smart-HTTP/promisor work in
+M5 becomes a predecessor of M2 rather than a parallel later milestone.
+
+Two operational details apply to either choice. The mount must be owned by the job's
+UID, or Git's `safe.directory` must be configured for it, or Git refuses to operate
+in a bind-mounted workspace owned by the host daemon. And whatever occupies `.git`
+must be excluded from search, diff, export, and hydration accounting.
+
+### 8.7 Bounding local overlay search
+
+`xvfs search` merges server results for the pinned base with a local search of the
+overlay. The server side is bounded by index policy, but the local side is not
+bounded by anything unless it is designed to be. A job that has run a build may hold
+gigabytes of `target/`, `node_modules/`, or generated output in its overlay, and a
+naive scan of every overlay file would make `xvfs search` slower than the `rg`
+invocation it replaces — the opposite of the product's purpose.
+
+Local search therefore applies the same class of policy the server index applies:
+it honors the `.gitignore` files present in the merged workspace, plus
+`.git/info/exclude` when the selected `.git` surface provides one, skips binary and
+oversized files using the server's classification rules and limits, and enforces its
+own time and bytes-read budget. Anything skipped is reported through
+the same two-dimensional completion contract described in section 7.5: exhausted
+local budgets affect execution status, while ignored, binary, and oversized paths
+affect coverage within the requested scope. An explicit flag searches ignored
+files, and pays for it.
+
 ## 9. Consistency and failure behavior
 
-- A mounted base never changes implicitly.
+- A mount generation's base never changes. Explicit refresh replaces it with a new
+  generation rather than modifying it in place.
 - Immutable tree/blob caches are keyed by repository hash algorithm and OID.
 - Ref resolution has a short TTL; commit/tree/blob data may be cached indefinitely
   subject to space limits.
+- A pinned commit stays readable for the life of its mount. An atomically created,
+  heartbeat-renewed retention lease keeps it reachable even if the branch is
+  force-pushed, deleted, or rebased upstream.
 - A search is correct only when its snapshot manifest and index generation are
-  ready. `BUILDING`, `NOT_INDEXABLE`, and `RESOURCE_LIMIT` are distinct errors.
+  ready. A snapshot is `READY`, `BUILDING`, or `FAILED`; `SNAPSHOT_BUILDING`,
+  `NOT_INDEXABLE`, and `RESOURCE_LIMIT` are distinct request errors.
+- A truncated or failed search is reported as such; corpus exclusions are reported
+  separately as scoped coverage. Missing terminal status is an error. No budget,
+  index exclusion, or partial failure is allowed to look like an exhaustive empty
+  result.
 - Network loss returns retryable I/O errors for uncached base data. Overlay writes
   and cached reads continue.
 - Overlay mutations commit metadata and file rename/fsync in a documented order.
@@ -587,6 +857,7 @@ monorepos, not guaranteed SLOs:
 | Uncached source file first byte | p95 under 250 ms in-region |
 | Warm literal search on an indexed branch | p95 under 2 seconds |
 | Search-induced client blob hydration | zero bytes |
+| `xvfs status` and shim `git status` after edits | p95 under 200 ms, no base metadata sweep |
 | Client disk for a job | overlay + bounded shared cache, independent of repository history size |
 | Crash recovery | no lost acknowledged overlay mutation in fault-injection tests |
 
@@ -600,16 +871,34 @@ MVP:
 - Linux and FUSE3;
 - case-sensitive paths;
 - Git smart HTTP clone/fetch;
-- SHA-1 repositories, with algorithm-generic internal types from day one;
+- SHA-1 repositories with the `files` ref backend, and algorithm-generic internal
+  types from day one;
 - whole-blob fetch;
 - tracked files, directories, executable bit, and symlinks;
 - writable overlay and patch export;
 - literal and bounded regex search;
+- a synthesized read-only `.git` plus the `git` shim, per section 8.6;
 - single-node server storage.
+
+The MVP also differs from a real checkout in ways that are correct by design but
+must be stated, because they are invisible to the agent unless documented:
+
+- **No Git content filters.** The mount serves raw blob bytes. `.gitattributes`
+  `text`/`eol` conversion, `core.autocrlf`, and clean/smudge filters are not
+  applied, so a repository that relies on them presents different bytes than
+  `git checkout` would produce for the same commit.
+- **LFS files appear as pointer files.** LFS content is not resolved in the MVP.
+- **Base timestamps use the server's sanitized stable snapshot time.** Overlay
+  timestamps cannot be set below the base-plus-one-tick floor, and base inode
+  numbers are stable only within a mount generation, per section 8.2.
+- **`reftable` repositories and SHA-256 repositories are rejected, not degraded.**
+  libgit2 cannot read the former and its support for the latter is experimental.
 
 Before production:
 
-- SHA-256 repository conformance;
+- SHA-256 repository conformance, which depends on libgit2 support maturing or on a
+  narrow non-libgit2 path for object hashing; if neither lands, SHA-256 hosting
+  stays out of scope and is declared rather than silently unsupported;
 - crash-safe overlay migration;
 - multi-replica server deployment;
 - tokenized search if users need it;
@@ -617,9 +906,10 @@ Before production:
 - documented large-file behavior;
 - push or a robust patch-application integration;
 - CSI/host-daemon packaging;
-- repository retention and derived-index garbage collection.
+- multi-node retention and derived-index garbage collection, extending the mount
+  retention leases that the MVP already requires.
 
-Submodules, special files, case-insensitive clients, sparse mutable refresh, and
+Submodules, special files, case-insensitive clients, refresh with local changes, and
 cross-platform clients require separate designs.
 
 ## 13. Key risks and mitigations
@@ -639,6 +929,16 @@ cross-platform clients require separate designs.
 | Very large blobs dominate latency/disk | Poor job behavior | Size policy, whole-blob MVP, later chunk/range design |
 | Index storage grows without bound | Server disk pressure | Blob deduplication, snapshot TTLs, ref retention, rebuildable generations |
 | Overlay crash corrupts job | Lost work | WAL, atomic rename, fsync policy, model/fault tests |
+| Pinned commit pruned by GC during a job | Mount breaks irrecoverably mid-task | Durable retention lease anchored as a ref; maintenance treats live mounts as roots |
+| Lease expires while a job is alive | Mount loses its reachability root | Atomic mount creation, authenticated heartbeat renewal, grace interval, renewal alert |
+| Internal lease ref is advertised or pruned | Old commits leak or live mounts break | Hide `refs/xvfs/`, reserve it from user revisions, exclude it from mirror/prune refspecs |
+| Agent or build tool requires a working `.git` | Task fails or agent runs `git init` | Synthesized read-only `.git`, `git` shim, M0 measurement of the partial-clone option |
+| Truncated search read as "not found" | Agent deletes or rewrites live code | Separate execution status and scoped coverage, missing-terminal failure, distinct truncation exit |
+| Overlay search scans build outputs | `xvfs search` slower than plain `rg` | Ignore rules, binary/size classification, local time and byte budgets |
+| libgit2 cannot open a target repository format | Repository unsupportable late in the project | Format validated at mirror creation; `reftable`/SHA-256 audited in M0 |
+| Writable `MAP_SHARED` unsupported by the FUSE setup | Some linkers and tools fail | Measure in M0, document the boundary, enable writeback cache only if it is safe |
+| Future-dated commit or skewed host clock | Build system treats edits as older | Sanitized snapshot time plus monotonic overlay logical clock |
+| In-place refresh leaves stale kernel entries | Mixed old/new snapshot | Refresh by new mount generation and atomic bind-mount replacement |
 
 ## 14. Open questions
 
@@ -654,6 +954,11 @@ The prototype should answer these remaining questions with measurements:
 6. Can a host cache be shared within a tenant, and what is the security boundary?
 7. Are Git LFS, submodules, clean/smudge filters, and non-UTF-8 paths present in the
    target repositories?
+8. Is the synthesized `.git` plus shim sufficient for the pilot's agents and build
+   tooling, or does the measured cost of a shallow blobless partial clone justify
+   real Git behavior?
+9. Do any target repositories use the `reftable` backend or SHA-256, and is
+   converting them on ingest acceptable?
 
 ## 15. References
 
@@ -673,6 +978,10 @@ The prototype should answer these remaining questions with measurements:
   used from Rust through [`git2-rs`](https://docs.rs/git2/latest/git2/).
 - [`git-upload-pack`](https://git-scm.com/docs/git-upload-pack) documents the stock
   read-side Git service and its stateless HTTP modes.
+- [`git-http-backend`](https://git-scm.com/docs/git-http-backend) documents the
+  smart-HTTP request/response framing the gateway must reproduce, including the
+  version-dependent `# service=` advertisement preamble and gzip-encoded request
+  bodies.
 - [Linux FUSE documentation](https://docs.kernel.org/filesystems/fuse/fuse.html) and
   [`cberner/fuser`](https://github.com/cberner/fuser) cover the kernel/userspace
   model and selected Rust interface.
