@@ -78,6 +78,8 @@ protoc-bin-vendored = "3"
 # HTTP surface: the immutable blob endpoint, the file-by-revision convenience
 # endpoint, ingestion webhooks, and health/metrics.
 axum = "0.8"
+hyper-util = { version = "0.1", features = ["client", "client-legacy", "http1", "tokio"] }
+bytes = "1"
 tower = "0.5"
 tower-http = { version = "0.6", features = ["limit", "timeout", "trace"] }
 http = "1"
@@ -98,6 +100,16 @@ metrics-exporter-prometheus = "0.17"
 hmac = "0.12"
 sha2 = "0.10"
 subtle = "2"
+
+# The Linux filesystem. ADR 0003 pins the choice and the dispatch rule: `fuser`
+# 0.18's reply handles are `Send`, which is what makes "reply from a worker"
+# implementable and turns the measured 1321 ms serial case into 123 ms.
+fuser = "0.18"
+# SHA-1 for canonical `blob <size>\0<content>` verification in the client cache.
+# Separate from `sha2` because a Git SHA-1 object ID is not a SHA-256 digest and
+# the two must never be reachable through one generic call.
+sha1 = "0.10"
+libc = "0.2"
 
 anyhow = "1"
 thiserror = "2"
