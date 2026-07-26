@@ -119,8 +119,19 @@ replacing this with real manifest state is additive.
 Both M0 conditions remain open and are **not** M1's to close:
 
 1. **Re-run the FUSE deployment matrix on the real hosted runner.** Kubernetes and
-   CSI are still unmeasured. M2 commits to the host-daemon skeleton, so this is
-   best done before then.
+   CSI are still unmeasured. **Deliberately deferred until the prototype mounts and
+   serves a workspace locally** — see the amendment to
+   [ADR 0003](../adr/0003-fuse-deployment-model.md). The short version: the script
+   has already run on this machine, so the gap is specifically Kubernetes and the
+   real runner, neither of which is reachable; and the unmeasured leg affects how a
+   mount is *published* to a job (M6.1, M7.4), not the inode model, blob cache, or
+   `.git` surface that M2 builds. The trigger is M2 complete, and it stops being
+   deferrable before M6.1.
+
+   The M0 go/no-go's suggestion to do this "ideally before M2 commits to the
+   host-daemon skeleton" is dropped in favour of a design constraint: M2 keeps mount
+   publication behind one seam, so a later CSI answer does not ripple into the
+   filesystem code.
 2. **Confirm the corpus.** Every number in `benchmarks/baseline.md` and every
    measurement above uses public stand-ins. The LFS question in particular is
    unanswered.
@@ -170,6 +181,8 @@ separate CI jobs rather than skipped — `bigtree` for the million-entry criteri
 **Proceed to M2.** The milestone graph is unchanged: M0 → M1 → M2 → M3 → M6, with
 M5 parallel to M3/M4.
 
-Before M2 commits to the host-daemon skeleton, re-run
-`spikes/fuse-probe/deployment-matrix.sh` on the real hosted runner. That is M0's
-first carried condition and M2.1's most expensive assumption.
+M0's first carried condition — re-running
+`spikes/fuse-probe/deployment-matrix.sh` on the real hosted runner and on Kubernetes
+— is deferred until the prototype works locally, with the reasoning recorded in the
+[ADR 0003 amendment](../adr/0003-fuse-deployment-model.md). M2 carries one design
+constraint in exchange: mount publication stays behind a single seam.

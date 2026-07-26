@@ -104,6 +104,15 @@ is not a measurement, and this is the milestone's highest-risk assumption.
 `spikes/fuse-probe/deployment-matrix.sh` runs in minutes. It must pass on the
 real runner before M6, and ideally before M2 commits to the host-daemon skeleton.
 
+> **Superseded, 2026-07-26 (after M1).** The "ideally before M2" half is dropped.
+> The condition is now deliberately deferred until the prototype mounts and serves a
+> workspace locally, because the script has already run on this machine — the gap is
+> Kubernetes and the real runner, neither reachable — and the unmeasured leg
+> constrains how a mount is *published* to a job (M6.1, M7.4) rather than anything
+> M2 builds. In exchange, M2 keeps mount publication behind a single seam. The
+> "before M6" half stands. Reasoning and the trigger:
+> [ADR 0003 amendment](../../docs/adr/0003-fuse-deployment-model.md).
+
 ### 2. Confirm the corpus
 
 Every number here comes from public stand-ins. The harness is parameterized by

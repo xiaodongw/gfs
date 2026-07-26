@@ -98,7 +98,9 @@ Duration: 2–3 weeks, run concurrently across the whole team
 > The `.git` decision went to the synthesized surface, so **the M2 → M5
 > dependency does not invert** and the milestone graph below is unchanged.
 >
-> Two conditions carry forward: re-run
+> Two conditions carry forward. The first is now **deliberately deferred until the
+> prototype works locally** ([ADR 0003 amendment](adr/0003-fuse-deployment-model.md));
+> it stops being deferrable before M6.1. Re-run
 > [`spikes/fuse-probe/deployment-matrix.sh`](../spikes/fuse-probe/deployment-matrix.sh)
 > on the real hosted runner, and replace the public stand-in corpus in
 > [`spikes/corpus/corpus.conf`](../spikes/corpus/corpus.conf) with the real

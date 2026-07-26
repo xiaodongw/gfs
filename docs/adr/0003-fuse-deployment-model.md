@@ -1,6 +1,6 @@
 # ADR 0003: FUSE deployment model and the FUSE dispatch rule
 
-- Status: Accepted, with one gate condition unmeasured
+- Status: Accepted; the CSI leg is deliberately deferred (see the amendment below)
 - Date: 2026-07-26
 - Milestone: M0.2
 - Evidence: `spikes/fuse-probe`, `spikes/reports/m02-fuse-deployment.md`
@@ -136,3 +136,70 @@ the real hosted runner is tested.
 - Orphan-mount cleanup is an orchestrator responsibility (PLAN.md M6.1 already
   lists it). The `ENOTCONN` behaviour means a leaked mount is visible and
   inert rather than silently wrong.
+
+## Amendment, 2026-07-26: the CSI measurement is deferred until the prototype works locally
+
+Decided after M1 completed. This changes *when* the unmeasured leg gets measured,
+not what the ADR concluded.
+
+### Decision
+
+**Defer re-running `spikes/fuse-probe/deployment-matrix.sh` on a real hosted runner
+and on Kubernetes until the prototype mounts and serves a workspace locally.** The
+trigger is M2 complete — a working local mount — not a date.
+
+The M0 go/no-go listed this as condition 1 and suggested "ideally before M2 commits
+to the host-daemon skeleton". That ordering is dropped.
+
+### Why deferring is cheap
+
+The two things that could make this expensive are both absent:
+
+1. **It is currently unrunnable rather than unrun.** The script has already run on
+   this machine; the gap is specifically Kubernetes and the real hosted runner, and
+   neither is reachable. Re-running it here would reproduce the tables above.
+2. **The unmeasured leg does not constrain M2's code.** Everything M2 builds on is
+   measured for WSL2 + Docker: the unprivileged host mount, the pooled-dispatch rule
+   (1321 ms → 123 ms), the 0-upcall metadata caching, `ENOTCONN` on daemon death, and
+   `EROFS` on a base write. What CSI would change is how a mount is *published* to a
+   job — a packaging concern owned by M6.1 and M7.4 — not the inode model, the blob
+   cache, or the `.git` surface.
+
+The residual risk is that M2's host-daemon skeleton hardens around Docker-shaped
+assumptions and has to be reworked. That is mitigated by design rather than by
+measurement: see below.
+
+### What M2 must do to keep the deferral cheap
+
+- **Keep mount publication behind one seam.** The M2.1 skeleton should treat "make
+  this mount visible to the job" as a single replaceable step. A CSI node plugin and
+  a host daemon differ only in that step, so a later answer must not ripple into the
+  filesystem code.
+- **Do not assume the daemon and the job share a UID, and do not require that they
+  differ.** M2's own tests mount and read as the same UID (see below); the
+  cross-UID path stays exercised by ADR 0003's existing measurements until M6.1
+  needs it for real.
+
+### `user_allow_other` and M2's tests
+
+`user_allow_other` is still unset in `/etc/fuse.conf` on the development host, so
+`dockerd` cannot stat a uid-1000 FUSE mount and the `container_bind_mount_from_host`
+case remains `BLOCKED` here.
+
+**M2's tests therefore mount and read as the same UID.** That is sufficient for
+everything M2 is accountable for — POSIX conformance, the blob cache, the timestamp
+rule, and the `.git` surface — none of which depends on cross-UID access. Requiring
+`user_allow_other` for the ordinary test suite would make a privileged host action a
+prerequisite for running `cargo test`, which is a worse trade than deferring one
+integration path.
+
+The prerequisite itself is unchanged and still belongs in the installation
+documentation: the bind-mount model does not work without it, and section 2 above is
+the measurement that says so.
+
+### When this stops being deferrable
+
+Before M6.1. The pilot's orchestrator bind-mounts a workspace into an unprivileged
+container, which is exactly the path that is `BLOCKED` locally and unmeasured on
+Kubernetes. `xvfs materialize` also cannot be resolved until then, for the reason
+already given under Alternatives.
