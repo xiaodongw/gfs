@@ -1,0 +1,52 @@
+﻿# ==========================================
+# AI Model Exclusion Rules (.aiignore)
+# ==========================================
+
+# 1. Build & Compilation Artifacts
+/target/
+/dist/
+/build/
+*.so
+*.dylib
+*.dll
+*.rlib
+*.a
+*.exe
+*.pdb
+
+# 2. IDE & Tooling Metadata
+.idea/
+.vscode/
+.git/
+
+# 3. Lockfiles & Dependencies (high token waste, low semantic value)
+Cargo.lock
+
+# 4. Binary Data & Assets
+*.png
+*.jpg
+*.jpeg
+*.webp
+*.ico
+*.pdf
+*.zip
+*.tar.gz
+*.mp3
+*.mp4
+*.ttf
+*.woff2
+
+# 5. Credentials & Secrets
+.env
+.env.*
+*.pem
+*.key
+credentials.json
+secrets/
+
+# 6. Data & Databases
+*.csv
+*.sqlite
+*.db
+*.parquet
+*.log
