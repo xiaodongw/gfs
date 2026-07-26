@@ -8,6 +8,7 @@
 use std::sync::Arc;
 
 use xvfs_git::GitRepository;
+use xvfs_server::auth::CapabilityKey;
 use xvfs_server::catalog::repositories::{NewRepository, RepositoryState};
 use xvfs_server::{Catalog, MountManager, Registry, RepositoryLocks};
 use xvfs_types::error::ErrorCode;
@@ -48,7 +49,13 @@ impl Harness {
     registry.activate(&repo_id).unwrap();
 
     let locks = Arc::new(RepositoryLocks::new());
-    let mounts = MountManager::new(Arc::clone(&catalog), Arc::clone(&registry), locks, policy);
+    let mounts = MountManager::new(
+      Arc::clone(&catalog),
+      Arc::clone(&registry),
+      locks,
+      policy,
+      CapabilityKey::generate().unwrap(),
+    );
     Harness {
       catalog,
       registry,

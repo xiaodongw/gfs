@@ -14,6 +14,7 @@ use xvfs_types::{
   SubjectId,
 };
 
+use crate::auth::capability::{CapabilityKey, MountCapability};
 use crate::catalog::{Catalog, Lease};
 use crate::locks::RepositoryLocks;
 use crate::registry::Registry;
@@ -35,6 +36,14 @@ pub struct MountManager {
   registry: Arc<Registry>,
   locks: Arc<RepositoryLocks>,
   policy: LeasePolicy,
+  /// The capability signing key.
+  ///
+  /// Held here rather than left to the service layer so `create_mount` mints the
+  /// capability itself. The alternative -- returning a grant with an empty
+  /// capability for a handler to fill in -- makes "forgot to sign it" a reachable
+  /// state, and an unsigned capability is one that fails only when a client later
+  /// tries to renew.
+  key: CapabilityKey,
 }
 
 impl std::fmt::Debug for MountManager {
@@ -51,12 +60,14 @@ impl MountManager {
     registry: Arc<Registry>,
     locks: Arc<RepositoryLocks>,
     policy: LeasePolicy,
+    key: CapabilityKey,
   ) -> Self {
     MountManager {
       catalog,
       registry,
       locks,
       policy,
+      key,
     }
   }
 
@@ -113,6 +124,7 @@ impl MountManager {
     let repository_id = repository_id.clone();
     let subject = subject.clone();
     let heartbeat_interval = self.policy.heartbeat_interval;
+    let key = self.key.clone();
 
     // One blocking closure for the entire sequence. No `.await` inside means no
     // interleaving, and holding the async lock across it means no other task on
@@ -153,15 +165,28 @@ impl MountManager {
         return Err(e);
       }
 
+      // Signed only after the lease is ACTIVE. A capability minted earlier could
+      // escape for a lease whose anchor never became durable.
+      let lease_expiry = xvfs_types::Timestamp::from_secs(lease.expires_at);
+      let capability = MountCapability::issue(
+        &key,
+        &MountCapability {
+          subject: subject.clone(),
+          repository_id: repository_id.clone(),
+          commit: resolved.commit.clone(),
+          mount_id: lease.mount_id.clone(),
+          expires_at: lease_expiry,
+        },
+      );
+
       Ok(MountGrant {
         mount_id: lease.mount_id,
         commit: resolved.commit,
         tree: resolved.tree,
         ref_name: resolved.ref_name,
         snapshot_time,
-        // Filled in by the authorization layer, which owns the signing key.
-        capability: String::new(),
-        lease_expiry: xvfs_types::Timestamp::from_secs(lease.expires_at),
+        capability,
+        lease_expiry,
         heartbeat_interval,
       })
     })

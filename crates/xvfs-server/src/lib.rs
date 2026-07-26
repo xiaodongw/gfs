@@ -16,6 +16,8 @@
 //! why `PREPARING` exists, and why a crash at each step is recoverable -- is
 //! written out there rather than distributed across handlers.
 
+pub mod audit;
+pub mod auth;
 pub mod catalog;
 pub mod locks;
 pub mod mirror;
@@ -23,6 +25,7 @@ pub mod mounts;
 pub mod registry;
 pub mod util;
 
+pub use auth::{Authorizer, CapabilityKey};
 pub use catalog::Catalog;
 pub use locks::RepositoryLocks;
 pub use mounts::{MountManager, ReconcileOutcome};
