@@ -1,0 +1,6 @@
+[toolchain]
+# Pinned in M0 and inherited by the M1.1 workspace as the MSRV baseline.
+# Bump deliberately; CI and the local development stack must not drift.
+channel = "1.97.1"
+components = ["rustfmt", "clippy"]
+profile = "minimal"

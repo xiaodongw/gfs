@@ -1,0 +1,20 @@
+[package]
+name = "gateway-probe"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+# Deliberately no HTTP framework. The M0.3 question is whether the *subprocess
+# contract* with stock `upload-pack` can be reproduced byte for byte — the
+# framing, the version-dependent preamble, gzip request bodies, the protected
+# configuration. A hand-written HTTP/1.1 server keeps that contract visible
+# instead of hiding it behind a framework's body handling. Axum/Hyper/Tower
+# arrive in M5.1, once the contract is known.
+flate2 = "1"
