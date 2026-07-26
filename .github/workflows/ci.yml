@@ -49,6 +49,20 @@ jobs:
           path: target/sbom/
           if-no-files-found: warn
 
+  # Gated stages, as separate jobs so the main gate stays fast. M1's first exit
+  # criterion needs the million-entry snapshot, and a criterion nothing runs is not
+  # verified.
+  gated:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Large-snapshot exit criterion
+        run: scripts/check.sh bigtree
+      - name: Local development stack
+        run: scripts/check.sh devstack
+
   reproducible-release:
     runs-on: ubuntu-latest
     steps:

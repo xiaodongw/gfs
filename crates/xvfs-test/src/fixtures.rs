@@ -374,7 +374,7 @@ fn build_attrs(dir: &Path) -> Result<()> {
 /// The cache root: `target/xvfs-fixtures/<version>/`.
 ///
 /// Under `target/` so `cargo clean` clears it and `.gitignore` already covers it.
-fn cache_root() -> PathBuf {
+pub(crate) fn cache_root() -> PathBuf {
   // `OUT_DIR` is not set for a test binary, so the target directory is derived
   // from the test executable's own path: `target/debug/deps/<name>` gives
   // `target/` three levels up. Falling back to a temp directory keeps this

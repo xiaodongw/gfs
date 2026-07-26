@@ -56,7 +56,7 @@ behavior required by real builds.
 | Milestone | Outcome | Exit gate |
 | --- | --- | --- |
 | M0: feasibility ✅ | Highest-risk assumptions measured | **Complete — conditional go**, see [go/no-go](../spikes/reports/m0-go-no-go.md) |
-| M1: repository API | Exact revision/tree/file access, retained for the life of a mount | API conformance, auth, and retention tests pass |
+| M1: repository API ✅ | Exact revision/tree/file access, retained for the life of a mount | **Complete**, see [M1 report](reports/m1-completion.md) |
 | M2: read-only mount | Lazy snapshot is usable as a workspace, `.git` surface included | Representative read/build smoke tests pass |
 | M3: writable workspace | Crash-safe overlay and patch export | Mutation model and recovery tests pass |
 | M4: agent search | Search does not hydrate base, sees edits, and separates execution status from scoped coverage | Results match the supported materialized `rg` corpus |
@@ -230,9 +230,39 @@ storage is viable at steady state, a Git-command surface that the pilot's toolin
 accepts has been identified and costed, and projected task savings are meaningful
 over partial clone.
 
-## 4. M1 — Repository and snapshot API
+## 4. M1 — Repository and snapshot API ✅ COMPLETE
 
 Duration: 3 weeks
+
+> **Status: complete, 2026-07-26.** All five exit criteria met; see the
+> [M1 completion report](reports/m1-completion.md).
+>
+> Code is in [`crates/`](../crates/), the gate is
+> [`scripts/check.sh`](../scripts/check.sh), and the local stack is
+> [`scripts/dev-stack.sh`](../scripts/dev-stack.sh).
+>
+> | Sub-milestone | Status | Deliverable |
+> | --- | --- | --- |
+> | M1.1 workspace and foundation | ✅ | `xvfs-*` workspace, `scripts/check.sh`, `scripts/dev-stack.sh` |
+> | M1.2 catalog and retention leases | ✅ | `xvfs-server/src/catalog/`, `mounts.rs`, `mirror.rs` |
+> | M1.3 Git object service | ✅ | `xvfs-git` |
+> | M1.4 snapshot and blob APIs | ✅ | `xvfs-proto`, `xvfs-server/src/service/` |
+> | M1.5 authentication and authorization | ⚠️ OIDC is a declared seam | `xvfs-server/src/auth/`, `audit.rs` |
+>
+> Criterion 1 measured: 1,000,002 entries paged across 1000 directories in 13.2 s,
+> then one file read, with no client-side repository.
+>
+> Four findings changed something rather than confirming it: `rustfmt.toml`'s BOM
+> silently disabled formatting entirely; `revparse` is too powerful for a service
+> boundary, and `main^{tree}` in particular yields a tree where every layer expects
+> a commit; hiding `refs/xvfs/` needs *two* spellings, because Git resolves the
+> short name `xvfs/mounts/<id>` to a live lease anchor; and lease protection has to
+> account for the prune delay, or a mistaken expiry is unrecoverable by definition.
+>
+> One scope reduction carries forward: **M1.5's OIDC integration is a seam.** No
+> provider has been chosen (ADR 0006) and none was reachable, so `Authenticator` is
+> a trait with a development static-token verifier. Everything M1.5 gates on is
+> provider-independent and implemented.
 
 ### M1.1 Workspace and engineering foundation
 

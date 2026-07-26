@@ -46,6 +46,15 @@ struct Args {
   #[arg(long, env = "XVFS_CAPABILITY_KEY", hide_env_values = true)]
   capability_key: Option<String>,
 
+  /// Register a repository at startup, as `id=/path/to/bare.git`. Repeatable.
+  ///
+  /// Idempotent, so the local development stack can be restarted without
+  /// bookkeeping. This is a bootstrap convenience, not the admin API: M6.1 wires the
+  /// orchestrator's own repository provisioning, and a real deployment creates
+  /// repositories through the catalog rather than through argv.
+  #[arg(long = "import", value_name = "ID=PATH")]
+  imports: Vec<String>,
+
   /// Development bearer token, granting read access to every repository.
   ///
   /// Present because M1.5's OIDC integration is a declared seam. A deployment must
@@ -119,6 +128,13 @@ async fn main() -> anyhow::Result<()> {
     LeasePolicy::adr_0006(),
   ));
 
+  for spec in &args.imports {
+    let (id, path) = spec
+      .split_once('=')
+      .ok_or_else(|| anyhow::anyhow!("--import expects ID=PATH, got {spec:?}"))?;
+    import_repository(&server, id, std::path::Path::new(path))?;
+  }
+
   // Before listening, not after.
   server.recover().await?;
   tracing::info!("reconciliation complete");
@@ -160,6 +176,48 @@ async fn main() -> anyhow::Result<()> {
   let _ = http_task.await;
   let _ = grpc_task.await;
   Ok(())
+}
+
+/// Register and activate one repository, tolerating a repeat run.
+///
+/// Activation applies ADR 0001's format gate, so an unsupported mirror is refused
+/// here with a stated reason rather than at the first read.
+fn import_repository(server: &Server, id: &str, path: &std::path::Path) -> anyhow::Result<()> {
+  use xvfs_server::catalog::repositories::NewRepository;
+  use xvfs_types::{DisplayName, RepositoryId};
+
+  let repository_id = RepositoryId::parse(id)?;
+  let path = path
+    .canonicalize()
+    .map_err(|e| anyhow::anyhow!("cannot resolve {}: {e}", path.display()))?;
+
+  if server.catalog.get_repository(&repository_id)?.is_none() {
+    // The on-disk format decides the algorithm; the catalog records what was found
+    // rather than asserting a default that activation would then contradict.
+    let format = xvfs_git::read_format(&path)?;
+    server.catalog.create_repository(&NewRepository {
+      repository_id: repository_id.clone(),
+      display_name: DisplayName::parse(id)?,
+      repo_path: path.clone(),
+      algorithm: format.algorithm,
+      upstream_url: None,
+      credential_ref: None,
+    })?;
+  }
+  match server.registry.activate(&repository_id) {
+    Ok(record) => {
+      tracing::info!(
+        repository_id = %record.repository_id,
+        algorithm = %record.algorithm,
+        "repository imported"
+      );
+      Ok(())
+    }
+    Err(e) => {
+      tracing::error!(repository_id = %repository_id, error = %e, "repository refused");
+      Err(e.into())
+    }
+  }
 }
 
 fn decode_hex(s: &str) -> anyhow::Result<Vec<u8>> {

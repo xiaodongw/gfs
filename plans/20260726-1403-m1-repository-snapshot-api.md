@@ -133,6 +133,69 @@ commits, audit records, and the confused-deputy and traversal tests — is imple
 against the trait and is provider-independent. This is a recorded scope reduction,
 not an oversight.
 
+### The lease policy has to travel with the protection check
+
+`Lease::is_protecting` takes a `&LeasePolicy`, which looks like avoidable coupling
+until you write the test that separates ADR 0006's three expiry stages. Without the
+policy, the check compares against `terminal_at` and an expired lease stops
+protecting its commit immediately — which makes the 24-hour prune delay decorative
+and a mistaken expiry unrecoverable by definition.
+
+### `reserved_refs()` is a separate trait method, not a flag
+
+Nothing on a request path should be able to enumerate lease anchors.
+`list_refs(include_internal: bool)` would put that one mistaken argument away.
+Reconciliation is not a request path, so it gets its own door.
+
+### The million-entry fixture shares one blob
+
+`git fast-import` with a single blob mark builds a 1,000,002-entry snapshot in three
+seconds as one blob and 1001 trees. The criterion is about snapshot scale — entry
+count and directory paging — which is unaffected by whether the blobs differ, and a
+million distinct blobs would dominate build time and disk for no extra coverage.
+
 ## Details
 
-_To be filled in as phases complete._
+### Phase order deviated from the plan
+
+M1.5 (auth) was built before M1.4 (the APIs), swapping phases 5 and 6. The APIs need
+the authorizer to exist: `CreateMount` has to mint a capability, and every read
+handler has to produce a `CommitAccess` before touching the repository. Building the
+APIs first would have meant stubbing authorization and then retrofitting it, which is
+how a `TODO: check auth` reaches production.
+
+### What runs, and how
+
+```
+scripts/check.sh              the full gate: versions, fmt, clippy, test, doc,
+                              deny, licenses, sbom, secrets
+scripts/check.sh bigtree      the million-entry exit criterion (~20 s)
+scripts/check.sh devstack     the local stack, end to end
+scripts/dev-stack.sh          seed fixtures, start the server, demonstrate the API
+scripts/dev-stack.sh --big    also seed the million-entry snapshot
+scripts/build-release.sh --verify   build twice, compare digests
+```
+
+CI runs the gate as one job, and `bigtree` plus `devstack` as a second, so the main
+gate stays fast without the gated stages being skipped.
+
+### Ports and defaults
+
+gRPC on 8431, HTTP on 8430. Two listeners rather than one multiplexed port: sniffing
+the protocol per connection is a known source of subtle failures with proxies in
+front, and two ports costs a line of configuration.
+
+### Things a later milestone will need to know
+
+* **The capability key must be persistent.** `xvfsd-server` generates an ephemeral
+  one when `--capability-key` is absent and warns loudly. A restart with a fresh key
+  invalidates every outstanding capability, which breaks live mounts.
+* **`PrepareSnapshot` returns `READY` unconditionally** in M1, because there is no
+  index yet. M4.2 replaces the body; the RPC and its three-state vocabulary already
+  exist, so the change is additive.
+* **Authenticated upstream fetch is untested.** The refspec and sandbox behaviour is
+  verified against local `file://` upstreams, which need no credential. M6.1 wires
+  the secret store, and `mirror::fetch` marks the spot.
+* **`xvfs mount` creates a lease, not a filesystem.** M2.1 adds the FUSE half. The
+  CLI deliberately does not offer `unmount`, `status`, `diff`, or `search` yet, so
+  `--help` does not advertise something that would fail.

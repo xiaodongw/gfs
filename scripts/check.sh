@@ -83,6 +83,15 @@ stage_deny() {
 
 stage_licenses() { scripts/check-licenses.sh; }
 
+# Gated, not skipped. The million-entry snapshot takes tens of seconds to build, so
+# it is out of the default run and in CI as its own job -- M1's first exit criterion
+# depends on it, and a criterion nothing runs is not verified.
+stage_bigtree() { cargo test --workspace --all-features -- --ignored --nocapture; }
+
+# The local development stack, run end to end. PLAN.md M1.1 makes it a deliverable,
+# so it is verified rather than assumed to still work.
+stage_devstack() { scripts/dev-stack.sh --smoke; }
+
 stage_sbom() {
   need cargo-cyclonedx "cargo install cargo-cyclonedx" || return 0
   mkdir -p target/sbom
@@ -129,7 +138,7 @@ stage_secrets() {
 
 for stage in "${STAGES[@]}"; do
   case "$stage" in
-    versions | fmt | clippy | test | doc | deny | licenses | sbom | secrets)
+    versions | fmt | clippy | test | doc | deny | licenses | sbom | secrets | bigtree | devstack)
       run_stage "$stage" "stage_$stage"
       ;;
     *)

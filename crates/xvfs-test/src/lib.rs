@@ -10,6 +10,8 @@
 //!   raw-tree materializer uses `git ls-tree` and `git cat-file` so that a bug
 //!   shared between the API and its check cannot hide.
 
+pub mod bigtree;
 pub mod fixtures;
 
+pub use bigtree::{big_tree, expected_entries};
 pub use fixtures::{bare, fixture, git, git_raw, scratch_clone, worktree, Fixture, FIXTURES};

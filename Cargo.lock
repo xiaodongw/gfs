@@ -2354,6 +2354,13 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "http",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "tokio",
+ "tonic",
+ "xvfs-proto",
  "xvfs-types",
 ]
 
