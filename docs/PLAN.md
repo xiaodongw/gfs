@@ -55,7 +55,7 @@ behavior required by real builds.
 
 | Milestone | Outcome | Exit gate |
 | --- | --- | --- |
-| M0: feasibility | Highest-risk assumptions measured | Go/no-go architecture review |
+| M0: feasibility ✅ | Highest-risk assumptions measured | **Complete — conditional go**, see [go/no-go](../spikes/reports/m0-go-no-go.md) |
 | M1: repository API | Exact revision/tree/file access, retained for the life of a mount | API conformance, auth, and retention tests pass |
 | M2: read-only mount | Lazy snapshot is usable as a workspace, `.git` surface included | Representative read/build smoke tests pass |
 | M3: writable workspace | Crash-safe overlay and patch export | Mutation model and recovery tests pass |
@@ -68,9 +68,41 @@ behavior required by real builds.
 M8 can move before M7 if direct pushes are required for the pilot. Otherwise patch
 export keeps the critical path smaller.
 
-## 3. M0 — Feasibility and architecture spikes
+## 3. M0 — Feasibility and architecture spikes ✅ COMPLETE
 
 Duration: 2–3 weeks, run concurrently across the whole team
+
+> **Status: complete, 2026-07-26. Recommendation: conditional go.**
+>
+> Spike code is in [`spikes/`](../spikes/), reports in
+> [`spikes/reports/`](../spikes/reports/), decisions as ADRs in
+> [`docs/adr/`](adr/), and the clone baseline in
+> [`benchmarks/baseline.md`](../benchmarks/baseline.md).
+>
+> | Sub-milestone | Status | Deliverable |
+> | --- | --- | --- |
+> | M0.1 workload baseline | ✅ | [`benchmarks/baseline.md`](../benchmarks/baseline.md) |
+> | M0.2 FUSE deployment | ⚠️ met for WSL2 + Docker; **Kubernetes unmeasured** | [ADR 0003](adr/0003-fuse-deployment-model.md) |
+> | M0.3 Git integration | ✅ | [ADR 0001](adr/0001-git-integration.md), [ADR 0002](adr/0002-git-object-authorization-boundary.md) |
+> | M0.4 search representation | ✅ | [ADR 0004](adr/0004-search-representation.md) |
+> | M0.5 Git-command surface | ✅ | [ADR 0005](adr/0005-git-command-surface.md) |
+> | M0.6 product decisions | ⚠️ two items need product input | [ADR 0006](adr/0006-mvp-boundary-and-policies.md) |
+>
+> Four findings **contradicted** the design and changed it: SHA-256 is
+> unreachable through `git2-rs` rather than merely experimental; hiding
+> `refs/xvfs/` prevents discovery but not access; the specified synthesized
+> `.git` contents do not form a repository at all; and `git ls-files`/`git diff`
+> against that surface return empty with exit 0 instead of failing visibly,
+> which makes the shim a correctness requirement.
+>
+> The `.git` decision went to the synthesized surface, so **the M2 → M5
+> dependency does not invert** and the milestone graph below is unchanged.
+>
+> Two conditions carry forward: re-run
+> [`spikes/fuse-probe/deployment-matrix.sh`](../spikes/fuse-probe/deployment-matrix.sh)
+> on the real hosted runner, and replace the public stand-in corpus in
+> [`spikes/corpus/corpus.conf`](../spikes/corpus/corpus.conf) with the real
+> target monorepos.
 
 ### M0.1 Workload and baseline
 
