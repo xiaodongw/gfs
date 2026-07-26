@@ -22,7 +22,9 @@ pub mod catalog;
 pub mod locks;
 pub mod mirror;
 pub mod mounts;
+pub mod observability;
 pub mod registry;
+pub mod service;
 pub mod util;
 
 pub use auth::{Authorizer, CapabilityKey};
@@ -30,3 +32,4 @@ pub use catalog::Catalog;
 pub use locks::RepositoryLocks;
 pub use mounts::{MountManager, ReconcileOutcome};
 pub use registry::Registry;
+pub use service::Server;
