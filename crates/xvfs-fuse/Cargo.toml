@@ -7,6 +7,10 @@ publish.workspace = true
 license.workspace = true
 description = "FUSE filesystem adapter and the xvfsd mount daemon"
 
+[[bin]]
+name = "xvfsd"
+path = "src/bin/xvfsd.rs"
+
 [dependencies]
 xvfs-types = { workspace = true }
 xvfs-proto = { workspace = true }
@@ -29,9 +33,11 @@ hyper = { workspace = true, features = ["client", "http1"] }
 hyper-util = { workspace = true }
 
 anyhow = { workspace = true }
+clap = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
 
 [dev-dependencies]
 xvfs-test = { workspace = true }

@@ -30,7 +30,7 @@ use xvfs_proto::convert;
 use xvfs_proto::v1;
 use xvfs_types::error::{ErrorCode, XvfsError};
 use xvfs_types::{
-  BytePath, CommitMeta, HashAlgorithm, ObjectId, RepositoryId, Timestamp, TreeEntryInfo,
+  BytePath, CommitMeta, HashAlgorithm, MountId, ObjectId, RepositoryId, Timestamp, TreeEntryInfo,
 };
 
 type Grpc = v1::snapshot_service_client::SnapshotServiceClient<tonic::transport::Channel>;
@@ -115,6 +115,15 @@ impl SnapshotClient {
 
   fn capability(&self) -> String {
     self.capability.read().expect("capability lock").clone()
+  }
+
+  /// The current capability, for writing into `mount.json`.
+  ///
+  /// Deliberately verbose. This is the one call that takes a credential out of
+  /// the client, and a reviewer reading `state.rs` should be able to see that it
+  /// was an explicit decision rather than an accessor someone reached for.
+  pub fn capability_for_persistence(&self) -> String {
+    self.capability()
   }
 
   /// The authorization proof for a commit-scoped call.
@@ -250,6 +259,48 @@ impl SnapshotClient {
         })
         .collect(),
     )
+  }
+
+  /// Extend the lease, installing the fresh capability the server returns.
+  ///
+  /// Idempotent by contract, which is what makes a heartbeat that cannot tell
+  /// whether its last attempt landed recoverable: the previous capability stays
+  /// valid until its own expiry, so a renewal whose *response* was lost does not
+  /// strand the daemon holding a token the server has forgotten.
+  pub async fn renew_mount(&self, mount_id: &MountId) -> Result<Timestamp, XvfsError> {
+    let request = self.authed(v1::RenewMountRequest {
+      mount_id: mount_id.as_str().to_owned(),
+      mount_capability: self.capability(),
+    })?;
+    let response = self
+      .grpc
+      .clone()
+      .renew_mount(request)
+      .await
+      .map_err(|s| convert::from_status(&s))?
+      .into_inner();
+    self.set_capability(response.mount_capability);
+    Ok(
+      response
+        .lease_expiry
+        .map(|t| Timestamp::new(t.secs, t.nanos))
+        .unwrap_or_else(Timestamp::now),
+    )
+  }
+
+  /// Release the lease eagerly. Expiry is the crash fallback, not the normal path.
+  pub async fn release_mount(&self, mount_id: &MountId) -> Result<(), XvfsError> {
+    let request = self.authed(v1::ReleaseMountRequest {
+      mount_id: mount_id.as_str().to_owned(),
+      mount_capability: self.capability(),
+    })?;
+    self
+      .grpc
+      .clone()
+      .release_mount(request)
+      .await
+      .map_err(|s| convert::from_status(&s))?;
+    Ok(())
   }
 
   pub async fn get_commit(&self) -> Result<CommitMeta, XvfsError> {

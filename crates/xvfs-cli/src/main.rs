@@ -1,13 +1,29 @@
 //! The `xvfs` command-line interface.
 //!
-//! M1 gives it the commands that exercise the repository and snapshot API, which is
-//! what makes the local development stack demonstrable rather than merely running.
-//! `mount` here creates a *lease*, not a filesystem: `unmount`, `inspect`, `status`,
-//! `diff`, and `search` arrive with M2-M4 and are absent rather than stubbed, so
-//! `--help` does not advertise something that would fail.
+//! Two families of command, and the split matters:
+//!
+//! * **Workspace commands** — `mount`, `unmount`, `inspect`, `health`,
+//!   `refresh` — act on a *mounted workspace*. They start `xvfsd` or talk to a
+//!   running one over its control socket, and they are what an orchestrator and
+//!   an agent use.
+//! * **Snapshot commands** — `resolve`, `ls`, `cat` — read the server directly,
+//!   with no mount involved. They are how the API is demonstrated and debugged.
+//! * **`lease`** — creates, renews, and releases a retention lease by hand. A
+//!   mount does this for itself; the subcommand exists so M1's lease machine can
+//!   be exercised without one, which is what `scripts/dev-stack.sh` does.
+//!
+//! # Where things live
+//!
+//! Given `--workspace /path/to/ws`, the state directory defaults to
+//! `/path/to/ws.xvfs`. Every workspace command can therefore find a running
+//! daemon from the workspace path alone, which is the only thing a job knows.
 
-use anyhow::{Context, Result};
+use std::path::{Path, PathBuf};
+
+use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
+use xvfs_fuse::control::{self, Request, Response};
+use xvfs_fuse::state::MountState;
 use xvfs_proto::v1;
 
 #[derive(Parser, Debug)]
@@ -73,23 +89,96 @@ enum Command {
     path: String,
   },
 
-  /// Create a mount lease, pinning a commit for the life of a job.
+  /// Mount a pinned commit as a workspace.
   Mount {
     #[arg(long)]
     repo: String,
     #[arg(long, default_value = "HEAD")]
     rev: String,
+    /// The path the job will use.
+    #[arg(long)]
+    workspace: PathBuf,
+    /// Defaults to `<workspace>.xvfs`.
+    #[arg(long)]
+    state_dir: Option<PathBuf>,
+    /// Defaults to `$XDG_CACHE_HOME/xvfs`.
+    #[arg(long)]
+    cache_dir: Option<PathBuf>,
+    /// Allow a different UID to read the mount. Needs `user_allow_other` in
+    /// `/etc/fuse.conf` (ADR 0003), a privileged one-time host action.
+    #[arg(long)]
+    allow_other: bool,
+    #[arg(long, default_value_t = 8 * 1024 * 1024 * 1024)]
+    cache_quota: u64,
+    #[arg(long, default_value_t = 1024 * 1024 * 1024)]
+    overlay_quota: u64,
+    /// Run the daemon in this terminal instead of in the background.
+    #[arg(long)]
+    foreground: bool,
+    /// How long to wait for the workspace to become usable.
+    #[arg(long, default_value_t = 30)]
+    timeout_seconds: u64,
   },
 
-  /// Renew a mount lease.
+  /// Release the lease, unmount, and stop the daemon.
+  Unmount {
+    #[arg(long)]
+    workspace: PathBuf,
+    #[arg(long)]
+    state_dir: Option<PathBuf>,
+  },
+
+  /// Everything about a mounted workspace.
+  Inspect {
+    #[arg(long)]
+    workspace: PathBuf,
+    #[arg(long)]
+    state_dir: Option<PathBuf>,
+    #[arg(long)]
+    json: bool,
+  },
+
+  /// Daemon and lease health. Exits non-zero when the lease is not renewing.
+  Health {
+    #[arg(long)]
+    workspace: PathBuf,
+    #[arg(long)]
+    state_dir: Option<PathBuf>,
+    #[arg(long)]
+    json: bool,
+  },
+
+  /// Re-resolve the revision and publish a new mount generation.
+  ///
+  /// Only for a clean workspace. Old file and directory handles keep reading the
+  /// old generation until they close.
+  Refresh {
+    #[arg(long)]
+    workspace: PathBuf,
+    #[arg(long)]
+    state_dir: Option<PathBuf>,
+  },
+
+  /// Retention leases, without a mount. Used by the development stack.
+  #[command(subcommand)]
+  Lease(LeaseCommand),
+}
+
+#[derive(Subcommand, Debug)]
+enum LeaseCommand {
+  /// Create a lease, pinning a commit.
+  Create {
+    #[arg(long)]
+    repo: String,
+    #[arg(long, default_value = "HEAD")]
+    rev: String,
+  },
   Renew {
     #[arg(long)]
     mount_id: String,
     #[arg(long, hide_env_values = true)]
     capability: String,
   },
-
-  /// Release a mount lease.
   Release {
     #[arg(long)]
     mount_id: String,
@@ -142,6 +231,190 @@ async fn resolve(cli: &Cli, client: &mut Client, repo: &str, rev: &str) -> Resul
       .into_inner()
       .commit_oid,
   )
+}
+
+/// `<workspace>.xvfs` unless told otherwise.
+fn state_dir_for(workspace: &Path, explicit: &Option<PathBuf>) -> PathBuf {
+  explicit.clone().unwrap_or_else(|| {
+    let mut name = workspace.as_os_str().to_os_string();
+    name.push(".xvfs");
+    PathBuf::from(name)
+  })
+}
+
+fn default_cache_dir() -> PathBuf {
+  std::env::var_os("XDG_CACHE_HOME")
+    .map(PathBuf::from)
+    .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))
+    .unwrap_or_else(std::env::temp_dir)
+    .join("xvfs")
+}
+
+/// Locate `xvfsd`.
+///
+/// Next to this binary first: a development build and an installed package both
+/// put the two together, and picking up a *different* daemon from `PATH` than the
+/// CLI it shipped with is a version-skew bug that only appears at runtime.
+fn daemon_binary() -> PathBuf {
+  if let Some(explicit) = std::env::var_os("XVFS_DAEMON") {
+    return PathBuf::from(explicit);
+  }
+  if let Ok(current) = std::env::current_exe() {
+    if let Some(sibling) = current.parent().map(|d| d.join("xvfsd")) {
+      if sibling.is_file() {
+        return sibling;
+      }
+    }
+  }
+  PathBuf::from("xvfsd")
+}
+
+fn call(state_dir: &Path, request: &Request) -> Result<Response> {
+  let socket = MountState::control_socket(state_dir);
+  let response = control::call(&socket, request)
+    .map_err(|e| anyhow::anyhow!("{}: {}", e.code.as_str(), e.message))?;
+  response
+    .into_result()
+    .map_err(|e| anyhow::anyhow!("{}: {}", e.code.as_str(), e.message))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn do_mount(cli: &Cli, args: MountArgs) -> Result<()> {
+  let state_dir = state_dir_for(&args.workspace, &args.state_dir);
+  let cache_dir = args.cache_dir.clone().unwrap_or_else(default_cache_dir);
+  std::fs::create_dir_all(&state_dir)
+    .with_context(|| format!("creating {}", state_dir.display()))?;
+  let ready = state_dir.join("ready");
+  let _ = std::fs::remove_file(&ready);
+
+  let mut command = std::process::Command::new(daemon_binary());
+  command
+    .arg("--state-dir")
+    .arg(&state_dir)
+    .arg("--workspace")
+    .arg(&args.workspace)
+    .arg("--cache-dir")
+    .arg(&cache_dir)
+    .arg("--endpoint")
+    .arg(&cli.endpoint)
+    .arg("--http-endpoint")
+    .arg(&cli.http_endpoint)
+    .arg("--token")
+    .arg(&cli.token)
+    .arg("--repo")
+    .arg(&args.repo)
+    .arg("--rev")
+    .arg(&args.rev)
+    .arg("--cache-quota")
+    .arg(args.cache_quota.to_string())
+    .arg("--overlay-quota")
+    .arg(args.overlay_quota.to_string());
+  if args.allow_other {
+    command.arg("--allow-other");
+  }
+
+  if args.foreground {
+    let status = command.status().context("running xvfsd")?;
+    if !status.success() {
+      bail!("xvfsd exited with {status}");
+    }
+    return Ok(());
+  }
+
+  command.arg("--ready-file").arg(&ready);
+  // The daemon outlives this process, so none of its descriptors may stay tied
+  // to this terminal. This is not tidiness: a backgrounded daemon holding the
+  // inherited stderr keeps the write end of a pipe open, so `xvfs mount | tee`
+  // never sees EOF and appears to hang long after the command finished.
+  //
+  // A supervisor that wants the logs elsewhere reads this file or runs
+  // `--foreground`.
+  let log_path = state_dir.join("xvfsd.log");
+  let log = std::fs::OpenOptions::new()
+    .create(true)
+    .append(true)
+    .open(&log_path)
+    .with_context(|| format!("opening {}", log_path.display()))?;
+  command
+    .stdin(std::process::Stdio::null())
+    .stdout(std::process::Stdio::null())
+    .stderr(std::process::Stdio::from(log));
+  let mut child = command.spawn().with_context(|| {
+    format!(
+      "starting {} (set XVFS_DAEMON if it is elsewhere)",
+      daemon_binary().display()
+    )
+  })?;
+
+  let deadline = std::time::Instant::now() + std::time::Duration::from_secs(args.timeout_seconds);
+  loop {
+    if ready.is_file() {
+      break;
+    }
+    // A daemon that exited is a failure to report now, not a timeout to wait out.
+    if let Some(status) = child.try_wait().context("waiting for xvfsd")? {
+      bail!("xvfsd exited before the workspace was ready ({status})");
+    }
+    if std::time::Instant::now() >= deadline {
+      let _ = child.kill();
+      bail!(
+        "the workspace was not ready within {}s",
+        args.timeout_seconds
+      );
+    }
+    std::thread::sleep(std::time::Duration::from_millis(50));
+  }
+
+  let Response::Inspect(report) = call(&state_dir, &Request::Inspect)? else {
+    bail!("the daemon answered an inspect request with something else");
+  };
+  print_report(&report);
+  println!("log        {}", log_path.display());
+  Ok(())
+}
+
+struct MountArgs {
+  repo: String,
+  rev: String,
+  workspace: PathBuf,
+  state_dir: Option<PathBuf>,
+  cache_dir: Option<PathBuf>,
+  allow_other: bool,
+  cache_quota: u64,
+  overlay_quota: u64,
+  foreground: bool,
+  timeout_seconds: u64,
+}
+
+fn print_report(report: &xvfs_fuse::control::MountReport) {
+  println!("workspace  {}", report.workspace);
+  println!("repository {}", report.repository_id);
+  // The pinned commit, shown because it is the thing that matters: the branch
+  // name was only a selector, and PLAN.md M2.1 requires the CLI to show it.
+  println!("commit     {}", report.commit);
+  println!("ref        {}", report.ref_name.as_deref().unwrap_or("-"));
+  println!("mount      {}", report.mount_id);
+  println!("generation {}", report.generation);
+  println!("publication {}", report.publication);
+  println!("state      {}", report.state_dir);
+  println!("owner uid  {}", report.owner_uid);
+  println!(
+    "snapshot   {}.{:09}",
+    report.snapshot_time.secs, report.snapshot_time.nanos
+  );
+  println!("lease      {:?}", report.health.state);
+  println!(
+    "expires    {} (grace to {})",
+    report.health.lease_expiry.secs, report.health.grace_deadline.secs
+  );
+  println!("read-only  {}", report.read_only);
+  println!(
+    "hydration  {} blobs, {} bytes, {} cache hits",
+    report.cache.fetches, report.cache.bytes_fetched, report.cache.hits
+  );
+  if !report.retiring_generations.is_empty() {
+    println!("retiring   {:?}", report.retiring_generations);
+  }
 }
 
 #[tokio::main]
@@ -256,7 +529,114 @@ async fn main() -> Result<()> {
       std::io::stdout().write_all(&bytes)?;
     }
 
-    Command::Mount { repo, rev } => {
+    Command::Mount {
+      repo,
+      rev,
+      workspace,
+      state_dir,
+      cache_dir,
+      allow_other,
+      cache_quota,
+      overlay_quota,
+      foreground,
+      timeout_seconds,
+    } => {
+      // Blocking work, deliberately: starting a child process and waiting for a
+      // file to appear gains nothing from a runtime, and doing it inside one
+      // would block a worker thread anyway.
+      tokio::task::block_in_place(|| {
+        do_mount(
+          &cli,
+          MountArgs {
+            repo: repo.clone(),
+            rev: rev.clone(),
+            workspace: workspace.clone(),
+            state_dir: state_dir.clone(),
+            cache_dir: cache_dir.clone(),
+            allow_other: *allow_other,
+            cache_quota: *cache_quota,
+            overlay_quota: *overlay_quota,
+            foreground: *foreground,
+            timeout_seconds: *timeout_seconds,
+          },
+        )
+      })?;
+    }
+
+    Command::Unmount {
+      workspace,
+      state_dir,
+    } => {
+      let state_dir = state_dir_for(workspace, state_dir);
+      match call(&state_dir, &Request::Unmount)? {
+        Response::Unmounted => println!("unmounted {}", workspace.display()),
+        other => bail!("unexpected daemon response: {other:?}"),
+      }
+    }
+
+    Command::Inspect {
+      workspace,
+      state_dir,
+      json,
+    } => {
+      let state_dir = state_dir_for(workspace, state_dir);
+      let Response::Inspect(report) = call(&state_dir, &Request::Inspect)? else {
+        bail!("the daemon answered an inspect request with something else");
+      };
+      if *json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+      } else {
+        print_report(&report);
+      }
+    }
+
+    Command::Health {
+      workspace,
+      state_dir,
+      json,
+    } => {
+      let state_dir = state_dir_for(workspace, state_dir);
+      let Response::Health(health) = call(&state_dir, &Request::Health)? else {
+        bail!("the daemon answered a health request with something else");
+      };
+      if *json {
+        println!("{}", serde_json::to_string_pretty(&health)?);
+      } else {
+        println!("state      {:?}", health.state);
+        println!("failures   {}", health.consecutive_failures);
+        println!("expires    {}", health.lease_expiry.secs);
+        println!("grace to   {}", health.grace_deadline.secs);
+        println!("heartbeat  {}s", health.heartbeat_interval_secs);
+        if let Some(error) = &health.last_error {
+          println!("last error {error}");
+        }
+      }
+      // A non-zero exit so a probe or a shell script does not have to parse the
+      // output to learn that a lease is failing to renew.
+      if !health.is_healthy() {
+        std::process::exit(1);
+      }
+    }
+
+    Command::Refresh {
+      workspace,
+      state_dir,
+    } => {
+      let state_dir = state_dir_for(workspace, state_dir);
+      let Response::Refresh(report) = call(&state_dir, &Request::Refresh)? else {
+        bail!("the daemon answered a refresh request with something else");
+      };
+      println!(
+        "generation {} -> {}",
+        report.previous_generation, report.generation
+      );
+      println!("commit     {}", report.commit);
+      if report.unchanged {
+        println!("           (unchanged; the selector still resolves to the same commit)");
+      }
+    }
+
+    Command::Lease(LeaseCommand::Create { repo, rev }) => {
       let mut client = connect(&cli).await?;
       let resp = client
         .create_mount(authed(
@@ -270,8 +650,6 @@ async fn main() -> Result<()> {
         .await?
         .into_inner();
       println!("mount      {}", resp.mount_id);
-      // The pinned commit, shown because it is the thing that matters: the branch
-      // name was only a selector, and PLAN.md M2.1 requires the CLI to show it.
       println!("commit     {}", resp.commit_oid);
       println!("ref        {}", resp.ref_name.as_deref().unwrap_or("-"));
       if let Some(t) = resp.lease_expiry {
@@ -282,10 +660,10 @@ async fn main() -> Result<()> {
       println!("capability {}", resp.mount_capability);
     }
 
-    Command::Renew {
+    Command::Lease(LeaseCommand::Renew {
       mount_id,
       capability,
-    } => {
+    }) => {
       let mut client = connect(&cli).await?;
       let resp = client
         .renew_mount(authed(
@@ -303,10 +681,10 @@ async fn main() -> Result<()> {
       println!("capability {}", resp.mount_capability);
     }
 
-    Command::Release {
+    Command::Lease(LeaseCommand::Release {
       mount_id,
       capability,
-    } => {
+    }) => {
       let mut client = connect(&cli).await?;
       client
         .release_mount(authed(
@@ -355,4 +733,29 @@ async fn http_get(url: &str, token: &str) -> Result<Vec<u8>> {
     );
   }
   Ok(bytes)
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn the_state_directory_is_derivable_from_the_workspace_alone() {
+    // The property every workspace command depends on: a job knows its workspace
+    // path and nothing else, and must still be able to find its daemon.
+    assert_eq!(
+      state_dir_for(Path::new("/jobs/42/ws"), &None),
+      PathBuf::from("/jobs/42/ws.xvfs")
+    );
+    assert_eq!(
+      state_dir_for(Path::new("/jobs/42/ws"), &Some(PathBuf::from("/elsewhere"))),
+      PathBuf::from("/elsewhere")
+    );
+  }
+
+  #[test]
+  fn the_cli_accepts_the_workspace_command_grammar() {
+    use clap::CommandFactory;
+    Cli::command().debug_assert();
+  }
 }

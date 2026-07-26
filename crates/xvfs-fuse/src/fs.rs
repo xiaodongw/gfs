@@ -97,7 +97,7 @@ impl Default for FsConfig {
 }
 
 /// Counters DESIGN.md section 8.4 requires the client to keep.
-#[derive(Clone, Copy, Default, Debug, serde::Serialize)]
+#[derive(Clone, Copy, Default, Debug, serde::Serialize, serde::Deserialize)]
 pub struct FsStats {
   pub lookups: u64,
   pub negative_lookups: u64,
@@ -210,6 +210,15 @@ impl Xvfs {
   pub fn inode_counts(&self) -> (usize, usize) {
     let table = self.inodes.lock().expect("inode table");
     (table.live(), table.assigned())
+  }
+
+  /// Open file and directory handles.
+  ///
+  /// `xvfs refresh` reads this: PLAN.md M2.1 requires the old mount generation
+  /// and its lease to survive until every handle opened through it has closed,
+  /// so that no reader ever observes a mixture of two generations.
+  pub fn open_handles(&self) -> usize {
+    self.files.lock().expect("file handles").len() + self.dirs.lock().expect("dir handles").len()
   }
 
   fn bump(&self, f: impl FnOnce(&mut FsStats)) {

@@ -30,13 +30,22 @@
 pub mod attr;
 pub mod cache;
 pub mod client;
+pub mod control;
+pub mod daemon;
 pub mod fs;
 pub mod gitdir;
 pub mod inode;
+pub mod lease;
+pub mod publish;
 pub mod session;
+pub mod state;
 
 pub use cache::{BlobCache, CacheStats, Hydration};
 pub use client::{MountBinding, SnapshotClient};
+pub use daemon::{Daemon, DaemonConfig};
 pub use fs::{root_entry, FsConfig, FsStats, Xvfs, XvfsFilesystem};
 pub use gitdir::{GitDir, GitDirFacts};
+pub use lease::{HealthState, LeaseHealth, LeaseMonitor};
+pub use publish::{MountPublisher, SymlinkPublisher};
 pub use session::{spawn_mount, MountConfig};
+pub use state::MountState;

@@ -1,0 +1,160 @@
+//! `xvfsd`: the client daemon that owns one mounted workspace.
+//!
+//! Started by `xvfs mount`, or directly in the foreground for debugging. It
+//! creates the retention lease, mounts the pinned commit, publishes it at the
+//! workspace path, renews the lease on a heartbeat, and answers the control
+//! socket until told to unmount.
+//!
+//! Deliberately one mount per daemon. A daemon owning several would have to
+//! decide what a partial failure means -- one mount lost, the others alive -- and
+//! ADR 0006's failure policy has no answer for that. One process per mount makes
+//! "the daemon died" and "the mount is gone" the same event, which is the
+//! behaviour an orchestrator can reason about.
+
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::Duration;
+
+use anyhow::{Context, Result};
+use clap::Parser;
+use xvfs_fuse::daemon::{Daemon, DaemonConfig};
+use xvfs_fuse::{FsConfig, MountConfig};
+use xvfs_types::{LeasePolicy, RepositoryId};
+
+#[derive(Parser, Debug)]
+#[command(name = "xvfsd", version, about = "The XVFS mount daemon")]
+struct Args {
+  /// Where the job's state lives: `mount.json`, the control socket, and the
+  /// per-generation mount points.
+  #[arg(long)]
+  state_dir: PathBuf,
+
+  /// The path the job uses. Published by the daemon; must not already exist as
+  /// a real directory.
+  #[arg(long)]
+  workspace: PathBuf,
+
+  /// The shared blob cache. Shared between mounts of the same repository on one
+  /// host, and scoped to that repository (ADR 0002, ADR 0006).
+  #[arg(long)]
+  cache_dir: PathBuf,
+
+  #[arg(long, env = "XVFS_ENDPOINT", default_value = "http://127.0.0.1:8431")]
+  endpoint: String,
+
+  #[arg(
+    long,
+    env = "XVFS_HTTP_ENDPOINT",
+    default_value = "http://127.0.0.1:8430"
+  )]
+  http_endpoint: String,
+
+  #[arg(long, env = "XVFS_TOKEN", hide_env_values = true, default_value = "")]
+  token: String,
+
+  #[arg(long)]
+  repo: String,
+
+  /// A branch, tag, or object ID. Resolved once, by `CreateMount`.
+  #[arg(long, default_value = "HEAD")]
+  rev: String,
+
+  /// Blob cache quota in bytes.
+  #[arg(long, default_value_t = 8 * 1024 * 1024 * 1024)]
+  cache_quota: u64,
+
+  /// Overlay quota in bytes, reported by `statfs`. Enforced from M3.
+  #[arg(long, default_value_t = 1024 * 1024 * 1024)]
+  overlay_quota: u64,
+
+  /// Allow a different UID to read the mount. Requires `user_allow_other` in
+  /// `/etc/fuse.conf`, a privileged one-time host action (ADR 0003).
+  #[arg(long)]
+  allow_other: bool,
+
+  /// FUSE event-loop threads. More than one is half of ADR 0003's dispatch rule.
+  #[arg(long, default_value_t = 4)]
+  fuse_threads: usize,
+
+  /// Write this file once the workspace is usable. `xvfs mount` waits for it,
+  /// which is more reliable than polling for the socket: the socket exists
+  /// before the first mount is published.
+  #[arg(long)]
+  ready_file: Option<PathBuf>,
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+  tracing_subscriber::fmt()
+    .with_env_filter(
+      tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+    )
+    .init();
+
+  let args = Args::parse();
+  let config = DaemonConfig {
+    state_dir: args.state_dir.clone(),
+    workspace: args.workspace.clone(),
+    cache_dir: args.cache_dir,
+    grpc_endpoint: args.endpoint,
+    http_endpoint: args.http_endpoint,
+    token: args.token,
+    repository_id: RepositoryId::parse(&args.repo).context("invalid repository id")?,
+    revision_selector: args.rev,
+    cache_quota_bytes: args.cache_quota,
+    fs: FsConfig {
+      overlay_quota_bytes: args.overlay_quota,
+      ..FsConfig::default()
+    },
+    mount: MountConfig {
+      threads: args.fuse_threads,
+      allow_other: args.allow_other,
+      // Only with `allow_other`, which `fuser` enforces anyway: `auto_unmount`
+      // needs it, and asking for it without would fail the mount outright.
+      auto_unmount: args.allow_other,
+    },
+    lease_policy: LeasePolicy::adr_0006(),
+    retire_timeout: Duration::from_secs(300),
+  };
+
+  let daemon = Daemon::start(config)
+    .await
+    .map_err(|e| anyhow::anyhow!("{}: {}", e.code.as_str(), e.message))?;
+
+  if let Some(ready) = &args.ready_file {
+    std::fs::write(ready, format!("{}\n", std::process::id()))
+      .with_context(|| format!("writing {}", ready.display()))?;
+  }
+  tracing::info!(
+    workspace = %args.workspace.display(),
+    state_dir = %args.state_dir.display(),
+    "workspace is ready"
+  );
+
+  let heartbeat = tokio::spawn(Arc::clone(&daemon).run_heartbeat());
+  let control = tokio::spawn(Arc::clone(&daemon).serve_control());
+
+  // A signal is a *request* to tear down cleanly, not a reason to abandon a
+  // lease. ADR 0003 measured that a mount point survives its daemon and returns
+  // ENOTCONN until something unmounts it, so exiting without this leaves the job
+  // with a workspace that fails every operation.
+  let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+    .context("installing the SIGTERM handler")?;
+  let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
+    .context("installing the SIGINT handler")?;
+
+  tokio::select! {
+    _ = sigterm.recv() => tracing::info!("SIGTERM: tearing down"),
+    _ = sigint.recv() => tracing::info!("SIGINT: tearing down"),
+    // `Unmount` over the control socket returns from `serve_control`.
+    _ = control => tracing::info!("unmount requested over the control socket"),
+  }
+
+  daemon.shutdown().await;
+  heartbeat.abort();
+  if let Some(ready) = &args.ready_file {
+    let _ = std::fs::remove_file(ready);
+  }
+  Ok(())
+}

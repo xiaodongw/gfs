@@ -14,14 +14,19 @@ path = "src/main.rs"
 [dependencies]
 xvfs-types = { workspace = true }
 xvfs-proto = { workspace = true }
+# For the control-socket protocol and the state-directory layout. The CLI is a
+# front end to `xvfsd`, so it shares the daemon's vocabulary rather than
+# re-declaring it and drifting.
+xvfs-fuse = { workspace = true }
 anyhow = { workspace = true }
 clap = { workspace = true }
+serde_json = { workspace = true }
 tokio = { workspace = true }
 tonic = { workspace = true }
 http = { workspace = true }
 http-body-util = { workspace = true }
 hyper = { workspace = true, features = ["client", "http1"] }
-hyper-util = { version = "0.1", features = ["tokio"] }
+hyper-util = { workspace = true }
 
 [lints]
 workspace = true

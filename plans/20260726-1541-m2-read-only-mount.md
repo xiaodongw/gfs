@@ -133,6 +133,42 @@ because `user_allow_other` is a privileged host action and requiring it would
 make `cargo test` need one. `MountConfig::allow_other` exists and defaults to
 false; the daemon opts in when the deployment has been prepared.
 
+### Publication is a symlink swap, not a bind mount
+
+ADR 0003's amendment asks only that publication stay behind one replaceable
+step. The local implementation is a symlink replaced by `rename(2)` because
+`mount --bind` needs `CAP_SYS_ADMIN`, and the ADR's entire argument is that the
+daemon needs no capability where it runs. The symlink gives exactly the property
+`xvfs refresh` needs: the swap is atomic, a path resolved after it reaches the
+new generation, and a descriptor opened before it keeps the old one.
+
+`MountPublisher` has one implementation today. The bind-mount and CSI forms
+replace it without touching the filesystem code, which is the deferral's price.
+
+### `mount.json` holds the capability, at 0600
+
+A restarted daemon cannot renew a lease it cannot prove it holds, and asking the
+control plane to re-issue one would make lease renewal depend on the very
+authentication round trip a control-plane outage removes. The file is 0600 in a
+0700 directory the daemon owns — the same boundary ADR 0006 puts around the blob
+cache. `SnapshotClient::capability_for_persistence` is deliberately verbose so
+the one call that takes a credential out of the client reads as a decision.
+
+### One mount per daemon
+
+A daemon owning several mounts would have to define what a partial failure means
+— one mount lost, the others alive — and ADR 0006's failure policy has no answer
+for that. One process per mount makes "the daemon died" and "the mount is gone"
+the same event.
+
+### The `lease` subcommand, split out of `mount`
+
+M1's `xvfs mount` created a lease and nothing else. M2's `xvfs mount` mounts, so
+the lease-only path moved to `xvfs lease create|renew|release` rather than being
+deleted: `scripts/dev-stack.sh` uses it to demonstrate M1's lease machine
+without a filesystem, and an orchestrator debugging a lease should not have to
+mount to do it.
+
 ## Details
 
 - **`unsafe` appears twice, both with a recorded reason.** The workspace denies
@@ -148,3 +184,20 @@ false; the daemon opts in when the deployment has been prepared.
   is the test that found it.
 - **The `content` fixture's `large-blob.bin` is 12 MiB**, which is what makes
   the single-flight test meaningful: eight concurrent openers reliably overlap.
+- **A backgrounded daemon must not inherit stderr.** `xvfs mount` redirects the
+  daemon's stderr to `<state-dir>/xvfsd.log`. Without it a daemon holds the
+  write end of the caller's pipe open, so `xvfs mount | tee` never sees EOF and
+  appears to hang long after the command finished. This was found by the dev
+  stack hanging for ten minutes with no output.
+- **Paths are made absolute inside `Daemon::start`.** A symlink target resolves
+  relative to the *link's* directory, so a relative `--state-dir` published a
+  workspace pointing at a path that does not exist. Found by the dev stack.
+- **`git rev-parse --show-toplevel` reports the generation path, not the
+  workspace path.** Git resolves the publication symlink, so a tool inside the
+  workspace sees `<state-dir>/generations/N`. Correct, and worth knowing: a bind
+  mount would report the workspace path instead, so the two publishers differ
+  observably here. M6.1 owns whether that matters to the pilot's tooling.
+- **`rm -rf` over a live mount is a trap.** The dev stack originally cleaned up
+  with it and spent minutes failing against a read-only base left by an earlier
+  run. The script now unmounts first, then `fusermount3 -u -z` each generation,
+  and only then removes anything.

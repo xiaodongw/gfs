@@ -152,14 +152,68 @@ $XVFS cat --repo attrs --rev main converted.txt | od -c | head -2
 say "a non-UTF-8 path is addressable"
 $XVFS ls --repo bytes --rev main | head -8
 
-say "create, renew, and release a mount lease"
-MOUNT_OUT=$($XVFS mount --repo basic --rev main)
+say "create, renew, and release a retention lease by hand"
+MOUNT_OUT=$($XVFS lease create --repo basic --rev main)
 printf '%s\n' "$MOUNT_OUT"
 MOUNT_ID=$(printf '%s\n' "$MOUNT_OUT" | awk '$1=="mount"{print $2}')
 CAP=$(printf '%s\n' "$MOUNT_OUT" | awk '$1=="capability"{print $2}')
-$XVFS renew --mount-id "$MOUNT_ID" --capability "$CAP" >/dev/null
+$XVFS lease renew --mount-id "$MOUNT_ID" --capability "$CAP" >/dev/null
 say "  lease renewed; the anchor is verified under the repository lock"
-$XVFS release --mount-id "$MOUNT_ID" --capability "$CAP"
+$XVFS lease release --mount-id "$MOUNT_ID" --capability "$CAP"
+
+# ---------------------------------------------------------------------------
+# The M2 half: a real FUSE mount, driven through the daemon.
+#
+# Skipped rather than failed where FUSE is unavailable. ADR 0003's prerequisites
+# are /dev/fuse and fuse3; a container without them is a legitimate place to run
+# the rest of this stack, and a skip that says so is more useful than a failure
+# that looks like a regression.
+if [ -c /dev/fuse ] && command -v fusermount3 >/dev/null 2>&1; then
+  WS="$STATE_DIR/workspace"
+
+  # Clean up after an earlier run, without ever recursing into a live mount.
+  # `rm -rf` over a mounted workspace is both wrong and slow: the base is
+  # read-only, so every removal fails, and ADR 0003 measured that a mount point
+  # outlives its daemon and answers ENOTCONN until something unmounts it.
+  $XVFS unmount --workspace "$WS" >/dev/null 2>&1 || true
+  for gen in "$WS.xvfs"/generations/*; do
+    [ -d "$gen" ] && fusermount3 -u -z "$gen" >/dev/null 2>&1 || true
+  done
+  rm -f "$WS"
+  rm -rf "$WS.xvfs"
+  # Whatever happens below, do not leave a daemon behind.
+  # shellcheck disable=SC2317
+  cleanup_mount() { $XVFS unmount --workspace "$WS" >/dev/null 2>&1 || true; }
+  trap 'cleanup_mount; cleanup' EXIT
+
+  say "mount a pinned commit as a workspace"
+  $XVFS mount --repo basic --rev main --workspace "$WS" --cache-dir "$STATE_DIR/cache"
+
+  say "read a file through the mount, with no repository on the client"
+  cat "$WS/README.md"
+
+  say "the synthesized .git surface (ADR 0005: six entries, not four)"
+  ls -A "$WS/.git"
+  printf '  HEAD is: '
+  cat "$WS/.git/HEAD"
+
+  say "git finds the repository root through the synthesized surface"
+  ( cd "$WS" && git rev-parse --show-toplevel && git rev-parse --abbrev-ref HEAD )
+
+  say "hydration accounting"
+  $XVFS inspect --workspace "$WS" | grep -E 'hydration|generation|lease'
+
+  say "refresh publishes a new generation atomically"
+  $XVFS refresh --workspace "$WS"
+
+  say "health"
+  $XVFS health --workspace "$WS"
+
+  say "unmount"
+  $XVFS unmount --workspace "$WS"
+else
+  say "FUSE is unavailable (need /dev/fuse and fuse3); the mount demo is SKIPPED"
+fi
 
 say "a revision expression is refused, not interpreted"
 if $XVFS resolve --repo basic 'main^{tree}' 2>/dev/null; then

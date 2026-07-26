@@ -78,7 +78,7 @@ pub enum Hydration {
   Coalesced,
 }
 
-#[derive(Clone, Copy, Default, Debug, serde::Serialize)]
+#[derive(Clone, Copy, Default, Debug, serde::Serialize, serde::Deserialize)]
 pub struct CacheStats {
   pub hits: u64,
   pub fetches: u64,
