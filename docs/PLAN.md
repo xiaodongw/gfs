@@ -57,7 +57,7 @@ behavior required by real builds.
 | --- | --- | --- |
 | M0: feasibility ✅ | Highest-risk assumptions measured | **Complete — conditional go**, see [go/no-go](../spikes/reports/m0-go-no-go.md) |
 | M1: repository API ✅ | Exact revision/tree/file access, retained for the life of a mount | **Complete**, see [M1 report](reports/m1-completion.md) |
-| M2: read-only mount | Lazy snapshot is usable as a workspace, `.git` surface included | Representative read/build smoke tests pass |
+| M2: read-only mount ✅ | Lazy snapshot is usable as a workspace, `.git` surface included | **Complete**, see [M2 report](reports/m2-completion.md) |
 | M3: writable workspace | Crash-safe overlay and patch export | Mutation model and recovery tests pass |
 | M4: agent search | Search does not hydrate base, sees edits, and separates execution status from scoped coverage | Results match the supported materialized `rg` corpus |
 | M5: Git compatibility | Stock Git clone/fetch works | Version/protocol matrix passes |
@@ -376,9 +376,47 @@ Exit criteria:
 - Unauthorized users cannot infer blob existence through status, timing within a
   defined tolerance, cache, or error differences.
 
-## 5. M2 — Read-only FUSE client
+## 5. M2 — Read-only FUSE client ✅ COMPLETE
 
 Duration: 3–4 weeks
+
+> **Status: complete, 2026-07-26.** All six exit criteria met; see the
+> [M2 completion report](reports/m2-completion.md).
+>
+> Code is in [`crates/xvfs-fuse/`](../crates/xvfs-fuse/), the daemon is `xvfsd`,
+> the shim is `xvfs-git-shim`, and the workspace commands are `xvfs
+> mount|unmount|inspect|health|refresh|install-shim`.
+>
+> | Sub-milestone | Status | Deliverable |
+> | --- | --- | --- |
+> | M2.1 mount lifecycle | ✅ | `daemon.rs`, `state.rs`, `publish.rs`, `lease.rs`, `control.rs` |
+> | M2.2 metadata and inode model | ✅ | `inode.rs`, `attr.rs`, `fs.rs` |
+> | M2.3 blob cache and reads | ✅ | `cache.rs`, `client.rs` |
+> | M2.4 compatibility tests | ⚠️ `pjdfstest`/xfstests **not run** | `tests/compat.rs`, `xvfs-test/src/oracle.rs`, `bin/xvfs-git-shim.rs` |
+>
+> Measured: cold mount to a usable root in **99 ms** having downloaded **zero**
+> blob bytes; a two-file read from a 16 MiB snapshot transfers 28 bytes; 1000
+> repeated `stat(2)` calls cost no round trips and 50 misses on one path cost at
+> most two; eight concurrent opens of a 12 MiB blob cause one download.
+>
+> Four findings changed something rather than confirming it: cache adoption after
+> a restart was keyed by the file name rather than the whole digest, so a
+> restarted daemon would have silently re-downloaded its warm cache; the test
+> oracle's own `from_utf8_lossy` corrupted the non-UTF-8 paths it was checking and
+> blamed the mount; a backgrounded daemon inheriting stderr holds the caller's
+> pipe open so `xvfs mount | tee` never terminates; and a symlink target resolves
+> relative to the link's directory, so a relative `--state-dir` published a
+> workspace pointing nowhere.
+>
+> **One gap carries forward.** `pjdfstest` and xfstests were **not run** — neither
+> is installed here nor packaged as a Rust dependency — and `tests/compat.rs`
+> covers a hand-written subset of the same ground instead. It should close before
+> M6.1.
+>
+> **One deferral is now unblocked.** ADR 0003's amendment set "the prototype
+> mounts and serves a workspace locally" as the trigger for re-running
+> [`spikes/fuse-probe/deployment-matrix.sh`](../spikes/fuse-probe/deployment-matrix.sh)
+> on the real hosted runner and on Kubernetes. That trigger has fired.
 
 ### M2.1 Mount lifecycle
 

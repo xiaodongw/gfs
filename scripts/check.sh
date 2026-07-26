@@ -61,6 +61,18 @@ stage_versions() {
     printf 'ok   stock Git %s matches ADR 0001\n' "$got_git"
   fi
   printf 'ok   toolchain %s\n' "$(rustc --version)"
+
+  # M2's suite mounts a real filesystem, so FUSE is a prerequisite of the `test`
+  # stage rather than of one optional job. Reported here so a fresh container
+  # says what it is missing before a mount failure buried in test output does.
+  if [ -c /dev/fuse ] && command -v fusermount3 >/dev/null 2>&1; then
+    printf 'ok   FUSE is available (%s)\n' "$(fusermount3 --version 2>&1 | head -1)"
+  else
+    printf '\033[31mmissing\033[0m: /dev/fuse or fusermount3. ADR 0003 makes both\n'
+    printf 'prerequisites of the host-daemon model, and the M2 mount tests need them.\n'
+    printf 'Install fuse3 and ensure /dev/fuse is present.\n'
+    return 1
+  fi
 }
 
 stage_fmt() { cargo fmt --all -- --check; }

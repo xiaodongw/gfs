@@ -197,6 +197,15 @@ The prerequisite itself is unchanged and still belongs in the installation
 documentation: the bind-mount model does not work without it, and section 2 above is
 the measurement that says so.
 
+### The trigger has fired, 2026-07-26
+
+M2 is complete: the prototype mounts and serves a workspace locally
+([M2 report](../reports/m2-completion.md)). The deferral's condition is therefore
+met and re-running `spikes/fuse-probe/deployment-matrix.sh` on the real hosted
+runner and on Kubernetes is unblocked. What M2 owed in exchange was delivered:
+mount publication is behind one replaceable step (`xvfs-fuse/src/publish.rs`),
+and M2's own tests mount and read as the same UID.
+
 ### When this stops being deferrable
 
 Before M6.1. The pilot's orchestrator bind-mounts a workspace into an unprivileged

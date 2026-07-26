@@ -148,3 +148,40 @@ producing a second, wrong source of truth inside the job.
 - A documented limitation for the compatibility boundary: tools that invoke Git
   by absolute path, bypassing the shim in `PATH`, will get empty rather than
   erroring answers from `ls-files` and `diff`.
+
+## Amendment, 2026-07-26: the shim landed in M2, not M3.3
+
+This ADR's Consequences put the six-entry surface in M2.1 and the shim's
+`ls-files`/`diff` work in M3.3. The surface landed where predicted. The shim
+landed **one milestone earlier**, in M2, and the reason is this ADR's own
+argument.
+
+PLAN.md M2.4 requires exercising "the `.git` surface and `git` shim", including
+"confirmation that unsupported subcommands fail with an actionable message
+instead of a wrong answer". A shim that did not exist could not be exercised, and
+the alternative — testing the raw surface alone — would have signed off a
+milestone knowing that `ls-files` and `diff` return confidently wrong answers.
+
+`xvfs-fuse/src/bin/xvfs-git-shim.rs` implements the frozen grammar in full.
+`status`, `diff`, and `ls-files` currently answer from the mount and from the
+fact that a read-only mount has no local changes, which is correct rather than
+approximate: there is no overlay yet to differ from the base. **M3.3's work is
+unchanged in substance and reduced in scope**: rewire those three to the overlay
+journal, and add the cases that only exist once something can be edited.
+
+Two details settled by building it:
+
+- **The shim needs no credential.** The daemon calls `GetCommit` once at mount
+  time and embeds the result in `.git/xvfs.json`, so bounded `log -1` reads a
+  local file. A shim that called the server would carry the mount capability,
+  and a `PATH`-installed wrapper any process can invoke is the wrong place for
+  one.
+- **It refuses outside an XVFS workspace.** Installed early in `PATH` it is
+  invoked everywhere; answering for an ordinary Git repository would replace a
+  working `git` with a crippled one. It searches upward for `.git/xvfs.json`
+  specifically.
+
+The measured behaviour this ADR recorded was re-verified against the current
+stock Git rather than assumed: `compat.rs::stock_git_ls_files_and_diff_are_silently_empty_which_is_why_the_shim_exists`
+asserts that `ls-files` and `diff` still exit 0 with empty output, so the shim's
+justification is a live test rather than a historical note.

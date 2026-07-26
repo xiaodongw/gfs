@@ -66,6 +66,13 @@ Four commits, each one green under `scripts/check.sh` before the next starts.
   implementations left for M6.1/M7.4 to add without touching the filesystem code.
 * `xvfs mount|unmount|inspect|health|refresh` in the CLI, talking to the daemon.
 
+Landed as planned, with these additions discovered during the work: `state.rs`
+(`mount.json`), `control.rs` (the socket protocol), `lease.rs` (heartbeat health),
+`xvfs install-shim`, a `future` fixture carrying a 2050-dated commit, and a
+separate `tests/exit_criteria.rs` holding the six measured criteria. The shim
+binary lives in `xvfs-fuse` rather than in `xvfs-cli`, because it reads only the
+mount and the synthesized surface.
+
 ### 3. Compatibility (`xvfs-test`, `xvfs-git-shim`)
 
 * A raw-tree materializer oracle built from `git ls-tree` and `git cat-file`, and
@@ -82,6 +89,17 @@ Four commits, each one green under `scripts/check.sh` before the next starts.
 Measure each of M2's six exit criteria, write `docs/reports/m2-completion.md`,
 update PLAN.md, and extend `scripts/dev-stack.sh` and `scripts/check.sh` so a
 mount is part of the one-command stack and the gate.
+
+Measured: cold mount to a usable root in **99 ms** having downloaded **zero**
+blob bytes; a two-file read from a 16 MiB snapshot transfers 28 bytes across two
+blobs and four metadata requests; 1000 repeated `stat(2)` calls cost no round
+trips; 50 misses on one path cost at most two; eight concurrent opens of a 12 MiB
+blob cause one download; a warm cache survives an unclean daemon exit with zero
+bytes re-fetched and zero verification failures.
+
+Also amended ADR 0003 (its deferral trigger has fired: the prototype mounts
+locally) and ADR 0005 (the shim landed in M2 rather than M3.3, and M3.3's scope
+is correspondingly reduced to rewiring `status`/`diff`/`ls-files` to the journal).
 
 ## Decisions
 

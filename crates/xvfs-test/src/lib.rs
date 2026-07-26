@@ -15,7 +15,9 @@ pub mod fixtures;
 pub mod oracle;
 
 pub use bigtree::{big_tree, expected_entries};
-pub use fixtures::{bare, fixture, git, git_raw, scratch_clone, worktree, Fixture, FIXTURES};
+pub use fixtures::{
+  bare, fixture, git, git_bytes, git_env, git_raw, scratch_clone, worktree, Fixture, FIXTURES,
+};
 pub use oracle::{
   diff_trees, materialize_checkout, materialize_raw, snapshot_tree, EntrySnapshot, TreeSnapshot,
 };

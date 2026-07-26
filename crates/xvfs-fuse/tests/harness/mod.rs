@@ -139,7 +139,28 @@ impl Mount {
     Mount::with_config(backend, revision, FsConfig::default()).await
   }
 
+  /// Fail loudly, not silently, when FUSE is unavailable.
+  ///
+  /// A suite that skipped here would report green while verifying nothing about
+  /// the filesystem, which is the one thing M2 is accountable for. ADR 0003
+  /// names the prerequisites; this repeats them so a fresh container says what
+  /// it needs rather than what it could not do.
+  fn require_fuse() {
+    assert!(
+      Path::new("/dev/fuse").exists(),
+      "/dev/fuse is missing: M2's suite mounts a real filesystem. \
+       ADR 0003's prerequisites are /dev/fuse and fuse3 (`fusermount3`)."
+    );
+    assert!(
+      std::env::var_os("PATH")
+        .map(|paths| std::env::split_paths(&paths).any(|d| d.join("fusermount3").is_file()))
+        .unwrap_or(false),
+      "fusermount3 is not on PATH: install fuse3 (ADR 0003)."
+    );
+  }
+
   pub async fn with_config(backend: &Backend, revision: &str, config: FsConfig) -> Mount {
+    Mount::require_fuse();
     let mut grpc = backend.grpc_client().await;
     let mut request = tonic::Request::new(v1::CreateMountRequest {
       repository_id: backend.repo_id.as_str().to_owned(),

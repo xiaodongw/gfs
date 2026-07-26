@@ -26,7 +26,7 @@ use std::process::Command;
 use anyhow::{bail, Context, Result};
 
 /// Bump to invalidate every cached fixture.
-pub const FIXTURE_VERSION: &str = "v1";
+pub const FIXTURE_VERSION: &str = "v2";
 
 #[derive(Debug)]
 pub struct Fixture {
@@ -105,6 +105,12 @@ pub const FIXTURES: &[Fixture] = &[
     openable: false,
   },
   Fixture {
+    name: "future",
+    rationale: "a commit dated 2050; ADR 0006's snapshot_time clamp, end to end",
+    build: build_future,
+    openable: true,
+  },
+  Fixture {
     name: "attrs",
     rationale: ".gitattributes text/eol and an LFS pointer; the mount serves raw bytes",
     build: build_attrs,
@@ -141,7 +147,13 @@ pub fn git_raw(dir: &Path, args: &[&OsStr]) -> Result<String> {
 /// oracle in [`crate::oracle`] must reproduce them exactly or it reports a
 /// difference that only exists in the oracle.
 pub fn git_bytes(dir: &Path, args: &[&OsStr]) -> Result<Vec<u8>> {
-  let out = Command::new("git")
+  git_bytes_env(dir, args, &[])
+}
+
+/// [`git_bytes`] with environment overrides applied after the hermetic set.
+pub fn git_bytes_env(dir: &Path, args: &[&OsStr], extra: &[(&str, &str)]) -> Result<Vec<u8>> {
+  let mut command = Command::new("git");
+  command
     .current_dir(dir)
     .args(args)
     .env("GIT_CONFIG_GLOBAL", "/dev/null")
@@ -151,7 +163,11 @@ pub fn git_bytes(dir: &Path, args: &[&OsStr]) -> Result<Vec<u8>> {
     .env("GIT_COMMITTER_NAME", "XVFS Fixture")
     .env("GIT_COMMITTER_EMAIL", "fixture@xvfs.invalid")
     .env("GIT_AUTHOR_DATE", "2020-01-01T00:00:00Z")
-    .env("GIT_COMMITTER_DATE", "2020-01-01T00:00:00Z")
+    .env("GIT_COMMITTER_DATE", "2020-01-01T00:00:00Z");
+  for (key, value) in extra {
+    command.env(key, value);
+  }
+  let out = command
     .output()
     .with_context(|| format!("spawning git {args:?}"))?;
   if !out.status.success() {
@@ -169,6 +185,17 @@ pub fn git_bytes(dir: &Path, args: &[&OsStr]) -> Result<Vec<u8>> {
 pub fn git(dir: &Path, args: &[&str]) -> Result<String> {
   let owned: Vec<&OsStr> = args.iter().map(OsStr::new).collect();
   git_raw(dir, &owned)
+}
+
+/// Run git with the hermetic environment plus overrides.
+///
+/// The overrides are applied last, so a fixture that needs a different commit
+/// date replaces the pinned one rather than fighting it. Only the date is
+/// expected to need this; identity and configuration stay fixed so object IDs
+/// remain reproducible.
+pub fn git_env(dir: &Path, args: &[&str], extra: &[(&str, &str)]) -> Result<String> {
+  let owned: Vec<&OsStr> = args.iter().map(OsStr::new).collect();
+  Ok(String::from_utf8_lossy(&git_bytes_env(dir, &owned, extra)?).into_owned())
 }
 
 fn init(dir: &Path, extra: &[&str]) -> Result<()> {
@@ -332,6 +359,28 @@ fn build_deep(dir: &Path) -> Result<()> {
   rel.push_str("leaf.txt");
   write(dir, &rel, b"deep\n")?;
   commit_all(dir, "deep")?;
+  Ok(())
+}
+
+/// A commit whose committer timestamp is in 2050.
+///
+/// Git accepts future-dated commits and real repositories contain them. ADR 0006
+/// clamps `snapshot_time` to just before the catalog's first-seen time for
+/// exactly this case, because a source file dated in the future makes a build
+/// system either rebuild forever or never. Without a fixture the clamp is only
+/// tested against a hand-built `Timestamp`, never against a real commit.
+fn build_future(dir: &Path) -> Result<()> {
+  init(dir, &[])?;
+  write(dir, "future.txt", b"from the future\n")?;
+  git(dir, &["add", "-A", "."])?;
+  git_env(
+    dir,
+    &["commit", "-q", "-m", "dated 2050"],
+    &[
+      ("GIT_AUTHOR_DATE", "2050-01-01T00:00:00Z"),
+      ("GIT_COMMITTER_DATE", "2050-01-01T00:00:00Z"),
+    ],
+  )?;
   Ok(())
 }
 
