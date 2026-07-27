@@ -60,7 +60,7 @@ behavior required by real builds.
 | M2: read-only mount ✅ | Lazy snapshot is usable as a workspace, `.git` surface included | **Complete**, see [M2 report](reports/m2-completion.md) |
 | M3: writable workspace ✅ | Crash-safe overlay and patch export | **Complete**, see [M3 report](reports/m3-completion.md) |
 | M4: agent search ✅ | Search does not hydrate base, sees edits, and separates execution status from scoped coverage | **Complete**, see [M4 report](reports/m4-completion.md) |
-| M5: Git compatibility | Stock Git clone/fetch works | Version/protocol matrix passes |
+| M5: Git compatibility ✅ | Stock Git clone/fetch works | **Complete**, see [M5 report](reports/m5-completion.md) |
 | M6: hosted pilot | End-to-end jobs run safely | Performance and reliability gates met |
 | M7: production | Scaled, operable, supportable service | SLO/security/DR review passes |
 | M8: native commit/push | Optional direct Git write workflow | CAS and interoperability tests pass |
@@ -743,9 +743,51 @@ Exit criteria:
 - No tested failure or limit produces a result that is indistinguishable from
   "no matches".
 
-## 8. M5 — Git smart HTTP compatibility
+## 8. M5 — Git smart HTTP compatibility ✅ COMPLETE
 
 Duration: 2–4 weeks
+
+> **Status: complete, 2026-07-26.** Both exit criteria met for the feature
+> matrix; see the [M5 completion report](reports/m5-completion.md).
+>
+> Code is in [`crates/xvfs-server/src/gateway/`](../crates/xvfs-server/src/gateway/),
+> the routes are on the existing HTTP listener, and a clone URL is
+> `http://<http-addr>/v1/repos/<repository-id>`.
+>
+> | Sub-milestone | Status | Deliverable |
+> | --- | --- | --- |
+> | M5.1 smart HTTP gateway | ✅ | `gateway/mod.rs`, `Server::git_router`, `scripts/dev-stack.sh` |
+> | M5.2 protocol feature matrix | ⚠️ client **version** row not covered | `xvfs-server/tests/gateway.rs` |
+> | M5.3 subprocess and repository isolation | ⚠️ memory limit omitted by decision | `gateway/upload_pack.rs`, `gateway/pkt.rs` |
+>
+> Measured on the worst case (linux, 2 870 refs): a **6.4 GiB full bare clone**
+> in 350 s with the server peaking at **14 MiB RSS**, `git fsck` clean and
+> `HEAD` equal to the bare repository. The RSS is the result — the M0.3 probe
+> buffered whole responses, and 14 MiB against 6.4 GiB is the evidence that the
+> gateway streams.
+>
+> Two findings would have left a test passing for the wrong reason.
+> `git clone --filter=blob:none` **checks out**, and checking out a partial
+> clone lazily fetches every blob in the working tree, so without
+> `--no-checkout` and `GIT_NO_LAZY_FETCH=1` the filtered and unfiltered cases
+> are byte-identical on disk. And withdrawing the `filter` capability does not
+> make a client fail: it degrades to a full clone, exits 0, and still records
+> `remote.origin.partialclonefilter` from the command line. The advertisement is
+> therefore advice; the gateway's own validation of the exact filter spec is the
+> enforcement, and an unadvertised filter line is refused `403`.
+>
+> One item in M5.3 is **deliberately not implemented**: a process memory limit.
+> `upload-pack` mmaps packfiles and mapped pack bytes count against `RLIMIT_AS`,
+> and linux.git's pack is 4.5 GiB, so any limit small enough to be a backstop is
+> small enough to break clones of the repositories XVFS exists to serve. Memory
+> is a cgroup concern, which is what ADR 0003's deployment model already assumes.
+> `RLIMIT_CPU` is applied through `prlimit`, because `pre_exec` is unavailable
+> under this workspace's `unsafe_code = "deny"`.
+>
+> **One gap carries forward.** Only the pinned Git 2.53.0 is installed here, so
+> the client-**version** row of the matrix is not covered; the test runs whatever
+> `XVFS_GIT_CLIENTS` names and skips loudly otherwise. ADR 0002's v0/v2 split is
+> version-sensitive, so this should close before M6.1.
 
 ### M5.1 Smart HTTP gateway
 

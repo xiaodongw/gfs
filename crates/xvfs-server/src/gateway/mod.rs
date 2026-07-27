@@ -49,7 +49,7 @@
 //! of `uploadpack.allowAnySHA1InWant`, so a repository reader can always reach a
 //! lease-retained commit through Git. **One bare repository is one authorization
 //! domain.** The gateway enforces repository authorization -- the same
-//! [`Authorizer`](crate::auth::Authorizer) the snapshot, blob, and search APIs
+//! [`Authorizer`] the snapshot, blob, and search APIs
 //! use -- and does not claim object authorization. PLAN.md M1.5 says it plainly:
 //! do not write an acceptance test that expects the Git path to deny it.
 
