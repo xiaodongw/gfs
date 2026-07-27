@@ -103,6 +103,17 @@ pub enum ExclusionReason {
   InvalidUtf8,
   Generated,
   Vendored,
+  /// The index has no answer for this path: its blob was interned but never
+  /// classified, was classified but has no posting lists yet, or vanished from
+  /// the object database under a running query.
+  ///
+  /// Not a policy exclusion — it is an index *state*, and it never appears in
+  /// [`CorpusPolicy::declared_exclusions`]. It shares this vocabulary because a
+  /// coverage report has to list it beside the policy reasons: from the caller's
+  /// side, "the index cannot answer for this file" and "policy excluded this
+  /// file" have the same consequence, and both are the opposite of "no match
+  /// here".
+  IndexGap,
 }
 
 impl ExclusionReason {
@@ -115,6 +126,7 @@ impl ExclusionReason {
       ExclusionReason::InvalidUtf8 => "invalid_utf8",
       ExclusionReason::Generated => "generated",
       ExclusionReason::Vendored => "vendored",
+      ExclusionReason::IndexGap => "index_gap",
     }
   }
 }

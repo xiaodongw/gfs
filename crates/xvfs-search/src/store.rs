@@ -34,7 +34,7 @@ use xvfs_types::error::{ErrorCode, XvfsError};
 /// The reasoning is weaker here — this data is rebuildable — but reading a
 /// layout you do not understand still produces wrong search results, and a wrong
 /// search result is precisely what M4's exit gate forbids.
-pub const SCHEMA_VERSION: i64 = 2;
+pub const SCHEMA_VERSION: i64 = 3;
 
 /// The index store.
 ///
@@ -133,6 +133,9 @@ fn migrate(conn: &Connection) -> Result<(), XvfsError> {
   if current < 2 {
     conn.execute_batch(V2).map_err(db_error)?;
   }
+  if current < 3 {
+    conn.execute_batch(V3).map_err(db_error)?;
+  }
   conn
     .pragma_update(None, "user_version", SCHEMA_VERSION)
     .map_err(db_error)?;
@@ -222,6 +225,25 @@ CREATE INDEX snapshots_by_expiry ON snapshots (repository_id, expires_at);
 CREATE TABLE index_generations (
   repository_id  TEXT    PRIMARY KEY,
   generation     INTEGER NOT NULL
+);
+"#;
+
+/// V3: trigram posting lists.
+///
+/// One row per trigram per repository, holding a serialized Roaring bitmap of
+/// blob keys. There are deliberately no segments: a batch is merged into the
+/// single bitmap for its trigram at write time, so a query never has to union an
+/// unbounded number of partial lists and no background compaction has to run for
+/// queries to stay fast. See `postings.rs` for what that costs.
+///
+/// `trigram` is `INTEGER` holding a 24-bit packed value, so it is always
+/// positive and SQLite's lack of an unsigned type causes no trouble here.
+const V3: &str = r#"
+CREATE TABLE postings (
+  repository_id  TEXT    NOT NULL,
+  trigram        INTEGER NOT NULL,
+  keys           BLOB    NOT NULL,
+  PRIMARY KEY (repository_id, trigram)
 );
 "#;
 

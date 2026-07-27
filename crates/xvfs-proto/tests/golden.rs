@@ -223,6 +223,77 @@ const PINNED: &[(&str, &[Field])] = &[
     &[(1, "mount_id", "string"), (2, "mount_capability", "string")],
   ),
   ("ReleaseMountResponse", &[]),
+  // --- Search (M4.3) ---------------------------------------------------------
+  (
+    "SearchRequest",
+    &[
+      (1, "repository_id", "string"),
+      (2, "commit_oid", "string"),
+      (3, "authorization", ".xvfs.v1.SnapshotAuthorization"),
+      (4, "pattern", "string"),
+      (5, "literal", "bool"),
+      (6, "case_insensitive", "bool"),
+      // `bytes`, for the same reason as `TreeEntry.path`: a path scope need not
+      // be UTF-8.
+      (7, "scope", "bytes"),
+      (8, "include_globs", "string"),
+      (9, "exclude_globs", "string"),
+      (10, "context_before", "uint32"),
+      (11, "context_after", "uint32"),
+      (12, "start_after_path", "bytes"),
+      (13, "max_results", "uint32"),
+      (14, "max_time_ms", "uint64"),
+      (15, "max_bytes_read", "uint64"),
+      (16, "max_candidates", "uint64"),
+    ],
+  ),
+  (
+    "SearchResponse",
+    &[
+      (1, "match", ".xvfs.v1.SearchMatch"),
+      (2, "completion", ".xvfs.v1.SearchCompletion"),
+    ],
+  ),
+  (
+    "SearchMatch",
+    &[
+      (1, "path", "bytes"),
+      (2, "line", "uint64"),
+      (3, "column", "uint64"),
+      (4, "matched", "bytes"),
+      (5, "line_text", "bytes"),
+      (6, "before", "bytes"),
+      (7, "after", "bytes"),
+      (8, "blob_oid", "string"),
+    ],
+  ),
+  (
+    "Coverage",
+    &[
+      (1, "scope", "bytes"),
+      (2, "eligible_paths", "uint64"),
+      (3, "excluded", ".xvfs.v1.Coverage.ExcludedEntry"),
+      (4, "declared_exclusions", "string"),
+    ],
+  ),
+  (
+    "SearchCompletion",
+    &[
+      // The two dimensions ADR 0004 froze. `execution_status` is whether the
+      // query finished; `coverage` is what was outside the corpus. Collapsing
+      // them into one field is the change this pin exists to catch, because an
+      // agent that cannot tell them apart concludes a symbol does not exist.
+      (1, "execution_status", ".xvfs.v1.ExecutionStatus"),
+      (2, "truncation_reason", "string"),
+      (3, "stop_budget", "string"),
+      (4, "coverage", ".xvfs.v1.Coverage"),
+      (5, "index_generation", "uint64"),
+      (6, "commit_oid", "string"),
+      (7, "candidates_considered", "uint64"),
+      (8, "bytes_read", "uint64"),
+      (9, "elapsed_ms", "uint64"),
+    ],
+  ),
 ];
 
 /// The pinned enum values. Repurposing one is the change this catches.
@@ -250,6 +321,18 @@ const PINNED_ENUMS: &[(&str, &[(i32, &str)])] = &[
       (1, "SNAPSHOT_STATE_READY"),
       (2, "SNAPSHOT_STATE_BUILDING"),
       (3, "SNAPSHOT_STATE_FAILED"),
+    ],
+  ),
+  (
+    // Execution status is one of the two independent dimensions of the
+    // completion contract. It must never gain a value that folds coverage into
+    // it -- "complete but some files were skipped" is a coverage fact, not an
+    // execution one, and merging them is what makes an empty answer ambiguous.
+    "ExecutionStatus",
+    &[
+      (0, "EXECUTION_STATUS_UNSPECIFIED"),
+      (1, "EXECUTION_STATUS_COMPLETE"),
+      (2, "EXECUTION_STATUS_TRUNCATED"),
     ],
   ),
 ];
@@ -369,6 +452,7 @@ fn service_methods_are_stable() {
   // Removing or renaming a method breaks a deployed client outright; the gRPC
   // path is built from the service and method names.
   let expected = [
+    "SearchService/Search(.xvfs.v1.SearchRequest) -> .xvfs.v1.SearchResponse",
     "SnapshotService/BatchGetEntry(.xvfs.v1.BatchGetEntryRequest) -> .xvfs.v1.BatchGetEntryResponse",
     "SnapshotService/CreateMount(.xvfs.v1.CreateMountRequest) -> .xvfs.v1.CreateMountResponse",
     "SnapshotService/GetCommit(.xvfs.v1.GetCommitRequest) -> .xvfs.v1.GetCommitResponse",

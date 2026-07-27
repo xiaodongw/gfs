@@ -11,7 +11,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
   // than documenting "install protoc" is what makes a fresh clone build.
   std::env::set_var("PROTOC", &protoc);
 
-  let protos = ["proto/xvfs/v1/common.proto", "proto/xvfs/v1/snapshot.proto"];
+  let protos = [
+    "proto/xvfs/v1/common.proto",
+    "proto/xvfs/v1/snapshot.proto",
+    "proto/xvfs/v1/search.proto",
+  ];
 
   // Emit the descriptor set as well as the Rust code. `golden.rs` reads it to
   // assert ADR 0006's compatibility rules -- that no field was renumbered and no

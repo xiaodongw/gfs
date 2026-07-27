@@ -99,6 +99,7 @@ roaring = "0.11"
 # matching `rg` is the contract. `bytes::Regex` is what actually runs, because a
 # blob is bytes and may not be valid UTF-8.
 regex = "1"
+regex-syntax = "0.8"
 memchr = "2"
 
 # Observability.

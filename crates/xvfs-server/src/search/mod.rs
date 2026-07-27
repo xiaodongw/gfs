@@ -14,10 +14,13 @@
 //! tree walk, fanned out one task per top-level directory so several libgit2
 //! handles work at once under the pool's existing admission control.
 //!
-//! Both paths must produce byte-identical manifests for the same commit;
-//! `manifest.rs`'s `a_first_parent_delta_costs_the_diff_rather_than_the_tree`
-//! asserts exactly that, because an incremental build that drifts from a full
-//! build would return *wrong search results* rather than slow ones.
+//! Both paths must describe the same tree, and an incremental build that drifted
+//! from a full one would return *wrong search results* rather than slow ones, so
+//! it is asserted twice: `manifest.rs` pins byte-for-byte equality of the two
+//! constructions within one registry, and `tests/search_index.rs` compares
+//! `(path, mode, blob OID)` across two independent indexes. The second is the
+//! weaker claim on purpose — a blob *key* is an allocation within one registry,
+//! so two stores legitimately number the same content differently.
 //!
 //! # Waiting is bounded, and "still building" is an answer
 //!
@@ -34,6 +37,7 @@ use std::time::Duration;
 
 use xvfs_git::{AsyncRepository, GitRepository, TreeDelta};
 use xvfs_search::manifest::{Manifest, ManifestDelta, PathEntry};
+use xvfs_search::postings::{PostingBatch, PostingStore};
 use xvfs_search::snapshots::{Claim, PreparePolicy, Progress, SnapshotRecord, SnapshotStore};
 use xvfs_search::{
   BlobFact, BlobRegistry, BlobSource, Cancel, CorpusPolicy, GcReport, IngestBudget, SearchStore,
@@ -254,11 +258,14 @@ impl IndexManager {
     cancel: &Cancel,
     snapshots: &SnapshotStore,
   ) -> Result<SnapshotRecord, XvfsError> {
-    let repo = self.registry.repository(repository)?;
-    let blobs = Arc::new(self.blobs(repository));
+    let ctx = BuildContext {
+      repo: self.registry.repository(repository)?,
+      blobs: Arc::new(self.blobs(repository)),
+      postings: Arc::new(self.postings(repository)),
+    };
 
     cancel.check()?;
-    let manifest = match self.incremental_base(&repo, commit, snapshots).await? {
+    let manifest = match self.incremental_base(&ctx.repo, commit, snapshots).await? {
       Some((parent, base)) => {
         tracing::debug!(
           commit = %commit.to_qualified(),
@@ -266,14 +273,10 @@ impl IndexManager {
           "building the manifest from its first parent"
         );
         self
-          .build_incremental(&repo, commit, &parent, &base, &blobs, cancel)
+          .build_incremental(&ctx, commit, &parent, &base, cancel)
           .await?
       }
-      None => {
-        self
-          .build_full(&repo, commit, &blobs, cancel, snapshots)
-          .await?
-      }
+      None => self.build_full(&ctx, commit, cancel, snapshots).await?,
     };
 
     cancel.check()?;
@@ -305,14 +308,16 @@ impl IndexManager {
 
   async fn build_incremental(
     &self,
-    repo: &AsyncRepository,
+    ctx: &BuildContext,
     commit: &ObjectId,
     parent: &ObjectId,
     base: &Manifest,
-    blobs: &Arc<BlobRegistry>,
     cancel: &Cancel,
   ) -> Result<Manifest, XvfsError> {
-    let deltas = repo.diff_commits(parent.clone(), commit.clone()).await?;
+    let deltas = ctx
+      .repo
+      .diff_commits(parent.clone(), commit.clone())
+      .await?;
     cancel.check()?;
 
     let upserts: Vec<(BytePath, u32, BlobFact)> = deltas
@@ -336,7 +341,7 @@ impl IndexManager {
       .collect();
 
     let facts: Vec<BlobFact> = upserts.iter().map(|(_, _, f)| f.clone()).collect();
-    let keys = self.ingest(repo, blobs, facts, cancel).await?;
+    let keys = self.ingest(ctx, facts, cancel).await?;
 
     let mut manifest_deltas = Vec::with_capacity(deltas.len());
     for delta in &deltas {
@@ -356,9 +361,8 @@ impl IndexManager {
 
   async fn build_full(
     &self,
-    repo: &AsyncRepository,
+    ctx: &BuildContext,
     commit: &ObjectId,
-    blobs: &Arc<BlobRegistry>,
     cancel: &Cancel,
     snapshots: &SnapshotStore,
   ) -> Result<Manifest, XvfsError> {
@@ -368,6 +372,7 @@ impl IndexManager {
     // produce a manifest missing whole directories.
     let mut directories = Vec::new();
     let mut files: Vec<(BytePath, u32, BlobFact)> = Vec::new();
+    let repo = &ctx.repo;
     let mut after: Option<Vec<u8>> = None;
     loop {
       let page = repo
@@ -442,7 +447,7 @@ impl IndexManager {
     }
 
     let facts: Vec<BlobFact> = walked.iter().map(|(_, _, f)| f.clone()).collect();
-    let keys = self.ingest(repo, blobs, facts, cancel).await?;
+    let keys = self.ingest(ctx, facts, cancel).await?;
 
     let entries = walked
       .into_iter()
@@ -452,19 +457,33 @@ impl IndexManager {
     Ok(Manifest::build(commit.clone(), entries))
   }
 
-  /// Intern and classify, looping until the batch budget stops asking for more.
+  /// Intern, classify, and index, looping until the batch budget stops asking
+  /// for more.
   ///
   /// Returns one key per input fact, in order. The loop is the reason
   /// `IngestReport::budget_exhausted` exists: a caller that ran one batch and
   /// stopped would leave part of the corpus unclassified, and every path in it
   /// would show up as an index gap forever.
+  ///
+  /// # The order of the last three steps is the correctness argument
+  ///
+  /// Postings are merged **before** `mark_indexed`. `indexed` is what a query
+  /// trusts, so setting it before the posting lists exist would make a blob
+  /// answer "no match" for trigrams that are simply not written yet — an
+  /// unreported wrong answer, which is the one outcome this milestone treats as
+  /// unacceptable. In the other order the worst case is a blob correctly
+  /// reported as an index gap for a moment.
   async fn ingest(
     &self,
-    repo: &AsyncRepository,
-    blobs: &Arc<BlobRegistry>,
+    ctx: &BuildContext,
     facts: Vec<BlobFact>,
     cancel: &Cancel,
   ) -> Result<Vec<xvfs_search::BlobKey>, XvfsError> {
+    let BuildContext {
+      repo,
+      blobs,
+      postings,
+    } = ctx;
     let keys = {
       let blobs = Arc::clone(blobs);
       let facts = facts.clone();
@@ -473,25 +492,106 @@ impl IndexManager {
         .map_err(crate::util::join_error)??
     };
 
+    let mut indexed_any = false;
     loop {
       cancel.check()?;
-      let blobs = Arc::clone(blobs);
-      let facts = facts.clone();
-      let budget = self.ingest_budget;
-      let report = repo
-        .run(move |r| {
-          let source = RepoBlobSource(r);
-          // M4.3 hangs trigram extraction on this callback. Until then the
-          // classification itself is the product, and a blob stays `indexed = 0`
-          // -- which is honest: no posting list exists for it yet.
-          blobs.ingest(&source, &facts, &budget, |_key, _content| Ok(()))
+      let (report, batch) = {
+        let blobs = Arc::clone(blobs);
+        let facts = facts.clone();
+        let budget = self.ingest_budget;
+        repo
+          .run(move |r| {
+            let source = RepoBlobSource(r);
+            let mut batch = PostingBatch::new();
+            let report = blobs.ingest(&source, &facts, &budget, |key, content| {
+              batch.add(key, content);
+              Ok(())
+            })?;
+            Ok((report, batch))
+          })
+          .await?
+      };
+
+      if !batch.is_empty() {
+        indexed_any = true;
+        let blobs = Arc::clone(blobs);
+        let postings = Arc::clone(postings);
+        tokio::task::spawn_blocking(move || {
+          postings.merge(&batch)?;
+          blobs.mark_indexed(batch.keys())
         })
-        .await?;
+        .await
+        .map_err(crate::util::join_error)??;
+      }
+
       if !report.budget_exhausted {
         break;
       }
     }
+
+    if indexed_any {
+      // The shared index changed, so two answers computed either side of this
+      // point saw different data and must be distinguishable.
+      self.snapshots(blobs.repository()).bump_generation()?;
+    }
     Ok(keys)
+  }
+
+  /// Run one query against a prepared snapshot.
+  ///
+  /// Fails with `SnapshotBuilding` when the manifest is not READY. That is a
+  /// distinct, retryable code on purpose (DESIGN.md section 9): an agent must be
+  /// able to tell "ask again shortly" from "there are no matches", and returning
+  /// an empty result here would erase the difference.
+  pub async fn search(
+    &self,
+    repository: &RepositoryId,
+    commit: &ObjectId,
+    query: xvfs_search::Query,
+  ) -> Result<xvfs_search::SearchResult, XvfsError> {
+    let snapshots = self.snapshots(repository);
+    let Some(manifest) = snapshots.manifest(commit)? else {
+      return Err(XvfsError::new(
+        xvfs_types::ErrorCode::SnapshotBuilding,
+        "the snapshot is not prepared; call PrepareSnapshot and retry",
+      ));
+    };
+    let generation = snapshots
+      .get(commit)?
+      .map(|r| r.index_generation)
+      .unwrap_or(0);
+
+    let repo = self.registry.repository(repository)?;
+    let blobs = self.blobs(repository);
+    let postings = Arc::new(self.postings(repository));
+    let policy = self.corpus.clone();
+
+    // Records for the whole manifest, fetched once. A per-path lookup would be
+    // one SQLite round trip per file in scope, which on a monorepo directory is
+    // thousands of round trips before a single blob is read.
+    let keys: Vec<xvfs_search::BlobKey> = manifest.members().iter().collect();
+    let records = tokio::task::spawn_blocking(move || blobs.records_for_keys(&keys))
+      .await
+      .map_err(crate::util::join_error)??;
+    let records = xvfs_search::query::records_by_key(records);
+
+    repo
+      .run(move |r| {
+        let source = RepoBlobSource(r);
+        let inputs = xvfs_search::SearchInputs {
+          manifest: &manifest,
+          postings: &postings,
+          policy: &policy,
+          index_generation: generation,
+          records: &records,
+        };
+        xvfs_search::search(&source, &inputs, &query)
+      })
+      .await
+  }
+
+  pub fn postings(&self, repository: &RepositoryId) -> PostingStore {
+    PostingStore::new(Arc::clone(&self.store), repository.clone())
   }
 
   /// Prepare every configured branch tip eagerly, and collect what nothing pins.
@@ -517,6 +617,17 @@ impl IndexManager {
     }
     self.snapshots(repository).gc(pinned)
   }
+}
+
+/// The three handles every build step needs.
+///
+/// Grouped rather than passed one at a time because they are only ever used
+/// together, and threading five arguments through four functions is how one of
+/// them ends up being the wrong repository's.
+struct BuildContext {
+  repo: AsyncRepository,
+  blobs: Arc<BlobRegistry>,
+  postings: Arc<PostingStore>,
 }
 
 /// A [`BlobSource`] over a checked-out repository handle.

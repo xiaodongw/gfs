@@ -46,9 +46,12 @@ pub mod classify;
 pub mod glob;
 pub mod lines;
 pub mod manifest;
+pub mod postings;
+pub mod query;
 pub mod registry;
 pub mod snapshots;
 pub mod store;
+pub mod trigram;
 
 pub use classify::{
   classify_content, classify_path, ContentClass, CorpusPolicy, ExclusionReason, PathClass,
@@ -56,11 +59,17 @@ pub use classify::{
 pub use glob::Glob;
 pub use lines::{lines, Line};
 pub use manifest::{Manifest, ManifestDelta, PathEntry, MANIFEST_FORMAT_VERSION};
+pub use postings::{PostingBatch, PostingStore};
+pub use query::{
+  exit_code, search, Budget, Completion, Coverage, ExecutionStatus, Match, Query, SearchInputs,
+  SearchOutcome, SearchResult, TruncationReason,
+};
 pub use registry::{BlobFact, BlobKey, BlobRecord, BlobRegistry, IngestBudget, IngestReport};
 pub use snapshots::{
   Cancel, Claim, GcReport, PreparePolicy, Progress, SnapshotRecord, SnapshotStore,
 };
 pub use store::{SearchStore, SCHEMA_VERSION};
+pub use trigram::{required_literals, trigrams, RequiredLiterals};
 
 /// Where a blob's bytes come from.
 ///

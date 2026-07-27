@@ -7,6 +7,7 @@
 //! line of configuration.
 
 pub mod http;
+pub mod search;
 pub mod snapshot;
 
 use std::sync::Arc;
@@ -131,6 +132,14 @@ impl Server {
       mounts: Arc::clone(&self.mounts),
       authz: Arc::clone(&self.authz),
       search: Arc::clone(&self.search),
+    }
+  }
+
+  pub fn search_api(&self) -> search::SearchApi {
+    search::SearchApi {
+      registry: Arc::clone(&self.registry),
+      authz: Arc::clone(&self.authz),
+      index: Arc::clone(&self.search),
     }
   }
 

@@ -19,6 +19,11 @@ roaring = { workspace = true }
 # splitting touches every candidate blob in full.
 memchr = { workspace = true }
 regex = { workspace = true }
+# The HIR, for the required-literal analysis in `trigram.rs`. Reached for
+# directly rather than through `regex`'s public API because soundness here is
+# the difference between a search tool and a search tool that lies: the analysis
+# has to see alternation and optionality structurally, not by scanning bytes.
+regex-syntax = { workspace = true }
 rusqlite = { workspace = true }
 # Manifest checksums. A manifest is derived data that outlives a process and (in
 # M7.1) travels through object storage; a silently corrupted path table would

@@ -161,6 +161,7 @@ async fn main() -> anyhow::Result<()> {
       .add_service(xvfs_proto::SnapshotServiceServer::new(
         server.snapshot_api(),
       ))
+      .add_service(xvfs_proto::SearchServiceServer::new(server.search_api()))
       .serve_with_shutdown(grpc_addr, async move {
         let _ = grpc_shutdown.changed().await;
       }),
