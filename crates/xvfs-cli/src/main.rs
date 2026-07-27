@@ -18,12 +18,13 @@
 //! `/path/to/ws.xvfs`. Every workspace command can therefore find a running
 //! daemon from the workspace path alone, which is the only thing a job knows.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
-use xvfs_fuse::control::{self, Request, Response};
-use xvfs_fuse::state::MountState;
+use xvfs_cli::search_output;
+use xvfs_cli::workspace::{call, state_dir_for};
+use xvfs_fuse::control::{Request, Response};
 use xvfs_proto::v1;
 
 #[derive(Parser, Debug)]
@@ -173,6 +174,50 @@ enum Command {
     json: bool,
   },
 
+  /// Search the merged workspace: the pinned commit plus local edits.
+  ///
+  /// The server searches its index of the pinned commit and never hydrates the
+  /// mount; the daemon searches only the files the overlay has changed. Exit
+  /// codes follow ADR 0004: 0 matches, 1 none, 2 the search did not complete,
+  /// 3 truncated, 4 a coverage gap under `--require-exhaustive`.
+  Search {
+    #[arg(long)]
+    workspace: PathBuf,
+    #[arg(long)]
+    state_dir: Option<PathBuf>,
+    /// The pattern. A regex unless `--fixed-strings`.
+    pattern: String,
+    /// Limit the search to this path prefix.
+    #[arg(default_value = "")]
+    path: String,
+    /// Treat the pattern as a literal string.
+    #[arg(long, short = 'F')]
+    fixed_strings: bool,
+    #[arg(long, short = 'i')]
+    ignore_case: bool,
+    /// Include only paths matching this glob. Repeatable.
+    #[arg(long, short = 'g')]
+    glob: Vec<String>,
+    /// Exclude paths matching this glob. Repeatable.
+    #[arg(long)]
+    exclude: Vec<String>,
+    #[arg(long, short = 'B', default_value_t = 0)]
+    before_context: u32,
+    #[arg(long, short = 'A', default_value_t = 0)]
+    after_context: u32,
+    #[arg(long, default_value_t = 0)]
+    max_results: u32,
+    /// Search files the workspace's ignore rules would skip.
+    #[arg(long)]
+    no_ignore: bool,
+    /// Machine-readable output.
+    #[arg(long)]
+    json: bool,
+    /// Turn any coverage gap into a failure (exit 4) rather than a warning.
+    #[arg(long)]
+    require_exhaustive: bool,
+  },
+
   /// The same change set as a Git-compatible patch on stdout.
   Diff {
     #[arg(long)]
@@ -288,14 +333,6 @@ async fn resolve(cli: &Cli, client: &mut Client, repo: &str, rev: &str) -> Resul
 }
 
 /// `<workspace>.xvfs` unless told otherwise.
-fn state_dir_for(workspace: &Path, explicit: &Option<PathBuf>) -> PathBuf {
-  explicit.clone().unwrap_or_else(|| {
-    let mut name = workspace.as_os_str().to_os_string();
-    name.push(".xvfs");
-    PathBuf::from(name)
-  })
-}
-
 fn default_cache_dir() -> PathBuf {
   std::env::var_os("XDG_CACHE_HOME")
     .map(PathBuf::from)
@@ -329,15 +366,6 @@ fn sibling_binary(name: &str, override_var: &str) -> PathBuf {
     }
   }
   PathBuf::from(name)
-}
-
-fn call(state_dir: &Path, request: &Request) -> Result<Response> {
-  let socket = MountState::control_socket(state_dir);
-  let response = control::call(&socket, request)
-    .map_err(|e| anyhow::anyhow!("{}: {}", e.code.as_str(), e.message))?;
-  response
-    .into_result()
-    .map_err(|e| anyhow::anyhow!("{}: {}", e.code.as_str(), e.message))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -758,6 +786,53 @@ async fn main() -> Result<()> {
       // output instead.
     }
 
+    Command::Search {
+      workspace,
+      state_dir,
+      pattern,
+      path,
+      fixed_strings,
+      ignore_case,
+      glob,
+      exclude,
+      before_context,
+      after_context,
+      max_results,
+      no_ignore,
+      json,
+      require_exhaustive,
+    } => {
+      let state_dir = state_dir_for(workspace, state_dir);
+      let request = xvfs_fuse::search::SearchRequest {
+        pattern: pattern.clone(),
+        literal: *fixed_strings,
+        case_insensitive: *ignore_case,
+        scope: path.as_bytes().to_vec(),
+        include_globs: glob.clone(),
+        exclude_globs: exclude.clone(),
+        context_before: *before_context,
+        context_after: *after_context,
+        max_results: *max_results,
+        search_ignored: *no_ignore,
+      };
+      let Response::Search(report) = call(&state_dir, &Request::Search(Box::new(request)))? else {
+        bail!("the daemon answered a search request with something else");
+      };
+
+      if *json {
+        println!("{}", search_output::to_json(&report)?);
+      } else {
+        let mut out = std::io::stdout().lock();
+        search_output::print_text(&report, &mut out)?;
+        std::io::Write::flush(&mut out)?;
+        search_output::print_diagnostics(&report, &mut std::io::stderr())?;
+      }
+      // The exit code *is* the contract, so it is set explicitly rather than
+      // left to `Result`'s 0-or-1. An agent that cannot tell exit 1 from exit 3
+      // concludes a symbol does not exist when the query was merely cut short.
+      std::process::exit(search_output::exit_code(&report, *require_exhaustive));
+    }
+
     Command::Diff {
       workspace,
       state_dir,
@@ -923,20 +998,6 @@ async fn http_get(url: &str, token: &str) -> Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
   use super::*;
-
-  #[test]
-  fn the_state_directory_is_derivable_from_the_workspace_alone() {
-    // The property every workspace command depends on: a job knows its workspace
-    // path and nothing else, and must still be able to find its daemon.
-    assert_eq!(
-      state_dir_for(Path::new("/jobs/42/ws"), &None),
-      PathBuf::from("/jobs/42/ws.xvfs")
-    );
-    assert_eq!(
-      state_dir_for(Path::new("/jobs/42/ws"), &Some(PathBuf::from("/elsewhere"))),
-      PathBuf::from("/elsewhere")
-    );
-  }
 
   #[test]
   fn the_cli_accepts_the_workspace_command_grammar() {

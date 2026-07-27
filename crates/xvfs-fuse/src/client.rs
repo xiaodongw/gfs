@@ -34,6 +34,7 @@ use xvfs_types::{
 };
 
 type Grpc = v1::snapshot_service_client::SnapshotServiceClient<tonic::transport::Channel>;
+type SearchGrpc = v1::search_service_client::SearchServiceClient<tonic::transport::Channel>;
 type Http = hyper_util::client::legacy::Client<HttpConnector, Empty<Bytes>>;
 
 /// Everything the client needs that does not change for the life of a mount.
@@ -55,6 +56,9 @@ pub struct DirectoryPage {
 
 pub struct SnapshotClient {
   grpc: Grpc,
+  /// The same channel, a different service. Multiplexed over one connection,
+  /// so a search costs no extra handshake.
+  search_grpc: SearchGrpc,
   http: Http,
   http_endpoint: String,
   token: String,
@@ -95,7 +99,8 @@ impl SnapshotClient {
       })?;
 
     Ok(Arc::new(SnapshotClient {
-      grpc: Grpc::new(channel),
+      grpc: Grpc::new(channel.clone()),
+      search_grpc: SearchGrpc::new(channel),
       http: hyper_util::client::legacy::Client::builder(TokioExecutor::new()).build_http(),
       http_endpoint: http_endpoint.trim_end_matches('/').to_owned(),
       token: token.to_owned(),
@@ -319,6 +324,87 @@ impl SnapshotClient {
       .try_into_domain(self.binding.algorithm)
   }
 
+  /// Search the pinned commit.
+  ///
+  /// Collects the stream into an outcome rather than surfacing it, and the
+  /// collection *is* the contract enforcement: a stream that ends without a
+  /// terminal completion becomes [`xvfs_search::SearchOutcome::FailedBeforeCompletion`],
+  /// never an empty result. A caller therefore cannot accidentally treat a
+  /// dropped connection as "no matches" -- there is no code path that produces
+  /// that value.
+  pub async fn search(
+    &self,
+    query: &xvfs_search::Query,
+    max_results: u32,
+  ) -> Result<xvfs_search::SearchOutcome, XvfsError> {
+    let request = self.authed(v1::SearchRequest {
+      repository_id: self.binding.repository_id.as_str().to_owned(),
+      commit_oid: self.binding.commit.to_qualified(),
+      authorization: self.authorization(),
+      pattern: query.pattern.clone(),
+      literal: query.literal,
+      case_insensitive: query.case_insensitive,
+      scope: query.scope.clone(),
+      include_globs: query
+        .include_globs
+        .iter()
+        .map(|g| g.as_str().to_owned())
+        .collect(),
+      exclude_globs: query
+        .exclude_globs
+        .iter()
+        .map(|g| g.as_str().to_owned())
+        .collect(),
+      context_before: query.context_before as u32,
+      context_after: query.context_after as u32,
+      start_after_path: Vec::new(),
+      max_results,
+      max_time_ms: 0,
+      max_bytes_read: 0,
+      max_candidates: 0,
+    })?;
+
+    let mut stream = self
+      .search_grpc
+      .clone()
+      .search(request)
+      .await
+      .map_err(|s| convert::from_status(&s))?
+      .into_inner();
+
+    let mut matches = Vec::new();
+    let mut completion = None;
+    loop {
+      match stream.message().await {
+        Ok(Some(message)) => match message.message {
+          Some(v1::search_response::Message::Match(m)) => matches.push(convert_match(m)),
+          Some(v1::search_response::Message::Completion(c)) => completion = Some(c),
+          None => {}
+        },
+        Ok(None) => break,
+        Err(status) => {
+          // A mid-stream failure. Whatever arrived is unusable as an answer,
+          // because the thing that would have said how complete it is never did.
+          return Ok(xvfs_search::SearchOutcome::FailedBeforeCompletion(
+            convert::from_status(&status).message,
+          ));
+        }
+      }
+    }
+
+    match completion {
+      Some(c) => Ok(xvfs_search::SearchOutcome::Completed(
+        xvfs_search::SearchResult {
+          matches,
+          completion: convert_completion(c),
+        },
+      )),
+      None => Ok(xvfs_search::SearchOutcome::FailedBeforeCompletion(
+        "the search stream ended without a completion message".to_owned(),
+      )),
+    }
+  }
+
   /// Fetch a whole blob over the immutable HTTP endpoint.
   ///
   /// Whole-blob, not ranged: DESIGN.md section 12 fixes whole-blob fetch as the
@@ -430,6 +516,57 @@ fn code_from_wire(s: &str) -> Option<ErrorCode> {
     "INTERNAL" => ErrorCode::Internal,
     _ => return None,
   })
+}
+
+/// Wire match to domain match.
+fn convert_match(m: v1::SearchMatch) -> xvfs_search::Match {
+  xvfs_search::Match {
+    path: m.path,
+    line: m.line,
+    column: m.column,
+    matched: m.matched,
+    line_text: m.line_text,
+    before: m.before,
+    after: m.after,
+    blob_oid: m.blob_oid,
+  }
+}
+
+/// Wire completion to domain completion.
+///
+/// An unrecognized `execution_status` decodes as `Truncated`, not `Complete`.
+/// A client reading a newer server must fail toward "this answer may be
+/// incomplete"; the opposite default would make a status the client does not
+/// understand look like a clean, exhaustive result.
+fn convert_completion(c: v1::SearchCompletion) -> xvfs_search::Completion {
+  use xvfs_search::{Coverage, ExecutionStatus, TruncationReason};
+  let coverage = c.coverage.unwrap_or_default();
+  xvfs_search::Completion {
+    execution_status: match v1::ExecutionStatus::try_from(c.execution_status) {
+      Ok(v1::ExecutionStatus::Complete) => ExecutionStatus::Complete,
+      _ => ExecutionStatus::Truncated,
+    },
+    truncation: c.truncation_reason.as_deref().map(|name| match name {
+      "result_limit" => TruncationReason::ResultLimit,
+      "time_budget" => TruncationReason::TimeBudget,
+      "bytes_budget" => TruncationReason::BytesBudget,
+      "candidate_budget" => TruncationReason::CandidateBudget,
+      "no_required_literal" => TruncationReason::NoRequiredLiteral,
+      _ => TruncationReason::BackendFailure,
+    }),
+    coverage: Coverage {
+      scope: coverage.scope,
+      eligible_paths: coverage.eligible_paths,
+      excluded: coverage.excluded.into_iter().collect(),
+      declared_exclusions: coverage.declared_exclusions,
+    },
+    index_generation: c.index_generation,
+    commit: c.commit_oid,
+    stop_budget: c.stop_budget,
+    candidates_considered: c.candidates_considered,
+    bytes_read: c.bytes_read,
+    elapsed_ms: c.elapsed_ms,
+  }
 }
 
 #[cfg(test)]

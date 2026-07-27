@@ -157,7 +157,7 @@ pub struct Match {
   pub blob_oid: String,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SearchResult {
   pub matches: Vec<Match>,
   pub completion: Completion,
@@ -169,7 +169,8 @@ pub struct SearchResult {
 /// *representable*, and therefore testable. The design says a missing completion
 /// is an error; a type that could not express the state would let that rule
 /// lapse the first time someone wrote `unwrap_or_default`.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
 pub enum SearchOutcome {
   Completed(SearchResult),
   /// EOF, transport reset, or backend failure before the terminal message.
@@ -506,6 +507,46 @@ struct LineHit {
   line_text: Vec<u8>,
   before: Vec<Vec<u8>>,
   after: Vec<Vec<u8>>,
+}
+
+/// Compile a query's pattern.
+///
+/// Public because the local half of a client search must use the *same* matcher
+/// as the server: a client that built its own would be free to differ on case
+/// folding, Unicode classes, or the size limit, and the merged answer would be
+/// two different searches presented as one.
+pub fn compile(query: &Query) -> Result<regex::bytes::Regex, XvfsError> {
+  build_matcher(query)
+}
+
+/// Every match in one blob, as [`Match`] values at `path`.
+///
+/// The other half of the shared-matcher rule: line numbering, column
+/// derivation, and per-occurrence counting are done once, here, for both halves
+/// of a merged search.
+pub fn find_matches(
+  matcher: &regex::bytes::Regex,
+  content: &[u8],
+  query: &Query,
+  path: &[u8],
+) -> Vec<Match> {
+  find_in_blob(matcher, content, query)
+    .into_iter()
+    .map(|hit| Match {
+      path: path.to_vec(),
+      line: hit.line,
+      column: hit.column,
+      matched: hit.matched,
+      line_text: hit.line_text,
+      before: hit.before,
+      after: hit.after,
+      // Local content has no blob object ID until it is hashed, and hashing it
+      // to fill a display field would be a real cost for no reader. Empty means
+      // "not from the pinned commit", which is exactly what a caller needs to
+      // know about a local match.
+      blob_oid: String::new(),
+    })
+    .collect()
 }
 
 fn build_matcher(query: &Query) -> Result<regex::bytes::Regex, XvfsError> {

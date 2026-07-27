@@ -455,6 +455,34 @@ impl Daemon {
       .map_err(crate::fs::overlay_as_service_error)
   }
 
+  /// Search the merged workspace.
+  ///
+  /// Reads the generation's client and overlay under the lock and then releases
+  /// it: a search can take seconds, and holding the generation lock for its
+  /// duration would block `refresh`, `status`, and every other control command
+  /// behind one agent's query.
+  pub async fn search(
+    &self,
+    request: &crate::search::SearchRequest,
+  ) -> Result<crate::search::SearchReport, XvfsError> {
+    let (client, overlay, commit, ref_name) = {
+      let current = self.current.lock().expect("current generation");
+      (
+        Arc::clone(&current.client),
+        Arc::clone(&current.overlay),
+        current.commit.clone(),
+        current.ref_name.clone(),
+      )
+    };
+    let (outcome, local_matches) = crate::search::search(&client, &overlay, request).await?;
+    Ok(crate::search::SearchReport {
+      base_commit: commit.to_qualified(),
+      ref_name,
+      local_matches,
+      outcome,
+    })
+  }
+
   pub async fn export(&self, bundle: &Path) -> Result<xvfs_overlay::ExportReport, XvfsError> {
     let (status, base, overlay, commit) = self.export_inputs().await?;
     let exporter = xvfs_overlay::Exporter::new(
@@ -667,6 +695,10 @@ impl Daemon {
       },
       Request::Export { bundle } => match self.export(&bundle).await {
         Ok(report) => Response::Export(report),
+        Err(e) => Response::from_error(&e),
+      },
+      Request::Search(request) => match self.search(&request).await {
+        Ok(report) => Response::Search(Box::new(report)),
         Err(e) => Response::from_error(&e),
       },
       Request::Unmount => {

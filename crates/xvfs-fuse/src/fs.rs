@@ -268,6 +268,16 @@ impl Xvfs {
     self.cache.stats()
   }
 
+  /// The snapshot client, for callers that search rather than read files.
+  ///
+  /// Handed out rather than duplicated because the client holds the *mount
+  /// capability*, which is refreshed by every heartbeat renewal. A second client
+  /// built for search would hold a copy that goes stale, and its first read
+  /// after a force push -- the exact moment a mount must not break -- would fail.
+  pub fn client(&self) -> &Arc<SnapshotClient> {
+    &self.client
+  }
+
   pub fn overlay(&self) -> &Arc<Overlay> {
     &self.overlay
   }

@@ -55,6 +55,7 @@
 pub mod classify;
 pub mod glob;
 pub mod lines;
+pub mod local;
 pub mod manifest;
 pub mod postings;
 pub mod query;
@@ -68,6 +69,7 @@ pub use classify::{
 };
 pub use glob::Glob;
 pub use lines::{lines, Line};
+pub use local::{search_local, IgnoreRules, LocalBudget, LocalOutcome, LocalPath};
 pub use manifest::{Manifest, ManifestDelta, PathEntry, MANIFEST_FORMAT_VERSION};
 pub use postings::{PostingBatch, PostingStore};
 pub use query::{

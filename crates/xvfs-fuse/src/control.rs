@@ -43,6 +43,9 @@ pub enum Request {
   Diff,
   /// Write an atomic, checksummed export bundle.
   Export { bundle: std::path::PathBuf },
+  /// Search the merged workspace: the pinned commit's index, minus what the
+  /// overlay changed, plus what it has instead.
+  Search(Box<crate::search::SearchRequest>),
   /// Release the lease, unmount, and exit.
   Unmount,
 }
@@ -113,6 +116,7 @@ pub enum Response {
     patch_b64url: String,
   },
   Export(xvfs_overlay::ExportReport),
+  Search(Box<crate::search::SearchReport>),
   Unmounted,
   Error {
     code: String,

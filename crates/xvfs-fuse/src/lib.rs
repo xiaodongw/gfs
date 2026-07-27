@@ -42,6 +42,7 @@ pub mod gitdir;
 pub mod inode;
 pub mod lease;
 pub mod publish;
+pub mod search;
 pub mod session;
 pub mod state;
 

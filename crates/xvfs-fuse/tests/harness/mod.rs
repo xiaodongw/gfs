@@ -85,10 +85,12 @@ impl Backend {
     let grpc_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let grpc_addr = grpc_listener.local_addr().unwrap();
     let api = server.snapshot_api();
+    let search_api = server.search_api();
     let mut grpc_shutdown = shutdown_rx.clone();
     tokio::spawn(async move {
       tonic::transport::Server::builder()
         .add_service(xvfs_proto::SnapshotServiceServer::new(api))
+        .add_service(xvfs_proto::SearchServiceServer::new(search_api))
         .serve_with_incoming_shutdown(
           tokio_stream::wrappers::TcpListenerStream::new(grpc_listener),
           async move {
