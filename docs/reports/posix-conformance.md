@@ -61,11 +61,24 @@ followed; the rest stand as recorded.
 
 ### 1. Object types XVFS does not implement — 5 files
 
-`mkfifo_02`, `mkfifo_03`, `open_17`, `open_24`, `rmdir_01`
+`mkfifo_02`, `mkfifo_03`, `open_17`, `rmdir_01` (named pipes), `open_24` (UNIX
+domain socket)
 
-`mkfifo` and `mknod` return `EPERM`. Every failure in these files is a setup step
-that needs a FIFO, a device node, or a UNIX domain socket — `rmdir_01` is
-labelled "rmdir returns ENOTDIR" but fails only where it first creates a FIFO.
+Measured live, every special type is refused with the same errno:
+
+| operation | object | result |
+| --- | --- | ---: |
+| `mkfifo`, `mknod … f` | named pipe (FIFO) | `EPERM` |
+| `mknod … b` | block device node | `EPERM` |
+| `mknod … c` | character device node | `EPERM` |
+| `bind()` on a path | UNIX domain socket | `EPERM` |
+| `link` | hard link | `EPERM` |
+
+Four of the five files are FIFOs and one is a socket. **Device nodes never reach
+the comparison at all**: creating one requires root, so those tests fail on the
+ext4 control too and the diff excludes them. Every failure here is a setup step —
+`rmdir_01` is labelled "rmdir returns ENOTDIR" but fails only where it first
+creates a FIFO.
 
 **Assessment: by design, and already stated.** DESIGN.md section 12 lists special
 files as out of scope. Worth confirming `EPERM` is the errno the design intends,
@@ -78,13 +91,33 @@ since `EOPNOTSUPP` is the more usual answer for "this filesystem cannot".
 `link` returns `EPERM`. A Git tree has no hard-link concept, so this is expected;
 it is recorded because the design does not appear to say so explicitly.
 
-### 3. Long-path errno — 18 files
+### 3. Long paths and long names — 18 files, and they are not one thing
 
-`chmod_02` `chmod_03` `ftruncate_02` `ftruncate_03` `link_02` `link_03`
-`mkdir_03` `open_02` `open_03` `rename_01` `rename_02` `rmdir_02` `rmdir_03`
-`symlink_03` `truncate_02` `truncate_03` `unlink_02` `unlink_03`
+Corrected after the fix in "What was fixed": this cluster was first written up as
+one group and is three, two of which have nothing to do with path length.
 
-The largest cluster, and the one that contains something bug-shaped.
+**3a. The whole path exceeds the limit — 10 files.** `chmod_03` `ftruncate_03`
+`link_03` `mkdir_03` `open_03` `rename_02` `rmdir_03` `symlink_03` `truncate_03`
+`unlink_03`. Each builds a path just under the advertised `_PC_PATH_MAX` and
+expects the create to succeed; the remaining assertions cascade to `ENOENT`
+because the file was never made.
+
+**3b. A component exceeds `NAME_MAX`, on a lookup — 6 files.** `chmod_02`
+`ftruncate_02` `rename_01` `rmdir_02` `truncate_02` `unlink_02`, each
+`expected ENAMETOOLONG, got ENOENT`. This is *not* the same bug: `check_name`
+refuses an over-long component when **creating**, and deliberately does not when
+reading, because a Git tree may legitimately contain such a name and "refusing to
+read what the commit contains would be worse" (its own doc comment). Given that,
+a name that does not exist is simply absent, and `ENOENT` is the consistent
+answer. pjdfstest assumes `NAME_MAX` is a hard limit for every operation.
+
+**3c. Two files that were mis-filed here.** `open_02` fails only on
+`expected regular,0620, got regular,0644` — mode rounding, section 6; its
+`ENAMETOOLONG` assertion passes, because `open O_CREAT` does go through
+`check_name`. `link_02` fails on `EPERM` from `link` plus cascades — hard links,
+section 2.
+
+The bug-shaped part was in 3a.
 
 The straightforward boundaries are **correct** and were checked directly against
 ext4: a 255-byte component succeeds, 256 gives `ENAMETOOLONG`, and paths of
