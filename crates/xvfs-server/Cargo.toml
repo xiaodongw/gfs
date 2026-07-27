@@ -36,6 +36,8 @@ serde_json = { workspace = true }
 
 [dev-dependencies]
 xvfs-proto = { workspace = true }
+# The gateway's protocol matrix sends a real gzipped `git-upload-pack` body.
+flate2 = { workspace = true }
 http-body-util = { workspace = true }
 hyper = { workspace = true, features = ["client", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio"] }

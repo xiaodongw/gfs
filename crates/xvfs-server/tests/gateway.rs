@@ -33,6 +33,7 @@ use std::sync::Arc;
 
 use xvfs_server::auth::{AllowList, CapabilityKey, StaticTokens};
 use xvfs_server::catalog::repositories::NewRepository;
+use xvfs_server::gateway::{FilterPolicy, UploadPackPolicy};
 use xvfs_server::{Catalog, Server};
 use xvfs_types::{DisplayName, HashAlgorithm, LeasePolicy, RepositoryId, SubjectId};
 
@@ -56,10 +57,18 @@ impl Fixture {
 
 /// Start a server serving the named fixtures, the first of which is `r-git`.
 async fn start(fixtures: &[(&str, &str)]) -> Fixture {
+  start_with(fixtures, UploadPackPolicy::default()).await
+}
+
+/// [`start`] with a non-default gateway policy.
+async fn start_with(fixtures: &[(&str, &str)], git_policy: UploadPackPolicy) -> Fixture {
   let catalog = Arc::new(Catalog::open_in_memory().unwrap());
   let owner = SubjectId::parse("job-owner").unwrap();
   let outsider = SubjectId::parse("job-outsider").unwrap();
-  let mut policy = AllowList::new();
+  // Allow-all for the owner rather than a grant per repository, so a test can
+  // register one more repository on a running fixture. The outsider still has
+  // no grant at all, which is what the masking assertions rest on.
+  let policy = AllowList::new().allow_all_repositories(&owner);
   let mut tmps = Vec::new();
   let mut first_path = None;
 
@@ -76,7 +85,6 @@ async fn start(fixtures: &[(&str, &str)]) -> Fixture {
         credential_ref: None,
       })
       .unwrap();
-    policy = policy.allow(&owner, &repo_id);
     if first_path.is_none() {
       first_path = Some(path);
     }
@@ -88,13 +96,16 @@ async fn start(fixtures: &[(&str, &str)]) -> Fixture {
       .with_token(OWNER_TOKEN, owner)
       .with_token(OUTSIDER_TOKEN, outsider),
   );
-  let server = Arc::new(Server::new(
-    Arc::clone(&catalog),
-    authenticator,
-    Arc::new(policy),
-    CapabilityKey::generate().unwrap(),
-    LeasePolicy::adr_0006(),
-  ));
+  let server = Arc::new(
+    Server::new(
+      Arc::clone(&catalog),
+      authenticator,
+      Arc::new(policy),
+      CapabilityKey::generate().unwrap(),
+      LeasePolicy::adr_0006(),
+    )
+    .with_git_policy(git_policy),
+  );
   for (id, _) in fixtures {
     server
       .registry
@@ -488,15 +499,771 @@ async fn git_traffic_uses_the_same_repository_authorization_as_every_other_surfa
 }
 
 // ---------------------------------------------------------------------------
+// Filter policy
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn filtering_is_advertised_exactly_when_policy_enables_it() {
+  // Advertised under the default policy, and a clone that asks for it really
+  // is partial -- Git records a promisor remote only when the server agreed.
+  let fx = start(&[("r-git", "basic")]).await;
+  let (_, _, body) = http_get(
+    &format!("{}/info/refs?service=git-upload-pack", fx.url("r-git")),
+    OWNER_TOKEN,
+    None,
+  )
+  .await;
+  assert!(
+    String::from_utf8_lossy(&body).contains("filter"),
+    "the default policy serves blob:none, so `filter` must be advertised"
+  );
+  let tmp = tempfile::tempdir().unwrap();
+  let checkout = tmp.path().join("c");
+  let out = git_client(
+    &[
+      "clone",
+      "-q",
+      // `--no-checkout` is load-bearing: a checkout of a `blob:none` clone
+      // lazily fetches every blob in the working tree, so without it the
+      // filtered and unfiltered cases end up byte-identical on disk.
+      "--no-checkout",
+      "--filter=blob:none",
+      &fx.url("r-git"),
+      checkout.to_str().unwrap(),
+    ],
+    Some(OWNER_TOKEN),
+  );
+  assert!(out.status.success(), "{}", stderr(&out));
+  assert!(
+    !blob_is_local(&checkout, "HEAD:README.md"),
+    "the filter was advertised but the server sent the blobs anyway"
+  );
+
+  // Switched off, the capability is absent. **A client then silently degrades
+  // to a full clone** rather than failing -- measured, and the reason this test
+  // does not assert a non-zero exit. The observable difference is that the
+  // result is not a partial clone.
+  let fx = start_with(
+    &[("r-git", "basic")],
+    UploadPackPolicy {
+      filter: FilterPolicy::Disabled,
+      ..Default::default()
+    },
+  )
+  .await;
+  let (_, _, body) = http_get(
+    &format!("{}/info/refs?service=git-upload-pack", fx.url("r-git")),
+    OWNER_TOKEN,
+    None,
+  )
+  .await;
+  assert!(!String::from_utf8_lossy(&body).contains("filter"));
+
+  let tmp = tempfile::tempdir().unwrap();
+  let checkout = tmp.path().join("c");
+  let out = git_client(
+    &[
+      "clone",
+      "-q",
+      // `--no-checkout` is load-bearing: a checkout of a `blob:none` clone
+      // lazily fetches every blob in the working tree, so without it the
+      // filtered and unfiltered cases end up byte-identical on disk.
+      "--no-checkout",
+      "--filter=blob:none",
+      &fx.url("r-git"),
+      checkout.to_str().unwrap(),
+    ],
+    Some(OWNER_TOKEN),
+  );
+  assert!(out.status.success(), "{}", stderr(&out));
+  assert!(
+    blob_is_local(&checkout, "HEAD:README.md"),
+    "the clone was filtered even though the capability was withdrawn"
+  );
+
+  // And a client that sends the filter line anyway -- withdrawing a capability
+  // is advice, not enforcement -- is refused by the gateway's own validation.
+  let mut request = Vec::new();
+  request.extend_from_slice(&pkt(b"command=fetch\n"));
+  request.extend_from_slice(b"0001");
+  request.extend_from_slice(&pkt(b"filter blob:none\n"));
+  request.extend_from_slice(b"0000");
+  let (status, _, _) = http_post(
+    &format!("{}/git-upload-pack", fx.url("r-git")),
+    OWNER_TOKEN,
+    Some("version=2"),
+    &request,
+    false,
+  )
+  .await;
+  assert_eq!(status, 403, "an unadvertised filter was not refused");
+}
+
+/// Whether a blob is present in the clone's own object database.
+///
+/// `GIT_NO_LAZY_FETCH` is what makes this an honest question. Without it a
+/// partial clone silently fetches the missing blob from its promisor remote and
+/// every check reports "present", which is exactly the difference under test.
+///
+/// The client's `remote.origin.partialclonefilter` is **not** usable for this:
+/// Git records it from the command line whether or not the server honoured the
+/// filter, so it says what was asked for, not what happened.
+fn blob_is_local(checkout: &Path, rev_path: &str) -> bool {
+  Command::new("git")
+    .env("GIT_CONFIG_GLOBAL", "/dev/null")
+    .env("GIT_CONFIG_SYSTEM", "/dev/null")
+    .env("GIT_NO_LAZY_FETCH", "1")
+    .args(["-C", checkout.to_str().unwrap(), "cat-file", "-e", rev_path])
+    .output()
+    .expect("spawning git")
+    .status
+    .success()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn every_filter_git_would_allow_but_policy_does_not_fails_closed() {
+  let fx = start(&[("r-git", "basic")]).await;
+  // `blob:limit` and `tree:<depth>` are inside families Git's own
+  // `uploadpackfilter.*` granularity cannot separate from what is allowed, so
+  // these are refused by the gateway's own validation rather than by Git.
+  for filter in [
+    "--filter=tree:0",
+    "--filter=blob:limit=1k",
+    "--filter=object:type=blob",
+    "--filter=combine:blob:none+tree:0",
+  ] {
+    let tmp = tempfile::tempdir().unwrap();
+    let out = git_client(
+      &[
+        "clone",
+        "-q",
+        filter,
+        &fx.url("r-git"),
+        tmp.path().join("c").to_str().unwrap(),
+      ],
+      Some(OWNER_TOKEN),
+    );
+    assert!(!out.status.success(), "{filter} was served");
+  }
+  // And the permitted one still works, so the test above is not passing because
+  // filtering is broken outright.
+  let tmp = tempfile::tempdir().unwrap();
+  clone_and_verify(&fx, &["--filter=blob:none"], tmp.path());
+}
+
+// ---------------------------------------------------------------------------
+// Repository shapes
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_repository_shapes_in_the_fixture_matrix_all_clone() {
+  // One server, several repositories: `content` is 16 MiB and forces the
+  // response past a single read chunk, `bigdir` has 5000 entries in one tree,
+  // `bytes` has paths that are not valid UTF-8, `deep` is 40 components, and
+  // `packed` is the normal server-side shape with everything in a pack.
+  let fixtures = [
+    ("r-git", "packed"),
+    ("r-content", "content"),
+    ("r-bigdir", "bigdir"),
+    ("r-bytes", "bytes"),
+    ("r-deep", "deep"),
+  ];
+  let fx = start(&fixtures).await;
+
+  for (id, name) in fixtures {
+    let tmp = tempfile::tempdir().unwrap();
+    let via_gateway = tmp.path().join("gateway");
+    let out = git_client(
+      &["clone", "-q", &fx.url(id), via_gateway.to_str().unwrap()],
+      Some(OWNER_TOKEN),
+    );
+    assert!(out.status.success(), "{name}: {}", stderr(&out));
+    fsck_clean(&via_gateway);
+
+    let direct = tmp.path().join("direct");
+    let bare = fx
+      .server
+      .catalog
+      .get_repository(&RepositoryId::parse(id).unwrap())
+      .unwrap()
+      .unwrap()
+      .repo_path;
+    direct_clone(&bare, &direct);
+    assert_eq!(tree_of(&via_gateway), tree_of(&direct), "{name}");
+  }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_empty_repository_advertises_nothing_and_clones_cleanly() {
+  // An unborn HEAD is not an error state. Git warns and produces an empty
+  // clone; what must not happen is a hang or a 500.
+  let fx = start(&[("r-git", "empty")]).await;
+  let tmp = tempfile::tempdir().unwrap();
+  let out = git_client(
+    &[
+      "clone",
+      "-q",
+      &fx.url("r-git"),
+      tmp.path().join("c").to_str().unwrap(),
+    ],
+    Some(OWNER_TOKEN),
+  );
+  assert!(out.status.success(), "{}", stderr(&out));
+  let out = git_client(
+    &[
+      "-C",
+      tmp.path().join("c").to_str().unwrap(),
+      "rev-parse",
+      "HEAD",
+    ],
+    None,
+  );
+  assert!(
+    !out.status.success(),
+    "an empty clone must have no HEAD commit"
+  );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_alternates_based_repository_serves_the_objects_it_borrows() {
+  // A repository whose objects live in another repository's object database.
+  // The gateway never sets `GIT_ALTERNATE_OBJECT_DIRECTORIES` -- the allow-list
+  // environment deliberately omits it -- so this only works if Git reads
+  // `objects/info/alternates` itself, which is the property under test.
+  let fx = start(&[("r-git", "basic")]).await;
+  let tmp = tempfile::tempdir().unwrap();
+  let borrower = tmp.path().join("borrower.git");
+  let out = git_client(
+    &[
+      "clone",
+      "-q",
+      "--bare",
+      "--shared",
+      fx.repo_path.to_str().unwrap(),
+      borrower.to_str().unwrap(),
+    ],
+    None,
+  );
+  assert!(out.status.success(), "{}", stderr(&out));
+  assert!(borrower.join("objects/info/alternates").is_file());
+
+  let borrow_fx = register_extra(&fx, "r-alt", &borrower).await;
+  let checkout = tmp.path().join("clone");
+  let out = git_client(
+    &["clone", "-q", &borrow_fx, checkout.to_str().unwrap()],
+    Some(OWNER_TOKEN),
+  );
+  assert!(out.status.success(), "{}", stderr(&out));
+  fsck_clean(&checkout);
+  let direct = tmp.path().join("direct");
+  direct_clone(&fx.repo_path, &direct);
+  assert_eq!(tree_of(&checkout), tree_of(&direct));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_corrupt_object_fails_the_transfer_rather_than_producing_a_broken_clone() {
+  let fx = start(&[("r-git", "basic")]).await;
+  // Find a loose blob and replace its content with something that is not a
+  // valid zlib stream. `transfer.fsckObjects` plus Git's own decompression is
+  // what has to notice.
+  let objects = fx.repo_path.join("objects");
+  let corrupted = std::fs::read_dir(&objects)
+    .unwrap()
+    .flatten()
+    .filter(|shard| {
+      let name = shard.file_name();
+      name.len() == 2
+        && name
+          .to_string_lossy()
+          .chars()
+          .all(|c| c.is_ascii_hexdigit())
+    })
+    .find_map(|shard| std::fs::read_dir(shard.path()).unwrap().flatten().next())
+    .map(|object| object.path());
+  let corrupted = corrupted.expect("the fixture had no loose object to corrupt");
+  // Loose objects are written read-only, so the file is replaced rather than
+  // overwritten in place.
+  std::fs::remove_file(&corrupted).unwrap();
+  std::fs::write(&corrupted, b"this is not a git object").unwrap();
+
+  let tmp = tempfile::tempdir().unwrap();
+  let out = git_client(
+    &[
+      "clone",
+      "-q",
+      &fx.url("r-git"),
+      tmp.path().join("c").to_str().unwrap(),
+    ],
+    Some(OWNER_TOKEN),
+  );
+  assert!(
+    !out.status.success(),
+    "a corrupt object must break the transfer, not arrive silently"
+  );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_repository_format_xvfs_cannot_serve_never_reaches_the_gateway() {
+  // ADR 0001 rejects reftable and SHA-256 at ingest. The gateway inherits that
+  // for free by going through `require_servable`, and this asserts the
+  // inheritance rather than assuming it: an unservable repository is masked as
+  // absent, not served partially by stock Git which *can* read both formats.
+  for fixture in ["reftable", "sha256"] {
+    let catalog = Arc::new(Catalog::open_in_memory().unwrap());
+    let (_tmp, path) = xvfs_test::scratch_clone(fixture).unwrap();
+    let repo_id = RepositoryId::parse("r-git").unwrap();
+    catalog
+      .create_repository(&NewRepository {
+        repository_id: repo_id.clone(),
+        display_name: DisplayName::parse("acme/unsupported").unwrap(),
+        repo_path: path,
+        algorithm: HashAlgorithm::Sha1,
+        upstream_url: None,
+        credential_ref: None,
+      })
+      .unwrap();
+    let owner = SubjectId::parse("job-owner").unwrap();
+    let server = Arc::new(Server::new(
+      Arc::clone(&catalog),
+      Arc::new(StaticTokens::new().with_token(OWNER_TOKEN, owner.clone())),
+      Arc::new(AllowList::new().allow(&owner, &repo_id)),
+      CapabilityKey::generate().unwrap(),
+      LeasePolicy::adr_0006(),
+    ));
+    assert!(
+      server.registry.activate(&repo_id).is_err(),
+      "{fixture} must be refused at ingest"
+    );
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let router = server.http_router();
+    let handle = tokio::spawn(async move { axum::serve(listener, router).await });
+
+    let (status, _, _) = http_get(
+      &format!("http://{addr}/v1/repos/r-git/info/refs?service=git-upload-pack"),
+      OWNER_TOKEN,
+      None,
+    )
+    .await;
+    assert_eq!(status, 404, "{fixture} was reachable over Git");
+    handle.abort();
+  }
+}
+
+// ---------------------------------------------------------------------------
+// M5.3: repository configuration cannot widen the sandbox
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_hostile_repository_config_cannot_reopen_anything_the_gateway_closed() {
+  let fx = start(&[("r-git", "basic")]).await;
+  let grant = fx
+    .server
+    .mounts
+    .create_mount(
+      &RepositoryId::parse("r-git").unwrap(),
+      xvfs_types::RevisionSelector::parse("main", HashAlgorithm::Sha1).unwrap(),
+      &SubjectId::parse("job-owner").unwrap(),
+      None,
+    )
+    .await
+    .unwrap();
+  let anchor = xvfs_types::revision::lease_anchor_ref(grant.mount_id.as_str());
+
+  // Everything an operator could be tricked into importing, or an attacker
+  // could write if they reached the object directory.
+  for (key, value) in [
+    // `transfer.hideRefs` is a list and `!` negates an entry.
+    ("transfer.hideRefs", "!refs/xvfs/"),
+    ("uploadpack.hideRefs", "!refs/xvfs/"),
+    ("uploadpack.allowAnySHA1InWant", "true"),
+    ("uploadpack.allowFilter", "true"),
+    ("uploadpackfilter.allow", "true"),
+    ("uploadpackfilter.tree.allow", "true"),
+    // Git documents that it ignores this one from repository-level config
+    // precisely because fetching from an untrusted repository would otherwise
+    // be remote code execution. Asserted rather than trusted.
+    ("uploadpack.packObjectsHook", "/bin/false"),
+  ] {
+    xvfs_test::git(&fx.repo_path, &["config", key, value]).unwrap();
+  }
+
+  // The reserved namespace is still hidden.
+  for version in ["0", "2"] {
+    let out = git_client(
+      &[
+        "-c",
+        &format!("protocol.version={version}"),
+        "ls-remote",
+        &fx.url("r-git"),
+      ],
+      Some(OWNER_TOKEN),
+    );
+    assert!(out.status.success(), "v{version}: {}", stderr(&out));
+    assert!(
+      !stdout(&out).contains("refs/xvfs/"),
+      "repository config un-hid the reserved namespace under v{version}"
+    );
+  }
+  assert!(!anchor.is_empty());
+
+  // The filter the repository tried to enable is still refused.
+  let tmp = tempfile::tempdir().unwrap();
+  let out = git_client(
+    &[
+      "clone",
+      "-q",
+      "--filter=tree:0",
+      &fx.url("r-git"),
+      tmp.path().join("c").to_str().unwrap(),
+    ],
+    Some(OWNER_TOKEN),
+  );
+  assert!(!out.status.success(), "repository config re-enabled tree:0");
+
+  // And an ordinary clone still works, which is what proves the hook was
+  // ignored rather than run.
+  let tmp = tempfile::tempdir().unwrap();
+  clone_and_verify(&fx, &[], tmp.path());
+}
+
+// ---------------------------------------------------------------------------
+// Request bodies, limits, and malformed input
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_gzip_request_body_is_accepted_and_a_decompression_bomb_is_not() {
+  use std::io::Write;
+  let fx = start(&[("r-git", "basic")]).await;
+  let url = format!("{}/git-upload-pack", fx.url("r-git"));
+
+  // A real v2 `ls-refs` request, gzipped the way a Git client may send it.
+  let mut request = Vec::new();
+  request.extend_from_slice(&pkt(b"command=ls-refs\n"));
+  request.extend_from_slice(&pkt(b"agent=test\n"));
+  request.extend_from_slice(b"0001");
+  request.extend_from_slice(&pkt(b"peel\n"));
+  request.extend_from_slice(b"0000");
+
+  let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+  encoder.write_all(&request).unwrap();
+  let gzipped = encoder.finish().unwrap();
+
+  let (status, headers, body) =
+    http_post(&url, OWNER_TOKEN, Some("version=2"), &gzipped, true).await;
+  assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
+  assert_eq!(
+    headers.get("content-type").map(String::as_str),
+    Some("application/x-git-upload-pack-result")
+  );
+  assert!(String::from_utf8_lossy(&body).contains("refs/heads/main"));
+
+  // 4 MiB of one byte compresses far past the 100:1 ratio cap, and the cap has
+  // to fire during inflation rather than after it.
+  let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::best());
+  encoder.write_all(&vec![b'a'; 4 * 1024 * 1024]).unwrap();
+  let bomb = encoder.finish().unwrap();
+  let (status, _, _) = http_post(&url, OWNER_TOKEN, Some("version=2"), &bomb, true).await;
+  assert_eq!(status, 429, "the bomb was not refused");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn malformed_requests_are_refused_without_taking_the_server_with_them() {
+  // The fuzz sweep PLAN.md M5.2 asks for, written as a fixed corpus rather than
+  // a random one: a randomized sweep that fails is not reproducible, and every
+  // shape below is one a real client or a real attacker produces.
+  let fx = start(&[("r-git", "basic")]).await;
+  let rpc = format!("{}/git-upload-pack", fx.url("r-git"));
+
+  let malformed: Vec<Vec<u8>> = vec![
+    b"".to_vec(),
+    b"0000".to_vec(),
+    b"zzzz".to_vec(),
+    b"0003".to_vec(),
+    b"0001".to_vec(),
+    b"ffff".to_vec(),      // a length past Git's maximum
+    b"0010short".to_vec(), // truncated payload
+    pkt(b"command=nonsense\n"),
+    pkt(b"want \n"),
+    pkt(b"filter \n"),
+    pkt(b"filter blob:none extra\n"),
+    vec![0u8; 4096],      // NUL bytes where a length belongs
+    b"0004".repeat(4096), // many empty-payload packets
+  ];
+  for body in &malformed {
+    let (status, _, _) = http_post(&rpc, OWNER_TOKEN, Some("version=2"), body, false).await;
+    assert!(
+      (200..600).contains(&status),
+      "malformed body produced no HTTP response"
+    );
+    assert!(
+      status != 500,
+      "malformed body reached an internal error: {status}"
+    );
+  }
+
+  // Repository selection: the traversal shapes `RepositoryId::parse` exists to
+  // refuse, none of which may become a filesystem path.
+  for name in [
+    "..",
+    "../..",
+    ".%2e/",
+    "a/../../etc",
+    "%2e%2e",
+    ".git",
+    "a b",
+    "a\nb",
+    "",
+  ] {
+    let (status, _, _) = http_get(
+      &format!(
+        "{}/v1/repos/{name}/info/refs?service=git-upload-pack",
+        fx.base
+      ),
+      OWNER_TOKEN,
+      None,
+    )
+    .await;
+    assert!(
+      (400..500).contains(&status),
+      "repository name {name:?} produced {status}"
+    );
+  }
+
+  // Headers: a hostile `Git-Protocol` must not negotiate anything or escape
+  // into the environment.
+  for protocol in [
+    "version=2:evil=1",
+    "version=99",
+    &"version=2".repeat(1000),
+    "\u{7f}",
+  ] {
+    let (status, _, _) = http_get(
+      &format!("{}/info/refs?service=git-upload-pack", fx.url("r-git")),
+      OWNER_TOKEN,
+      Some(protocol),
+    )
+    .await;
+    assert!(
+      (200..500).contains(&status),
+      "{protocol:?} produced {status}"
+    );
+  }
+
+  // Still alive and still correct.
+  let tmp = tempfile::tempdir().unwrap();
+  clone_and_verify(&fx, &[], tmp.path());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn admission_control_refuses_rather_than_queues() {
+  let fx = start_with(
+    &[("r-git", "basic")],
+    UploadPackPolicy {
+      max_concurrent_processes: 1,
+      ..Default::default()
+    },
+  )
+  .await;
+  // Held directly rather than by racing two real clones: the property under
+  // test is that exhaustion produces an actionable refusal, and a race would
+  // test the scheduler instead.
+  let held = Arc::clone(&fx.server.gateway.admission)
+    .try_acquire_owned()
+    .expect("the only permit");
+
+  let (status, _, _) = http_get(
+    &format!("{}/info/refs?service=git-upload-pack", fx.url("r-git")),
+    OWNER_TOKEN,
+    None,
+  )
+  .await;
+  assert_eq!(
+    status, 429,
+    "an exhausted process budget must refuse, not queue"
+  );
+
+  drop(held);
+  let (status, _, _) = http_get(
+    &format!("{}/info/refs?service=git-upload-pack", fx.url("r-git")),
+    OWNER_TOKEN,
+    None,
+  )
+  .await;
+  assert_eq!(status, 200, "the permit was not returned");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_client_that_disconnects_mid_transfer_releases_its_child() {
+  use tokio::io::AsyncWriteExt;
+
+  let fx = start(&[("r-git", "content")]).await;
+  let before = fx.server.gateway.admission.available_permits();
+
+  // Send the request, read nothing, and hang up. The 16 MiB fixture guarantees
+  // the child is still producing output when the socket closes.
+  {
+    let authority = fx.base.strip_prefix("http://").unwrap();
+    let mut socket = tokio::net::TcpStream::connect(authority).await.unwrap();
+    socket
+      .write_all(
+        format!(
+          "GET /v1/repos/r-git/info/refs?service=git-upload-pack HTTP/1.1\r\n\
+           Host: {authority}\r\nAuthorization: Bearer {OWNER_TOKEN}\r\n\r\n"
+        )
+        .as_bytes(),
+      )
+      .await
+      .unwrap();
+    // Dropped without reading a byte.
+  }
+
+  // The permit comes back only when the pump task ends, and the pump task ends
+  // only when the child has been reaped. Waiting on the permit is therefore a
+  // direct assertion about reaping without inspecting the process table.
+  let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+  while fx.server.gateway.admission.available_permits() < before {
+    assert!(
+      std::time::Instant::now() < deadline,
+      "a disconnected transfer never released its process permit"
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+  }
+
+  // And the server is still serving.
+  let (status, _, _) = http_get(
+    &format!("{}/info/refs?service=git-upload-pack", fx.url("r-git")),
+    OWNER_TOKEN,
+    None,
+  )
+  .await;
+  assert_eq!(status, 200);
+}
+
+// ---------------------------------------------------------------------------
+// Client version matrix
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn every_configured_git_client_version_clones() {
+  // PLAN.md M5.2 asks for multiple maintained Git client versions on Linux and
+  // at least one other OS. Only the pinned 2.53.0 is installed here, so the
+  // matrix is driven by `XVFS_GIT_CLIENTS` -- a colon-separated list of `git`
+  // binaries -- and reports what it actually ran. An unset variable means the
+  // row was **not** covered, which the M5 report records as a carried-forward
+  // gap rather than a pass.
+  let Ok(clients) = std::env::var("XVFS_GIT_CLIENTS") else {
+    eprintln!(
+      "SKIPPED: set XVFS_GIT_CLIENTS=/path/to/git:/path/to/other-git to run the \
+       client version matrix. Only the pinned client is covered without it."
+    );
+    return;
+  };
+
+  let fx = start(&[("r-git", "basic")]).await;
+  let direct_tmp = tempfile::tempdir().unwrap();
+  let direct = direct_tmp.path().join("direct");
+  direct_clone(&fx.repo_path, &direct);
+
+  for binary in clients.split(':').filter(|s| !s.is_empty()) {
+    for version in ["0", "2"] {
+      let tmp = tempfile::tempdir().unwrap();
+      let checkout = tmp.path().join("c");
+      let out = Command::new(binary)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .args([
+          "-c",
+          &format!("http.extraHeader=Authorization: Bearer {OWNER_TOKEN}"),
+          "-c",
+          &format!("protocol.version={version}"),
+          "clone",
+          "-q",
+          &fx.url("r-git"),
+          checkout.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap_or_else(|e| panic!("{binary} is not runnable: {e}"));
+      assert!(
+        out.status.success(),
+        "{binary} v{version}: {}",
+        String::from_utf8_lossy(&out.stderr)
+      );
+      assert_eq!(tree_of(&checkout), tree_of(&direct), "{binary} v{version}");
+      eprintln!("ok   {binary} protocol v{version}");
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
 // HTTP helpers
 // ---------------------------------------------------------------------------
 
-async fn http_get(
+fn pkt(payload: &[u8]) -> Vec<u8> {
+  let mut framed = format!("{:04x}", payload.len() + 4).into_bytes();
+  framed.extend_from_slice(payload);
+  framed
+}
+
+/// Register one more repository on a running fixture and return its clone URL.
+async fn register_extra(fx: &Fixture, id: &str, path: &Path) -> String {
+  let repo_id = RepositoryId::parse(id).unwrap();
+  fx.server
+    .catalog
+    .create_repository(&NewRepository {
+      repository_id: repo_id.clone(),
+      display_name: DisplayName::parse(&format!("acme/{id}")).unwrap(),
+      repo_path: path.to_path_buf(),
+      algorithm: HashAlgorithm::Sha1,
+      upstream_url: None,
+      credential_ref: None,
+    })
+    .unwrap();
+  fx.server.registry.activate(&repo_id).unwrap();
+  fx.url(id)
+}
+
+type HttpResponse = (u16, std::collections::HashMap<String, String>, Vec<u8>);
+
+async fn http_get(url: &str, token: &str, git_protocol: Option<&str>) -> HttpResponse {
+  http_get_raw(url, Some(token), git_protocol).await
+}
+
+/// `POST` a raw body, optionally declaring it gzipped.
+async fn http_post(
   url: &str,
   token: &str,
   git_protocol: Option<&str>,
-) -> (u16, std::collections::HashMap<String, String>, Vec<u8>) {
-  http_get_raw(url, Some(token), git_protocol).await
+  body: &[u8],
+  gzipped: bool,
+) -> HttpResponse {
+  use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+  let rest = url.strip_prefix("http://").expect("http url");
+  let (authority, path) = rest.split_once('/').unwrap_or((rest, ""));
+  let mut head = format!(
+    "POST /{path} HTTP/1.1\r\nHost: {authority}\r\nConnection: close\r\n\
+     Authorization: Bearer {token}\r\n\
+     Content-Type: application/x-git-upload-pack-request\r\n\
+     Content-Length: {}\r\n",
+    body.len()
+  );
+  if gzipped {
+    head.push_str("Content-Encoding: gzip\r\n");
+  }
+  if let Some(protocol) = git_protocol {
+    head.push_str(&format!("Git-Protocol: {protocol}\r\n"));
+  }
+  head.push_str("\r\n");
+
+  let mut stream = tokio::net::TcpStream::connect(authority).await.unwrap();
+  stream.write_all(head.as_bytes()).await.unwrap();
+  stream.write_all(body).await.unwrap();
+  let mut raw = Vec::new();
+  stream.read_to_end(&mut raw).await.unwrap();
+  parse_response(&raw)
 }
 
 /// A minimal HTTP/1.1 client.
@@ -504,11 +1271,7 @@ async fn http_get(
 /// Hand-written rather than pulled in: the tests need to send a `Git-Protocol`
 /// header and read a raw body, and a client library would add a dependency for
 /// two requests' worth of work.
-async fn http_get_raw(
-  url: &str,
-  token: Option<&str>,
-  git_protocol: Option<&str>,
-) -> (u16, std::collections::HashMap<String, String>, Vec<u8>) {
+async fn http_get_raw(url: &str, token: Option<&str>, git_protocol: Option<&str>) -> HttpResponse {
   use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
   let rest = url.strip_prefix("http://").expect("http url");
@@ -526,7 +1289,10 @@ async fn http_get_raw(
   stream.write_all(request.as_bytes()).await.unwrap();
   let mut raw = Vec::new();
   stream.read_to_end(&mut raw).await.unwrap();
+  parse_response(&raw)
+}
 
+fn parse_response(raw: &[u8]) -> HttpResponse {
   let split = raw
     .windows(4)
     .position(|w| w == b"\r\n\r\n")
