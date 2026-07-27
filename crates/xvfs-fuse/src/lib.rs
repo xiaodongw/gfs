@@ -37,6 +37,7 @@ pub mod cache;
 pub mod client;
 pub mod control;
 pub mod daemon;
+pub mod find;
 pub mod fs;
 pub mod gitdir;
 pub mod inode;

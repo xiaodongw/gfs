@@ -34,6 +34,22 @@ service SnapshotService {
 
   rpc ListDirectory(ListDirectoryRequest) returns (ListDirectoryResponse);
 
+  // The pinned commit's ancestry, newest first.
+  //
+  // A revwalk rather than a tree query, and the reason `git log` is answerable
+  // at all in a workspace whose `.git` has no object database: ADR 0005 froze
+  // the shim's `log` at `-1` because nothing could serve the second commit.
+  // Paging is by `skip`, not by a token, because a revwalk from a pinned commit
+  // is deterministic and repeating it is cheaper than carrying a cursor.
+  rpc Log(LogRequest) returns (LogResponse);
+
+  // Paths in the pinned commit's tree, filtered by glob.
+  //
+  // A filename search. The alternative an agent has otherwise is `ListDirectory`
+  // per directory, which on a 7 000-file repository is thousands of round trips
+  // and was measured at 56 seconds for what this answers in one.
+  rpc FindPaths(FindPathsRequest) returns (FindPathsResponse);
+
   // Many paths in one round trip. Per-path failures travel in the response;
   // one unreadable path does not fail the batch.
   rpc BatchGetEntry(BatchGetEntryRequest) returns (BatchGetEntryResponse);
@@ -125,6 +141,73 @@ message GetCommitResponse {
   // Bytes, for the same reason as `Signature.name`.
   bytes message = 6;
   Timestamp snapshot_time = 7;
+}
+
+message LogRequest {
+  string repository_id = 1;
+  string commit_oid = 2;
+  SnapshotAuthorization authorization = 3;
+  // Commits to skip before emitting. Paging for `log --skip`.
+  uint32 skip = 4;
+  // Maximum commits to return. Zero takes the server's default; the server caps
+  // it either way, because an unbounded revwalk on a 1.4-million-commit history
+  // is a request to serialize the whole repository.
+  uint32 limit = 5;
+}
+
+// One commit in a log. Deliberately not `GetCommitResponse`: that carries a
+// `snapshot_time` and a `tree_oid` that mean something for the *pinned* commit
+// and nothing for its ancestors, and reusing it would invite a client to read
+// them as if they did.
+message LogCommit {
+  string commit_oid = 1;
+  repeated string parent_oids = 2;
+  Signature author = 3;
+  Signature committer = 4;
+  // Bytes, for the same reason as `Signature.name`.
+  bytes message = 5;
+}
+
+message LogResponse {
+  repeated LogCommit commits = 1;
+  // True when the walk stopped at the limit with ancestry still unvisited, so a
+  // caller can tell "that is all of it" from "there is more". An empty page with
+  // `has_more` false is the end of history, which is a different fact from a
+  // truncated one.
+  bool has_more = 2;
+}
+
+message FindPathsRequest {
+  string repository_id = 1;
+  string commit_oid = 2;
+  SnapshotAuthorization authorization = 3;
+  // Directory prefix to walk. Empty walks the whole tree.
+  bytes scope = 4;
+  // Match a path when any include glob matches, and no exclude glob does. No
+  // includes means every path in scope.
+  repeated string include_globs = 5;
+  repeated string exclude_globs = 6;
+  // Zero takes the server's default. Capped by the server.
+  uint32 limit = 7;
+  // Resume after this path, for paging a tree larger than one page.
+  bytes start_after_path = 8;
+}
+
+message FoundPath {
+  bytes path = 1;
+  EntryKind kind = 2;
+  uint32 mode = 3;
+}
+
+message FindPathsResponse {
+  repeated FoundPath paths = 1;
+  // Set when the limit stopped the walk. Distinct from an empty result for the
+  // same reason as search's truncation flag: "no matches" and "I stopped early"
+  // are different answers and an agent acts differently on each.
+  bool truncated = 2;
+  // The last path emitted, to pass back as `start_after_path`. Empty when the
+  // walk finished.
+  bytes next_start_after_path = 3;
 }
 
 message GetEntryRequest {

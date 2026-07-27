@@ -103,17 +103,7 @@ fn run() -> Result<i32> {
     .clone()
     .ok_or_else(|| anyhow::anyhow!("no pattern given"))?;
 
-  let start = match &args.workspace {
-    Some(path) => path.clone(),
-    None => std::env::current_dir().context("reading the current directory")?,
-  };
-  let (workspace_root, state_dir) = workspace::discover(&start).ok_or_else(|| {
-    anyhow::anyhow!(
-      "not inside an XVFS workspace (looked upward from {}). \
-       Run this inside a mount, or pass --workspace.",
-      start.display()
-    )
-  })?;
+  let (workspace_root, state_dir) = workspace::resolve(&args.workspace)?;
 
   if args.hydrate {
     return hydrate(&workspace_root, &argv);

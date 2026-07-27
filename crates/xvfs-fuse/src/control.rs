@@ -46,6 +46,11 @@ pub enum Request {
   /// Search the merged workspace: the pinned commit's index, minus what the
   /// overlay changed, plus what it has instead.
   Search(Box<crate::search::SearchRequest>),
+  /// The pinned commit's ancestry, newest first. Answered by the server's
+  /// revwalk: the workspace has no object database to walk.
+  Log { skip: u32, limit: u32 },
+  /// Filename search over the merged workspace.
+  Find(Box<crate::find::FindRequest>),
   /// Release the lease, unmount, and exit.
   Unmount,
 }
@@ -78,6 +83,36 @@ pub struct MountReport {
   pub cache: crate::cache::CacheStats,
   pub live_inodes: usize,
   pub assigned_inodes: usize,
+}
+
+/// One commit, rendered for a log.
+///
+/// Strings and raw bytes rather than domain types: this crosses the control
+/// socket as JSON, and a commit message and an author name are both allowed to be
+/// non-UTF-8 (DESIGN.md's rule for `Signature.name`), so they travel as bytes and
+/// are decoded — or escaped — by whatever prints them.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct LogEntry {
+  pub commit: String,
+  pub parents: Vec<String>,
+  pub author_name: Vec<u8>,
+  pub author_email: Vec<u8>,
+  pub author_time: i64,
+  pub author_tz_offset_minutes: i32,
+  pub committer_name: Vec<u8>,
+  pub committer_email: Vec<u8>,
+  pub committer_time: i64,
+  pub message: Vec<u8>,
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct LogReport {
+  /// The commit the walk started from: the workspace's pin.
+  pub base_commit: String,
+  pub ref_name: Option<String>,
+  pub commits: Vec<LogEntry>,
+  /// True when ancestry remains past this page.
+  pub has_more: bool,
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -117,6 +152,8 @@ pub enum Response {
   },
   Export(xvfs_overlay::ExportReport),
   Search(Box<crate::search::SearchReport>),
+  Log(Box<LogReport>),
+  Find(Box<crate::find::FindReport>),
   Unmounted,
   Error {
     code: String,

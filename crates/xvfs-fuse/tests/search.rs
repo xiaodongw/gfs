@@ -347,13 +347,22 @@ async fn a_search_names_the_pinned_commit_it_answered_for() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn searching_before_the_snapshot_is_prepared_is_an_error_not_an_empty_answer() {
+async fn an_unprepared_snapshot_is_prepared_on_demand_rather_than_answered_empty() {
   let backend = Backend::start("basic").await;
   let mount = Mount::new(&backend, "main").await;
-  // Deliberately not prepared.
+  // Deliberately not prepared. This used to be a permanent condition rather than
+  // a transient one: the server's `Search` reports `SnapshotBuilding` when the
+  // manifest is missing but never builds it, and nothing in the client path
+  // called `PrepareSnapshot`, so every search in a fresh workspace failed for as
+  // long as the workspace existed. The search path now asks.
 
-  let err = search(mount.fs.client(), &mount.overlay, &request("println"))
+  let (outcome, _) = search(mount.fs.client(), &mount.overlay, &request("println"))
     .await
-    .unwrap_err();
-  assert_eq!(err.code, xvfs_types::ErrorCode::SnapshotBuilding);
+    .expect("an unprepared snapshot must be prepared on demand, not refused");
+
+  // Asserting the matches, not merely the absence of an error. The property
+  // being defended is the one ADR 0004 exists for — a query must never come back
+  // empty when the truth is "not indexed yet" — and only a real answer shows
+  // that preparation actually happened rather than being skipped.
+  assert_eq!(paths(&outcome), vec![b"src/main.rs".to_vec()]);
 }

@@ -53,7 +53,7 @@ use xvfs_search::query::{
   Completion, ExecutionStatus, Match, Query, SearchResult, TruncationReason,
 };
 use xvfs_search::SearchOutcome;
-use xvfs_types::error::XvfsError;
+use xvfs_types::error::{ErrorCode, XvfsError};
 use xvfs_types::BytePath;
 
 use crate::client::SnapshotClient;
@@ -173,7 +173,12 @@ impl OverlayView {
   }
 
   /// Where a base match belongs now, or `None` if the workspace overrode it.
-  fn place(&self, path: &[u8]) -> Option<Vec<u8>> {
+  ///
+  /// `pub(crate)` because a filename search merges its base half exactly the same
+  /// way a content search does — a renamed file is reported at its new path, a
+  /// deleted one is not reported — and duplicating the rule would let the two
+  /// answers disagree about the same workspace.
+  pub(crate) fn place(&self, path: &[u8]) -> Option<Vec<u8>> {
     if let Some(destination) = self.rehomed.get(path) {
       return Some(destination.clone());
     }
@@ -212,7 +217,24 @@ pub async fn search(
   // The base half. Always the pinned commit: `SnapshotClient` is constructed
   // around one commit and has no method that takes a selector, so this cannot
   // accidentally become a branch query.
-  let base = client.search(&query, request.max_results).await?;
+  let base = match client.search(&query, request.max_results).await {
+    Ok(outcome) => outcome,
+    // The server reports this whenever the snapshot manifest is absent, and its
+    // `Search` never builds one — only `PrepareSnapshot` does. Asking and
+    // retrying once is what turns a permanent failure into a first search that
+    // is merely slow. `prepare_snapshot` waits up to the server's own bound
+    // (ADR 0006: under 5 seconds to READY) before answering, so a false return
+    // means the build is genuinely still running and the original error, which
+    // is retryable and says so, is the honest thing to surface.
+    Err(e) if e.code == ErrorCode::SnapshotBuilding => {
+      if client.prepare_snapshot().await? {
+        client.search(&query, request.max_results).await?
+      } else {
+        return Err(e);
+      }
+    }
+    Err(e) => return Err(e),
+  };
   let SearchOutcome::Completed(base) = base else {
     // The stream ended without a terminal message. Nothing local can repair
     // that: the base half's answer is unknown, so the merged answer is too.

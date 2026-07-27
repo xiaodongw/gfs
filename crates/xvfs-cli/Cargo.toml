@@ -21,6 +21,17 @@ path = "src/main.rs"
 name = "xvfs-rg"
 path = "src/bin/xvfs-rg.rs"
 
+# `find` and `log`, delegated to the server for the same reason as `rg`: the
+# workspace has no object database and walking the mount is the cost the project
+# exists to avoid.
+[[bin]]
+name = "xvfs-find"
+path = "src/bin/xvfs-find.rs"
+
+[[bin]]
+name = "xvfs-log"
+path = "src/bin/xvfs-log.rs"
+
 [dependencies]
 xvfs-types = { workspace = true }
 xvfs-proto = { workspace = true }
@@ -38,6 +49,9 @@ http = { workspace = true }
 http-body-util = { workspace = true }
 hyper = { workspace = true, features = ["client", "http1"] }
 hyper-util = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
 
 [lints]
 workspace = true

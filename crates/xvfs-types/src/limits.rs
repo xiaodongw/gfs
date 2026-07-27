@@ -63,6 +63,23 @@ pub const MAX_DIRECTORY_PAGE_SIZE: usize = 10_000;
 /// Maximum paths in one `BatchGetEntry`. Each one is an independent tree walk.
 pub const MAX_BATCH_ENTRIES: usize = 1000;
 
+/// Commits returned by one `Log` page.
+///
+/// The default is what `git log` shows on a terminal before a human stops
+/// reading, and the ceiling keeps a revwalk over the M0.1 worst case — 1.4
+/// million commits — from becoming one response.
+pub const DEFAULT_LOG_LIMIT: usize = 50;
+pub const MAX_LOG_LIMIT: usize = 1000;
+
+/// Paths returned by one `FindPaths` page.
+///
+/// Larger than a directory page because a filename search is answered against
+/// the whole tree and a caller that asked for `*.py` across a monorepo wants the
+/// set, not a tour of it. Still bounded: the M0.1 worst case has 94 751 files at
+/// tip and the glob may match all of them.
+pub const DEFAULT_FIND_PATHS_LIMIT: usize = 10_000;
+pub const MAX_FIND_PATHS_LIMIT: usize = 100_000;
+
 /// Largest blob the API will return in a single whole-blob response.
 ///
 /// DESIGN.md section 7.4 takes whole-blob fetch for the MVP, so this is also the

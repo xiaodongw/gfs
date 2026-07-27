@@ -170,6 +170,59 @@ const PINNED: &[(&str, &[Field])] = &[
     ],
   ),
   (
+    "LogRequest",
+    &[
+      (1, "repository_id", "string"),
+      (2, "commit_oid", "string"),
+      (3, "authorization", ".xvfs.v1.SnapshotAuthorization"),
+      (4, "skip", "uint32"),
+      (5, "limit", "uint32"),
+    ],
+  ),
+  (
+    "LogCommit",
+    &[
+      (1, "commit_oid", "string"),
+      (2, "parent_oids", "string"),
+      (3, "author", ".xvfs.v1.Signature"),
+      (4, "committer", ".xvfs.v1.Signature"),
+      (5, "message", "bytes"),
+    ],
+  ),
+  (
+    "LogResponse",
+    &[(1, "commits", ".xvfs.v1.LogCommit"), (2, "has_more", "bool")],
+  ),
+  (
+    "FindPathsRequest",
+    &[
+      (1, "repository_id", "string"),
+      (2, "commit_oid", "string"),
+      (3, "authorization", ".xvfs.v1.SnapshotAuthorization"),
+      (4, "scope", "bytes"),
+      (5, "include_globs", "string"),
+      (6, "exclude_globs", "string"),
+      (7, "limit", "uint32"),
+      (8, "start_after_path", "bytes"),
+    ],
+  ),
+  (
+    "FoundPath",
+    &[
+      (1, "path", "bytes"),
+      (2, "kind", ".xvfs.v1.EntryKind"),
+      (3, "mode", "uint32"),
+    ],
+  ),
+  (
+    "FindPathsResponse",
+    &[
+      (1, "paths", ".xvfs.v1.FoundPath"),
+      (2, "truncated", "bool"),
+      (3, "next_start_after_path", "bytes"),
+    ],
+  ),
+  (
     "PrepareSnapshotRequest",
     &[
       (1, "repository_id", "string"),
@@ -458,9 +511,11 @@ fn service_methods_are_stable() {
     "SearchService/Search(.xvfs.v1.SearchRequest) -> .xvfs.v1.SearchResponse",
     "SnapshotService/BatchGetEntry(.xvfs.v1.BatchGetEntryRequest) -> .xvfs.v1.BatchGetEntryResponse",
     "SnapshotService/CreateMount(.xvfs.v1.CreateMountRequest) -> .xvfs.v1.CreateMountResponse",
+    "SnapshotService/FindPaths(.xvfs.v1.FindPathsRequest) -> .xvfs.v1.FindPathsResponse",
     "SnapshotService/GetCommit(.xvfs.v1.GetCommitRequest) -> .xvfs.v1.GetCommitResponse",
     "SnapshotService/GetEntry(.xvfs.v1.GetEntryRequest) -> .xvfs.v1.GetEntryResponse",
     "SnapshotService/ListDirectory(.xvfs.v1.ListDirectoryRequest) -> .xvfs.v1.ListDirectoryResponse",
+    "SnapshotService/Log(.xvfs.v1.LogRequest) -> .xvfs.v1.LogResponse",
     "SnapshotService/PrepareSnapshot(.xvfs.v1.PrepareSnapshotRequest) -> .xvfs.v1.PrepareSnapshotResponse",
     "SnapshotService/ReleaseMount(.xvfs.v1.ReleaseMountRequest) -> .xvfs.v1.ReleaseMountResponse",
     "SnapshotService/RenewMount(.xvfs.v1.RenewMountRequest) -> .xvfs.v1.RenewMountResponse",

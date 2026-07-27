@@ -102,6 +102,24 @@ pub trait GitRepository: Send + Sync + std::fmt::Debug {
 
   fn read_commit(&self, commit: &ObjectId) -> Result<CommitMeta, XvfsError>;
 
+  /// Walk `commit`'s ancestry, newest first, in Git's own topological-and-date
+  /// order — the order `git log` prints.
+  ///
+  /// Returns at most `limit` commits after skipping `skip`, and whether the walk
+  /// stopped with ancestry still unvisited. The caller gets that flag rather than
+  /// inferring it from a full page, because a history whose length is an exact
+  /// multiple of the page size would otherwise look truncated forever.
+  ///
+  /// Paging is by `skip` rather than a cursor: a revwalk from a pinned commit is
+  /// deterministic, so repeating the prefix costs traversal but cannot produce a
+  /// page that disagrees with the one before it.
+  fn log(
+    &self,
+    commit: &ObjectId,
+    skip: usize,
+    limit: usize,
+  ) -> Result<(Vec<CommitMeta>, bool), XvfsError>;
+
   /// Look up one path in a commit's tree. `Ok(None)` means the path is absent,
   /// which is an ordinary result rather than an error.
   fn entry(&self, commit: &ObjectId, path: &BytePath) -> EntryLookup;
@@ -139,6 +157,23 @@ pub trait GitRepository: Send + Sync + std::fmt::Debug {
     commit: &ObjectId,
     root: &BytePath,
     visit: &mut dyn FnMut(WalkEntry) -> Result<(), XvfsError>,
+  ) -> Result<(), XvfsError>;
+
+  /// Walk every *named* entry under `root`, recursively: files, symlinks,
+  /// gitlinks, and modes XVFS does not model. Directories are recursed into but
+  /// not themselves emitted, which is the set `git ls-files` reports.
+  ///
+  /// Deliberately not [`GitRepository::walk_tree`]. That walk's corpus is the
+  /// *searchable* one — it drops symlinks and gitlinks to agree with `rg`, and
+  /// reads a blob header per file to get a size. Answering a filename query from
+  /// it would silently omit every symlink in the repository, which on the M0.1
+  /// corpus is 99 paths in linux and 4 in django, and would charge an object
+  /// lookup per file for a size the caller never asked about.
+  fn walk_paths(
+    &self,
+    commit: &ObjectId,
+    root: &BytePath,
+    visit: &mut dyn FnMut(BytePath, u32) -> Result<(), XvfsError>,
   ) -> Result<(), XvfsError>;
 
   /// The paths that differ between two commits' trees.
@@ -260,6 +295,37 @@ impl AsyncRepository {
 
   pub async fn read_commit(&self, commit: ObjectId) -> Result<CommitMeta, XvfsError> {
     self.run(move |r| r.read_commit(&commit)).await
+  }
+
+  pub async fn log(
+    &self,
+    commit: ObjectId,
+    skip: usize,
+    limit: usize,
+  ) -> Result<(Vec<CommitMeta>, bool), XvfsError> {
+    self.run(move |r| r.log(&commit, skip, limit)).await
+  }
+
+  /// Every named entry under `root`, as `(path, mode)`.
+  ///
+  /// Collected rather than streamed, for the reason [`RepoPool::walk_tree`]
+  /// gives: a streaming version would hold a blocking thread for as long as the
+  /// consumer took, which defeats the pool's admission control.
+  pub async fn walk_paths(
+    &self,
+    commit: ObjectId,
+    root: BytePath,
+  ) -> Result<Vec<(BytePath, u32)>, XvfsError> {
+    self
+      .run(move |r| {
+        let mut out = Vec::new();
+        r.walk_paths(&commit, &root, &mut |path, mode| {
+          out.push((path, mode));
+          Ok(())
+        })?;
+        Ok(out)
+      })
+      .await
   }
 
   pub async fn entry(&self, commit: ObjectId, path: BytePath) -> EntryLookup {

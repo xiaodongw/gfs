@@ -212,6 +212,42 @@ impl From<CommitMeta> for v1::GetCommitResponse {
   }
 }
 
+impl From<CommitMeta> for v1::LogCommit {
+  fn from(c: CommitMeta) -> Self {
+    v1::LogCommit {
+      commit_oid: c.commit.to_qualified(),
+      parent_oids: c.parents.iter().map(ObjectId::to_qualified).collect(),
+      author: Some(c.author.into()),
+      committer: Some(c.committer.into()),
+      message: c.message,
+    }
+  }
+}
+
+impl v1::LogCommit {
+  /// The tree and snapshot time a [`CommitMeta`] carries are not on the wire for
+  /// a log entry, so they are filled from the commit itself: the tree is set to
+  /// the commit's own ID as a placeholder no caller reads, and the time comes
+  /// from the committer signature, which is what `git log` orders and prints by.
+  pub fn try_into_domain(self, algorithm: HashAlgorithm) -> Result<CommitMeta, XvfsError> {
+    let commit = try_oid(&self.commit_oid, algorithm, "commit_oid")?;
+    let committer: Signature = required(self.committer, "committer")?.try_into_domain("committer")?;
+    Ok(CommitMeta {
+      tree: commit.clone(),
+      commit,
+      parents: self
+        .parent_oids
+        .iter()
+        .map(|p| try_oid(p, algorithm, "parent_oids"))
+        .collect::<Result<_, _>>()?,
+      author: required(self.author, "author")?.try_into_domain("author")?,
+      snapshot_time: committer.time,
+      committer,
+      message: self.message,
+    })
+  }
+}
+
 impl v1::GetCommitResponse {
   pub fn try_into_domain(self, algorithm: HashAlgorithm) -> Result<CommitMeta, XvfsError> {
     Ok(CommitMeta {

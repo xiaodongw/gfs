@@ -133,6 +133,7 @@ async fn main() -> Result<()> {
     "workspace is ready"
   );
 
+  daemon.spawn_index_warmup();
   let heartbeat = tokio::spawn(Arc::clone(&daemon).run_heartbeat());
   let control = tokio::spawn(Arc::clone(&daemon).serve_control());
 
@@ -145,17 +146,38 @@ async fn main() -> Result<()> {
   let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
     .context("installing the SIGINT handler")?;
 
+  // `serve_control` resolving is not by itself good news: it returns `Ok` when a
+  // client asked to unmount and `Err` when it could not serve at all. Matching
+  // only on the join handle reported a bind failure — an over-long socket path,
+  // a permissions problem — as a clean unmount and exited 0, so `xvfs mount`
+  // said "xvfsd exited before the workspace was ready (exit status: 0)" and the
+  // cause was recorded nowhere. The failure is distinguished and propagated.
+  let mut control_failure = None;
   tokio::select! {
     _ = sigterm.recv() => tracing::info!("SIGTERM: tearing down"),
     _ = sigint.recv() => tracing::info!("SIGINT: tearing down"),
-    // `Unmount` over the control socket returns from `serve_control`.
-    _ = control => tracing::info!("unmount requested over the control socket"),
+    outcome = control => match outcome {
+      Ok(Ok(())) => tracing::info!("unmount requested over the control socket"),
+      Ok(Err(e)) => {
+        tracing::error!(error = %e.message, "the control socket stopped serving");
+        control_failure = Some(anyhow::anyhow!("{}: {}", e.code.as_str(), e.message));
+      }
+      Err(e) => {
+        tracing::error!(error = %e, "the control task did not finish");
+        control_failure = Some(anyhow::anyhow!("the control task did not finish: {e}"));
+      }
+    },
   }
 
+  // Teardown happens either way: a control socket that failed still leaves a
+  // mount point that returns ENOTCONN until something unmounts it (ADR 0003).
   daemon.shutdown().await;
   heartbeat.abort();
   if let Some(ready) = &args.ready_file {
     let _ = std::fs::remove_file(ready);
   }
-  Ok(())
+  match control_failure {
+    Some(e) => Err(e),
+    None => Ok(()),
+  }
 }

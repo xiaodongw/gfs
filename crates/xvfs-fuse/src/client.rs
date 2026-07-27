@@ -324,6 +324,139 @@ impl SnapshotClient {
       .try_into_domain(self.binding.algorithm)
   }
 
+  /// The pinned commit's ancestry, newest first.
+  ///
+  /// Returns the page and whether ancestry remains beyond it.
+  pub async fn log(&self, skip: u32, limit: u32) -> Result<(Vec<CommitMeta>, bool), XvfsError> {
+    let request = self.authed(v1::LogRequest {
+      repository_id: self.binding.repository_id.as_str().to_owned(),
+      commit_oid: self.binding.commit.to_qualified(),
+      authorization: self.authorization(),
+      skip,
+      limit,
+    })?;
+    let response = self
+      .grpc
+      .clone()
+      .log(request)
+      .await
+      .map_err(|s| convert::from_status(&s))?
+      .into_inner();
+    let mut commits = Vec::with_capacity(response.commits.len());
+    for commit in response.commits {
+      commits.push(commit.try_into_domain(self.binding.algorithm)?);
+    }
+    Ok((commits, response.has_more))
+  }
+
+  /// Paths in the pinned commit's tree matching the globs.
+  ///
+  /// Pages internally until the server stops truncating, so a caller gets the
+  /// whole matching set or an error — never a silently short list. The bound is
+  /// the caller's `limit`, which is what stops a `*` glob over a monorepo from
+  /// becoming an unbounded loop.
+  pub async fn find_paths(
+    &self,
+    scope: &BytePath,
+    include_globs: &[String],
+    exclude_globs: &[String],
+    limit: usize,
+  ) -> Result<(Vec<TreeEntryInfo>, bool), XvfsError> {
+    let mut found: Vec<TreeEntryInfo> = Vec::new();
+    let mut start_after = Vec::new();
+    loop {
+      let remaining = limit.saturating_sub(found.len());
+      if remaining == 0 {
+        return Ok((found, true));
+      }
+      let request = self.authed(v1::FindPathsRequest {
+        repository_id: self.binding.repository_id.as_str().to_owned(),
+        commit_oid: self.binding.commit.to_qualified(),
+        authorization: self.authorization(),
+        scope: scope.as_bytes().to_vec(),
+        include_globs: include_globs.to_vec(),
+        exclude_globs: exclude_globs.to_vec(),
+        limit: remaining.min(u32::MAX as usize) as u32,
+        start_after_path: start_after.clone(),
+      })?;
+      let response = self
+        .grpc
+        .clone()
+        .find_paths(request)
+        .await
+        .map_err(|s| convert::from_status(&s))?
+        .into_inner();
+
+      for path in response.paths {
+        found.push(TreeEntryInfo {
+          path: convert::try_path(path.path)?,
+          kind: xvfs_types::EntryKind::from_mode(path.mode),
+          mode: path.mode,
+          // A filename search answers about names, not content. The object ID is
+          // not on the wire because carrying one would invite a caller to read a
+          // blob from a result that never proved the blob was authorized.
+          oid: self.binding.commit.clone(),
+          size: 0,
+          symlink_target: None,
+          blob_ticket: None,
+        });
+      }
+      if !response.truncated {
+        return Ok((found, false));
+      }
+      // A truncated page with no cursor cannot be continued, and looping on it
+      // would spin forever against a server that always says "more".
+      if response.next_start_after_path.is_empty() {
+        return Ok((found, true));
+      }
+      start_after = response.next_start_after_path;
+    }
+  }
+
+  /// Ask the server to build the pinned commit's search index.
+  ///
+  /// Nothing else in the client path calls this, which is why it exists: the
+  /// server's `Search` never triggers a build, it only reports `SnapshotBuilding`
+  /// when the manifest is missing. Without a caller, that condition was
+  /// permanent and every search in a freshly mounted workspace failed.
+  ///
+  /// Returns whether the snapshot is ready *now*. `false` means the build is
+  /// still running server-side and a later search may succeed; the distinction
+  /// between "building" and "failed" is preserved in the error rather than
+  /// folded into the boolean, because one is worth retrying and the other is not.
+  pub async fn prepare_snapshot(&self) -> Result<bool, XvfsError> {
+    let request = self.authed(v1::PrepareSnapshotRequest {
+      repository_id: self.binding.repository_id.as_str().to_owned(),
+      commit_oid: self.binding.commit.to_qualified(),
+      authorization: self.authorization(),
+    })?;
+    let response = self
+      .grpc
+      .clone()
+      .prepare_snapshot(request)
+      .await
+      .map_err(|s| convert::from_status(&s))?
+      .into_inner();
+
+    match v1::SnapshotState::try_from(response.state) {
+      Ok(v1::SnapshotState::Ready) => Ok(true),
+      Ok(v1::SnapshotState::Building) => Ok(false),
+      Ok(v1::SnapshotState::Failed) => Err(XvfsError::new(
+        ErrorCode::Internal,
+        format!(
+          "the server could not build the search index for {}: {}",
+          self.binding.commit.to_qualified(),
+          response
+            .failure_reason
+            .unwrap_or_else(|| "no reason given".to_owned())
+        ),
+      )),
+      _ => Err(XvfsError::internal(
+        "the server reported an unrecognized snapshot state",
+      )),
+    }
+  }
+
   /// Search the pinned commit.
   ///
   /// Collects the stream into an outcome rather than surfacing it, and the

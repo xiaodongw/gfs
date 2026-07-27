@@ -22,7 +22,7 @@ use xvfs_proto::convert;
 use xvfs_proto::v1::{self, snapshot_service_server::SnapshotService};
 use xvfs_types::error::{ErrorCode, XvfsError};
 use xvfs_types::{
-  limits, BytePath, HashAlgorithm, MountId, ObjectId, RepositoryId, RevisionSelector,
+  limits, BytePath, EntryKind, HashAlgorithm, MountId, ObjectId, RepositoryId, RevisionSelector,
 };
 
 use crate::audit::{self, Action, AuditRecord};
@@ -199,6 +199,19 @@ impl SnapshotApi {
       );
     }
     entry
+  }
+}
+
+/// Resolve a client's requested page size against a default and a ceiling.
+///
+/// Clamped rather than rejected, for the reason `list_directory` gives: a client
+/// that asks for too much should get a smaller page and a way to continue, not an
+/// error it has to learn to handle. Zero means "server default".
+fn page_limit(requested: u32, default: usize, max: usize) -> usize {
+  if requested == 0 {
+    default
+  } else {
+    (requested as usize).min(max)
   }
 }
 
@@ -552,6 +565,164 @@ impl SnapshotService for SnapshotApi {
       ),
       Err(e) => self.finish(
         Action::BatchGetEntry,
+        &ctx,
+        AuditRecord {
+          subject: Some(&ctx.identity.subject),
+          request_id: Some(ctx.request_id.as_str()),
+          ..Default::default()
+        },
+        Err(e),
+      ),
+    }
+  }
+
+  async fn log(&self, request: Request<v1::LogRequest>) -> Result<Response<v1::LogResponse>, Status> {
+    let ctx = self.begin(&request)?;
+    let req = request.into_inner();
+
+    let result = async {
+      let (access, _) = self
+        .commit_context(&ctx, &req.repository_id, &req.commit_oid, req.authorization)
+        .await?;
+      let repo = self.registry.repository(&access.repository_id)?;
+      let limit = page_limit(req.limit, limits::DEFAULT_LOG_LIMIT, limits::MAX_LOG_LIMIT);
+      let (commits, has_more) = repo
+        .log(access.commit.clone(), req.skip as usize, limit)
+        .await?;
+      Ok((access, commits, has_more))
+    }
+    .await;
+
+    match result {
+      Ok((access, commits, has_more)) => {
+        let response = v1::LogResponse {
+          commits: commits.into_iter().map(v1::LogCommit::from).collect(),
+          has_more,
+        };
+        self.finish(
+          Action::Log,
+          &ctx,
+          AuditRecord {
+            subject: Some(&access.subject),
+            repository_id: Some(&access.repository_id),
+            commit: Some(&access.commit),
+            via_capability: access.via_capability,
+            request_id: Some(ctx.request_id.as_str()),
+            ..Default::default()
+          },
+          Ok(response),
+        )
+      }
+      Err(e) => self.finish(
+        Action::Log,
+        &ctx,
+        AuditRecord {
+          subject: Some(&ctx.identity.subject),
+          request_id: Some(ctx.request_id.as_str()),
+          ..Default::default()
+        },
+        Err(e),
+      ),
+    }
+  }
+
+  async fn find_paths(
+    &self,
+    request: Request<v1::FindPathsRequest>,
+  ) -> Result<Response<v1::FindPathsResponse>, Status> {
+    let ctx = self.begin(&request)?;
+    let req = request.into_inner();
+
+    let result = async {
+      let (access, _) = self
+        .commit_context(&ctx, &req.repository_id, &req.commit_oid, req.authorization)
+        .await?;
+      let repo = self.registry.repository(&access.repository_id)?;
+      let scope = convert::try_path(req.scope)?;
+      let limit = page_limit(
+        req.limit,
+        limits::DEFAULT_FIND_PATHS_LIMIT,
+        limits::MAX_FIND_PATHS_LIMIT,
+      );
+      let includes: Vec<xvfs_search::Glob> =
+        req.include_globs.iter().map(|g| xvfs_search::Glob::new(g)).collect();
+      let excludes: Vec<xvfs_search::Glob> =
+        req.exclude_globs.iter().map(|g| xvfs_search::Glob::new(g)).collect();
+
+      // The whole subtree, then filtered here. The walk collects rather than
+      // streams by design (see `RepoPool::walk_paths`), so the cost is one pass
+      // over the scope no matter how selective the glob is — which is the trade
+      // that makes this one round trip instead of one per directory.
+      //
+      // `walk_paths`, not `walk_tree`: the latter's corpus is the searchable one
+      // and drops symlinks and gitlinks, which a filename query must report.
+      let entries = repo.walk_paths(access.commit.clone(), scope).await?;
+
+      let mut paths = Vec::new();
+      let mut truncated = false;
+      for (entry_path, mode) in entries {
+        // Paging over a deterministic walk: resume strictly after the last path
+        // the previous page emitted. Git's tree order is stable for a fixed
+        // commit, so this cannot skip or repeat an entry.
+        if !req.start_after_path.is_empty()
+          && entry_path.as_bytes() <= req.start_after_path.as_slice()
+        {
+          continue;
+        }
+        let path = entry_path.as_bytes();
+        if !includes.is_empty() && !includes.iter().any(|g| g.matches(path)) {
+          continue;
+        }
+        if excludes.iter().any(|g| g.matches(path)) {
+          continue;
+        }
+        if paths.len() == limit {
+          truncated = true;
+          break;
+        }
+        paths.push((entry_path, mode));
+      }
+      Ok((access, paths, truncated))
+    }
+    .await;
+
+    match result {
+      Ok((access, paths, truncated)) => {
+        let response = v1::FindPathsResponse {
+          next_start_after_path: if truncated {
+            paths
+              .last()
+              .map(|(path, _)| path.as_bytes().to_vec())
+              .unwrap_or_default()
+          } else {
+            Vec::new()
+          },
+          paths: paths
+            .into_iter()
+            .map(|(path, mode)| v1::FoundPath {
+              kind: v1::EntryKind::from(EntryKind::from_mode(mode)) as i32,
+              path: path.as_bytes().to_vec(),
+              mode,
+            })
+            .collect(),
+          truncated,
+        };
+        self.finish(
+          Action::FindPaths,
+          &ctx,
+          AuditRecord {
+            subject: Some(&access.subject),
+            repository_id: Some(&access.repository_id),
+            commit: Some(&access.commit),
+            via_capability: access.via_capability,
+            request_id: Some(ctx.request_id.as_str()),
+            ..Default::default()
+          },
+          Ok(response),
+        )
+      }
+      Err(e) => self.finish(
+        Action::FindPaths,
         &ctx,
         AuditRecord {
           subject: Some(&ctx.identity.subject),

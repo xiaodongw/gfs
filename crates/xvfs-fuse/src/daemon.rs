@@ -360,6 +360,31 @@ impl Daemon {
     let _ = self.persist();
   }
 
+  /// Ask the server to start building the pinned commit's search index.
+  ///
+  /// Spawned rather than awaited at mount time: a mount is 0.06 s and indexing a
+  /// large repository is not, so blocking one on the other would trade the
+  /// property the project exists for against a query the job may never run. The
+  /// search path prepares on demand as well, so this is a warm-up and not the
+  /// mechanism — losing it costs the first search some latency and nothing else.
+  ///
+  /// Failure is logged and dropped for the same reason: a repository whose index
+  /// cannot be built still serves every read, and refusing to mount over it
+  /// would turn a degraded search into a job that cannot start.
+  pub fn spawn_index_warmup(self: &Arc<Self>) {
+    let client = {
+      let current = self.current.lock().expect("current generation");
+      Arc::clone(&current.client)
+    };
+    tokio::spawn(async move {
+      match client.prepare_snapshot().await {
+        Ok(true) => tracing::info!("the search index for the pinned commit is ready"),
+        Ok(false) => tracing::info!("the search index for the pinned commit is building"),
+        Err(e) => tracing::warn!(error = %e.message, "could not prepare the search index"),
+      }
+    });
+  }
+
   /// Run the heartbeat until shutdown.
   pub async fn run_heartbeat(self: Arc<Self>) {
     loop {
@@ -480,6 +505,70 @@ impl Daemon {
       ref_name,
       local_matches,
       outcome,
+    })
+  }
+
+  /// The pinned commit's ancestry.
+  ///
+  /// No overlay half. The overlay holds file changes, not commits — a workspace
+  /// with local edits still has exactly the history its pin has — so there is
+  /// nothing to merge and pretending otherwise would invent commits.
+  pub async fn log(&self, skip: u32, limit: u32) -> Result<crate::control::LogReport, XvfsError> {
+    let (client, commit, ref_name) = {
+      let current = self.current.lock().expect("current generation");
+      (
+        Arc::clone(&current.client),
+        current.commit.clone(),
+        current.ref_name.clone(),
+      )
+    };
+    let (commits, has_more) = client.log(skip, limit).await?;
+    Ok(crate::control::LogReport {
+      base_commit: commit.to_qualified(),
+      ref_name,
+      commits: commits
+        .into_iter()
+        .map(|c| crate::control::LogEntry {
+          commit: c.commit.to_qualified(),
+          parents: c.parents.iter().map(|p| p.to_qualified()).collect(),
+          author_name: c.author.name,
+          author_email: c.author.email,
+          author_time: c.author.time.secs,
+          author_tz_offset_minutes: c.author.tz_offset_minutes,
+          committer_name: c.committer.name,
+          committer_email: c.committer.email,
+          committer_time: c.committer.time.secs,
+          message: c.message,
+        })
+        .collect(),
+      has_more,
+    })
+  }
+
+  /// Filename search over the merged workspace.
+  ///
+  /// Takes the generation's client and overlay under the lock and releases it
+  /// before the request, for the reason `search` gives: a walk of a monorepo's
+  /// tree must not hold `refresh` and `status` behind it.
+  pub async fn find(
+    &self,
+    request: &crate::find::FindRequest,
+  ) -> Result<crate::find::FindReport, XvfsError> {
+    let (client, overlay, commit, ref_name) = {
+      let current = self.current.lock().expect("current generation");
+      (
+        Arc::clone(&current.client),
+        Arc::clone(&current.overlay),
+        current.commit.clone(),
+        current.ref_name.clone(),
+      )
+    };
+    let (paths, truncated) = crate::find::find(&client, &overlay, request).await?;
+    Ok(crate::find::FindReport {
+      base_commit: commit.to_qualified(),
+      ref_name,
+      paths,
+      truncated,
     })
   }
 
@@ -699,6 +788,14 @@ impl Daemon {
       },
       Request::Search(request) => match self.search(&request).await {
         Ok(report) => Response::Search(Box::new(report)),
+        Err(e) => Response::from_error(&e),
+      },
+      Request::Log { skip, limit } => match self.log(skip, limit).await {
+        Ok(report) => Response::Log(Box::new(report)),
+        Err(e) => Response::from_error(&e),
+      },
+      Request::Find(request) => match self.find(&request).await {
+        Ok(report) => Response::Find(Box::new(report)),
         Err(e) => Response::from_error(&e),
       },
       Request::Unmount => {

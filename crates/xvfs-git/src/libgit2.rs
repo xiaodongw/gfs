@@ -388,6 +388,79 @@ impl GitRepository for Libgit2Repository {
     Ok(meta)
   }
 
+  fn log(
+    &self,
+    commit: &ObjectId,
+    skip: usize,
+    limit: usize,
+  ) -> Result<(Vec<CommitMeta>, bool), XvfsError> {
+    let pooled = self.checkout()?;
+    let repo: &git2::Repository = &pooled;
+    let start = self.git_oid(commit)?;
+    // Verified before the walk. `revwalk.push` on an object that is not a commit
+    // fails somewhere inside the iteration instead, which surfaces as a mid-page
+    // error after a caller has already received commits.
+    self.find_commit(repo, start)?;
+
+    let mut walk = repo
+      .revwalk()
+      .map_err(|e| XvfsError::internal(format!("starting a revision walk: {}", e.message())))?;
+    // `git log`'s default is reverse chronological, and `--topo-order` is opt-in.
+    // Matching it is both the correct order and the cheap one: topological
+    // sorting has to buffer the reachable graph before it can emit anything.
+    // Measured on the M0.1 worst case, `git log -10` on linux.git is 0.007 s in
+    // date order and 10.383 s with `--topo-order` — 1 500x, for ten commits.
+    //
+    // One divergence is accepted and is visible only for commits that share a
+    // commit timestamp: Git and libgit2 break that tie differently, so the *set*
+    // and the ordering by time agree while two same-second commits may swap.
+    // django's history has such a pair. The alternative is the 10 seconds above.
+    //
+    // Sorting is set before pushing, which libgit2 requires: a sort mode applied
+    // afterwards resets the walk.
+    walk
+      .set_sorting(git2::Sort::TIME)
+      .map_err(|e| XvfsError::internal(format!("sorting a revision walk: {}", e.message())))?;
+    walk
+      .push(start)
+      .map_err(|e| XvfsError::internal(format!("seeding a revision walk: {}", e.message())))?;
+
+    let mut commits = Vec::new();
+    let mut seen = 0usize;
+    let mut has_more = false;
+    for step in walk {
+      let oid =
+        step.map_err(|e| XvfsError::internal(format!("walking revisions: {}", e.message())))?;
+      if seen < skip {
+        seen += 1;
+        continue;
+      }
+      if commits.len() == limit {
+        // One past the page is what proves there is a next page. The walk stops
+        // here rather than counting the whole history, which on the M0.1 worst
+        // case is 1.4 million commits to answer `log -10`.
+        has_more = true;
+        break;
+      }
+      let c = self.find_commit(repo, oid)?;
+      let author = Self::signature_of(&c.author());
+      let committer = Self::signature_of(&c.committer());
+      commits.push(CommitMeta {
+        commit: self.to_oid(c.id())?,
+        tree: self.to_oid(c.tree_id())?,
+        parents: c
+          .parent_ids()
+          .map(|p| self.to_oid(p))
+          .collect::<Result<_, _>>()?,
+        author,
+        committer,
+        message: c.message_bytes().to_vec(),
+        snapshot_time: Timestamp::from_secs(c.time().seconds()),
+      });
+    }
+    Ok((commits, has_more))
+  }
+
   fn entry(&self, commit: &ObjectId, path: &BytePath) -> EntryLookup {
     let pooled = self.checkout()?;
     let found = {
@@ -533,6 +606,59 @@ impl GitRepository for Libgit2Repository {
           // Symlinks, gitlinks, and unsupported modes are not searchable
           // content. See `WalkEntry`: the corpus is chosen to agree with `rg`.
           _ => {}
+        }
+      }
+      for child in children.into_iter().rev() {
+        stack.push(child);
+      }
+    }
+    Ok(())
+  }
+
+  fn walk_paths(
+    &self,
+    commit: &ObjectId,
+    root: &BytePath,
+    visit: &mut dyn FnMut(BytePath, u32) -> Result<(), XvfsError>,
+  ) -> Result<(), XvfsError> {
+    let pooled = self.checkout()?;
+    let repo: &git2::Repository = &pooled;
+    let commit_oid = self.git_oid(commit)?;
+
+    let start = if root.is_empty() {
+      self.find_commit(repo, commit_oid)?.tree_id()
+    } else {
+      let Some((parent, name)) = self.walk_to_parent(repo, commit, root)? else {
+        return Err(XvfsError::not_found("no such directory"));
+      };
+      let Some(entry) = parent.get(&name) else {
+        return Err(XvfsError::not_found("no such directory"));
+      };
+      if entry.mode != mode::DIRECTORY {
+        return Err(XvfsError::new(
+          ErrorCode::InvalidArgument,
+          "not a directory",
+        ));
+      }
+      self.git_oid(&entry.oid)?
+    };
+
+    // The same explicit stack as `walk_tree`, for the same two reasons its
+    // comment gives. No object-database read here: a name query needs the tree
+    // entries only, and a blob header per file would be one lookup per path.
+    let mut stack: Vec<(git2::Oid, BytePath)> = vec![(start, root.clone())];
+    while let Some((tree_oid, prefix)) = stack.pop() {
+      let tree = self.decoded_tree(repo, tree_oid)?;
+      let mut children = Vec::new();
+      for decoded in tree.entries() {
+        let path = prefix.join(&decoded.name);
+        if decoded.mode == mode::DIRECTORY {
+          children.push((self.git_oid(&decoded.oid)?, path));
+        } else {
+          // Every non-directory mode, including symlinks and gitlinks. A
+          // filename search that dropped them would answer "no such file" about
+          // a file that is right there.
+          visit(path, decoded.mode)?;
         }
       }
       for child in children.into_iter().rev() {

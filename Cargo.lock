@@ -2587,6 +2587,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "serde_json",
+ "tempfile",
  "tokio",
  "tonic",
  "xvfs-fuse",

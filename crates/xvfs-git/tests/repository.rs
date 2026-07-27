@@ -947,3 +947,125 @@ async fn the_async_wrapper_bounds_concurrency_and_returns_correct_results() {
   }
   assert_eq!(count, 32);
 }
+
+// ---------------------------------------------------------------------------
+// Ancestry, for `xvfs-log`
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_log_walks_ancestry_newest_first_and_pages_without_gaps() {
+  let repo = open("basic");
+  let head = head(&repo);
+
+  let (all, has_more) = repo.log(&head, 0, 100).unwrap();
+  assert!(!has_more, "the whole history fits in one page of 100");
+  assert!(all.len() >= 2, "the basic fixture has at least two commits");
+  assert_eq!(all[0].commit, head, "the walk starts at the commit asked for");
+  // Newest first: each commit lists the next as a parent. This holds for the
+  // fixture because its history is linear with distinct commit times; the walk
+  // is ordered by time, not topologically, so a repository with equal timestamps
+  // or clock skew can legitimately interleave branches. See `log`'s comment on
+  // why topological order is not used.
+  for pair in all.windows(2) {
+    assert!(
+      pair[0].parents.contains(&pair[1].commit),
+      "{} does not descend from {}",
+      pair[0].commit,
+      pair[1].commit
+    );
+  }
+
+  // A page short of the history reports that more remains, and `skip` resumes
+  // exactly where it stopped — no gap, no repeat.
+  let (first, more) = repo.log(&head, 0, 1).unwrap();
+  assert_eq!(first.len(), 1);
+  assert!(more, "one commit of a multi-commit history leaves more");
+  let (second, _) = repo.log(&head, 1, 1).unwrap();
+  assert_eq!(second[0].commit, all[1].commit);
+}
+
+#[test]
+fn a_log_limit_equal_to_the_history_does_not_claim_more() {
+  // The off-by-one that a naive implementation gets wrong: a page whose size is
+  // exactly the remaining history is complete, not truncated, and reporting
+  // otherwise sends a caller into a page that is always empty.
+  let repo = open("basic");
+  let head = head(&repo);
+  let (all, _) = repo.log(&head, 0, 100).unwrap();
+
+  let (exact, has_more) = repo.log(&head, 0, all.len()).unwrap();
+  assert_eq!(exact.len(), all.len());
+  assert!(!has_more, "a page that covered the history must not claim more");
+}
+
+// ---------------------------------------------------------------------------
+// Name walks, for `xvfs-find`
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_path_walk_reports_the_entries_the_searchable_walk_drops() {
+  // The distinction `xvfs-find` depends on. `walk_tree`'s corpus is the
+  // searchable one and omits symlinks and gitlinks to agree with `rg`; answering
+  // a filename query from it silently loses every symlink in the repository.
+  let repo = open("modes");
+  let head = head(&repo);
+
+  let mut searchable = Vec::new();
+  repo
+    .walk_tree(&head, &BytePath::new(""), &mut |e| {
+      searchable.push(e.path.as_bytes().to_vec());
+      Ok(())
+    })
+    .unwrap();
+
+  let mut named = Vec::new();
+  repo
+    .walk_paths(&head, &BytePath::new(""), &mut |path, mode| {
+      named.push((path.as_bytes().to_vec(), mode));
+      Ok(())
+    })
+    .unwrap();
+
+  let named_paths: Vec<Vec<u8>> = named.iter().map(|(p, _)| p.clone()).collect();
+  for link in [b"rel-link".as_slice(), b"abs-link", b"loop-a"] {
+    assert!(
+      named_paths.iter().any(|p| p == link),
+      "walk_paths lost the symlink {}",
+      String::from_utf8_lossy(link)
+    );
+    assert!(
+      !searchable.iter().any(|p| p == link),
+      "walk_tree is expected to drop symlinks; this test's premise is gone"
+    );
+  }
+  assert!(
+    named_paths.iter().any(|p| p == b"vendor/submodule"),
+    "walk_paths lost the gitlink"
+  );
+
+  // Directories are recursed into, never emitted: the set is `git ls-files`'s.
+  assert!(
+    named.iter().all(|(_, mode)| *mode != mode::DIRECTORY),
+    "a directory was emitted as a named entry"
+  );
+  // And it is a superset of the searchable corpus, not a different one.
+  for path in &searchable {
+    assert!(
+      named_paths.contains(path),
+      "walk_paths is missing a searchable file: {}",
+      String::from_utf8_lossy(path)
+    );
+  }
+}
+
+#[test]
+fn a_path_walk_of_a_missing_directory_is_an_error_not_an_empty_result() {
+  // Same rule `walk_tree` states: a mistyped scope that returned nothing would
+  // be indistinguishable from a directory that is genuinely empty.
+  let repo = open("basic");
+  let head = head(&repo);
+  let err = repo
+    .walk_paths(&head, &BytePath::new("no/such/dir"), &mut |_, _| Ok(()))
+    .unwrap_err();
+  assert_eq!(err.code, xvfs_types::error::ErrorCode::NotFound);
+}

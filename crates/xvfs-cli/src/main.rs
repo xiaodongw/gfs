@@ -822,8 +822,22 @@ async fn main() -> Result<()> {
         max_line_bytes: *max_columns,
         search_ignored: *no_ignore,
       };
-      let Response::Search(report) = call(&state_dir, &Request::Search(Box::new(request)))? else {
-        bail!("the daemon answered a search request with something else");
+      // A failed search must not leave by the `Result` path. `main` returns
+      // `Result`, and anyhow exits 1 for an error — which ADR 0004 defines as
+      // "complete, and the pattern genuinely does not occur". A server that is
+      // unreachable, unauthorized, or still building an index would therefore
+      // tell an agent the symbol does not exist. Exit 2 is the code for "no
+      // answer", and every failure here is one.
+      let report = match call(&state_dir, &Request::Search(Box::new(request))) {
+        Ok(Response::Search(report)) => report,
+        Ok(_) => {
+          eprintln!("xvfs: the daemon answered a search request with something else");
+          std::process::exit(2);
+        }
+        Err(e) => {
+          eprintln!("xvfs: {e:#}");
+          std::process::exit(2);
+        }
       };
 
       if *json {
