@@ -187,6 +187,10 @@ pub fn search_local(
   let started = Instant::now();
   let matcher = crate::query::compile(query)?;
   let mut out = LocalOutcome::default();
+  // From the query's budget, not `LocalBudget`: both halves of a merged answer
+  // must cut lines at the same width, or the same match found by both would come
+  // back at two different lengths and a caller could not deduplicate it.
+  let mut display = crate::query::DisplayBudget::new(&query.budget);
 
   // Sorted so the local half's own ordering is deterministic before it is merged
   // with the server's.
@@ -217,7 +221,10 @@ pub fn search_local(
       continue;
     }
 
-    if started.elapsed() > budget.max_time || out.bytes_read > budget.max_bytes_read {
+    if started.elapsed() > budget.max_time
+      || out.bytes_read > budget.max_bytes_read
+      || display.exhausted()
+    {
       out.truncated = true;
       break;
     }
@@ -241,13 +248,27 @@ pub fn search_local(
     }
     out.eligible_paths += 1;
 
-    for hit in crate::query::find_matches(&matcher, &content, query, path) {
+    // Only as many as the page can still take, plus the one that proves there
+    // were more. Collecting every match first made the budget a bound on what
+    // was *reported* rather than on what was built, and a single long line can
+    // hold more matches than memory holds copies of it.
+    let room = budget
+      .max_results
+      .saturating_sub(out.matches.len())
+      .saturating_add(1);
+    for hit in crate::query::find_matches(&matcher, &content, query, path, room, &mut display) {
       if out.matches.len() >= budget.max_results {
         out.truncated = true;
         return Ok(out);
       }
       out.matches.push(hit);
     }
+  }
+
+  // The loop-top check needs a next path to fire on. A budget spent on the last
+  // one still cut a line short, and an answer that dropped bytes is not complete.
+  if display.exhausted() {
+    out.truncated = true;
   }
 
   Ok(out)

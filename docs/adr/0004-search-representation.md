@@ -162,3 +162,97 @@ dependency, and no token query mode.
   assumes a corpus whose boundaries are declared, and a ranked mode that
   silently returned the top *N* would be a truncation the contract would have to
   learn to describe.
+
+## Amendment, 2026-07-26: a result's line text is capped, and the cap is a budget
+
+Decided after an out-of-memory kill during M4.6. This adds to decision 3 rather
+than changing it: the new bound is a truncation, reported through the mechanism
+already there.
+
+### What the measurements missed
+
+Every cost in the original decision is a cost of the *index*: postings per byte
+of content, manifest per snapshot, blobs read per query. None of them is a cost
+of the *answer*, and the answer turns out to be the one that is unbounded.
+
+A `Match` carries a copy of the line it was found on. So the memory a query
+retains is not the size of the corpus but
+
+```
+matches x (1 + context_before + context_after) x line length
+```
+
+and nothing in the design bounded the last factor. The fixture matrix's
+`content` tree has a file that is 4 MiB of `x` on a single line — deliberately,
+to prove such a file is searchable. Searching it for `xxx` yields 1 398 101
+matches, each copying 4 MiB: about 5.6 TiB requested. The process was killed at
+45.5 GiB, having exhausted 47.6 GiB of RAM and 12 GiB of swap. `max_results` was
+set to 10 at the time. It was consulted only when emitting results, which is
+after the memory was already spent.
+
+The shape is not exotic. A minified bundle or a generated JSON file is one long
+line, and searching for a common token in one is an ordinary thing to do.
+
+### Decision
+
+**Three bounds, applied where the memory is spent rather than where the results
+are counted.**
+
+1. **A per-blob hit limit.** The matcher stops at `max_results + 1` hits in any
+   one blob. No path can emit more than `max_results`, so a further hit is
+   unreportable by construction; the `+ 1` is what keeps an over-full page
+   distinguishable from an exactly-full one, which decision 3's
+   complete-versus-truncated rule depends on.
+2. **`max_line_bytes`, default 8 KiB.** A cap on any one line returned for
+   display, matched or context, and on the matched span itself — a regex may
+   match a whole line, so the span is as unbounded as the line. 8 KiB is this
+   ADR's own binary-probe window, reused because it is already the distance the
+   design treats as far enough into a file to know what it is, and it is one to
+   two orders of magnitude past any line that is read rather than generated.
+3. **`max_display_bytes`, default 64 MiB.** A cap on the total line text one
+   query retains. The per-line cap alone still multiplies by results and context
+   lines, both of which a client may legitimately set high (the server clamps
+   them at 10 000 and 64 each way, whose product with 8 KiB is over 10 GiB).
+
+Both budgets clamp downward only at every boundary — gRPC request, daemon
+request, CLI flag. A caller may ask for narrower lines than the default; it may
+not ask a server to retain wider ones, because the memory is the server's.
+
+### The honesty rules this inherits
+
+Decision 3 says an answer must never be quietly smaller than the question.
+Applied here:
+
+- Exhausting `max_display_bytes` is `TRUNCATED` with reason `display_budget`,
+  and therefore **exit 3**. It is deliberately not `result_limit`: the page was
+  not full, the answer was too wide to hold, and a caller that narrows the
+  pattern gets further than one that pages forward.
+- A cut line sets `line_truncated` on the match. `--json` carries the flag;
+  text output appends `[... line truncated]` after the text. Not inside
+  `line_text`: an agent grepping that field must not find a marker this code
+  invented, and a byte field that is sometimes bytes-as-stored and sometimes
+  bytes-plus-commentary cannot be consumed at all.
+- **`column` is unchanged, and still an offset into the whole line.** On a cut
+  line it may point past the end of `line_text`. That is the existing rule in
+  `xvfs-search`'s line module — the column is what an agent edits with, the text
+  is what it displays — and `blob_oid` still leads to the untruncated bytes.
+- A cut never splits a UTF-8 sequence, so a terminal is not shown a replacement
+  character the file does not contain. On content that is not UTF-8 this gives up
+  at most three bytes.
+
+### Consequences
+
+- Peak retained line text per query is `max_display_bytes`, independent of the
+  corpus, the pattern, and the client's parameters. Under the defaults that is
+  64 MiB.
+- `xvfs search --max-columns` and `xvfs-rg -M/--max-columns` expose the per-line
+  cap. `rg` suppresses a line that wide and prints a note in its place; XVFS
+  keeps the first bytes and marks them. The flag is spelled the same because the
+  intent is the same.
+- The oracle comparison in M4.6 is unaffected: it compares `(path, line,
+  column)`, none of which this changes.
+- `SearchMatch.line_truncated` (field 9) and `SearchRequest.max_line_bytes` /
+  `max_display_bytes` (fields 17, 18) are additive, so an older client decodes a
+  newer server's messages unchanged — it simply does not learn that a line was
+  cut. That is the reason `line_truncated` defaults to `false` rather than being
+  signalled by a sentinel inside `line_text`.

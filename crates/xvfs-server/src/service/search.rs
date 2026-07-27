@@ -206,6 +206,20 @@ fn build_query(req: &v1::SearchRequest) -> Result<Query, XvfsError> {
         req.max_candidates.min(defaults.max_candidates)
       },
       max_regex_bytes: defaults.max_regex_bytes,
+      // Clamped down only. A client may ask for narrower lines than the server
+      // default; it may not ask the server to retain more than the default, or
+      // the two caps above -- 10 000 results and 64 lines of context each way --
+      // would multiply into gigabytes of `line_text` from one legal request.
+      max_line_bytes: if req.max_line_bytes == 0 {
+        defaults.max_line_bytes
+      } else {
+        (req.max_line_bytes as usize).min(defaults.max_line_bytes)
+      },
+      max_display_bytes: if req.max_display_bytes == 0 {
+        defaults.max_display_bytes
+      } else {
+        req.max_display_bytes.min(defaults.max_display_bytes)
+      },
     },
   })
 }
@@ -220,6 +234,7 @@ fn to_proto_match(m: &xvfs_search::Match) -> v1::SearchMatch {
     before: m.before.clone(),
     after: m.after.clone(),
     blob_oid: m.blob_oid.clone(),
+    line_truncated: m.line_truncated,
   }
 }
 
@@ -258,6 +273,7 @@ fn truncation_name(reason: xvfs_search::TruncationReason) -> &'static str {
     T::TimeBudget => "time_budget",
     T::BytesBudget => "bytes_budget",
     T::CandidateBudget => "candidate_budget",
+    T::DisplayBudget => "display_budget",
     T::NoRequiredLiteral => "no_required_literal",
     T::BackendFailure => "backend_failure",
   }

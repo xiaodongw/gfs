@@ -33,6 +33,11 @@ use xvfs_search::query::{ExecutionStatus, SearchOutcome};
 /// default. The default groups by file and prints a header, which is nicer to
 /// read and harder to consume; every agent-facing tool here optimizes for the
 /// consumer.
+///
+/// A line cut to `max_line_bytes` gets a trailing marker, after the text rather
+/// than inside it, so a reader is not shown a prefix as though it were the
+/// line. `--json` carries the same fact as `line_truncated` instead, because a
+/// JSON consumer parses a field and would have to strip a marker back out.
 pub fn print_text(report: &SearchReport, out: &mut impl Write) -> std::io::Result<()> {
   let SearchOutcome::Completed(result) = &report.outcome else {
     return Ok(());
@@ -41,6 +46,9 @@ pub fn print_text(report: &SearchReport, out: &mut impl Write) -> std::io::Resul
     out.write_all(&m.path)?;
     write!(out, ":{}:{}:", m.line, m.column)?;
     out.write_all(&m.line_text)?;
+    if m.line_truncated {
+      out.write_all(b" [... line truncated]")?;
+    }
     out.write_all(b"\n")?;
   }
   Ok(())
@@ -164,8 +172,23 @@ mod tests {
       line_text: b"    let needle = 1;".to_vec(),
       before: Vec::new(),
       after: Vec::new(),
+      line_truncated: false,
       blob_oid: String::new(),
     }
+  }
+
+  #[test]
+  fn a_truncated_line_is_marked_rather_than_printed_as_though_it_were_whole() {
+    let mut m = a_match();
+    m.line_text = b"aaaa".to_vec();
+    m.line_truncated = true;
+    let mut out = Vec::new();
+    print_text(
+      &report(completed(vec![m], ExecutionStatus::Complete, false)),
+      &mut out,
+    )
+    .unwrap();
+    assert_eq!(out, b"src/main.rs:4:9:aaaa [... line truncated]\n");
   }
 
   #[test]

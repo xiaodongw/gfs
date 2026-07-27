@@ -362,6 +362,11 @@ impl SnapshotClient {
       max_time_ms: 0,
       max_bytes_read: 0,
       max_candidates: 0,
+      // Sent rather than left at the server default, because the local half cuts
+      // lines with the same numbers. A merged answer whose two halves truncated
+      // at different widths would report one match at two lengths.
+      max_line_bytes: query.budget.max_line_bytes as u32,
+      max_display_bytes: query.budget.max_display_bytes,
     })?;
 
     let mut stream = self
@@ -528,6 +533,7 @@ fn convert_match(m: v1::SearchMatch) -> xvfs_search::Match {
     line_text: m.line_text,
     before: m.before,
     after: m.after,
+    line_truncated: m.line_truncated,
     blob_oid: m.blob_oid,
   }
 }
@@ -551,6 +557,7 @@ fn convert_completion(c: v1::SearchCompletion) -> xvfs_search::Completion {
       "time_budget" => TruncationReason::TimeBudget,
       "bytes_budget" => TruncationReason::BytesBudget,
       "candidate_budget" => TruncationReason::CandidateBudget,
+      "display_budget" => TruncationReason::DisplayBudget,
       "no_required_literal" => TruncationReason::NoRequiredLiteral,
       _ => TruncationReason::BackendFailure,
     }),

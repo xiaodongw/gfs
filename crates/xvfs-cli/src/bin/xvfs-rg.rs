@@ -52,6 +52,7 @@ const SUPPORTED: &[(&str, &str)] = &[
   ("-B/--before-context", "leading context lines"),
   ("-C/--context", "context lines on both sides"),
   ("-m/--max-count", "result limit"),
+  ("-M/--max-columns", "cut a returned line to this many bytes"),
   ("--json", "machine-readable output"),
   ("--no-ignore", "search ignored files"),
   ("--require-exhaustive", "a coverage gap becomes exit 4"),
@@ -81,6 +82,7 @@ struct Args {
   before: u32,
   after: u32,
   max_results: u32,
+  max_columns: u32,
   json: bool,
   no_ignore: bool,
   require_exhaustive: bool,
@@ -140,6 +142,7 @@ fn run() -> Result<i32> {
     context_before: args.before,
     context_after: args.after,
     max_results: args.max_results,
+    max_line_bytes: args.max_columns,
     search_ignored: args.no_ignore,
   };
 
@@ -201,6 +204,11 @@ fn parse(argv: &[String]) -> Result<Args> {
         args.after = n;
       }
       "-m" | "--max-count" => args.max_results = take_value("-m")?.parse()?,
+      // `rg` suppresses a line this wide and prints a note in its place; XVFS
+      // keeps the first bytes and marks them. The flag is spelled the same
+      // because the intent is the same, and a caller porting an `rg` invocation
+      // should not have to look this one up.
+      "-M" | "--max-columns" => args.max_columns = take_value("-M")?.parse()?,
       "--json" => args.json = true,
       "--no-ignore" => args.no_ignore = true,
       "--require-exhaustive" => args.require_exhaustive = true,
@@ -294,7 +302,7 @@ mod tests {
   #[test]
   fn the_supported_subset_parses() {
     let args = parsed(&[
-      "-F", "-i", "-g", "*.rs", "-C", "2", "-m", "10", "--json", "needle",
+      "-F", "-i", "-g", "*.rs", "-C", "2", "-m", "10", "-M", "200", "--json", "needle",
     ])
     .unwrap();
     assert!(args.literal);
@@ -303,6 +311,7 @@ mod tests {
     assert_eq!(args.before, 2);
     assert_eq!(args.after, 2);
     assert_eq!(args.max_results, 10);
+    assert_eq!(args.max_columns, 200);
     assert!(args.json);
     assert_eq!(args.pattern.as_deref(), Some("needle"));
   }

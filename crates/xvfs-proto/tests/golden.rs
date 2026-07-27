@@ -245,6 +245,8 @@ const PINNED: &[(&str, &[Field])] = &[
       (14, "max_time_ms", "uint64"),
       (15, "max_bytes_read", "uint64"),
       (16, "max_candidates", "uint64"),
+      (17, "max_line_bytes", "uint32"),
+      (18, "max_display_bytes", "uint64"),
     ],
   ),
   (
@@ -265,6 +267,7 @@ const PINNED: &[(&str, &[Field])] = &[
       (6, "before", "bytes"),
       (7, "after", "bytes"),
       (8, "blob_oid", "string"),
+      (9, "line_truncated", "bool"),
     ],
   ),
   (

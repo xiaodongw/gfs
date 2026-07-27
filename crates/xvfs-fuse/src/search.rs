@@ -84,6 +84,11 @@ pub struct SearchRequest {
   pub context_before: u32,
   pub context_after: u32,
   pub max_results: u32,
+  /// Cap on the bytes of any one line returned for display. Zero means the
+  /// default. Only ever narrows it: the default is also the ceiling, because the
+  /// memory it bounds is the daemon's.
+  #[serde(default)]
+  pub max_line_bytes: u32,
   /// Search files the workspace's ignore rules would otherwise skip.
   pub search_ignored: bool,
 }
@@ -245,6 +250,15 @@ fn build_query(request: &SearchRequest) -> Query {
         xvfs_search::Budget::default().max_results
       } else {
         request.max_results as usize
+      },
+      // `min`, not a plain override: the default is the ceiling as well as the
+      // fallback. A client may ask for narrower lines than the daemon retains by
+      // default; it may not ask the daemon to retain wider ones, because the
+      // memory that bounds is not the client's.
+      max_line_bytes: if request.max_line_bytes == 0 {
+        xvfs_search::Budget::default().max_line_bytes
+      } else {
+        (request.max_line_bytes as usize).min(xvfs_search::Budget::default().max_line_bytes)
       },
       ..xvfs_search::Budget::default()
     },

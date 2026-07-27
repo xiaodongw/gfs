@@ -56,6 +56,15 @@ message SearchRequest {
   uint64 max_time_ms = 14;
   uint64 max_bytes_read = 15;
   uint64 max_candidates = 16;
+  // Cap on the bytes of any one line returned for display, and on the total
+  // line text one answer carries. `rg --max-columns`, and a ceiling on the
+  // product of it with `max_results` and the context lines.
+  //
+  // A result carries a copy of its line, so an uncapped line is a per-match cost
+  // rather than a per-file one: a minified bundle on one 4 MiB line with a
+  // thousand matches is 4 GiB of `line_text`.
+  uint32 max_line_bytes = 17;
+  uint64 max_display_bytes = 18;
 }
 
 message SearchResponse {
@@ -75,13 +84,22 @@ message SearchMatch {
   // a `\r` or expanded a tab would send it to the wrong place.
   uint64 column = 3;
   bytes matched = 4;
-  // The whole line. A CRLF's `\r` is removed here, and only here, because this
-  // field is for display and the `\r` would corrupt a terminal.
+  // The line. A CRLF's `\r` is removed here, and only here, because this field
+  // is for display and the `\r` would corrupt a terminal. Cut to
+  // `max_line_bytes`; see `line_truncated`.
   bytes line_text = 5;
   repeated bytes before = 6;
   repeated bytes after = 7;
   // The blob the match is in, so a caller can deduplicate by content.
   string blob_oid = 8;
+  // Whether `line_text` or a context line was longer than `max_line_bytes` and
+  // holds only its first bytes.
+  //
+  // `column` remains an offset into the **whole** line, so on a truncated line
+  // it may point past the end of `line_text`. The column is what an agent edits
+  // with and the text is what it displays; those are separate jobs, and
+  // `blob_oid` leads to the untruncated bytes.
+  bool line_truncated = 9;
 }
 
 // Did the query finish evaluating the searchable corpus?
@@ -113,7 +131,8 @@ message Coverage {
 message SearchCompletion {
   ExecutionStatus execution_status = 1;
   // Present only when truncated: `result_limit`, `time_budget`, `bytes_budget`,
-  // `candidate_budget`, `no_required_literal`, `backend_failure`.
+  // `candidate_budget`, `display_budget`, `no_required_literal`,
+  // `backend_failure`.
   optional string truncation_reason = 2;
   // The budget that stopped the query, rendered for a human.
   optional string stop_budget = 3;

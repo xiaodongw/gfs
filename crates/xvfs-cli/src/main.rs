@@ -207,6 +207,11 @@ enum Command {
     after_context: u32,
     #[arg(long, default_value_t = 0)]
     max_results: u32,
+    /// Cut a returned line to this many bytes. 0 uses the daemon's default,
+    /// which is also the maximum. `rg --max-columns`, except that the line's
+    /// first bytes are kept and marked rather than the line being suppressed.
+    #[arg(long, default_value_t = 0)]
+    max_columns: u32,
     /// Search files the workspace's ignore rules would skip.
     #[arg(long)]
     no_ignore: bool,
@@ -798,6 +803,7 @@ async fn main() -> Result<()> {
       before_context,
       after_context,
       max_results,
+      max_columns,
       no_ignore,
       json,
       require_exhaustive,
@@ -813,6 +819,7 @@ async fn main() -> Result<()> {
         context_before: *before_context,
         context_after: *after_context,
         max_results: *max_results,
+        max_line_bytes: *max_columns,
         search_ignored: *no_ignore,
       };
       let Response::Search(report) = call(&state_dir, &Request::Search(Box::new(request)))? else {

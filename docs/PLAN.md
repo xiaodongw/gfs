@@ -59,7 +59,7 @@ behavior required by real builds.
 | M1: repository API ✅ | Exact revision/tree/file access, retained for the life of a mount | **Complete**, see [M1 report](reports/m1-completion.md) |
 | M2: read-only mount ✅ | Lazy snapshot is usable as a workspace, `.git` surface included | **Complete**, see [M2 report](reports/m2-completion.md) |
 | M3: writable workspace ✅ | Crash-safe overlay and patch export | **Complete**, see [M3 report](reports/m3-completion.md) |
-| M4: agent search | Search does not hydrate base, sees edits, and separates execution status from scoped coverage | Results match the supported materialized `rg` corpus |
+| M4: agent search ✅ | Search does not hydrate base, sees edits, and separates execution status from scoped coverage | **Complete**, see [M4 report](reports/m4-completion.md) |
 | M5: Git compatibility | Stock Git clone/fetch works | Version/protocol matrix passes |
 | M6: hosted pilot | End-to-end jobs run safely | Performance and reliability gates met |
 | M7: production | Scaled, operable, supportable service | SLO/security/DR review passes |
@@ -601,9 +601,58 @@ Exit criteria:
   workspace.
 - Fault injection meets the no-lost-acknowledged-mutation goal.
 
-## 7. M4 — Revision-aware agent search
+## 7. M4 — Revision-aware agent search ✅ COMPLETE
 
 Duration: 3–4 weeks
+
+> **Status: complete, 2026-07-26.** All four exit criteria met; see the
+> [M4 completion report](reports/m4-completion.md) and
+> [`benchmarks/search-preparation.md`](../benchmarks/search-preparation.md).
+>
+> Code is in [`crates/xvfs-search/`](../crates/xvfs-search/), the server half is
+> `xvfs-server/src/search/`, the merged client half is `xvfs-fuse/src/search.rs`,
+> and the commands are `xvfs search` plus the `xvfs-rg` front end.
+>
+> | Sub-milestone | Status | Deliverable |
+> | --- | --- | --- |
+> | M4.1 blob registry and classification | ✅ | `registry.rs`, `classify.rs`, `lines.rs`, `store.rs` |
+> | M4.2 snapshot manifests | ✅ | `manifest.rs`, `snapshots.rs`, `xvfs-server/src/search/mod.rs` |
+> | M4.3 literal and regex index | ✅ | `trigram.rs`, `postings.rs`, `query.rs`, `service/search.rs` |
+> | M4.4 optional token search | ⏭️ **not implemented, deliberately** | [ADR 0004 amendment](adr/0004-search-representation.md) |
+> | M4.5 overlay-aware client search | ⚠️ `rg` comparison **not benchmarked against a real build tree** | `local.rs`, `glob.rs`, `xvfs-fuse/src/search.rs`, `xvfs-rg`, `docs/agent-search.md` |
+> | M4.6 correctness and performance | ✅ | `search_oracle.rs`, `search_faults.rs`, `examples/prepare-bench.rs` |
+>
+> Measured on the worst case (linux, 94 735 eligible paths): warm search **p95
+> 787 ms** against DESIGN.md's 2 s target, arbitrary-commit preparation **4.0 s**
+> against a 53 s cold build, and an adjacent retained snapshot **1.9 MiB**
+> against ADR 0004's projected 1.99 MiB. A server search hydrates **zero** blob
+> bytes into the client cache. **ADR 0004 decision 1 holds against the
+> implementation:** on-demand search for arbitrary commits does not need to be
+> rationed.
+>
+> One finding would have shipped a denial of service rather than a wrong detail.
+> A `Match` carries a copy of its line, so retained memory was `matches × (1 +
+> context lines) × line length` with nothing bounding the last factor; searching
+> the fixture matrix's deliberate 4 MiB single-line file for `xxx` asked for
+> terabytes and was killed at 45.5 GiB, with `max_results` set to 10. The result
+> budget was only consulted when *emitting*. Three bounds now apply where the
+> memory is spent — see the
+> [ADR 0004 amendment](adr/0004-search-representation.md) — and the same search
+> peaks at 33 MiB.
+>
+> **One gap carries forward.** M4.5's own criterion is that `xvfs search` must
+> not become slower than the `rg` invocation it replaces, benchmarked against an
+> overlay containing a full build tree. The p95 above is server-side on loopback;
+> the client-side comparison against a real build tree has not been taken. It
+> should close before M6.5's pilot evaluation.
+>
+> Two smaller notes. Index storage is 1.4× the M0 projection at the base
+> (277.0 MiB against 205.2 MiB on linux) because the measurement is a whole
+> SQLite database including the blob registry, while the projection priced
+> posting bitmaps and manifest bytes; the *marginal* per-snapshot cost, which is
+> what the storage decision rested on, matches. And a snapshot 100 commits back
+> costs 11.1 MiB against an adjacent one's 1.9 MiB, because it brings blobs of
+> its own — M7.2's retention policy should be written knowing it.
 
 ### M4.1 Blob registry and text classification
 

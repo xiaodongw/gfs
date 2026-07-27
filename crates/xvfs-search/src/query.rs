@@ -74,6 +74,11 @@ pub enum TruncationReason {
   TimeBudget,
   BytesBudget,
   CandidateBudget,
+  /// The query had retained as much line text as it was granted. Distinct from
+  /// `ResultLimit`: the page was not full, the answer was simply too wide to
+  /// hold, and a caller that narrows the pattern gets further than one that
+  /// pages forward.
+  DisplayBudget,
   /// The pattern had no literal the index could bound it with, so the query was
   /// limited by a scan budget rather than by the index.
   ///
@@ -146,13 +151,28 @@ pub struct Match {
   /// The matched bytes.
   #[serde(with = "crate::query::bytes_as_b64")]
   pub matched: Vec<u8>,
-  /// The whole line, with a CRLF's `\r` removed for display only.
+  /// The line, with a CRLF's `\r` removed for display only, cut to the budget's
+  /// `max_line_bytes`. See [`line_truncated`](Match::line_truncated).
   #[serde(with = "crate::query::bytes_as_b64")]
   pub line_text: Vec<u8>,
   #[serde(with = "crate::query::bytes_list_as_b64")]
   pub before: Vec<Vec<u8>>,
   #[serde(with = "crate::query::bytes_list_as_b64")]
   pub after: Vec<Vec<u8>>,
+  /// Whether `line_text` or a context line was longer than `max_line_bytes` and
+  /// holds only its first bytes.
+  ///
+  /// **`column` is still an offset into the whole line**, so on a truncated line
+  /// it can point past the end of `line_text`. That is not an inconsistency: the
+  /// column is what an agent edits with and the text is what it displays, and
+  /// [`mod@crate::lines`] keeps those two jobs apart on purpose. `blob_oid` is
+  /// the way to the untruncated bytes.
+  ///
+  /// A flag rather than an ellipsis in the text: an agent that greps `line_text`
+  /// must not find a marker this code invented, and a byte field that is
+  /// sometimes bytes-as-stored and sometimes bytes-plus-commentary cannot be
+  /// consumed at all.
+  pub line_truncated: bool,
   /// The blob the match is in. Lets a caller fetch or deduplicate by content.
   pub blob_oid: String,
 }
@@ -189,6 +209,25 @@ pub struct Budget {
   /// Compiled-regex size cap, so a pathological pattern costs memory it was
   /// granted rather than memory it was not.
   pub max_regex_bytes: usize,
+  /// Cap on the bytes of any one line carried back for display, matched or
+  /// context. `rg --max-columns`, with the difference that `rg` suppresses the
+  /// line and this keeps its first bytes and says it did.
+  ///
+  /// A result carries a *copy* of its line, so an uncapped line is a per-match
+  /// cost rather than a per-file one: a 4 MiB minified bundle with a thousand
+  /// matches on its single line is 4 GiB of `line_text`. No reader wants the
+  /// four-thousandth column of a generated file, so the cap loses nothing a
+  /// caller would have read, and `blob_oid` still leads to the real bytes.
+  pub max_line_bytes: usize,
+  /// Cap on the total display bytes -- matched lines plus context -- one query
+  /// retains.
+  ///
+  /// Distinct from `max_bytes_read`, which bounds what is *read* and handed
+  /// straight back. This bounds what is *kept* until the answer is serialized,
+  /// and the two differ by the number of matches sharing a line. Without it the
+  /// per-line cap still multiplies: `max_results` times one plus the context
+  /// lines, which a caller may legitimately set to 10 000 and 128.
+  pub max_display_bytes: u64,
 }
 
 impl Default for Budget {
@@ -199,6 +238,12 @@ impl Default for Budget {
       max_bytes_read: 512 * 1024 * 1024,
       max_candidates: 200_000,
       max_regex_bytes: 16 * 1024 * 1024,
+      // 8 KiB is ADR 0004's binary-probe window, reused deliberately: it is
+      // already the distance this design treats as "far enough into a file to
+      // know what it is", and it is one to two orders of magnitude past any line
+      // a person or an agent reads.
+      max_line_bytes: 8 * 1024,
+      max_display_bytes: 64 * 1024 * 1024,
     }
   }
 }
@@ -332,6 +377,9 @@ pub fn search(
   // precise failure ADR 0004's execution-status dimension exists to prevent,
   // and a round-trip test caught it.
   let mut stopped_early = false;
+  // Spent across blobs, not per blob: the thing being bounded is the size of the
+  // answer.
+  let mut display = DisplayBudget::new(&query.budget);
 
   for entry in &eligible {
     if let Some(candidates) = &candidates {
@@ -341,6 +389,10 @@ pub fn search(
     }
     if !examined.insert(entry.key) {
       continue;
+    }
+    if display.exhausted() {
+      note(&mut truncation, TruncationReason::DisplayBudget);
+      break;
     }
     if started.elapsed() > query.budget.max_time {
       note(&mut truncation, TruncationReason::TimeBudget);
@@ -377,7 +429,20 @@ pub fn search(
     };
     bytes_read += content.len() as u64;
 
-    let hits = find_in_blob(&matcher, &content, query);
+    // One more than the page, never the whole blob. No path can emit more than
+    // `max_results` matches, so a hit past that can never be reported -- and
+    // materializing it costs a copy of its whole line. A 4 MiB single-line blob
+    // searched for `xxx` has 1.4 million matches, and collecting them all asked
+    // for terabytes before the emit loop's limit was ever consulted. The `+ 1`
+    // is what makes an over-full page distinguishable from an exactly-full one
+    // below.
+    let hits = find_in_blob(
+      &matcher,
+      &content,
+      query,
+      query.budget.max_results.saturating_add(1),
+      &mut display,
+    );
     if !hits.is_empty() {
       potential += hits.len() * in_scope_paths.get(&entry.key).copied().unwrap_or(1);
       per_blob.insert(entry.key, hits);
@@ -421,9 +486,17 @@ pub fn search(
         line_text: hit.line_text.clone(),
         before: hit.before.clone(),
         after: hit.after.clone(),
+        line_truncated: hit.line_truncated,
         blob_oid: oid.clone(),
       });
     }
+  }
+
+  // The loop-top check only fires if there is a next candidate, so a budget spent
+  // on the last one would otherwise go unreported -- and hits were dropped inside
+  // that blob, which is the case least allowed to look complete.
+  if display.exhausted() {
+    note(&mut truncation, TruncationReason::DisplayBudget);
   }
 
   // The candidate loop stopped with work left. If the emit loop did not already
@@ -481,6 +554,10 @@ fn describe_budget(reason: TruncationReason, budget: &Budget) -> String {
     TruncationReason::TimeBudget => format!("max_time_ms={}", budget.max_time.as_millis()),
     TruncationReason::BytesBudget => format!("max_bytes_read={}", budget.max_bytes_read),
     TruncationReason::CandidateBudget => format!("max_candidates={}", budget.max_candidates),
+    TruncationReason::DisplayBudget => format!(
+      "max_display_bytes={} (line text retained, at max_line_bytes={} per line)",
+      budget.max_display_bytes, budget.max_line_bytes
+    ),
     TruncationReason::NoRequiredLiteral => {
       "the pattern has no literal of three or more bytes that every match must \
        contain, so the query was bounded by a scan budget rather than by the index"
@@ -507,6 +584,75 @@ struct LineHit {
   line_text: Vec<u8>,
   before: Vec<Vec<u8>>,
   after: Vec<Vec<u8>>,
+  line_truncated: bool,
+}
+
+/// How much line text a query may still retain, and how wide any one line may
+/// be.
+///
+/// Carried across blobs — and, for a merged search, across the local half too —
+/// because the thing being bounded is the size of the *answer*, not the cost of
+/// any one file.
+#[derive(Debug)]
+pub struct DisplayBudget {
+  per_line: usize,
+  remaining: u64,
+  exhausted: bool,
+}
+
+impl DisplayBudget {
+  pub fn new(budget: &Budget) -> DisplayBudget {
+    DisplayBudget {
+      per_line: budget.max_line_bytes,
+      remaining: budget.max_display_bytes,
+      exhausted: false,
+    }
+  }
+
+  /// Whether the budget ran out. A query that sees this must report
+  /// [`TruncationReason::DisplayBudget`]: it stopped, so it did not finish.
+  pub fn exhausted(&self) -> bool {
+    self.exhausted
+  }
+
+  /// One line, cut to the per-line cap and charged to the running total.
+  ///
+  /// Returns the bytes and whether anything was dropped. Charging *after*
+  /// copying means the budget can go one line over, which is the price of
+  /// knowing the line's capped length before deciding — bounded, and bounded by
+  /// the per-line cap.
+  fn take(&mut self, line: &[u8]) -> (Vec<u8>, bool) {
+    let end = utf8_safe_cut(line, self.per_line);
+    let kept = line[..end].to_vec();
+    if (kept.len() as u64) >= self.remaining {
+      self.exhausted = true;
+    }
+    self.remaining = self.remaining.saturating_sub(kept.len() as u64);
+    (kept, end < line.len())
+  }
+}
+
+/// The largest cut of `line` at or below `limit` that does not split a UTF-8
+/// sequence.
+///
+/// Content need not be UTF-8 and this makes no attempt to validate it — it only
+/// declines to cut in the middle of a multi-byte sequence, so a terminal that
+/// prints the result does not show a replacement character the file does not
+/// contain. On bytes that are not UTF-8 at all, it gives up at most three of
+/// them. The same reasoning as [`crate::lines::Line::display`]: this field is
+/// for reading, and the fields that drive an edit are computed elsewhere.
+fn utf8_safe_cut(line: &[u8], limit: usize) -> usize {
+  if line.len() <= limit {
+    return line.len();
+  }
+  let mut end = limit;
+  // A continuation byte is `10xxxxxx`. Walk back to the sequence's start, at
+  // most the three that can precede a lead byte.
+  let floor = limit.saturating_sub(3);
+  while end > floor && (line[end] & 0b1100_0000) == 0b1000_0000 {
+    end -= 1;
+  }
+  end
 }
 
 /// Compile a query's pattern.
@@ -524,13 +670,20 @@ pub fn compile(query: &Query) -> Result<regex::bytes::Regex, XvfsError> {
 /// The other half of the shared-matcher rule: line numbering, column
 /// derivation, and per-occurrence counting are done once, here, for both halves
 /// of a merged search.
+///
+/// `limit` bounds how many hits are *materialized*, not how many exist. A caller
+/// that will keep at most `n` more matches must pass `n + 1`: the extra hit is
+/// how it learns there was more, and stopping at `n` would report a truncated
+/// answer as complete.
 pub fn find_matches(
   matcher: &regex::bytes::Regex,
   content: &[u8],
   query: &Query,
   path: &[u8],
+  limit: usize,
+  display: &mut DisplayBudget,
 ) -> Vec<Match> {
-  find_in_blob(matcher, content, query)
+  find_in_blob(matcher, content, query, limit, display)
     .into_iter()
     .map(|hit| Match {
       path: path.to_vec(),
@@ -540,6 +693,7 @@ pub fn find_matches(
       line_text: hit.line_text,
       before: hit.before,
       after: hit.after,
+      line_truncated: hit.line_truncated,
       // Local content has no blob object ID until it is hashed, and hashing it
       // to fill a display field would be a real cost for no reader. Empty means
       // "not from the pinned commit", which is exactly what a caller needs to
@@ -575,26 +729,52 @@ fn build_matcher(query: &Query) -> Result<regex::bytes::Regex, XvfsError> {
 /// `rg --count-matches` counts every match on a line, and a line-oriented count
 /// silently under-reports exactly the patterns agents use most: a brace, a
 /// quote, an identifier appearing twice in one call.
-fn find_in_blob(matcher: &regex::bytes::Regex, content: &[u8], query: &Query) -> Vec<LineHit> {
+///
+/// Stops after `limit` hits, or when `display` runs out. Every hit carries a
+/// copy of its line, so the hit count is a memory cost and not merely a time
+/// one: a blob with more matches than any caller could report has to stop being
+/// *read*, not stop being reported.
+fn find_in_blob(
+  matcher: &regex::bytes::Regex,
+  content: &[u8],
+  query: &Query,
+  limit: usize,
+  display: &mut DisplayBudget,
+) -> Vec<LineHit> {
   let all: Vec<lines::Line<'_>> = lines::lines(content).collect();
   let mut out = Vec::new();
   for (index, line) in all.iter().enumerate() {
     for m in matcher.find_iter(line.bytes) {
+      if out.len() >= limit || display.exhausted() {
+        return out;
+      }
+      let mut truncated = false;
+      let mut take = |bytes: &[u8], display: &mut DisplayBudget| {
+        let (kept, cut) = display.take(bytes);
+        truncated |= cut;
+        kept
+      };
       let before = all[index.saturating_sub(query.context_before)..index]
         .iter()
-        .map(|l| l.display().to_vec())
+        .map(|l| take(l.display(), display))
         .collect();
       let after = all[(index + 1).min(all.len())..(index + 1 + query.context_after).min(all.len())]
         .iter()
-        .map(|l| l.display().to_vec())
+        .map(|l| take(l.display(), display))
         .collect();
+      let line_text = take(line.display(), display);
+      // `matched` is capped too. A regex is free to match a whole line -- `x+`
+      // over a minified bundle matches all 4 MiB of it -- so the span is as
+      // unbounded as the line it came from, and for the same reason.
+      let matched = take(m.as_bytes(), display);
       out.push(LineHit {
         line: line.number,
         column: line.column(m.start()),
-        matched: m.as_bytes().to_vec(),
-        line_text: line.display().to_vec(),
+        matched,
+        line_text,
         before,
         after,
+        line_truncated: truncated,
       });
     }
   }
@@ -681,6 +861,29 @@ mod tests {
         .get(&oid.to_qualified())
         .cloned()
         .ok_or_else(|| XvfsError::not_found("no such blob"))
+    }
+  }
+
+  /// A source that fails on one blob and serves the rest.
+  ///
+  /// A *failure*, not a `NotFound`: those are different faults with different
+  /// answers. A missing object is a `gc` race and becomes a coverage gap; a read
+  /// that errors is the backend being broken, and the results already in hand
+  /// stay valid while the answer stops being complete.
+  struct FailingSource {
+    inner: MapSource,
+    broken: String,
+  }
+
+  impl BlobSource for FailingSource {
+    fn size(&self, oid: &ObjectId) -> Result<u64, XvfsError> {
+      self.inner.size(oid)
+    }
+    fn read(&self, oid: &ObjectId) -> Result<Vec<u8>, XvfsError> {
+      if oid.to_qualified() == self.broken {
+        return Err(XvfsError::internal("the object database is unreadable"));
+      }
+      self.inner.read(oid)
     }
   }
 
@@ -966,6 +1169,144 @@ mod tests {
     assert_eq!(exit_code(&SearchOutcome::Completed(result), false), 3);
   }
 
+  /// A line of `x`, big enough to have far more matches than any page.
+  ///
+  /// 64 KiB rather than the fixture matrix's 4 MiB: the property is the same and
+  /// a regression should cost a failed assertion, not the machine's memory.
+  fn one_long_line() -> Vec<u8> {
+    vec![b'x'; 64 * 1024]
+  }
+
+  #[test]
+  fn a_limit_bounds_what_is_built_not_only_what_is_reported() {
+    // The OOM. Every hit carries a copy of its line, so per-blob cost is
+    // `matches * line length`, and a 4 MiB single-line blob searched for `xxx`
+    // has 1.4 million matches -- terabytes, asked for before the emit loop's
+    // `max_results` was ever consulted. Asserted on `find_matches` directly
+    // because the emit loop truncates the *page* either way, so an end-to-end
+    // assertion on `matches.len()` cannot tell the two versions apart.
+    let content = one_long_line();
+    let query = Query {
+      pattern: "xxx".to_owned(),
+      literal: true,
+      ..Query::default()
+    };
+    let matcher = compile(&query).unwrap();
+    let mut display = DisplayBudget::new(&query.budget);
+    let hits = find_matches(&matcher, &content, &query, b"huge.txt", 6, &mut display);
+    assert_eq!(hits.len(), 6);
+    assert!(hits.iter().all(|m| m.line == 1));
+  }
+
+  #[test]
+  fn a_line_wider_than_the_budget_is_cut_and_says_so() {
+    // The second half of the same cost: capping the hit *count* still leaves
+    // `max_results` copies of a line that may itself be megabytes.
+    let content = one_long_line();
+    let query = Query {
+      budget: Budget {
+        max_line_bytes: 100,
+        ..Budget::default()
+      },
+      ..literal("xxx")
+    };
+    let matcher = compile(&query).unwrap();
+    let mut display = DisplayBudget::new(&query.budget);
+    let hits = find_matches(&matcher, &content, &query, b"huge.txt", 3, &mut display);
+    assert_eq!(hits[0].line_text.len(), 100);
+    assert!(hits[0].line_truncated);
+    // The column still describes the whole line, not the cut of it. An agent
+    // edits with this number; the text is only what it shows.
+    assert_eq!(hits[1].column, 4);
+  }
+
+  #[test]
+  fn a_short_line_is_not_marked_truncated() {
+    // The flag has to mean something, so it must be off on the common case.
+    let f = fixture(&[("a.rs", b"let needle = 1;\n")]);
+    let result = run(&f, literal("needle"));
+    assert!(!result.matches[0].line_truncated);
+    assert_eq!(result.matches[0].line_text, b"let needle = 1;");
+  }
+
+  #[test]
+  fn a_cut_line_does_not_split_a_utf8_sequence() {
+    // `display()` exists so a snippet does not corrupt a terminal; a cut that
+    // landed mid-codepoint would put a replacement character in the output that
+    // the file does not contain.
+    // `needle ` is 7 bytes and `線` is 3, so byte 10 is a boundary and 11 is not.
+    let mut content = b"needle ".to_vec();
+    content.extend("線線線線線線".as_bytes());
+    content.push(b'\n');
+    let query = Query {
+      budget: Budget {
+        max_line_bytes: 11,
+        ..Budget::default()
+      },
+      ..literal("needle")
+    };
+    let matcher = compile(&query).unwrap();
+    let mut display = DisplayBudget::new(&query.budget);
+    let hits = find_matches(&matcher, &content, &query, b"a.rs", 2, &mut display);
+    assert_eq!(hits[0].line_text.len(), 10);
+    assert!(std::str::from_utf8(&hits[0].line_text).is_ok());
+    assert!(hits[0].line_truncated);
+  }
+
+  #[test]
+  fn the_display_budget_truncates_the_query_rather_than_the_machine() {
+    // The per-line cap alone still multiplies: `max_results` times one plus the
+    // context lines. This is the bound on the product, and it is a truncation
+    // rather than a silent shortfall.
+    let content = one_long_line();
+    let f = fixture(&[("huge.txt", content.as_slice())]);
+    let result = run(
+      &f,
+      Query {
+        budget: Budget {
+          max_results: 10_000,
+          max_line_bytes: 1024,
+          max_display_bytes: 16 * 1024,
+          ..Budget::default()
+        },
+        ..literal("xxx")
+      },
+    );
+    assert!(
+      result.matches.len() < 10_000,
+      "the display budget stopped it well before the result limit"
+    );
+    assert_eq!(
+      result.completion.truncation,
+      Some(TruncationReason::DisplayBudget)
+    );
+    assert_eq!(exit_code(&SearchOutcome::Completed(result), false), 3);
+  }
+
+  #[test]
+  fn a_blob_with_more_matches_than_the_page_still_reports_the_page_and_truncates() {
+    // The other half: bounding the read must not change the answer.
+    let content = one_long_line();
+    let f = fixture(&[("huge.txt", content.as_slice())]);
+    let result = run(
+      &f,
+      Query {
+        budget: Budget {
+          max_results: 5,
+          ..Budget::default()
+        },
+        ..literal("xxx")
+      },
+    );
+    assert_eq!(result.matches.len(), 5);
+    assert_eq!(result.matches[0].line, 1);
+    assert_eq!(result.matches[0].column, 1);
+    assert_eq!(
+      result.completion.truncation,
+      Some(TruncationReason::ResultLimit)
+    );
+  }
+
   #[test]
   fn matches_are_ordered_by_path_deterministically() {
     let f = fixture(&[
@@ -1144,6 +1485,76 @@ mod tests {
     let result = run(&f, literal("needle"));
     assert_eq!(result.matches.len(), 1);
     assert_eq!(result.completion.coverage.excluded["index_gap"], 1);
+  }
+
+  #[test]
+  fn a_backend_failure_partway_through_keeps_the_results_and_stops_claiming_completeness() {
+    // Partial backend failure, which is not the same fault as a vanished blob
+    // above. Two results are already valid and discarding them would help
+    // nobody; reporting them as the answer would be a lie. So: both.
+    let f = fixture(&[
+      ("a.rs", b"needle\n"),
+      ("b.rs", b"needle two\n"),
+      ("c.rs", b"needle three\n"),
+    ]);
+    let broken = f.records[&2].oid.to_qualified();
+    let source = FailingSource {
+      inner: MapSource(f.source.0.clone()),
+      broken,
+    };
+    let inputs = SearchInputs {
+      manifest: &f.manifest,
+      postings: &f.postings,
+      policy: &f.policy,
+      index_generation: 1,
+      records: &f.records,
+    };
+    let result = search(&source, &inputs, &literal("needle")).unwrap();
+
+    assert_eq!(
+      result.matches.len(),
+      2,
+      "the blobs that were readable still answered"
+    );
+    assert_eq!(
+      result.completion.truncation,
+      Some(TruncationReason::BackendFailure)
+    );
+    assert_eq!(
+      result.completion.execution_status,
+      ExecutionStatus::Truncated
+    );
+    // And the code an agent acts on is the "not finished" one, not the "found
+    // some" one.
+    assert_eq!(exit_code(&SearchOutcome::Completed(result), false), 3);
+  }
+
+  #[test]
+  fn a_backend_that_fails_on_the_first_blob_is_not_an_empty_result() {
+    // The worst shape of the same fault: nothing was readable, so the answer is
+    // empty *and* wrong. Exit 1 here would tell an agent the symbol does not
+    // exist anywhere in the repository.
+    let f = fixture(&[("a.rs", b"needle\n")]);
+    let broken = f.records[&0].oid.to_qualified();
+    let source = FailingSource {
+      inner: MapSource(f.source.0.clone()),
+      broken,
+    };
+    let inputs = SearchInputs {
+      manifest: &f.manifest,
+      postings: &f.postings,
+      policy: &f.policy,
+      index_generation: 1,
+      records: &f.records,
+    };
+    let result = search(&source, &inputs, &literal("needle")).unwrap();
+
+    assert!(result.matches.is_empty());
+    assert_eq!(
+      result.completion.truncation,
+      Some(TruncationReason::BackendFailure)
+    );
+    assert_eq!(exit_code(&SearchOutcome::Completed(result), false), 3);
   }
 
   #[test]

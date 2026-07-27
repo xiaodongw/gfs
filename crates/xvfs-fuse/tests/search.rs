@@ -39,6 +39,7 @@ fn request(pattern: &str) -> SearchRequest {
     context_before: 0,
     context_after: 0,
     max_results: 0,
+    max_line_bytes: 0,
     search_ignored: false,
   }
 }
