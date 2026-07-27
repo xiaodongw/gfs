@@ -14,7 +14,7 @@
 //!
 //! # The crate is network-free and synchronous
 //!
-//! Like [`xvfs_overlay`], and for the same reason: it knows nothing about gRPC,
+//! Like `xvfs-overlay`, and for the same reason: it knows nothing about gRPC,
 //! libgit2, or FUSE. Content arrives through the [`BlobSource`] trait, so the
 //! same engine indexes a server-side repository and searches a client-side
 //! overlay, and a property test can drive it against an in-memory corpus.
@@ -33,6 +33,16 @@
 //! [`classify`] therefore has two entry points, and [`CorpusPolicy`] maps both
 //! kinds of label onto one [`ExclusionReason`] vocabulary, because coverage
 //! metadata has to report them side by side.
+//!
+//! # There is no tokenized search mode
+//!
+//! PLAN.md M4.4 offers one and says to skip it if literal/regex covers agent
+//! workloads. It does, and the skip is recorded with its reasoning in
+//! [ADR 0004's M4.4 amendment](../../../docs/adr/0004-search-representation.md).
+//! The short version: substring matching inside identifiers — `authorize_re`
+//! finding `authorize_request` — is a trigram strength and a tokenizer
+//! weakness, and ranking, which trigrams genuinely cannot do, does not change
+//! which files an agent opens.
 //!
 //! # Nothing is excluded silently
 //!

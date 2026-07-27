@@ -117,3 +117,48 @@ this saving.
 - The trigram builder is the one component measured as slower than the
   alternative. If index build time becomes a constraint, that is where to look
   first, and it has obvious headroom (batching, compaction, parallel merge).
+
+## Amendment, 2026-07-26: M4.4 token search is skipped, confirmed against the implementation
+
+Decided after M4.3 completed. This confirms decision 2 rather than changing it,
+and records the confirmation where M4.4's absence would otherwise look like an
+oversight.
+
+### What changed since the original decision
+
+At M0 the reasoning was a projection: literal/regex search *would* match ripgrep
+on the supported corpus, and a per-snapshot Tantivy index *would* cost two
+orders of magnitude more at realistic retention. M4.3 makes the first half
+observable rather than projected.
+
+The implemented literal/regex engine covers the query shapes the pilot's agents
+issue: exact identifiers, escaped literals, alternation, anchored regexes,
+case-insensitive lookups, path-scoped and glob-filtered searches, and context
+lines. Two properties that a tokenized index would have been needed for turn out
+not to be needed:
+
+- **Substring matching inside identifiers.** `authorize_re` matching
+  `authorize_request` is what agents actually search for, and it is a trigram
+  strength, not a tokenizer strength — a source tokenizer would have to split
+  `authorize_request` and then fail this query, or keep it whole and fail
+  `authorize`.
+- **Ranking.** Trigrams cannot rank and Tantivy can, but an agent consuming
+  `--json` sorts by path and reads all of it. Ranking matters when a human scans
+  the first screen; it does not change which files an agent opens.
+
+### Decision
+
+**M4.4 is not implemented.** `xvfs-search` has no tokenizer, no Tantivy
+dependency, and no token query mode.
+
+### Consequences
+
+- The dependency set stays smaller by one large crate and its index format.
+- `PLAN.md` M4.4's own instruction — "skip this task if M0 shows literal/regex
+  covers agent workloads" — is satisfied, with M0's projection now backed by a
+  working engine.
+- If ranking is ever required, the natural home is a second explicit query mode
+  rather than a change to the default: the exit-code contract in decision 3
+  assumes a corpus whose boundaries are declared, and a ranked mode that
+  silently returned the top *N* would be a truncation the contract would have to
+  learn to describe.

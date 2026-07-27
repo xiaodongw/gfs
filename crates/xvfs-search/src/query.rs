@@ -140,7 +140,7 @@ pub struct Match {
   pub path: Vec<u8>,
   /// 1-based.
   pub line: u64,
-  /// 1-based, in **bytes** from the start of the line. See [`crate::lines`]: an
+  /// 1-based, in **bytes** from the start of the line. See [`mod@crate::lines`]: an
   /// agent edits with this number, so it is an offset into the file as stored.
   pub column: u64,
   /// The matched bytes.

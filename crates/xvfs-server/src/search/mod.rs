@@ -136,7 +136,8 @@ impl IndexManager {
     )
   }
 
-  /// Prepare a snapshot, waiting up to [`PREPARE_WAIT`] for it.
+  /// Prepare a snapshot, waiting up to five seconds (ADR 0006's target to READY)
+  /// for it.
   ///
   /// `retained` marks a snapshot kept by policy — a configured branch tip —
   /// rather than one that expires on a TTL.
