@@ -10,5 +10,18 @@ description = "Revision-aware search indexing and query library"
 [dependencies]
 xvfs-types = { workspace = true }
 
+# The representation ADR 0004 priced. Roaring for snapshot membership and
+# posting lists, because the intersection of a posting list with a snapshot
+# bitmap is the operation the whole design turns on and it has to be cheap.
+roaring = { workspace = true }
+# NUL detection and line splitting. `memchr` rather than an iterator over bytes
+# because classification touches every indexed blob's first 8 KiB and line
+# splitting touches every candidate blob in full.
+memchr = { workspace = true }
+regex = { workspace = true }
+rusqlite = { workspace = true }
+serde = { workspace = true }
+tracing = { workspace = true }
+
 [lints]
 workspace = true

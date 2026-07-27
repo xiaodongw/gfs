@@ -90,6 +90,17 @@ hyper = "1"
 # same reasoning as vendored libgit2.
 rusqlite = { version = "0.37", features = ["bundled"] }
 
+# Search (ADR 0004). Roaring bitmaps carry snapshot membership and trigram
+# posting lists; the intersection of the two before any blob is read is the
+# operation the whole representation exists to make cheap.
+roaring = "0.11"
+# `regex` with its default features, which include the Unicode tables: a search
+# tool that cannot honour `\w` on non-ASCII identifiers does not match `rg`, and
+# matching `rg` is the contract. `bytes::Regex` is what actually runs, because a
+# blob is bytes and may not be valid UTF-8.
+regex = "1"
+memchr = "2"
+
 # Observability.
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
