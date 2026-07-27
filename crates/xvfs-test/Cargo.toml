@@ -7,9 +7,17 @@ publish.workspace = true
 license.workspace = true
 description = "Fixture matrix, fake server, and fault injection"
 
+# The crash harness M3.4 kills mid-transaction. It is a separate *process*
+# because unwinding runs `Drop`, and `Drop` is exactly what a crash does not do.
+[[bin]]
+name = "xvfs-overlay-crash"
+path = "src/bin/xvfs-overlay-crash.rs"
+
 [dependencies]
 xvfs-types = { workspace = true }
+xvfs-overlay = { workspace = true }
 anyhow = { workspace = true }
+serde_json = { workspace = true }
 sha1 = { workspace = true }
 tempfile = { workspace = true }
 

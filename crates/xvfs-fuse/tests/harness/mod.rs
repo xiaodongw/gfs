@@ -325,10 +325,31 @@ impl Job {
     Job::with_overlay(backend, revision, xvfs_overlay::OverlayConfig::default()).await
   }
 
+  /// Start a daemon over an *existing* state directory, which is what a
+  /// supervisor restarting a killed job does.
+  pub async fn with_state(backend: &Backend, revision: &str, state_dir: &Path) -> Job {
+    Job::build(
+      backend,
+      revision,
+      xvfs_overlay::OverlayConfig::default(),
+      Some(state_dir.to_path_buf()),
+    )
+    .await
+  }
+
   pub async fn with_overlay(
     backend: &Backend,
     revision: &str,
     overlay: xvfs_overlay::OverlayConfig,
+  ) -> Job {
+    Job::build(backend, revision, overlay, None).await
+  }
+
+  async fn build(
+    backend: &Backend,
+    revision: &str,
+    overlay: xvfs_overlay::OverlayConfig,
+    existing_state: Option<PathBuf>,
   ) -> Job {
     use std::time::Duration;
     use xvfs_fuse::control;
@@ -339,7 +360,7 @@ impl Job {
     let tmp = tempfile::tempdir().unwrap();
     let cache = tempfile::tempdir().unwrap();
     let workspace = tmp.path().join("ws");
-    let state_dir = tmp.path().join("ws.xvfs");
+    let state_dir = existing_state.unwrap_or_else(|| tmp.path().join("ws.xvfs"));
 
     let daemon = Daemon::start(DaemonConfig {
       state_dir: state_dir.clone(),

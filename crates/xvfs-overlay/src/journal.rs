@@ -251,7 +251,9 @@ impl Journal {
       [next_content_id.to_string()],
     )
     .map_err(db)?;
+    crate::fault::trip(crate::fault::point::JOURNAL_UNCOMMITTED);
     tx.commit().map_err(db)?;
+    crate::fault::trip(crate::fault::point::JOURNAL_COMMITTED);
     Ok(())
   }
 

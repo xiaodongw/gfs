@@ -21,6 +21,18 @@ use std::time::Duration;
 /// Git tree in the M0.1 corpus comes near it.
 pub const MAX_PATH_BYTES: usize = 4096;
 
+/// Longest accepted single path component, in bytes.
+///
+/// POSIX's `NAME_MAX`, which every ordinary Linux filesystem enforces. Git does
+/// not impose one, so this is a deliberate narrowing: a workspace that accepted a
+/// 300-byte file name would produce a tree that cannot be checked out anywhere
+/// else, and the failure would arrive at `git checkout` on someone else's machine
+/// rather than at the write that caused it.
+///
+/// Reported by `statfs` as `f_namemax`, which is what makes the kernel refuse an
+/// over-long component before it ever becomes an upcall.
+pub const MAX_NAME_BYTES: usize = 255;
+
 /// Deepest accepted path. Guards tree traversal, which walks one tree object per
 /// component and therefore does one object read per component.
 pub const MAX_PATH_COMPONENTS: usize = 256;

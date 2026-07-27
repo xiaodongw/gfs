@@ -101,15 +101,56 @@ impl std::fmt::Debug for Generation {
   }
 }
 
+/// How long an unmount may wait for the kernel before it is forced.
+///
+/// A plain `umount` of a filesystem with an open descriptor fails with `EBUSY`,
+/// and `fuser`'s `umount_and_join` then waits for a session thread that will not
+/// exit — so an unbounded teardown hangs for as long as one process holds one
+/// file. That is the wrong failure for job cleanup: ADR 0003 already establishes
+/// that a leaked mount point is visible and inert (`ENOTCONN`), while a cleanup
+/// step that never returns strands the whole job.
+const UNMOUNT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Unmount, and force it if the kernel will not cooperate in time.
+///
+/// The lazy unmount detaches the mount point immediately and lets the kernel
+/// release it once the last descriptor closes, which is exactly the semantics a
+/// teardown wants: the workspace stops being reachable now, and the process that
+/// is still reading finishes reading.
+async fn unmount_session(session: fuser::BackgroundSession, mountpoint: PathBuf, generation: u64) {
+  let mut joined = Box::pin(tokio::task::spawn_blocking(move || {
+    session.umount_and_join()
+  }));
+  if tokio::time::timeout(UNMOUNT_TIMEOUT, &mut joined)
+    .await
+    .is_ok()
+  {
+    return;
+  }
+  tracing::warn!(
+    generation,
+    mountpoint = %mountpoint.display(),
+    "the mount is still busy after the unmount timeout; forcing a lazy unmount"
+  );
+  let _ = std::process::Command::new("fusermount3")
+    .args(["-u", "-z"])
+    .arg(&mountpoint)
+    .stdout(std::process::Stdio::null())
+    .stderr(std::process::Stdio::null())
+    .status();
+  if tokio::time::timeout(UNMOUNT_TIMEOUT, joined).await.is_err() {
+    tracing::error!(
+      generation,
+      "the FUSE session thread did not exit even after a lazy unmount"
+    );
+  }
+}
+
 impl Generation {
   /// Unmount and release, in that order. See the module docs on ordering.
   async fn tear_down(mut self) {
     if let Some(session) = self.session.take() {
-      // `umount_and_join` waits for the session thread, so by the time it
-      // returns the kernel has no path back into this filesystem.
-      if let Err(e) = session.umount_and_join() {
-        tracing::warn!(generation = self.number, error = %e, "unmount failed");
-      }
+      unmount_session(session, self.mountpoint.clone(), self.number).await;
     }
     if let Err(e) = self.client.release_mount(self.monitor.mount_id()).await {
       // Not fatal: the lease expires on its own. Logged because a release that
@@ -536,14 +577,16 @@ impl Daemon {
     // Swapped out under the lock and torn down outside it: `tear_down` awaits,
     // and holding a `std::sync::Mutex` across an await is how a daemon deadlocks
     // on its own shutdown.
-    let placeholder = {
+    let (placeholder, generation, point) = {
       let mut current = self.current.lock().expect("current generation");
-      current.session.take()
+      (
+        current.session.take(),
+        current.number,
+        current.mountpoint.clone(),
+      )
     };
     if let Some(session) = placeholder {
-      if let Err(e) = session.umount_and_join() {
-        tracing::warn!(error = %e, "unmount failed during shutdown");
-      }
+      unmount_session(session, point, generation).await;
     }
     let (client, monitor, mountpoint) = {
       let current = self.current.lock().expect("current generation");

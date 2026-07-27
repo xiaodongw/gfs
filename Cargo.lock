@@ -2645,8 +2645,10 @@ name = "xvfs-test"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "serde_json",
  "sha1",
  "tempfile",
+ "xvfs-overlay",
  "xvfs-types",
 ]
 

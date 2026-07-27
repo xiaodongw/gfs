@@ -41,6 +41,7 @@
 pub mod diff;
 pub mod error;
 pub mod export;
+pub mod fault;
 pub mod hash;
 pub mod journal;
 pub mod merge;

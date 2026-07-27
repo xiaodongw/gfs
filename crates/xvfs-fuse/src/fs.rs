@@ -679,6 +679,22 @@ impl Xvfs {
   }
 }
 
+/// Refuse a component longer than `NAME_MAX` on the way *in*.
+///
+/// The kernel does not enforce this for FUSE -- its own cap is 1024 bytes -- and
+/// `f_namemax` from `statfs` is advisory, so the filesystem has to. The asymmetry
+/// is deliberate: a base path that Git already holds with an over-long name stays
+/// readable, because refusing to read what the commit contains would be worse.
+/// What is refused is *creating* one, since the resulting tree could not be
+/// checked out on any ordinary filesystem and the failure would surface on
+/// someone else's machine rather than at the write that caused it.
+fn check_name(name: &[u8]) -> Result<(), Errno> {
+  if name.len() > xvfs_types::limits::MAX_NAME_BYTES {
+    return Err(Errno::ENAMETOOLONG);
+  }
+  Ok(())
+}
+
 fn join(prefix: &[u8], suffix: &[u8]) -> Vec<u8> {
   let mut out = prefix.to_vec();
   if !out.is_empty() {
@@ -1012,6 +1028,9 @@ impl Filesystem for XvfsFilesystem {
       };
       if parent.node.is_synth() {
         return reply.error(Errno::EROFS);
+      }
+      if let Err(e) = check_name(&name) {
+        return reply.error(e);
       }
       let path = parent.path.join(&name);
       let resolved = match fs.resolve_path(&path).await {
@@ -1595,7 +1614,10 @@ impl Filesystem for XvfsFilesystem {
       1 << 20,
       (1 << 20) - stats.entries.min(1 << 20),
       BLOCK as u32,
-      xvfs_types::limits::MAX_PATH_BYTES as u32,
+      // `f_namemax`, not the path limit: this is what the kernel checks a
+      // single component against, and reporting 4096 here let a 300-byte name
+      // through into a tree nothing else could check out.
+      xvfs_types::limits::MAX_NAME_BYTES as u32,
       BLOCK as u32,
     );
   }
@@ -1709,6 +1731,9 @@ impl Filesystem for XvfsFilesystem {
       if parent.node.is_synth() {
         return reply.error(Errno::EROFS);
       }
+      if let Err(e) = check_name(&name) {
+        return reply.error(e);
+      }
       let path = parent.path.join(&name);
       let resolved = match fs.resolve_path(&path).await {
         Ok(resolved) => resolved,
@@ -1753,6 +1778,9 @@ impl Filesystem for XvfsFilesystem {
       };
       if parent.node.is_synth() {
         return reply.error(Errno::EROFS);
+      }
+      if let Err(e) = check_name(&name) {
+        return reply.error(e);
       }
       let path = parent.path.join(&name);
       let resolved = match fs.resolve_path(&path).await {
@@ -1996,6 +2024,7 @@ impl Xvfs {
     if from_parent.node.is_synth() || to_parent.node.is_synth() {
       return Err(Errno::EROFS);
     }
+    check_name(newname)?;
     let from = from_parent.path.join(name);
     let to = to_parent.path.join(newname);
 

@@ -56,6 +56,7 @@ impl Staged {
       .write_all(bytes)
       .map_err(|e| OverlayError::io(format!("writing staged overlay content: {e}")))?;
     self.written += bytes.len() as u64;
+    crate::fault::trip(crate::fault::point::CONTENT_STAGED);
     Ok(())
   }
 
@@ -65,6 +66,7 @@ impl Staged {
     let copied = std::io::copy(reader, &mut self.file)
       .map_err(|e| OverlayError::io(format!("copying into staged overlay content: {e}")))?;
     self.written += copied;
+    crate::fault::trip(crate::fault::point::CONTENT_STAGED);
     Ok(copied)
   }
 
@@ -146,6 +148,7 @@ impl ContentStore {
       .file
       .sync_all()
       .map_err(|e| OverlayError::io(format!("syncing staged overlay content: {e}")))?;
+    crate::fault::trip(crate::fault::point::CONTENT_SYNCED);
     let target = self.path_of(id);
     let shard = target.parent().expect("a sharded path has a parent");
     std::fs::create_dir_all(shard)
@@ -157,6 +160,7 @@ impl ContentStore {
     // function now closes the file without removing the name it no longer owns.
     staged.armed = false;
     sync_dir(shard)?;
+    crate::fault::trip(crate::fault::point::CONTENT_PUBLISHED);
     Ok(size)
   }
 

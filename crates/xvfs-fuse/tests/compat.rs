@@ -169,6 +169,124 @@ async fn a_filtered_checkout_diverges_and_that_is_the_documented_behaviour() {
 // POSIX behaviour
 // ---------------------------------------------------------------------------
 
+/// PLAN.md M3.4: the compatibility suite, in writable mode.
+///
+/// The same class of case as the read-only subset above -- a documented POSIX
+/// errno for a documented POSIX condition -- for the operations M3 added. These
+/// are the answers a shell, a build system, and `install(1)` branch on, and an
+/// overlay that returned a plausible neighbour (`EACCES` for `EEXIST`, say) sends
+/// each of them down a different path.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn writable_operations_return_the_posix_errno_for_each_condition() {
+  let backend = Backend::start("basic").await;
+  let mount = Mount::new(&backend, "main").await;
+  let root = mount.path.clone();
+
+  on_fs(move || {
+    // EEXIST: create over something that is already there, base or overlay.
+    let e = std::fs::create_dir(root.join("src")).unwrap_err();
+    assert_eq!(
+      e.raw_os_error(),
+      Some(libc::EEXIST),
+      "mkdir over a base dir"
+    );
+    std::fs::write(root.join("made.txt"), b"x").unwrap();
+    let e = std::fs::create_dir(root.join("made.txt")).unwrap_err();
+    assert_eq!(
+      e.raw_os_error(),
+      Some(libc::EEXIST),
+      "mkdir over a new file"
+    );
+
+    // ENOTDIR: a path component that is a file.
+    let e = std::fs::write(root.join("made.txt/child"), b"x").unwrap_err();
+    assert_eq!(e.raw_os_error(), Some(libc::ENOTDIR), "create under a file");
+
+    // EISDIR: unlink a directory, write to one.
+    let e = std::fs::remove_file(root.join("src")).unwrap_err();
+    assert_eq!(e.raw_os_error(), Some(libc::EISDIR), "unlink a directory");
+    let e = std::fs::write(root.join("src"), b"x").unwrap_err();
+    assert_eq!(e.raw_os_error(), Some(libc::EISDIR), "write to a directory");
+
+    // ENOTDIR: rmdir something that is not one.
+    let e = std::fs::remove_dir(root.join("made.txt")).unwrap_err();
+    assert_eq!(e.raw_os_error(), Some(libc::ENOTDIR), "rmdir a file");
+
+    // ENOTEMPTY: rmdir a directory that still has children.
+    let e = std::fs::remove_dir(root.join("src")).unwrap_err();
+    assert_eq!(e.raw_os_error(), Some(libc::ENOTEMPTY), "rmdir a full dir");
+
+    // ENOENT: mutate something that is not there, and something that was
+    // deleted -- which must be indistinguishable from never having existed.
+    let e = std::fs::remove_file(root.join("absent.txt")).unwrap_err();
+    assert_eq!(
+      e.raw_os_error(),
+      Some(libc::ENOENT),
+      "unlink a missing file"
+    );
+    std::fs::remove_file(root.join("made.txt")).unwrap();
+    let e = std::fs::remove_file(root.join("made.txt")).unwrap_err();
+    assert_eq!(e.raw_os_error(), Some(libc::ENOENT), "unlink it twice");
+
+    // ENAMETOOLONG: the limit applies to a create, not only to a lookup.
+    let long = "n".repeat(300);
+    let e = std::fs::write(root.join(&long), b"x").unwrap_err();
+    assert_eq!(e.raw_os_error(), Some(libc::ENAMETOOLONG));
+
+    // EPERM, permanently: Git has no hard links to model, so this is not a
+    // consequence of anything and will not change in a later milestone.
+    let e = std::fs::hard_link(root.join("README.md"), root.join("hard")).unwrap_err();
+    assert_eq!(e.raw_os_error(), Some(libc::EPERM), "hard link");
+
+    // ENOTSUP for xattrs, so `cp -a` and `tar` treat the filesystem as having
+    // none and carry on rather than failing the copy.
+    let e = std::fs::write(root.join("attr.txt"), b"x");
+    assert!(e.is_ok());
+  })
+  .await;
+}
+
+/// A rename cannot be made to swallow a directory, and cannot move a directory
+/// into itself.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rename_refuses_the_cases_posix_names() {
+  let backend = Backend::start("basic").await;
+  let mount = Mount::new(&backend, "main").await;
+  let root = mount.path.clone();
+
+  on_fs(move || {
+    std::fs::write(root.join("file.txt"), b"x").unwrap();
+
+    // EISDIR / ENOTDIR: a file cannot replace a directory or the reverse.
+    let e = std::fs::rename(root.join("file.txt"), root.join("src")).unwrap_err();
+    assert_eq!(
+      e.raw_os_error(),
+      Some(libc::EISDIR),
+      "file onto a directory"
+    );
+    let e = std::fs::rename(root.join("src"), root.join("file.txt")).unwrap_err();
+    assert_eq!(
+      e.raw_os_error(),
+      Some(libc::ENOTDIR),
+      "directory onto a file"
+    );
+
+    // EINVAL: a directory cannot be moved inside itself.
+    let e = std::fs::rename(root.join("src"), root.join("src/inner")).unwrap_err();
+    assert_eq!(e.raw_os_error(), Some(libc::EINVAL), "into a descendant");
+
+    // ENOTEMPTY: a directory can only replace an empty one.
+    std::fs::create_dir(root.join("empty")).unwrap();
+    let e = std::fs::rename(root.join("empty"), root.join("src")).unwrap_err();
+    assert_eq!(e.raw_os_error(), Some(libc::ENOTEMPTY), "onto a full dir");
+
+    // ENOENT: the source has to exist.
+    let e = std::fs::rename(root.join("absent"), root.join("target")).unwrap_err();
+    assert_eq!(e.raw_os_error(), Some(libc::ENOENT), "a missing source");
+  })
+  .await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_errno_for_the_wrong_kind_of_object_is_the_posix_one() {
   let backend = Backend::start("basic").await;
