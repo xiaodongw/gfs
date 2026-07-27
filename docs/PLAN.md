@@ -391,7 +391,7 @@ Duration: 3–4 weeks
 > | --- | --- | --- |
 > | M2.1 mount lifecycle | ✅ | `daemon.rs`, `state.rs`, `publish.rs`, `lease.rs`, `control.rs` |
 > | M2.2 metadata and inode model | ✅ | `inode.rs`, `attr.rs`, `fs.rs` |
-> | M2.3 blob cache and reads | ✅ | `cache.rs`, `client.rs` |
+> | M2.3 blob cache and reads | ✅ | `cache.rs`, `client.rs`, `tests/mmap.rs` |
 > | M2.4 compatibility tests | ⚠️ `pjdfstest`/xfstests **not run** | `tests/compat.rs`, `xvfs-test/src/oracle.rs`, `bin/xvfs-git-shim.rs` |
 >
 > Measured: cold mount to a usable root in **99 ms** having downloaded **zero**
@@ -407,6 +407,13 @@ Duration: 3–4 weeks
 > pipe open so `xvfs mount | tee` never terminates; and a symlink target resolves
 > relative to the link's directory, so a relative `--state-dir` published a
 > workspace pointing nowhere.
+>
+> The mmap question M2.3 raised is answered and recorded as a compatibility
+> boundary ([ADR 0006 amendment](adr/0006-mvp-boundary-and-policies.md)):
+> read-only mapping works, writable `MAP_SHARED` works on FUSE **without**
+> `FUSE_WRITEBACK_CACHE`, and XVFS therefore does not enable that capability —
+> it would hand `size` and `mtime` to the kernel, which the overlay logical clock
+> cannot allow.
 >
 > **One gap carries forward.** `pjdfstest` and xfstests were **not run** — neither
 > is installed here nor packaged as a Rust dependency — and `tests/compat.rs`

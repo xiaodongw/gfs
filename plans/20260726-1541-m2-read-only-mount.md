@@ -206,6 +206,19 @@ Git repository would replace a working `git` with a crippled one, so it walks up
 looking for `.git/xvfs.json` specifically and fails with "not an XVFS workspace"
 when it finds none.
 
+### XVFS does not enable `FUSE_WRITEBACK_CACHE`
+
+Added after the milestone, closing PLAN.md M2.3's open mmap bullet. Measured in
+`tests/mmap.rs`: writable `MAP_SHARED` works on FUSE **without** the writeback
+cache, so the capability buys nothing we need — and enabling it would hand `size`
+and `mtime` to the kernel, which ADR 0006's overlay logical clock cannot allow,
+because the daemon has to assign `mtime` for an edit to be provably newer than
+the base under host clock skew.
+
+The write side needed its own one-file probe filesystem: XVFS refuses a
+read-write `open`, so a writable mapping fails before `mmap` is reached and
+measuring against the real mount would only re-measure that it is read-only.
+
 ### Refusals exit 2, not 1
 
 `git diff --quiet` uses exit 1 to mean "there were differences". A refusal that

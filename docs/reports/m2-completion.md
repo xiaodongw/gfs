@@ -40,6 +40,8 @@ debug build, server and client in one process over loopback.
 | 50 `stat(2)` calls on a *missing* path | **≤ 2** round trips | — |
 | 8 concurrent opens of one 12 MiB blob | **1** download | — |
 | Warm cache after an unclean daemon exit | **0 bytes re-fetched, 0 verification failures** | no corruption |
+| Read-only `mmap` (`MAP_PRIVATE` and `MAP_SHARED`) of a mounted file | **works** | supported |
+| Writable `MAP_SHARED` on FUSE **without** `FUSE_WRITEBACK_CACHE` | **works** | — |
 
 The zero in row two is the load-bearing one. The 10 MiB figure in ADR 0006 is a
 ceiling; a mount reaches a usable root having downloaded no file content at all,
@@ -68,6 +70,33 @@ The `grep -r` measurement also demonstrates the cost DESIGN.md section 8.4 warns
 about rather than hiding it: sweeping the tree hydrated every blob in it. A
 program that opens every file hydrates every file unless a budget stops it, and
 M6.2 owns that budget.
+
+### The mmap compatibility boundary
+
+PLAN.md M2.3 asks whether writable `MAP_SHARED` is available and whether enabling
+the FUSE writeback cache to get it is acceptable, "recorded as a compatibility
+boundary either way". Measured in `tests/mmap.rs`; the answer and its reasoning
+are in an [ADR 0006 amendment](../adr/0006-mvp-boundary-and-policies.md).
+
+Read-only `mmap` works against the mount today, both `MAP_PRIVATE` and
+`MAP_SHARED` — which is what a language server or a compiler that maps its inputs
+needs. A writable mapping is refused at `open(2)` with `EROFS`, before `mmap` is
+reached, so the FUSE-level question needed a separate one-file probe filesystem
+to answer: XVFS refuses a read-write open, and measuring against it would only
+re-measure that.
+
+**Writable `MAP_SHARED` works without `FUSE_WRITEBACK_CACHE`, so XVFS does not
+enable it.** That is the useful half of the result, because enabling writeback
+would have been actively harmful: it transfers ownership of `size` and `mtime` to
+the kernel, and ADR 0006's overlay logical clock requires the *daemon* to assign
+`mtime` so an acknowledged edit is strictly newer than the base even under host
+clock skew. A kernel-assigned `mtime` from the host clock is exactly the case
+that policy was written to survive. The requirement that looked like it would
+force writeback on us turns out not to need it.
+
+M3.2 therefore implements mutation with the daemon owning size and mtime, and
+must not reach for `FUSE_WRITEBACK_CACHE` to solve a write-performance problem
+without reopening the timestamp policy at the same time.
 
 ## Findings that changed something
 
@@ -159,6 +188,14 @@ than the suites.
 This is a real gap. It should close before M6.1, alongside the other deployment
 work, and it is cheap: the suites are packaged for Debian and Ubuntu.
 
+### The mmap measurement is one kernel
+
+`tests/mmap.rs` ran on Linux 6.18.33.2 (WSL2) only. The hosted runner is
+unmeasured, which is the same scope caveat ADR 0003 carries for the deployment
+matrix, and the two should be re-run together before M6.1. If a target kernel
+refuses a shared writable mapping without the writeback cache, the decision above
+has to be reopened *together with* the timestamp policy rather than separately.
+
 ### The cross-UID bind-mount path is still unmeasured here
 
 `user_allow_other` remains unset in `/etc/fuse.conf` on this host, so M2's tests
@@ -201,6 +238,7 @@ reason: there is nothing yet to write.
 | `tests/lifecycle.rs` | 8 | ordering, `mount.json`, control socket, lease renewal and failure, refresh generations, double-start refusal |
 | `tests/compat.rs` | 20 | raw-tree oracle over 7 fixtures, filtered-checkout divergence, POSIX subset, stock Git against the surface, the shim's frozen grammar |
 | `tests/exit_criteria.rs` | 8 | the six criteria above |
+| `tests/mmap.rs` | 5 | read-only mapping of the mount; writable `MAP_SHARED` on FUSE with and without the writeback cache |
 
 `scripts/check.sh` now fails when `/dev/fuse` or `fusermount3` is missing rather
 than letting the mount tests fail obscurely, and `scripts/dev-stack.sh`

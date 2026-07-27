@@ -198,3 +198,61 @@ These two are **not** engineering decisions and are recorded as open:
 2. **Whether patch export suffices for the first integration** (question 5). If
    the review pipeline requires real commits, M8 moves ahead of M7 and the
    critical path lengthens.
+
+## Amendment, 2026-07-26: mmap and the FUSE writeback cache
+
+PLAN.md M2.3 left one question open: "Determine whether writable `MAP_SHARED` is
+available in the target deployment and whether enabling the writeback cache to
+get it is acceptable; record the answer as a compatibility boundary either way."
+Measured in `crates/xvfs-fuse/tests/mmap.rs` on Linux 6.18.33.2 (WSL2).
+
+| Mapping | Against | Result |
+| --- | --- | --- |
+| `MAP_PRIVATE`, `PROT_READ` | the XVFS mount | works |
+| `MAP_SHARED`, `PROT_READ` | the XVFS mount, 4 MiB file | works |
+| `MAP_SHARED`, `PROT_READ\|PROT_WRITE` | the XVFS mount | `EROFS` at `open(2)`, before `mmap` |
+| `MAP_SHARED`, `PROT_READ\|PROT_WRITE`, **no** `FUSE_WRITEBACK_CACHE` | a writable probe filesystem | **works**; one `write` request; dirtied bytes reach the filesystem |
+| `MAP_SHARED`, `PROT_READ\|PROT_WRITE`, **with** `FUSE_WRITEBACK_CACHE` | the same probe | works; capability granted |
+
+The write side needed a second filesystem because XVFS refuses a read-write
+`open`, so a writable mapping never reaches `mmap`. The question is a property of
+FUSE, not of XVFS, and `tests/mmap.rs` mounts a one-file in-memory probe twice to
+answer it.
+
+### Decision
+
+**Writable `MAP_SHARED` is supported, and XVFS does not enable
+`FUSE_WRITEBACK_CACHE`.**
+
+The capability is not needed for it — the mapping works without it on this
+kernel — and enabling it would be actively harmful here. `FUSE_WRITEBACK_CACHE`
+transfers ownership of `size` and `mtime` to the kernel. This ADR's own
+timestamp policy requires the opposite:
+
+```text
+new_overlay_time = max(host_wall_clock, snapshot_time + one_tick,
+                       prior_entry_time + one_tick)
+```
+
+That formula exists so an acknowledged local edit is strictly newer than the base
+even for a future-dated commit or a host clock skewed backwards, and it is only
+enforceable if the daemon assigns `mtime`. A kernel-assigned `mtime` from the
+host clock is precisely the skew case the policy was written to survive.
+
+So the two requirements do not conflict: the one that would have forced writeback
+on us turns out not to need it.
+
+### Consequences
+
+- M3.2 implements mutation with the daemon owning `size` and `mtime`, and must
+  not enable `FUSE_WRITEBACK_CACHE` to "fix" a write-performance problem without
+  revisiting the timestamp policy first.
+- The compatibility boundary gains a line: **read-only `mmap` is supported;
+  writable `MAP_SHARED` is supported from M3 on overlay files, and remains
+  `EROFS` on base files for the life of the MVP** — the base is an immutable
+  commit, so there is nothing for a shared writable mapping of it to mean.
+- **Scope caveat, the same one ADR 0003 carries.** This is one kernel. The
+  hosted runner is unmeasured, and `tests/mmap.rs` should be re-run there
+  alongside `spikes/fuse-probe/deployment-matrix.sh` before M6.1. If a target
+  kernel refuses the mapping without writeback, the decision above has to be
+  reopened *together with* the timestamp policy, not separately.
