@@ -23,7 +23,7 @@
 //!
 //! The overlay is local SQLite rather than network, but it is still blocking
 //! work, and a copy-up streams a whole blob. Every overlay mutation therefore
-//! runs on a blocking pool through [`Xvfs::blocking`], which keeps the same rule
+//! runs on a blocking pool through `Xvfs::blocking`, which keeps the same rule
 //! for the same reason.
 //!
 //! # Three worlds, resolved in one order
@@ -31,7 +31,7 @@
 //! `lookup` consults, in order: the synthesized `.git` surface, the overlay, and
 //! the pinned base. The order is not arbitrary — the overlay's answer *replaces*
 //! the base's, including the answer "this path is gone" — and it is implemented
-//! once, in [`Xvfs::resolve_path`], so `readdir` and every mutation agree with
+//! once, in `Xvfs::resolve_path`, so `readdir` and every mutation agree with
 //! `lookup` about what exists.
 //!
 //! # Caching TTLs are long, and the overlay is what makes that need care

@@ -58,7 +58,7 @@ behavior required by real builds.
 | M0: feasibility ✅ | Highest-risk assumptions measured | **Complete — conditional go**, see [go/no-go](../spikes/reports/m0-go-no-go.md) |
 | M1: repository API ✅ | Exact revision/tree/file access, retained for the life of a mount | **Complete**, see [M1 report](reports/m1-completion.md) |
 | M2: read-only mount ✅ | Lazy snapshot is usable as a workspace, `.git` surface included | **Complete**, see [M2 report](reports/m2-completion.md) |
-| M3: writable workspace | Crash-safe overlay and patch export | Mutation model and recovery tests pass |
+| M3: writable workspace ✅ | Crash-safe overlay and patch export | **Complete**, see [M3 report](reports/m3-completion.md) |
 | M4: agent search | Search does not hydrate base, sees edits, and separates execution status from scoped coverage | Results match the supported materialized `rg` corpus |
 | M5: Git compatibility | Stock Git clone/fetch works | Version/protocol matrix passes |
 | M6: hosted pilot | End-to-end jobs run safely | Performance and reliability gates met |
@@ -507,9 +507,47 @@ Exit criteria:
   remain valid until close and no kernel-cached path mixes generations.
 - Daemon or server failure does not corrupt the shared cache.
 
-## 6. M3 — Writable overlay and export
+## 6. M3 — Writable overlay and export ✅ COMPLETE
 
 Duration: 3–4 weeks
+
+> **Status: complete, 2026-07-26.** All three exit criteria met; see the
+> [M3 completion report](reports/m3-completion.md).
+>
+> Code is in [`crates/xvfs-overlay/`](../crates/xvfs-overlay/), the mutation
+> surface is `xvfs-fuse/src/fs.rs`, and the commands are
+> `xvfs status|diff|export` plus the rewired `git` shim.
+>
+> | Sub-milestone | Status | Deliverable |
+> | --- | --- | --- |
+> | M3.1 overlay data model | ✅ | `state.rs`, `journal.rs`, `store.rs`, `merge.rs`, `model.rs` |
+> | M3.2 mutation operations | ✅ | `xvfs-fuse/src/fs.rs`, `inode.rs`, `attr.rs` |
+> | M3.3 status and diff | ✅ | `status.rs`, `diff.rs`, `export.rs`, `blobs.rs`, `xvfs-git-shim` |
+> | M3.4 crash and concurrency | ⚠️ `pjdfstest`/xfstests **still not run** | `fault.rs`, `xvfs-overlay-crash`, `tests/faults.rs` |
+>
+> Measured: `status` over a 5002-entry directory with two changes costs **zero**
+> metadata requests, **zero** directory pages, and **zero** blob bytes; a
+> directory rename, a `chmod +x` on a 12 MiB blob, and an `O_TRUNC` over one all
+> transfer **zero** bytes.
+>
+> Three findings would have shipped a broken feature rather than a wrong detail:
+> the mount was still mounted `MountOption::RO`, so the whole write path was
+> unreachable from any syscall; the kernel relinks a dentry across `rename(2)`
+> rather than looking the destination up again, so a renamed directory listed
+> empty; and `shutdown()` blocked forever when any descriptor was still open.
+> Nine more are in the report, including a Myers backtrack that silently dropped
+> every hunk's leading context line and a verifier that blamed the export for the
+> developer's `core.autocrlf`.
+>
+> **One gap carries forward unchanged from M2.** `pjdfstest` and xfstests are
+> still not run; `tests/compat.rs` now covers a hand-written *writable* subset on
+> top of the read-only one. It should close before M6.1.
+>
+> One scope note: `Status::directory_deletions` reports a directory whiteout
+> whose per-file record is not in the journal. Every mutation path that occurs in
+> practice leaves the per-file record, so it is empty for an ordinary edit set and
+> the exit-criterion test asserts that; it is reported rather than omitted so a
+> consumer knows when the patch is not the whole story.
 
 ### M3.1 Overlay data model
 

@@ -65,7 +65,10 @@ writable mode.
 
 ## Decisions
 
-_Filled in as the work proceeds; see the completion report for the final set._
+The full set, with the reasoning that survived contact with the implementation,
+is in [`docs/reports/m3-completion.md`](../docs/reports/m3-completion.md). The
+ones below are the load-bearing ones, plus the four the implementation forced
+that were not in the original plan.
 
 ### The journal is durable state; memory is the index
 
@@ -111,6 +114,64 @@ because status computes the Git OID of the local content and compares it with
 the base OID. Only changed paths are hashed, so the cost is proportional to the
 edit set rather than to the tree.
 
+### Forced during implementation: whiteouts are never dropped as redundant
+
+The original plan let `rmdir` delete the per-file whiteouts under a directory,
+since the directory whiteout already hides them. That would have made status and
+export walk the base subtree to find out what to delete. `rm -rf` unlinks each
+child first, so the per-file record already exists; keeping it is what lets
+status be journal-only for every case that occurs in practice.
+
+### Forced during implementation: `readdir` extras are keyed on base names
+
+The plan assumed a row that records base facts is one the base listing will also
+produce. After a rename that is false — the row remembers the base of the path it
+came *from* — so extras are decided by the names the base listing actually
+produced.
+
+### Forced during implementation: the inode table follows a rename
+
+The kernel does not look a path up again after `rename(2)`; it relinks the dentry
+it has. The destination therefore arrives carrying the source's inode number, and
+a table that did not follow answered the next request out of the source's record.
+
+### Forced during implementation: teardown is bounded
+
+`umount` of a busy filesystem fails with `EBUSY` and `umount_and_join` then waits
+forever. Job cleanup falls back to a lazy unmount after a timeout.
+
 ## Details
 
-_Filled in as the work proceeds._
+### The guarantee, stated precisely
+
+- **the daemon dies**: every committed transaction survives, so every
+  acknowledged mutation is recoverable. This is what `synchronous = NORMAL` buys
+  without an fsync per metadata operation.
+- **the host dies**: recent commits may be lost unless something forced them out,
+  which is what `fsync(2)` on a mounted file does.
+
+### What the mount reports differently from M2
+
+- base files are `0644`/`0755` rather than `0444`/`0555`, because with a
+  copy-on-write overlay behind them they are writable;
+- `MountOption::RO` is gone, and the synthesized `.git` surface is what stays
+  read-only;
+- `statfs` reports `f_namemax` as 255 rather than the path limit, and creating a
+  longer component is `ENAMETOOLONG`;
+- `FUSE_ATOMIC_O_TRUNC` is requested, so replacing a file does not first
+  download it.
+
+### Where things live
+
+```text
+<state-dir>/
+  mount.json            M2
+  generations/<n>       M2: the FUSE mount point
+  overlay/<n>/
+    overlay.sqlite      the journal
+    files/<shard>/<id>  content
+```
+
+One overlay per mount generation, bound to that generation's commit. `xvfs
+refresh` refuses a non-empty overlay, and a retired generation's (empty) overlay
+directory is removed with it.

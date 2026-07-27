@@ -328,6 +328,42 @@ fn comparable(tree: xvfs_test::TreeSnapshot) -> xvfs_test::TreeSnapshot {
     .collect()
 }
 
+/// The cost model, measured rather than asserted in the abstract.
+///
+/// Run with `--nocapture`; `docs/reports/m3-completion.md` quotes the numbers.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn status_costs_no_base_metadata_and_no_blob_bytes() {
+  // `bigdir` is 5002 entries in one directory. Stock `git status` against a
+  // partial clone stats every index entry (ADR 0005 measured 94 850 on the Linux
+  // kernel); this must stat none of them.
+  let backend = Backend::start("bigdir").await;
+  let job = Job::start(&backend, "main").await;
+  let ws = job.workspace.clone();
+
+  on_fs(move || {
+    std::fs::write(ws.join("many/edited.txt"), b"edited\n").unwrap();
+    std::fs::remove_file(ws.join("many/pager.h")).unwrap();
+  })
+  .await;
+
+  let before = job.daemon.inspect();
+  let report = status_of(job.call(Request::Status).await);
+  let after = job.daemon.inspect();
+
+  let metadata = after.stats.metadata_requests - before.stats.metadata_requests;
+  let pages = after.stats.directory_pages - before.stats.directory_pages;
+  let bytes = after.cache.bytes_fetched - before.cache.bytes_fetched;
+  println!(
+    "M3 status over a 5002-entry directory with 2 changes: \
+     {metadata} metadata requests, {pages} directory pages, {bytes} blob bytes"
+  );
+
+  assert_eq!(report.status.changes.len(), 2);
+  assert_eq!(metadata, 0, "status must not stat the base");
+  assert_eq!(pages, 0, "status must not list the base");
+  assert_eq!(bytes, 0, "status must not fetch content");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_shim_reports_the_overlay_rather_than_a_clean_tree() {
   let backend = Backend::start("basic").await;
