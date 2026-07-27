@@ -80,6 +80,11 @@ protoc-bin-vendored = "3"
 axum = "0.8"
 hyper-util = { version = "0.1", features = ["client", "client-legacy", "http1", "tokio"] }
 bytes = "1"
+# gzip request bodies on the Git gateway. Git clients compress `git-upload-pack`
+# POST bodies, so this is on the wire path rather than optional: without it a
+# stock client's fetch fails. Decompression is bounded by both an absolute
+# output cap and an expansion ratio -- see `gateway::upload_pack`.
+flate2 = "1"
 tower = "0.5"
 tower-http = { version = "0.6", features = ["limit", "timeout", "trace"] }
 http = "1"
