@@ -125,6 +125,25 @@ impl BytePath {
     Ok(())
   }
 
+  /// Whether the path is rejected specifically for being *too long*, as opposed
+  /// to malformed.
+  ///
+  /// [`BytePath::validate`] reports both through one `InvalidArgument`, which is
+  /// the right service vocabulary but the wrong POSIX one: a caller at a syscall
+  /// boundary owes `ENAMETOOLONG` for a long path and `EINVAL` for a malformed
+  /// one, and a filesystem that returns the same errno for both tells a program
+  /// that its path is wrong when the truth is that it is merely large.
+  ///
+  /// Both length limits count, because POSIX spells both `ENAMETOOLONG`: the
+  /// byte length, and the component count that bounds tree traversal.
+  pub fn exceeds_length_limits(&self) -> bool {
+    if self.0.len() > limits::MAX_PATH_BYTES {
+      return true;
+    }
+    self.0.split(|b| *b == b'/').filter(|c| !c.is_empty()).count()
+      > limits::MAX_PATH_COMPONENTS
+  }
+
   /// Lossless display form: valid UTF-8 verbatim, anything else escaped. The
   /// escape is unambiguous because a literal backslash is doubled.
   pub fn escaped(&self) -> String {

@@ -422,10 +422,13 @@ Duration: 3–4 weeks
 > **Update, 2026-07-27: `pjdfstest` now runs**, built from source and driven by
 > [`spikes/conformance/pjdfstest.sh`](../spikes/conformance/pjdfstest.sh) against
 > an ext4 control, because the suite requires root and 76 of its 238 files fail
-> on ext4 without it. 37 files fail on XVFS and not on ext4; three of those look
-> like defects rather than documented divergence — `EIO` for some long-path
-> shapes, directory mtime/ctime never moving when a child changes, and
-> `UTIME_OMIT` being ignored. See the
+> on ext4 without it. 37 files failed on XVFS and not on ext4. **Two were defects
+> and are fixed**: a too-long path reported as `EIO` rather than `ENAMETOOLONG`,
+> because the overlay's blanket error conversion treated its own local argument
+> validation as a storage failure; and a directory's mtime and ctime never
+> advancing when its contents changed, which anything keyed on directory mtime
+> relies on. 35 remain, and the largest single cause is that the overlay does not
+> model `atime` — a scope decision rather than a bug. See the
 > [POSIX conformance report](reports/posix-conformance.md).
 >
 > **xfstests is still not run** and is not a script invocation away: it wants a
@@ -556,6 +559,7 @@ Duration: 3–4 weeks
 > `pjdfstest` and xfstests were still not run at M3; `tests/compat.rs` covers a
 > hand-written *writable* subset on top of the read-only one. `pjdfstest` was run
 > on 2026-07-27 and found 37 files failing on XVFS that pass on an ext4 control
+> (35 after two fixes)
 > — including two of the writable paths M3 built, where a directory's mtime and
 > ctime do not move when a child is created or removed. See the
 > [POSIX conformance report](reports/posix-conformance.md). xfstests remains

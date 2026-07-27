@@ -57,6 +57,7 @@ use std::sync::Mutex;
 use xvfs_types::{BytePath, Timestamp};
 
 pub use error::{Condition, OverlayError, Result};
+
 pub use export::{ExportReport, Exporter};
 pub use journal::{Binding, Change, Journal, OVERLAY_FORMAT_VERSION};
 pub use merge::{BaseChild, Resolution};
@@ -65,6 +66,27 @@ pub use state::{
 };
 pub use status::{ChangeKind, Status};
 pub use store::{ContentStore, SweepReport};
+
+/// Validate a path for a syscall caller, splitting "too long" from "malformed".
+///
+/// [`BytePath::validate`] answers in the *service* vocabulary, where both are
+/// `InvalidArgument`. A syscall caller needs `ENAMETOOLONG` for one and `EINVAL`
+/// for the other, so the length question is asked first and separately.
+///
+/// Every overlay entry point that takes a caller-supplied path goes through
+/// here. Calling `validate` directly is what produced the bug this replaces: a
+/// 4 097-byte path reached `open` as `EIO`.
+pub fn path_condition(path: &BytePath) -> Result<()> {
+  if path.exceeds_length_limits() {
+    return Err(OverlayError::name_too_long(format!(
+      "path is longer than this filesystem can represent: {}",
+      path.escaped()
+    )));
+  }
+  path.validate()?;
+  Ok(())
+}
+
 
 /// Where overlay inode numbers start.
 ///
@@ -539,7 +561,7 @@ impl Overlay {
     ino: u64,
     executable: bool,
   ) -> Result<OverlayEntry> {
-    path.validate()?;
+    path_condition(path)?;
     let mut inner = self.lock();
     Self::check_parent(&inner, path, parent_base.as_ref())?;
     if Self::existing(&inner, path, base.as_ref()).is_some() {
@@ -580,7 +602,7 @@ impl Overlay {
     parent_base: Option<BaseFacts>,
     ino: u64,
   ) -> Result<OverlayEntry> {
-    path.validate()?;
+    path_condition(path)?;
     let mut inner = self.lock();
     Self::check_parent(&inner, path, parent_base.as_ref())?;
     if Self::existing(&inner, path, base.as_ref()).is_some() {
@@ -617,7 +639,7 @@ impl Overlay {
     parent_base: Option<BaseFacts>,
     ino: u64,
   ) -> Result<OverlayEntry> {
-    path.validate()?;
+    path_condition(path)?;
     if target.is_empty() || target.contains(&0) {
       return Err(OverlayError::invalid("a symlink target must be non-empty"));
     }
@@ -663,7 +685,7 @@ impl Overlay {
     ino: u64,
     source: Source<'_>,
   ) -> Result<OverlayEntry> {
-    path.validate()?;
+    path_condition(path)?;
     let mut inner = self.lock();
     // Resolved rather than looked up: a whiteout, or a path under one, is
     // *absent*, and treating it as "no row yet, use the base facts" would copy
@@ -908,7 +930,7 @@ impl Overlay {
   /// The resulting row keeps [`Content::Base`], so nothing is downloaded. This is
   /// the whole reason that variant exists.
   pub fn adopt(&self, path: &BytePath, base: Option<BaseFacts>, ino: u64) -> Result<OverlayEntry> {
-    path.validate()?;
+    path_condition(path)?;
     let mut inner = self.lock();
     // Resolved, not looked up: the path may be masked by a whiteout or an opaque
     // directory several levels above it, in which case there is nothing here to
@@ -1007,6 +1029,34 @@ impl Overlay {
     };
     self.commit(&mut inner, vec![Change::Put(updated.clone())], Vec::new())?;
     Ok(updated)
+  }
+
+  /// Record that a directory's contents changed.
+  ///
+  /// POSIX requires a directory's `mtime` and `ctime` to advance when an entry is
+  /// created or removed in it, and pjdfstest's `rmdir/00` and `symlink/00` check
+  /// exactly that. Before this, a mount reported the pinned commit's sanitized
+  /// snapshot time for a directory forever, however much a job changed inside it
+  /// — so a build system or watcher that keys on directory mtime, which is the
+  /// ordinary way to notice "something appeared in here", saw nothing.
+  ///
+  /// This adopts the directory into the overlay if it was base-only. That costs
+  /// one journal row per directory a job writes into, bounded by the job's edit
+  /// set rather than the repository, and it is invisible downstream:
+  /// [`Status`] skips directory rows outright because Git records no
+  /// directories, so an adopted parent produces no change, no diff hunk, and
+  /// nothing in an export.
+  ///
+  /// The caller supplies `ino` because a base directory's inode number belongs to
+  /// the client's inode table; allocating a fresh one here would change the
+  /// directory's identity underneath anything holding it open.
+  pub fn touch_directory(
+    &self,
+    path: &BytePath,
+    base: Option<BaseFacts>,
+    ino: u64,
+  ) -> Result<OverlayEntry> {
+    self.set_times(path, base, ino, None)
   }
 
   /// Remove a path: a whiteout when the base has one there, a plain delete when
@@ -1124,8 +1174,8 @@ impl Overlay {
     to_merged_is_empty: bool,
     no_replace: bool,
   ) -> Result<()> {
-    from.validate()?;
-    to.validate()?;
+    path_condition(from)?;
+    path_condition(to)?;
     if from.is_empty() || to.is_empty() {
       return Err(OverlayError::invalid("the mount root cannot be renamed"));
     }

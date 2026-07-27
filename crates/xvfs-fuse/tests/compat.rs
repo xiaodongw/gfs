@@ -607,3 +607,129 @@ async fn the_shim_works_from_a_subdirectory() {
   })
   .await;
 }
+
+// ---------------------------------------------------------------------------
+// Regressions found by pjdfstest
+//
+// `spikes/conformance/pjdfstest.sh` runs the suite against an ext4 control; these
+// two are the defects it found, kept here so they fail in `cargo test` rather
+// than only when someone remembers to run the suite.
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_path_longer_than_the_filesystem_allows_is_enametoolong_not_eio() {
+  // pjdfstest `open/03`. The path is under the kernel's PATH_MAX as passed to the
+  // syscall, so the kernel forwards it; XVFS's own limit is what rejects it, and
+  // it used to do so as `EIO` -- an internal error surfacing as "your disk
+  // failed" when the truth was "your path is too long for me". The blanket
+  // `From<XvfsError> for OverlayError` mapped every service error to
+  // `Condition::Io`, including the `InvalidArgument` its own path validation
+  // raises locally.
+  let backend = Backend::start("basic").await;
+  let mount = Mount::new(&backend, "main").await;
+  let root = mount.path.clone();
+
+  on_fs(move || {
+    // Components short enough for the kernel's NAME_MAX, deep enough that the
+    // path from the workspace root exceeds MAX_PATH_BYTES.
+    let component = "d".repeat(200);
+    let mut deep = root.clone();
+    for _ in 0..24 {
+      deep = deep.join(&component);
+    }
+    std::fs::create_dir_all(&deep).ok();
+    let e = std::fs::write(deep.join("f"), b"x").unwrap_err();
+    assert_eq!(
+      e.raw_os_error(),
+      Some(libc::ENAMETOOLONG),
+      "a too-long path must not be reported as an I/O failure"
+    );
+  })
+  .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_directorys_timestamps_advance_when_its_contents_change() {
+  // pjdfstest `rmdir/00` and `symlink/00`. A directory reported the pinned
+  // commit's sanitized snapshot time forever, however much a job wrote into it,
+  // so anything keyed on directory mtime -- the ordinary way a build system or a
+  // watcher notices that a file appeared -- saw nothing.
+  let backend = Backend::start("basic").await;
+  let mount = Mount::new(&backend, "main").await;
+  let root = mount.path.clone();
+
+  on_fs(move || {
+    let dir = root.join("timing");
+    std::fs::create_dir(&dir).unwrap();
+    let mtime = || {
+      std::fs::metadata(&dir)
+        .unwrap()
+        .modified()
+        .unwrap()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+    };
+
+    // Every step must be strictly later than the one before it. The overlay
+    // issues timestamps from its own monotonic clock, so this needs no sleep --
+    // which is also what makes it safe to assert `>` rather than `>=`.
+    let after_create_dir = mtime();
+    std::fs::write(dir.join("a.txt"), b"x").unwrap();
+    let after_create_file = mtime();
+    assert!(
+      after_create_file > after_create_dir,
+      "creating a file must advance its directory's mtime"
+    );
+
+    std::fs::rename(dir.join("a.txt"), dir.join("b.txt")).unwrap();
+    let after_rename = mtime();
+    assert!(
+      after_rename > after_create_file,
+      "renaming within a directory must advance its mtime"
+    );
+
+    std::fs::remove_file(dir.join("b.txt")).unwrap();
+    assert!(
+      mtime() > after_rename,
+      "removing a file must advance its directory's mtime"
+    );
+  })
+  .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn adopting_a_directory_for_its_timestamps_is_not_a_reportable_change() {
+  // The cost of the fix above is a journal row for every directory a job writes
+  // into. That must stay invisible downstream: `Status` skips directory rows
+  // because Git records none, and an export that listed touched directories as
+  // changes would be a patch nobody asked for.
+  let backend = Backend::start("basic").await;
+  let mount = Mount::new(&backend, "main").await;
+  let root = mount.path.clone();
+
+  on_fs({
+    let root = root.clone();
+    move || {
+      // `src` exists in the `basic` fixture, so this adopts a *base* directory.
+      std::fs::write(root.join("src/added.rs"), b"fn added() {}\n").unwrap();
+      std::fs::remove_file(root.join("src/added.rs")).unwrap();
+    }
+  })
+  .await;
+
+  let status = mount
+    .fs
+    .overlay()
+    .status(xvfs_types::HashAlgorithm::Sha1)
+    .unwrap();
+  let touched: Vec<String> = status
+    .changes
+    .iter()
+    .map(|c| c.path.escaped())
+    .filter(|p| p == "src")
+    .collect();
+  assert!(
+    touched.is_empty(),
+    "a directory adopted only to carry a timestamp was reported as a change: {touched:?}"
+  );
+}

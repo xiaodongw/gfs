@@ -13,7 +13,7 @@
 
 use std::fmt;
 
-use xvfs_types::error::XvfsError;
+use xvfs_types::error::{ErrorCode, XvfsError};
 
 /// The POSIX condition an overlay refusal corresponds to.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -30,6 +30,11 @@ pub enum Condition {
   NotEmpty,
   /// `EINVAL`
   Invalid,
+  /// `ENAMETOOLONG` — the path is well-formed but longer than the overlay can
+  /// represent. Distinct from [`Condition::Invalid`] because a program that
+  /// generated a deep path needs to know it was too long, not that it was
+  /// malformed.
+  NameTooLong,
   /// `EPERM` — refused for the life of the MVP rather than not yet implemented.
   NotPermitted,
   /// `EDQUOT` — the per-job overlay quota.
@@ -47,6 +52,7 @@ impl Condition {
       Condition::IsDirectory => "EISDIR",
       Condition::NotEmpty => "ENOTEMPTY",
       Condition::Invalid => "EINVAL",
+      Condition::NameTooLong => "ENAMETOOLONG",
       Condition::NotPermitted => "EPERM",
       Condition::QuotaExceeded => "EDQUOT",
       Condition::Io => "EIO",
@@ -99,6 +105,10 @@ impl OverlayError {
   pub fn io(message: impl Into<String>) -> Self {
     OverlayError::new(Condition::Io, message)
   }
+
+  pub fn name_too_long(message: impl Into<String>) -> Self {
+    OverlayError::new(Condition::NameTooLong, message)
+  }
 }
 
 impl fmt::Display for OverlayError {
@@ -109,11 +119,30 @@ impl fmt::Display for OverlayError {
 
 impl std::error::Error for OverlayError {}
 
-/// A service error reaching the overlay is always a storage or protocol failure
-/// by the time it gets here, so it becomes `EIO` with its message preserved.
+/// A service error reaching the overlay is *usually* a storage or protocol
+/// failure by the time it gets here, so it becomes `EIO` with its message
+/// preserved.
+///
+/// `InvalidArgument` is the exception, and treating it as the rule was a bug.
+/// The overlay calls `BytePath::validate` on its own arguments, so an
+/// `InvalidArgument` raised there is a caller error that never crossed a wire —
+/// and mapping it to `EIO` told a program its filesystem had failed when its
+/// path was simply not acceptable. pjdfstest found this as `EIO` from `open` on
+/// a 4 097-byte path; this module's own header promises that "a new condition
+/// cannot reach the kernel as a plausible-but-wrong `EIO`", and this conversion
+/// was the hole in that promise.
+///
+/// Length is separated from malformedness before this point, by
+/// [`crate::path_condition`], because the service vocabulary does not
+/// distinguish them and POSIX does.
 impl From<XvfsError> for OverlayError {
   fn from(e: XvfsError) -> Self {
-    OverlayError::io(format!("{}: {}", e.code.as_str(), e.message))
+    match e.code {
+      ErrorCode::InvalidArgument => {
+        OverlayError::new(Condition::Invalid, format!("{}: {}", e.code.as_str(), e.message))
+      }
+      _ => OverlayError::io(format!("{}: {}", e.code.as_str(), e.message)),
+    }
   }
 }
 

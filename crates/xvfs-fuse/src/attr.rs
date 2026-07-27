@@ -206,6 +206,7 @@ pub fn errno_of_overlay(error: &OverlayError) -> fuser::Errno {
     Condition::IsDirectory => Errno::EISDIR,
     Condition::NotEmpty => Errno::ENOTEMPTY,
     Condition::Invalid => Errno::EINVAL,
+    Condition::NameTooLong => Errno::ENAMETOOLONG,
     Condition::NotPermitted => Errno::EPERM,
     // `EDQUOT`, not `ENOSPC`: the host filesystem is not full, the *job's* quota
     // is, and ADR 0006's hydration policy uses the same distinction so an

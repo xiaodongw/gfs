@@ -39,19 +39,25 @@ before they were found:
   than probed. pjdfstest is a single C file and every `HAVE_*` set is a
   POSIX.1-2008 call glibc has.
 
-| | files |
-| --- | ---: |
-| test files run | 238 |
-| clean on ext4 (the baseline) | 162 |
-| clean on XVFS | 126 |
-| **XVFS-only failures** | **37** |
-| XVFS-only passes | 1 |
+| | first run | after the fixes below |
+| --- | ---: | ---: |
+| test files run | 238 | 238 |
+| clean on ext4 (the baseline) | 162 | 162 |
+| clean on XVFS | 126 | **128** |
+| **XVFS-only failures** | **37** | **35** |
+| XVFS-only passes | 1 | 1 |
+
+Two defects were found, root-caused and fixed in the same pass; a third was
+root-caused and is a decision rather than a fix. See "What was fixed" below.
 
 The single XVFS-only *pass* is `rename_22`, whose ext4 failure is a root-only
 `mknod b`. Not root-caused; it is an artifact of the unprivileged control rather
 than a claim that XVFS is more correct.
 
 ## The 37, triaged
+
+This is the triage of the **first** run. Sections 3, 4 and 5 carry the fixes that
+followed; the rest stand as recorded.
 
 ### 1. Object types XVFS does not implement — 5 files
 
@@ -90,10 +96,11 @@ What the suite finds is narrower and worse:
 
 - **`EIO` for some long-path shapes.** `open_03` assertion 1 and `link_03`
   assertion 1 build a deep path out of ~30 components of ~126 bytes and expect
-  the create to *succeed*; XVFS returns `EIO`. From a FUSE filesystem `EIO` means
-  the daemon returned an error the kernel could not classify — it is an internal
-  failure surfacing as I/O error, not a POSIX answer. **This one needs
-  root-causing.** It is the highest-value item in this report.
+  the create to *succeed*; XVFS returned `EIO`. From a FUSE filesystem `EIO` means
+  the daemon returned an error the kernel could not classify — an internal
+  failure surfacing as I/O error, not a POSIX answer. **Root-caused and fixed;
+  see "What was fixed".** The boundary is now exact: an in-workspace path of
+  4 096 bytes succeeds and 4 097 gives `ENAMETOOLONG`.
 - **`ENOENT` where `ENAMETOOLONG` is expected**, for an over-long component in a
   path whose parent also does not exist (`chmod_02` assertion 5). Arguably
   defensible ordering, but it differs from ext4.
@@ -113,6 +120,8 @@ directory's contents changed. DESIGN.md section 12 documents base timestamps as
 the sanitized snapshot time and an overlay floor, but that is about *values*; it
 does not say directory mtime is inert under mutation.
 
+**Fixed; see "What was fixed". Both files are now clean.**
+
 ### 5. `utimensat` semantics — 5 files
 
 `utimensat_02` `utimensat_04` `utimensat_05` `utimensat_08` `utimensat_09`
@@ -121,10 +130,12 @@ does not say directory mtime is inert under mutation.
 mount's snapshot time); atime and mtime cannot be set independently; subsecond
 precision and post-2038 values do not round-trip.
 
-**Assessment: partly by design, not wholly.** ADR 0006 and DESIGN.md section 12
-fix a timestamp policy with a base-plus-one-tick floor, which explains clamping.
-It does not explain `UTIME_OMIT` being ignored, which is a distinct bug from a
-clamped value.
+**Assessment, after root-causing: one cause, and it is a scope decision.** All
+five reduce to `atime` not being stored — `attr.rs` reports `atime: mtime` and
+`setattr` ignores its `_atime` argument. The first reading of `utimensat/09`
+("post-2038 values do not round-trip", 2³¹ read back as 2³²) was wrong: the test
+sets atime to 2³¹ and mtime to 2³², and XVFS returns mtime for both. There is no
+arithmetic bug. See "What is a decision, not a defect".
 
 ### 6. Mode fidelity — 1 file
 
@@ -162,18 +173,84 @@ Files over 2 GB, and truncate past the maximum file size not returning
 `EFBIG`/`EINVAL`. Not investigated; the blob-size ceiling in `limits.rs` is the
 likely explanation and this deserves its own pass.
 
-## What this changes
+## What was fixed
 
-Nothing yet — this run is measurement. Three items look like work rather than
-documentation:
+### `EIO` for a path longer than the filesystem allows — fixed
 
-1. **`EIO` on some long paths** (§3). An internal error reaching userspace as
-   `EIO` is a bug regardless of what the correct errno turns out to be.
-2. **Directory mtime/ctime inert under mutation** (§4). Widest practical impact.
-3. **`UTIME_OMIT` ignored** (§5), separable from the documented clamping.
+Root cause: `crates/xvfs-overlay/src/error.rs`'s blanket
+`From<XvfsError> for OverlayError` mapped **every** service error to
+`Condition::Io`, on the stated premise that "a service error reaching the overlay
+is always a storage or protocol failure". That premise is wrong for exactly one
+code. The overlay calls `BytePath::validate` on its own arguments, so the
+`InvalidArgument` it raises there never crossed a wire — it is a caller error,
+and reporting it as `EIO` told a program its filesystem had failed when its path
+was merely too long. The module's own header promises that "a new condition
+cannot reach the kernel as a plausible-but-wrong `EIO`"; this conversion was the
+hole in that promise.
 
-Three more are decisions to state rather than defects to fix: the `EPERM` errno
-for unsupported object types, `chmod` rounding silently, and directory `nlink`.
+The fix has three parts: `InvalidArgument` now maps to `Condition::Invalid`;
+a new `Condition::NameTooLong` carries `ENAMETOOLONG`; and `path_condition` asks
+the length question *before* the malformedness question, because the service
+vocabulary spells both `InvalidArgument` and POSIX spells them differently.
+
+**The tests still fail, and now they fail honestly.** pjdfstest builds a path just
+under the `_PC_PATH_MAX` the filesystem advertises and expects the create to
+succeed. XVFS applies its 4 096-byte cap to the path **from the workspace root**,
+while POSIX applies `PATH_MAX` to the pathname handed to the syscall — so a file
+reachable as a short relative path can still be over XVFS's limit. That is a
+real and deliberate difference in what the limit *means*, and the remaining
+`ENOENT` assertions in those files are cascades from the first one. The bug was
+the errno; the limit is policy, and it is now reported in a form a caller can act
+on.
+
+### Directory mtime and ctime inert under mutation — fixed
+
+Root cause: nothing advanced a directory's timestamps when its contents changed,
+and `getattr` is answered inline from the inode table, so even a committed
+overlay row would not have been reported. Both halves were needed:
+`Overlay::touch_directory` adopts the parent and stamps it, and `Xvfs::touch_parent`
+**republishes** the inode record — without the second, the first looks like it
+did nothing at all.
+
+It runs on create, mkdir, symlink, unlink, rmdir, and both ends of a rename. The
+cost is one journal row per directory a job writes into, bounded by the edit set
+rather than the repository, and it is invisible downstream: `Status` skips
+directory rows outright because Git records no directories, so an adopted parent
+produces no change, no diff hunk, and nothing in an export. A test asserts that.
+
+`rmdir/00` and `symlink/00` are now clean.
+
+## What is a decision, not a defect
+
+### `atime` is not stored — needs a product call
+
+Every remaining `utimensat` failure reduces to this. `attr.rs` reports
+`atime: mtime`, and `setattr` ignores its `_atime` argument entirely, so a
+program that sets atime and reads it back gets mtime instead — `utimensat/09`
+sets atime to 2³¹ and mtime to 2³², and reads 2³² back from both.
+
+Fixing it is not a bug fix but a change to what the overlay *models*: a new
+column in `entries`, an `OVERLAY_FORMAT_VERSION` bump with no migration
+machinery behind it (DESIGN.md section 12 lists crash-safe overlay migration as
+pre-production), and a decision about whether XVFS should carry a timestamp Git
+cannot record and no export can reproduce. POSIX atime semantics would also mean
+every read updates state, which is the cost `noatime` exists to avoid and which a
+lazily-hydrating filesystem can least afford.
+
+Two smaller things sit behind the same question: sub-second precision is replaced
+by the overlay's own clock tick (`utimensat/08`), and a requested time below the
+snapshot floor is clamped, which ADR 0006 already documents as deliberate
+(`utimensat/04`).
+
+The current behaviour is the shape this project avoids elsewhere — succeeding
+while quietly doing something else. If atime is out of scope, `utimensat` asking
+for one should probably say so rather than silently mirror mtime.
+
+### Three more to state rather than fix
+
+The `EPERM` errno for unsupported object types where `EOPNOTSUPP` is more usual;
+`chmod` returning success while rounding to Git's two modes; and directory
+`nlink` always reading 2.
 
 ## xfstests is still not run
 

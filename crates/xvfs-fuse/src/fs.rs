@@ -1095,6 +1095,7 @@ impl Filesystem for XvfsFilesystem {
         s.lookups += 1;
         s.opens += 1;
       });
+      fs.touch_parent(&parent).await;
       reply.created(
         &fs.config.ttl,
         &attr,
@@ -1761,6 +1762,7 @@ impl Filesystem for XvfsFilesystem {
             .expect("inode table")
             .insert_lookup(path, Node::Overlay(Box::new(entry)));
           fs.bump(|s| s.lookups += 1);
+          fs.touch_parent(&parent).await;
           reply.entry(&fs.config.ttl, &fs.attr(&record), GENERATION);
         }
         Err(e) => {
@@ -1813,6 +1815,7 @@ impl Filesystem for XvfsFilesystem {
             .expect("inode table")
             .insert_lookup(path, Node::Overlay(Box::new(entry)));
           fs.bump(|s| s.lookups += 1);
+          fs.touch_parent(&parent).await;
           reply.entry(&fs.config.ttl, &fs.attr(&record), GENERATION);
         }
         Err(e) => {
@@ -2007,7 +2010,49 @@ impl Xvfs {
     let target = path.clone();
     Self::blocking(move || overlay.remove(&target, resolved.base, expect_dir, empty))
       .await
-      .map_err(|e| errno_of_overlay(&e))
+      .map_err(|e| errno_of_overlay(&e))?;
+    self.touch_parent(&parent).await;
+    Ok(())
+  }
+
+  /// Advance a directory's mtime and ctime after an entry appeared in it or left.
+  ///
+  /// POSIX requires it and pjdfstest checks it (`rmdir/00`, `symlink/00`).
+  /// Without it a directory reported the pinned commit's snapshot time forever,
+  /// and a build system or watcher keyed on directory mtime — the ordinary way to
+  /// notice that something appeared in a directory — saw nothing change.
+  ///
+  /// Best-effort on purpose. The mutation itself has already committed and
+  /// succeeded; failing the syscall because its parent's timestamp could not be
+  /// recorded would turn a cosmetic loss into a broken write. A crash between the
+  /// two commits leaves the child present with a stale parent time, which is the
+  /// same thing every filesystem that does not journal the two together does.
+  ///
+  /// The mount root is skipped: it has no base facts to adopt from, and giving
+  /// the empty path an overlay row would create a second spelling of the root for
+  /// every resolver that walks ancestors.
+  async fn touch_parent(&self, parent: &Record) {
+    if parent.path.is_empty() || parent.node.is_synth() {
+      return;
+    }
+    let overlay = Arc::clone(&self.overlay);
+    let path = parent.path.clone();
+    let base = Xvfs::parent_base(parent);
+    let ino = parent.ino;
+    match Self::blocking(move || overlay.touch_directory(&path, base, ino)).await {
+      // Republished, not merely committed. `getattr` is answered inline from the
+      // inode table and never consults the overlay, so a row the table does not
+      // know about is a timestamp nothing will ever report -- which is what made
+      // the first attempt at this look like it had done nothing at all.
+      Ok(entry) => {
+        self.republish(&parent.path, entry);
+      }
+      Err(e) => tracing::debug!(
+        path = %parent.path.escaped(),
+        error = %e,
+        "could not advance the parent directory's timestamps"
+      ),
+    }
   }
 
   async fn rename_child(
@@ -2115,6 +2160,13 @@ impl Xvfs {
           .expect("inode table")
           .refresh(ino, Node::Overlay(Box::new(entry)));
       }
+    }
+    // Both ends: the entry left one directory and arrived in another. When the
+    // rename is within a single directory they are the same record and the
+    // second touch is a no-op update of the row the first one wrote.
+    self.touch_parent(&from_parent).await;
+    if to_parent.path != from_parent.path {
+      self.touch_parent(&to_parent).await;
     }
     Ok(())
   }
