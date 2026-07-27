@@ -45,7 +45,9 @@
 pub mod classify;
 pub mod glob;
 pub mod lines;
+pub mod manifest;
 pub mod registry;
+pub mod snapshots;
 pub mod store;
 
 pub use classify::{
@@ -53,7 +55,11 @@ pub use classify::{
 };
 pub use glob::Glob;
 pub use lines::{lines, Line};
+pub use manifest::{Manifest, ManifestDelta, PathEntry, MANIFEST_FORMAT_VERSION};
 pub use registry::{BlobFact, BlobKey, BlobRecord, BlobRegistry, IngestBudget, IngestReport};
+pub use snapshots::{
+  Cancel, Claim, GcReport, PreparePolicy, Progress, SnapshotRecord, SnapshotStore,
+};
 pub use store::{SearchStore, SCHEMA_VERSION};
 
 /// Where a blob's bytes come from.

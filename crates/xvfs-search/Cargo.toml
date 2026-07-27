@@ -20,6 +20,10 @@ roaring = { workspace = true }
 memchr = { workspace = true }
 regex = { workspace = true }
 rusqlite = { workspace = true }
+# Manifest checksums. A manifest is derived data that outlives a process and (in
+# M7.1) travels through object storage; a silently corrupted path table would
+# produce wrong search results, which is the outcome M4's exit gate ranks worst.
+sha2 = { workspace = true }
 serde = { workspace = true }
 tracing = { workspace = true }
 

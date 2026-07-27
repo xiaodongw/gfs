@@ -22,7 +22,7 @@ use xvfs_proto::convert;
 use xvfs_proto::v1::{self, snapshot_service_server::SnapshotService};
 use xvfs_types::error::{ErrorCode, XvfsError};
 use xvfs_types::{
-  limits, BytePath, HashAlgorithm, MountId, ObjectId, RepositoryId, RevisionSelector, SnapshotState,
+  limits, BytePath, HashAlgorithm, MountId, ObjectId, RepositoryId, RevisionSelector,
 };
 
 use crate::audit::{self, Action, AuditRecord};
@@ -44,6 +44,7 @@ pub struct SnapshotApi {
   pub catalog: Arc<Catalog>,
   pub mounts: Arc<MountManager>,
   pub authz: Arc<Authorizer>,
+  pub search: Arc<crate::search::IndexManager>,
 }
 
 impl std::fmt::Debug for SnapshotApi {
@@ -573,21 +574,34 @@ impl SnapshotService for SnapshotApi {
       let (access, _) = self
         .commit_context(&ctx, &req.repository_id, &req.commit_oid, req.authorization)
         .await?;
-      // M1 has no search index, so a snapshot is ready as soon as its commit is
-      // readable. Reported as READY rather than as an error, because that is the
-      // truthful answer to "can I read this snapshot": the snapshot APIs can.
-      // M4.2 replaces this with real manifest state, and the three-state
-      // vocabulary is already fixed so that change is additive.
-      Ok((access, SnapshotState::Ready))
+      // Retained by policy only when the commit is still reachable from a visible
+      // ref. An arbitrary commit a job asked about gets a TTL instead, which is
+      // what stops one exploratory search pinning a manifest forever.
+      let repo = self.registry.repository(&access.repository_id)?;
+      let retained = repo
+        .is_visible(access.commit.clone())
+        .await
+        .unwrap_or(false);
+      let outcome = self
+        .search
+        .prepare(&access.repository_id, &access.commit, retained)
+        .await?;
+      Ok((access, outcome))
     }
     .await;
 
     match result {
-      Ok((access, state)) => {
+      Ok((access, outcome)) => {
         let response = v1::PrepareSnapshotResponse {
-          state: v1::SnapshotState::from(state) as i32,
-          operation_id: None,
-          failure_reason: None,
+          state: v1::SnapshotState::from(outcome.state()) as i32,
+          operation_id: match &outcome {
+            crate::search::PrepareOutcome::Building { operation_id } => Some(operation_id.clone()),
+            _ => None,
+          },
+          failure_reason: match &outcome {
+            crate::search::PrepareOutcome::Failed { reason } => Some(reason.clone()),
+            _ => None,
+          },
           commit_oid: access.commit.to_qualified(),
         };
         self.finish(

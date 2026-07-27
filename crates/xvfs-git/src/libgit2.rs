@@ -17,7 +17,7 @@ use xvfs_types::{
 
 use crate::format::{self, RepositoryFormat};
 use crate::pool::{PooledRepo, RepoPool};
-use crate::repository::{DirectoryPage, EntryLookup, GitRepository};
+use crate::repository::{DirectoryPage, EntryLookup, GitRepository, TreeDelta, WalkEntry};
 use crate::tree::{DecodedEntry, DecodedTree, TreeCache, TreeCacheStats};
 
 /// The tree containing a path, plus that path's final component.
@@ -244,6 +244,23 @@ impl Libgit2Repository {
   }
 }
 
+/// libgit2's `FileMode` as the raw Git mode.
+///
+/// `git2::FileMode` is an enum, so a mode Git wrote that libgit2 does not model
+/// arrives as `Unreadable` (0). Mapped rather than cast because a cast of the
+/// enum's discriminant is not the Git mode at all.
+fn git_mode(m: git2::FileMode) -> u32 {
+  match m {
+    git2::FileMode::Blob => mode::REGULAR,
+    git2::FileMode::BlobExecutable => mode::EXECUTABLE,
+    git2::FileMode::Link => mode::SYMLINK,
+    git2::FileMode::Tree => mode::DIRECTORY,
+    git2::FileMode::Commit => mode::GITLINK,
+    git2::FileMode::BlobGroupWritable => 0o100_664,
+    git2::FileMode::Unreadable => 0,
+  }
+}
+
 /// Map a libgit2 error, distinguishing a genuine absence from a real failure.
 ///
 /// libgit2 reports both "no such object" and "the pack is corrupt" through
@@ -455,6 +472,141 @@ impl GitRepository for Libgit2Repository {
       }
     };
     Ok(page)
+  }
+
+  fn walk_tree(
+    &self,
+    commit: &ObjectId,
+    root: &BytePath,
+    visit: &mut dyn FnMut(WalkEntry) -> Result<(), XvfsError>,
+  ) -> Result<(), XvfsError> {
+    let pooled = self.checkout()?;
+    let repo: &git2::Repository = &pooled;
+    let commit_oid = self.git_oid(commit)?;
+
+    let start = if root.is_empty() {
+      self.find_commit(repo, commit_oid)?.tree_id()
+    } else {
+      let Some((parent, name)) = self.walk_to_parent(repo, commit, root)? else {
+        return Err(XvfsError::not_found("no such directory"));
+      };
+      let Some(entry) = parent.get(&name) else {
+        return Err(XvfsError::not_found("no such directory"));
+      };
+      if entry.mode != mode::DIRECTORY {
+        return Err(XvfsError::new(
+          ErrorCode::InvalidArgument,
+          "not a directory",
+        ));
+      }
+      self.git_oid(&entry.oid)?
+    };
+
+    // An explicit stack rather than libgit2's `Tree::walk`. Two reasons, and both
+    // bit the M0 spike: `walk`'s callback can only signal "skip" or "abort" and
+    // cannot carry an error out, so a budget or a cancellation becomes an opaque
+    // abort; and the callback receives a `&str`-ish directory prefix, which is
+    // the wrong type for a path that need not be UTF-8.
+    let mut stack: Vec<(git2::Oid, BytePath)> = vec![(start, root.clone())];
+    let odb = repo.odb().map_err(|e| not_found(&e, "object database"))?;
+
+    while let Some((tree_oid, prefix)) = stack.pop() {
+      let tree = self.decoded_tree(repo, tree_oid)?;
+      // Push subdirectories in reverse so the pop order is Git's tree order.
+      // A caller sorting the result would not need this; a caller streaming into
+      // a front-coded path table does.
+      let mut children = Vec::new();
+      for decoded in tree.entries() {
+        let path = prefix.join(&decoded.name);
+        match decoded.mode {
+          mode::DIRECTORY => children.push((self.git_oid(&decoded.oid)?, path)),
+          mode::REGULAR | mode::EXECUTABLE => {
+            let oid = self.git_oid(&decoded.oid)?;
+            let (size, _) = odb.read_header(oid).map_err(|e| not_found(&e, "blob"))?;
+            visit(WalkEntry {
+              path,
+              mode: decoded.mode,
+              oid: decoded.oid.clone(),
+              size: size as u64,
+            })?;
+          }
+          // Symlinks, gitlinks, and unsupported modes are not searchable
+          // content. See `WalkEntry`: the corpus is chosen to agree with `rg`.
+          _ => {}
+        }
+      }
+      for child in children.into_iter().rev() {
+        stack.push(child);
+      }
+    }
+    Ok(())
+  }
+
+  fn diff_commits(&self, from: &ObjectId, to: &ObjectId) -> Result<Vec<TreeDelta>, XvfsError> {
+    let pooled = self.checkout()?;
+    let repo: &git2::Repository = &pooled;
+    let old_tree = {
+      let oid = self.git_oid(from)?;
+      let id = self.find_commit(repo, oid)?.tree_id();
+      repo.find_tree(id).map_err(|e| not_found(&e, "tree"))?
+    };
+    let new_tree = {
+      let oid = self.git_oid(to)?;
+      let id = self.find_commit(repo, oid)?.tree_id();
+      repo.find_tree(id).map_err(|e| not_found(&e, "tree"))?
+    };
+
+    let mut opts = git2::DiffOptions::new();
+    // A type change is an upsert followed by nothing special, but libgit2 splits
+    // it into a delete and an add unless asked not to. Either is workable; the
+    // combined form is fewer deltas and no risk of the pair arriving out of order.
+    opts.include_typechange(true);
+    // Deliberately no rename detection. See `TreeDelta`.
+    let diff = repo
+      .diff_tree_to_tree(Some(&old_tree), Some(&new_tree), Some(&mut opts))
+      .map_err(|e| not_found(&e, "tree diff"))?;
+
+    let odb = repo.odb().map_err(|e| not_found(&e, "object database"))?;
+    let mut out = Vec::new();
+    for delta in diff.deltas() {
+      let new_file = delta.new_file();
+      let new_mode = git_mode(new_file.mode());
+      let searchable_now =
+        matches!(new_mode, mode::REGULAR | mode::EXECUTABLE) && new_file.exists();
+
+      if searchable_now {
+        let path = match new_file.path_bytes() {
+          Some(p) => BytePath::new(p.to_vec()),
+          None => continue,
+        };
+        let oid = self.to_oid(new_file.id())?;
+        let (size, _) = odb
+          .read_header(new_file.id())
+          .map_err(|e| not_found(&e, "blob"))?;
+        out.push(TreeDelta::Upserted {
+          path,
+          mode: new_mode,
+          oid,
+          size: size as u64,
+        });
+        continue;
+      }
+
+      // Not searchable in the new commit. If it was searchable in the old one,
+      // the manifest has to drop it -- including the case where a file *became*
+      // a symlink, which is a removal from the searchable corpus even though the
+      // path still exists.
+      let old_file = delta.old_file();
+      let old_mode = git_mode(old_file.mode());
+      if matches!(old_mode, mode::REGULAR | mode::EXECUTABLE) && old_file.exists() {
+        if let Some(p) = old_file.path_bytes() {
+          out.push(TreeDelta::Removed {
+            path: BytePath::new(p.to_vec()),
+          });
+        }
+      }
+    }
+    Ok(out)
   }
 
   fn read_blob(&self, blob: &ObjectId) -> Result<Vec<u8>, XvfsError> {

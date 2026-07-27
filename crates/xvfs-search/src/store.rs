@@ -34,7 +34,7 @@ use xvfs_types::error::{ErrorCode, XvfsError};
 /// The reasoning is weaker here — this data is rebuildable — but reading a
 /// layout you do not understand still produces wrong search results, and a wrong
 /// search result is precisely what M4's exit gate forbids.
-pub const SCHEMA_VERSION: i64 = 1;
+pub const SCHEMA_VERSION: i64 = 2;
 
 /// The index store.
 ///
@@ -130,6 +130,9 @@ fn migrate(conn: &Connection) -> Result<(), XvfsError> {
   if current < 1 {
     conn.execute_batch(V1).map_err(db_error)?;
   }
+  if current < 2 {
+    conn.execute_batch(V2).map_err(db_error)?;
+  }
   conn
     .pragma_update(None, "user_version", SCHEMA_VERSION)
     .map_err(db_error)?;
@@ -173,6 +176,52 @@ CREATE UNIQUE INDEX blobs_by_key ON blobs (repository_id, blob_key);
 CREATE TABLE blob_key_seq (
   repository_id  TEXT    PRIMARY KEY,
   next_key       INTEGER NOT NULL
+);
+"#;
+
+/// V2: snapshot manifests and their lifecycle.
+///
+/// The manifest is a `BLOB` in this row rather than a file beside the database.
+/// One transaction then makes the state change and the bytes it describes
+/// durable together, so a `READY` row can never name a manifest that a crash
+/// left half-written -- and M7.1's move to object storage is a change of one
+/// column's backing rather than a new consistency problem.
+const V2: &str = r#"
+CREATE TABLE snapshots (
+  repository_id    TEXT    NOT NULL,
+  commit_oid       TEXT    NOT NULL,
+  -- READY | BUILDING | FAILED. DESIGN.md section 7.3: exactly three, with
+  -- NOT_INDEXABLE and RESOURCE_LIMIT deliberately absent because they are
+  -- request errors and folding one into a state makes "this will never work"
+  -- look like "try again shortly".
+  state            TEXT    NOT NULL,
+  format_version   INTEGER NOT NULL,
+  index_generation INTEGER NOT NULL,
+  path_count       INTEGER NOT NULL,
+  manifest         BLOB,
+  checksum         TEXT,
+  updated_at       INTEGER NOT NULL,
+  -- NULL means retained by policy: a configured branch tip that is refreshed
+  -- rather than expired. Distinct from a far-future timestamp so that "kept
+  -- forever" and "kept for a long time" are different rows.
+  expires_at       INTEGER,
+  failure_reason   TEXT,
+  operation_id     TEXT,
+  attempts         INTEGER NOT NULL DEFAULT 0,
+  progress_paths   INTEGER NOT NULL DEFAULT 0,
+  progress_blobs   INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (repository_id, commit_oid)
+);
+
+CREATE INDEX snapshots_by_expiry ON snapshots (repository_id, expires_at);
+
+-- The shared index generation. Advanced when posting lists change, never when a
+-- single snapshot's manifest is written: a manifest is per-commit and cannot
+-- invalidate another query's result, while a change to the shared index means
+-- two answers computed either side of it saw different data.
+CREATE TABLE index_generations (
+  repository_id  TEXT    PRIMARY KEY,
+  generation     INTEGER NOT NULL
 );
 "#;
 

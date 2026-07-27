@@ -47,6 +47,7 @@ pub struct Server {
   pub registry: Arc<Registry>,
   pub mounts: Arc<MountManager>,
   pub authz: Arc<Authorizer>,
+  pub search: Arc<crate::search::IndexManager>,
   pub policy: LeasePolicy,
 }
 
@@ -87,13 +88,40 @@ impl Server {
       lease_policy,
       key,
     ));
+    // An in-memory index by default. The search index is derived data that is
+    // rebuildable from Git, so a server that has not been told where to keep it
+    // is *usable* rather than broken -- it simply re-prepares after a restart.
+    // `with_search_index` gives it a home; the binary always does.
+    let store = Arc::new(
+      xvfs_search::SearchStore::open_in_memory().expect("an in-memory search index always opens"),
+    );
+    let search = Arc::new(crate::search::IndexManager::new(
+      store,
+      Arc::clone(&registry),
+    ));
+
     Server {
       catalog,
       registry,
       mounts,
       authz,
+      search,
       policy: lease_policy,
     }
+  }
+
+  /// Keep the search index on disk instead of in memory.
+  ///
+  /// Called before the server is shared. Persisting it does not change any
+  /// answer -- every manifest and posting list is a function of a commit -- it
+  /// changes how much work a restart costs.
+  pub fn with_search_index(mut self, path: &std::path::Path) -> Result<Self, XvfsError> {
+    let store = Arc::new(xvfs_search::SearchStore::open(path)?);
+    self.search = Arc::new(crate::search::IndexManager::new(
+      store,
+      Arc::clone(&self.registry),
+    ));
+    Ok(self)
   }
 
   pub fn snapshot_api(&self) -> snapshot::SnapshotApi {
@@ -102,6 +130,7 @@ impl Server {
       catalog: Arc::clone(&self.catalog),
       mounts: Arc::clone(&self.mounts),
       authz: Arc::clone(&self.authz),
+      search: Arc::clone(&self.search),
     }
   }
 

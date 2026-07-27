@@ -2630,6 +2630,7 @@ dependencies = [
  "roaring",
  "rusqlite",
  "serde",
+ "sha2",
  "tracing",
  "xvfs-types",
 ]
@@ -2664,6 +2665,7 @@ dependencies = [
  "tracing-subscriber",
  "xvfs-git",
  "xvfs-proto",
+ "xvfs-search",
  "xvfs-test",
  "xvfs-types",
 ]

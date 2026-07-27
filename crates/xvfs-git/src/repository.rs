@@ -35,6 +35,54 @@ pub struct DirectoryPage {
   pub next_page_token: Option<Vec<u8>>,
 }
 
+/// One file a recursive tree walk found.
+///
+/// Only regular and executable files appear. That is the searchable corpus, and
+/// it is chosen to agree with `rg`: ripgrep does not follow symlinks by default,
+/// so a symlink's target text is not searched by either tool, and a gitlink's
+/// contents live in another repository entirely. Including them would make XVFS
+/// return matches `rg` does not, which is a worse failure than missing some.
+///
+/// `size` comes from the object header rather than from inflating the blob, so a
+/// walk over a monorepo costs one header read per file and no decompression.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WalkEntry {
+  /// Full path from the commit's root, even when the walk started in a subtree.
+  pub path: BytePath,
+  pub mode: u32,
+  pub oid: ObjectId,
+  pub size: u64,
+}
+
+/// How one path differs between two commits.
+///
+/// Deliberately two cases rather than Git's five. A manifest is a map from path
+/// to blob, so "modified", "added", and "type changed" are all the same
+/// operation on it — write this path's new blob — and "deleted" is the only
+/// other thing that can happen. Rename detection is *not* enabled: a rename is
+/// a delete plus an add to a path map, and asking libgit2 to pair them up would
+/// cost similarity scoring for information the manifest cannot use.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TreeDelta {
+  Removed {
+    path: BytePath,
+  },
+  Upserted {
+    path: BytePath,
+    mode: u32,
+    oid: ObjectId,
+    size: u64,
+  },
+}
+
+impl TreeDelta {
+  pub fn path(&self) -> &BytePath {
+    match self {
+      TreeDelta::Removed { path } | TreeDelta::Upserted { path, .. } => path,
+    }
+  }
+}
+
 /// Read access to one bare repository.
 ///
 /// Implementations must be `Send + Sync`. Every method is allowed to block.
@@ -71,6 +119,33 @@ pub trait GitRepository: Send + Sync + std::fmt::Debug {
     after: Option<&[u8]>,
     limit: usize,
   ) -> Result<DirectoryPage, XvfsError>;
+
+  /// Walk every searchable file under `root`, recursively.
+  ///
+  /// `root` is a directory path from the commit root, or empty for the whole
+  /// tree. Emitted paths are always full paths, so a caller that fanned the walk
+  /// out over top-level directories can concatenate the results without knowing
+  /// which task produced which entry.
+  ///
+  /// The visitor is called in Git's tree order within each directory. It returns
+  /// a `Result` so a caller can stop the walk by returning an error — a budget or
+  /// a cancellation, which a walk over a million-entry tree needs.
+  ///
+  /// A `root` that does not exist, or is not a directory, is an error rather than
+  /// an empty walk: a manifest built from a mistyped scope that silently produced
+  /// nothing would be indistinguishable from a repository with nothing in it.
+  fn walk_tree(
+    &self,
+    commit: &ObjectId,
+    root: &BytePath,
+    visit: &mut dyn FnMut(WalkEntry) -> Result<(), XvfsError>,
+  ) -> Result<(), XvfsError>;
+
+  /// The paths that differ between two commits' trees.
+  ///
+  /// Used for first-parent incremental manifest construction, which is what makes
+  /// preparing the next commit on a branch cost its diff rather than its tree.
+  fn diff_commits(&self, from: &ObjectId, to: &ObjectId) -> Result<Vec<TreeDelta>, XvfsError>;
 
   /// Read a whole blob, verifying its object ID against its contents.
   fn read_blob(&self, blob: &ObjectId) -> Result<Vec<u8>, XvfsError>;
@@ -215,6 +290,38 @@ impl AsyncRepository {
 
   pub async fn read_blob(&self, blob: ObjectId) -> Result<Vec<u8>, XvfsError> {
     self.run(move |r| r.read_blob(&blob)).await
+  }
+
+  /// Collect a subtree's searchable files.
+  ///
+  /// Returns a `Vec` rather than streaming, because the value of this call is
+  /// that a caller can issue several of them **concurrently** — one per top-level
+  /// directory — and have the pool's admission control decide how many libgit2
+  /// handles are busy at once. A streaming version would hold a blocking thread
+  /// for as long as the consumer took, which defeats the bound.
+  pub async fn walk_tree(
+    &self,
+    commit: ObjectId,
+    root: BytePath,
+  ) -> Result<Vec<WalkEntry>, XvfsError> {
+    self
+      .run(move |r| {
+        let mut out = Vec::new();
+        r.walk_tree(&commit, &root, &mut |entry| {
+          out.push(entry);
+          Ok(())
+        })?;
+        Ok(out)
+      })
+      .await
+  }
+
+  pub async fn diff_commits(
+    &self,
+    from: ObjectId,
+    to: ObjectId,
+  ) -> Result<Vec<TreeDelta>, XvfsError> {
+    self.run(move |r| r.diff_commits(&from, &to)).await
   }
 
   pub async fn visible_refs(&self) -> Result<Vec<(String, ObjectId)>, XvfsError> {

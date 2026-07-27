@@ -11,6 +11,7 @@ description = "Repository catalog, snapshot and blob APIs, and the Git gateway"
 xvfs-types = { workspace = true }
 xvfs-git = { workspace = true }
 xvfs-proto = { workspace = true }
+xvfs-search = { workspace = true }
 rusqlite = { workspace = true }
 hmac = { workspace = true }
 sha2 = { workspace = true }

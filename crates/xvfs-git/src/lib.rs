@@ -28,5 +28,7 @@ pub mod tree;
 pub use format::{check, read_format, verdict, FormatVerdict, RepositoryFormat};
 pub use libgit2::Libgit2Repository;
 pub use pool::RepoPool;
-pub use repository::{AsyncRepository, DirectoryPage, EntryLookup, GitRepository};
+pub use repository::{
+  AsyncRepository, DirectoryPage, EntryLookup, GitRepository, TreeDelta, WalkEntry,
+};
 pub use tree::{DecodedTree, TreeCache, TreeCacheStats};

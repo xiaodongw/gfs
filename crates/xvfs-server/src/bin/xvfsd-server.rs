@@ -120,13 +120,12 @@ async fn main() -> anyhow::Result<()> {
     }
   };
 
-  let server = Arc::new(Server::new(
-    catalog,
-    authenticator,
-    policy,
-    key,
-    LeasePolicy::adr_0006(),
-  ));
+  let index_path = args.state_dir.join("search.sqlite");
+  let server = Arc::new(
+    Server::new(catalog, authenticator, policy, key, LeasePolicy::adr_0006())
+      .with_search_index(&index_path)?,
+  );
+  tracing::info!(index = %index_path.display(), "search index opened");
 
   for spec in &args.imports {
     let (id, path) = spec

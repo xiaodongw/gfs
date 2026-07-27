@@ -24,6 +24,7 @@ pub mod mirror;
 pub mod mounts;
 pub mod observability;
 pub mod registry;
+pub mod search;
 pub mod service;
 pub mod util;
 
@@ -32,4 +33,5 @@ pub use catalog::Catalog;
 pub use locks::RepositoryLocks;
 pub use mounts::{MountManager, ReconcileOutcome};
 pub use registry::Registry;
+pub use search::{IndexManager, PrepareOutcome};
 pub use service::Server;
