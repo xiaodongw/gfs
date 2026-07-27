@@ -609,6 +609,35 @@ Duration: 3–4 weeks
 > [M4 completion report](reports/m4-completion.md) and
 > [`benchmarks/search-preparation.md`](../benchmarks/search-preparation.md).
 >
+> **Correction, 2026-07-27.** The exit criteria were met component by component
+> and the milestone was nonetheless not usable end to end. Running `xvfs-rg` in a
+> real workspace failed every time, for two independent reasons that each looked
+> like the other's absence:
+>
+> * **The search index was never built.** `PrepareSnapshot` had no caller outside
+>   the test suite, and `IndexManager::search` reports `SnapshotBuilding` when a
+>   manifest is missing rather than building one — so the condition was permanent,
+>   not transient. The daemon now warms the index at mount and the search path
+>   prepares on demand and retries.
+> * **`xvfs-rg` could not find its own workspace.** Discovery canonicalized the
+>   path first, which resolves the published symlink to
+>   `<workspace>.xvfs/generations/<n>` and destroys the `<workspace>` + `.xvfs`
+>   naming the upward walk looks for. It failed from inside the mount — its
+>   documented usage — and `--workspace` was routed through the same walk, so the
+>   flag that exists to bypass discovery depended on it.
+>
+> A third defect made both harder to see: `xvfs search` exited **1** on a server
+> error, which ADR 0004 defines as "complete, and the pattern genuinely does not
+> occur". It exits 2 now. Every one of these is a case of the exact failure the
+> M4 design set out to prevent — an empty answer that is indistinguishable from
+> a real one — reaching production code anyway.
+>
+> The lesson for later milestones is about the shape of the testing, not the
+> code: every M4 component had tests, and the component tests called
+> `PrepareSnapshot` themselves because that was what a component test needed. No
+> test ran the tools the way an agent runs them. `benchmarks/agent-workflow.md`
+> is now that test.
+>
 > Code is in [`crates/xvfs-search/`](../crates/xvfs-search/), the server half is
 > `xvfs-server/src/search/`, the merged client half is `xvfs-fuse/src/search.rs`,
 > and the commands are `xvfs search` plus the `xvfs-rg` front end.
@@ -619,7 +648,7 @@ Duration: 3–4 weeks
 > | M4.2 snapshot manifests | ✅ | `manifest.rs`, `snapshots.rs`, `xvfs-server/src/search/mod.rs` |
 > | M4.3 literal and regex index | ✅ | `trigram.rs`, `postings.rs`, `query.rs`, `service/search.rs` |
 > | M4.4 optional token search | ⏭️ **not implemented, deliberately** | [ADR 0004 amendment](adr/0004-search-representation.md) |
-> | M4.5 overlay-aware client search | ⚠️ `rg` comparison **not benchmarked against a real build tree** | `local.rs`, `glob.rs`, `xvfs-fuse/src/search.rs`, `xvfs-rg`, `docs/agent-search.md` |
+> | M4.5 overlay-aware client search | ⚠️ `rg` comparison **not benchmarked against a real build tree**; end-to-end defects fixed 2026-07-27 | `local.rs`, `glob.rs`, `xvfs-fuse/src/search.rs`, `xvfs-rg`, `docs/agent-search.md` |
 > | M4.6 correctness and performance | ✅ | `search_oracle.rs`, `search_faults.rs`, `examples/prepare-bench.rs` |
 >
 > Measured on the worst case (linux, 94 735 eligible paths): warm search **p95
@@ -788,6 +817,22 @@ Duration: 2–4 weeks
 > the client-**version** row of the matrix is not covered; the test runs whatever
 > `XVFS_GIT_CLIENTS` names and skips loudly otherwise. ADR 0002's v0/v2 split is
 > version-sensitive, so this should close before M6.1.
+>
+> **Addition, 2026-07-27: `xvfs-log` and `xvfs-find`.** With the gateway in
+> place, the two remaining questions an agent asks about a whole repository were
+> still answered badly inside a mount — `git log` was frozen at one commit
+> because the workspace has no object database, and `git ls-files` cost one
+> snapshot-API round trip per directory. Both are now delegated to the server
+> through new `SnapshotService` RPCs (`Log`, a libgit2 revwalk; `FindPaths`, a
+> server-side tree walk with globs) and exposed as tools beside `xvfs-rg`. This
+> does not reopen [ADR 0005](adr/0005-git-command-surface.md): nothing is
+> hydrated, and the flags that would need a tree or blob per commit are refused.
+> See the [ADR 0005 amendment](adr/0005-git-command-surface.md) and
+> [`benchmarks/agent-workflow.md`](../benchmarks/agent-workflow.md), which
+> measures the whole edit workflow rather than the clone alone: **2.6 s cold and
+> 266 KiB** against 12.6 s and 338 MiB for a full clone, with both flows
+> producing an identical tree. The `git` shim is **not** yet rewired to these
+> tools, so `git log` and `git ls-files` inside a mount still cost what they cost.
 
 ### M5.1 Smart HTTP gateway
 

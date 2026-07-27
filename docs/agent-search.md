@@ -1,10 +1,30 @@
 # Searching an XVFS workspace: instructions for agents and tools
 
-Status: current as of M4  
-Companion: [DESIGN.md](DESIGN.md) section 7.5, [ADR 0004](adr/0004-search-representation.md)
+Status: current as of M4, extended after M5 with `xvfs-find` and `xvfs-log`  
+Companion: [DESIGN.md](DESIGN.md) section 7.5, [ADR 0004](adr/0004-search-representation.md),
+[ADR 0005](adr/0005-git-command-surface.md)
 
 An XVFS workspace looks like an ordinary directory tree, and almost every tool
-that reads it works. Search is the exception, and this document is why.
+that reads it works. **Asking a question about the whole repository is the
+exception**, and this document is why.
+
+Three questions an agent asks constantly cost far more inside a mount than they
+look like they should, because each one wants to touch every path:
+
+| Question | Do not run | Run |
+| --- | --- | --- |
+| what does this content say? | `rg pattern` | `xvfs-rg pattern` |
+| which files are called this? | `find . -name` / `git ls-files` | `xvfs-find '<glob>'` |
+| what changed recently? | `git log` | `xvfs-log` |
+
+All three are answered by the **server**, which has the object database and the
+search index; none of them reads the mount. A warm run of all three against
+django leaves hydration at 0 blobs and 0 bytes. See
+[`benchmarks/agent-workflow.md`](../benchmarks/agent-workflow.md) for the
+measurements, including what the workflow cost before these tools existed.
+
+Each accepts `--workspace <path>` for an orchestrator that is not standing in the
+mount, and finds the workspace on its own otherwise.
 
 ## Use `xvfs-rg`, not `rg`
 
@@ -25,6 +45,62 @@ xvfs-rg -i needle -g '*.rs'
 
 `xvfs search --workspace <path> <pattern>` is the same search with an explicit
 workspace, for an orchestrator that is not standing inside the mount.
+
+## Use `xvfs-find`, not `find` or `git ls-files`
+
+`find` inside the mount walks every directory, for the same reason `rg` does.
+`git ls-files` through the shim avoids the walk but replaces it with one
+snapshot-API round trip per directory — measured at 28.9–53.7 s on django's
+7 077 files, for a question the server answers in one request.
+
+```
+xvfs-find '*.py'
+xvfs-find '*admin*' django/contrib      # a glob, then an optional scope
+xvfs-find -g '*.rs' -g '*.toml' --exclude '*/tests/*'
+xvfs-find '*.py' -0 | xargs -0 wc -l
+```
+
+The result set is `git ls-files`'s: files, symlinks, and gitlinks, with
+directories recursed into but not listed. **Symlinks are included** — the
+searchable corpus drops them to agree with `rg`, and answering a name query from
+that corpus silently loses 4 paths in django and 99 in the Linux kernel.
+
+Your edits are merged the same way they are for content search: a file you
+created is found, a deleted one is not, and a renamed one is found at its **new**
+path and no longer matches a glob that only matched its old name.
+
+## Use `xvfs-log`, not `git log`
+
+The workspace has no object database — [ADR 0005](adr/0005-git-command-surface.md)
+chose a synthesized `.git` over a real partial clone — so the shim's `log` is
+frozen at `-1`. A `--depth 1` clone, the raw-Git equivalent, has the same single
+commit. `xvfs-log` asks the server to walk instead.
+
+```
+xvfs-log -10 --oneline
+xvfs-log -n 50 --format='%h %an %s'
+xvfs-log --skip 20 -20                  # paging
+```
+
+Two behaviours worth knowing:
+
+- **The order is `git log`'s default — by commit time, not topological.**
+  `--topo-order` has to buffer the reachable graph before it can emit anything:
+  `git log -10` on linux.git is 0.007 s in date order and **10.383 s** with
+  `--topo-order`. The visible cost is that two commits sharing a commit
+  timestamp may appear in the opposite order to Git's. The set is the same.
+- **`%h` abbreviates to 7 characters.** Git scales its abbreviation with the
+  repository's object count — 10 for django — so `%h` here is stable rather than
+  identical to Git's. `%H` is the full ID and always matches.
+
+Local edits do not create commits, so they never appear in a log. Use
+`xvfs status` for what the workspace changed.
+
+`-p`, `-S`, `--follow`, `--stat` and `--graph` are **refused**, not
+approximated: each needs a tree or blob per commit, which is the unbounded
+download ADR 0005 rejected the partial clone for. To search content use
+`xvfs-rg`; for tooling that genuinely needs full history, clone through the
+smart-HTTP gateway.
 
 ## The answer has two dimensions, and both matter
 

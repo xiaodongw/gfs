@@ -119,6 +119,35 @@ under the synthesized surface there is no object database to delegate to.
 Pathspecs are literal paths and simple globs; magic pathspecs (`:(glob)`,
 `:(exclude)`) are rejected rather than approximated.
 
+### Amendment, 2026-07-27: two of these questions moved to the server
+
+The grammar above stays as the **shim's** contract, and the shim is unchanged.
+What changed is the premise behind two of its narrowest entries.
+
+`log` was frozen at `-1` because the workspace has no object database and there
+was no way to produce a second commit. `ls-files` was answerable but only by
+listing one directory at a time through the snapshot API, which on django's
+7 077 files took 28.9–53.7 s. Both are questions the **server** can answer
+directly, and it now does, through two new `SnapshotService` RPCs and two tools
+that sit beside `xvfs-rg`:
+
+| Question | Tool | RPC |
+| --- | --- | --- |
+| recent history | `xvfs-log` | `Log` — a libgit2 revwalk, paged by `skip` |
+| filenames | `xvfs-find` | `FindPaths` — a server-side tree walk with globs |
+
+This does not reopen the decision. Nothing is hydrated, no object database
+appears in the workspace, and the tools refuse what would require one — `-p`,
+`-S`, `--follow`, `--stat` and `--graph` each need a tree or blob per commit,
+which is exactly the unbounded download this ADR rejected the partial clone for.
+The escape hatch for a workload that genuinely needs full Git is still a clone
+through the M5 gateway.
+
+The shim itself is not yet rewired to these tools, so `git log` and
+`git ls-files` inside a mount still follow the frozen grammar above and still
+cost what they cost. See [`docs/agent-search.md`](../agent-search.md) and
+[`benchmarks/agent-workflow.md`](../../benchmarks/agent-workflow.md).
+
 ## Alternatives considered
 
 **Shallow blobless partial clone.** Rejected on the measurement above: a 9.7 MiB
