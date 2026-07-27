@@ -392,7 +392,7 @@ Duration: 3–4 weeks
 > | M2.1 mount lifecycle | ✅ | `daemon.rs`, `state.rs`, `publish.rs`, `lease.rs`, `control.rs` |
 > | M2.2 metadata and inode model | ✅ | `inode.rs`, `attr.rs`, `fs.rs` |
 > | M2.3 blob cache and reads | ✅ | `cache.rs`, `client.rs`, `tests/mmap.rs` |
-> | M2.4 compatibility tests | ⚠️ `pjdfstest`/xfstests **not run** | `tests/compat.rs`, `xvfs-test/src/oracle.rs`, `bin/xvfs-git-shim.rs` |
+> | M2.4 compatibility tests | ⚠️ `pjdfstest` run 2026-07-27 ([report](reports/posix-conformance.md)); xfstests **not run** | `tests/compat.rs`, `xvfs-test/src/oracle.rs`, `bin/xvfs-git-shim.rs` |
 >
 > Measured: cold mount to a usable root in **99 ms** having downloaded **zero**
 > blob bytes; a two-file read from a 16 MiB snapshot transfers 28 bytes; 1000
@@ -415,10 +415,23 @@ Duration: 3–4 weeks
 > it would hand `size` and `mtime` to the kernel, which the overlay logical clock
 > cannot allow.
 >
-> **One gap carries forward.** `pjdfstest` and xfstests were **not run** — neither
-> is installed here nor packaged as a Rust dependency — and `tests/compat.rs`
-> covers a hand-written subset of the same ground instead. It should close before
-> M6.1.
+> **One gap carries forward, now half closed.** `pjdfstest` and xfstests were
+> **not run** — neither is installed here nor packaged as a Rust dependency — and
+> `tests/compat.rs` covers a hand-written subset of the same ground instead.
+>
+> **Update, 2026-07-27: `pjdfstest` now runs**, built from source and driven by
+> [`spikes/conformance/pjdfstest.sh`](../spikes/conformance/pjdfstest.sh) against
+> an ext4 control, because the suite requires root and 76 of its 238 files fail
+> on ext4 without it. 37 files fail on XVFS and not on ext4; three of those look
+> like defects rather than documented divergence — `EIO` for some long-path
+> shapes, directory mtime/ctime never moving when a child changes, and
+> `UTIME_OMIT` being ignored. See the
+> [POSIX conformance report](reports/posix-conformance.md).
+>
+> **xfstests is still not run** and is not a script invocation away: it wants a
+> scratch block device and much of its `generic` group tests behaviour XVFS does
+> not claim. Scoping a meaningful subset — or recording it as deliberately not
+> applicable, with reasons — remains open before M6.1.
 >
 > **One deferral is now unblocked.** ADR 0003's amendment set "the prototype
 > mounts and serves a workspace locally" as the trigger for re-running
@@ -523,7 +536,7 @@ Duration: 3–4 weeks
 > | M3.1 overlay data model | ✅ | `state.rs`, `journal.rs`, `store.rs`, `merge.rs`, `model.rs` |
 > | M3.2 mutation operations | ✅ | `xvfs-fuse/src/fs.rs`, `inode.rs`, `attr.rs` |
 > | M3.3 status and diff | ✅ | `status.rs`, `diff.rs`, `export.rs`, `blobs.rs`, `xvfs-git-shim` |
-> | M3.4 crash and concurrency | ⚠️ `pjdfstest`/xfstests **still not run** | `fault.rs`, `xvfs-overlay-crash`, `tests/faults.rs` |
+> | M3.4 crash and concurrency | ⚠️ `pjdfstest` run 2026-07-27 ([report](reports/posix-conformance.md)); xfstests **not run** | `fault.rs`, `xvfs-overlay-crash`, `tests/faults.rs` |
 >
 > Measured: `status` over a 5002-entry directory with two changes costs **zero**
 > metadata requests, **zero** directory pages, and **zero** blob bytes; a
@@ -539,9 +552,14 @@ Duration: 3–4 weeks
 > every hunk's leading context line and a verifier that blamed the export for the
 > developer's `core.autocrlf`.
 >
-> **One gap carries forward unchanged from M2.** `pjdfstest` and xfstests are
-> still not run; `tests/compat.rs` now covers a hand-written *writable* subset on
-> top of the read-only one. It should close before M6.1.
+> **One gap carries forward unchanged from M2, and is now half closed.**
+> `pjdfstest` and xfstests were still not run at M3; `tests/compat.rs` covers a
+> hand-written *writable* subset on top of the read-only one. `pjdfstest` was run
+> on 2026-07-27 and found 37 files failing on XVFS that pass on an ext4 control
+> — including two of the writable paths M3 built, where a directory's mtime and
+> ctime do not move when a child is created or removed. See the
+> [POSIX conformance report](reports/posix-conformance.md). xfstests remains
+> open before M6.1.
 >
 > One scope note: `Status::directory_deletions` reports a directory whiteout
 > whose per-file record is not in the journal. Every mutation path that occurs in
