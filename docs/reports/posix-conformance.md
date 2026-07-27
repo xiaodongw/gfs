@@ -222,7 +222,7 @@ produces no change, no diff hunk, and nothing in an export. A test asserts that.
 
 ## What is a decision, not a defect
 
-### `atime` is not stored — needs a product call
+### `atime` is not modelled — decided 2026-07-27: it stays unmodelled
 
 Every remaining `utimensat` failure reduces to this. `attr.rs` reports
 `atime: mtime`, and `setattr` ignores its `_atime` argument entirely, so a
@@ -242,9 +242,24 @@ by the overlay's own clock tick (`utimensat/08`), and a requested time below the
 snapshot floor is clamped, which ADR 0006 already documents as deliberate
 (`utimensat/04`).
 
-The current behaviour is the shape this project avoids elsewhere — succeeding
-while quietly doing something else. If atime is out of scope, `utimensat` asking
-for one should probably say so rather than silently mirror mtime.
+**Decision: atime stays unmodelled, and is accepted rather than refused.**
+
+Refusing was the tempting answer and is the wrong one. `cp -p`, `tar -x`,
+`rsync -a` and `touch` all set atime and mtime in a *single* `utimensat`, so
+returning an error whenever atime is requested would break every one of them —
+much worse than a timestamp that tracks mtime. And the behaviour is not actually
+undeclared: the mount already carries `MountOption::NoAtime`, and "atime equals
+mtime and never moves on its own" is precisely what a `noatime` mount looks like.
+
+What was missing was the statement, not the behaviour. It is now in DESIGN.md
+section 12's divergence list, at the `setattr` parameter that discards it, and in
+a test that pins both halves — that atime tracks mtime, and that setting both
+stamps still succeeds. The five `utimensat` files stay red against the suite by
+design.
+
+Sub-second precision goes the same way: the overlay stamps from its own monotonic
+clock, so `utimensat/08` is the same decision rather than a separate one.
+`utimensat/04` is ADR 0006's documented clamp.
 
 ### Three more to state rather than fix
 

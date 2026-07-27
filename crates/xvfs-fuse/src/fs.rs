@@ -1646,6 +1646,18 @@ impl Filesystem for XvfsFilesystem {
     _uid: Option<u32>,
     _gid: Option<u32>,
     size: Option<u64>,
+    // Accepted and discarded, deliberately. The mount is `noatime` (see
+    // `session.rs`) and the overlay models one modification time per entry, so
+    // there is no atime to set: `getattr` reports mtime for it, which is what a
+    // `noatime` mount looks like, and Git could not record an atime an export
+    // would have to reproduce.
+    //
+    // Discarded rather than refused, which is the part worth stating. `cp -p`,
+    // `tar -x`, `rsync -a` and `touch` all set atime and mtime in one
+    // `utimensat`, so returning an error whenever atime is requested would fail
+    // every one of them — a far worse outcome than a timestamp that tracks mtime.
+    // pjdfstest's `utimensat/02`, `/04`, `/05`, `/08` and `/09` fail against this
+    // by design; `docs/reports/posix-conformance.md` records it as scope.
     _atime: Option<fuser::TimeOrNow>,
     mtime: Option<fuser::TimeOrNow>,
     _ctime: Option<std::time::SystemTime>,

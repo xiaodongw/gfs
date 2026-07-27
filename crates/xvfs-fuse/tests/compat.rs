@@ -733,3 +733,58 @@ async fn adopting_a_directory_for_its_timestamps_is_not_a_reportable_change() {
     "a directory adopted only to carry a timestamp was reported as a change: {touched:?}"
   );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_access_time_is_not_modelled_and_setting_one_is_accepted_rather_than_refused() {
+  // The scope decision behind pjdfstest's five `utimensat` failures. The mount is
+  // `noatime` and the overlay carries one modification time per entry, so atime
+  // is reported as mtime -- exactly what a `noatime` mount looks like, and a
+  // value Git could not record for an export to reproduce.
+  //
+  // The half that is easy to get wrong is *how* it is unsupported. `cp -p`,
+  // `tar -x`, `rsync -a` and `touch` set atime and mtime together in a single
+  // `utimensat`, so refusing whenever atime is requested would break all of them.
+  // Accepting and tracking mtime is the lesser divergence, and this pins both
+  // halves so neither is changed by accident.
+  let backend = Backend::start("basic").await;
+  let mount = Mount::new(&backend, "main").await;
+  let root = mount.path.clone();
+
+  on_fs(move || {
+    let path = root.join("times.txt");
+    std::fs::write(&path, b"x").unwrap();
+
+    // Well past the snapshot floor, so nothing here is the documented clamp.
+    // `File::set_times` is `futimens`, which is the same call `cp -p` makes and
+    // which carries both stamps in one request.
+    let atime = std::time::UNIX_EPOCH + std::time::Duration::from_secs(2_000_000_000);
+    let mtime = std::time::UNIX_EPOCH + std::time::Duration::from_secs(2_100_000_000);
+    let file = std::fs::File::options().write(true).open(&path).unwrap();
+    file
+      .set_times(
+        std::fs::FileTimes::new()
+          .set_accessed(atime)
+          .set_modified(mtime),
+      )
+      .expect("setting both times must succeed: cp -p and tar depend on it");
+    drop(file);
+
+    let meta = std::fs::metadata(&path).unwrap();
+    let seen_mtime = meta.modified().unwrap();
+    let seen_atime = meta.accessed().unwrap();
+
+    assert_eq!(
+      seen_mtime
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs(),
+      2_100_000_000,
+      "the modification time is the one XVFS does model"
+    );
+    assert_eq!(
+      seen_atime, seen_mtime,
+      "atime tracks mtime; it is not stored separately and must not appear to be"
+    );
+  })
+  .await;
+}

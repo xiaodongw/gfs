@@ -891,6 +891,19 @@ must be stated, because they are invisible to the agent unless documented:
 - **Base timestamps use the server's sanitized stable snapshot time.** Overlay
   timestamps cannot be set below the base-plus-one-tick floor, and base inode
   numbers are stable only within a mount generation, per section 8.2.
+- **Access times are not modelled.** The mount is `noatime` and the overlay
+  carries one modification time per entry, so `stat` reports mtime for atime and
+  an explicit `utimensat` atime is accepted and discarded rather than refused —
+  `cp -p`, `tar -x`, `rsync -a` and `touch` set both stamps in a single call, and
+  failing them to be pedantic about a timestamp Git cannot record would be the
+  worse trade. Sub-second precision is likewise not preserved: the overlay stamps
+  from its own monotonic clock. Measured against pjdfstest in
+  [`reports/posix-conformance.md`](reports/posix-conformance.md).
+- **Directory `nlink` is always 2**, so it does not encode the subdirectory
+  count. GNU `find`'s leaf optimization was checked against this and still
+  descends correctly.
+- **Only Git's two file modes exist.** A `chmod` to anything other than 644 or
+  755 succeeds and rounds; the executable bit is the one bit that is stored.
 - **`reftable` repositories and SHA-256 repositories are rejected, not degraded.**
   libgit2 cannot read the former and its support for the latter is experimental.
 
