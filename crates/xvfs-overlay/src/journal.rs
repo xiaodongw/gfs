@@ -1,0 +1,353 @@
+//! `overlay.sqlite`: the durable half of the overlay.
+//!
+//! # What the journal is authoritative for
+//!
+//! Everything except file bytes. A row says a path exists, what kind it is, which
+//! content it points at, and what the base had there. The bytes themselves live
+//! in `files/`, and the ordering rule in [`crate::store`] guarantees that a
+//! committed row's content is already on disk.
+//!
+//! # One transaction per acknowledged mutation
+//!
+//! A mutation is a [`Change`] list applied in a single SQLite transaction. That
+//! matters most for `rename`, which is a delete and one or more inserts that must
+//! not be separable: a crash between them would leave a path that exists twice or
+//! not at all. PLAN.md M3.1 asks for exactly this transaction ordering, and it is
+//! why `rename` is not implemented as "unlink then create".
+//!
+//! # `synchronous = NORMAL`, and what that buys
+//!
+//! Two failure models, and they get different guarantees, stated here so the
+//! crash tests can assert the right thing:
+//!
+//! * **the daemon dies** (`kill -9`, panic, OOM) — every committed transaction
+//!   survives, because the write-ahead log is already in the kernel's hands.
+//!   Every mutation the filesystem acknowledged is therefore recoverable.
+//! * **the host dies** (power loss) — recent commits may be lost unless something
+//!   forced them out, which is what `fsync(2)` on the mount does
+//!   ([`crate::Overlay::sync`]).
+//!
+//! `FULL` would fsync on every metadata operation. The catalog uses it because a
+//! lease that survives the process but not the machine lets `gc` prune a live
+//! mount's objects; the overlay's exposure is one job's uncommitted edits, and
+//! POSIX already says those need an `fsync` to be durable.
+
+use std::path::Path;
+
+use rusqlite::{Connection, OptionalExtension};
+
+use crate::error::{OverlayError, Result};
+use crate::state::{OverlayEntry, Row};
+
+/// The current schema version. Refused, never guessed at, when it is newer.
+pub const SCHEMA_VERSION: i64 = 1;
+
+/// The state-file format the overlay directory as a whole speaks.
+pub const OVERLAY_FORMAT_VERSION: u32 = 1;
+
+pub const OVERLAY_DB_FILE: &str = "overlay.sqlite";
+
+/// One atomic edit to the journal.
+#[derive(Clone, Debug)]
+pub enum Change {
+  Put(OverlayEntry),
+  Delete(xvfs_types::BytePath),
+}
+
+/// Identity the overlay is bound to, checked on every open.
+#[derive(Clone, Debug)]
+pub struct Binding {
+  pub repository_id: String,
+  /// The pinned commit, qualified. An overlay is only meaningful against the
+  /// base it diverged from, so opening it against another commit is refused
+  /// rather than merged — the paths would still resolve and the answers would
+  /// silently be about a different tree.
+  pub base_commit: String,
+}
+
+pub struct Journal {
+  conn: Connection,
+}
+
+impl std::fmt::Debug for Journal {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    f.debug_struct("Journal").finish_non_exhaustive()
+  }
+}
+
+impl Journal {
+  pub fn open(path: &Path, binding: &Binding) -> Result<Self> {
+    let conn = Connection::open(path).map_err(db)?;
+    configure(&conn)?;
+    migrate(&conn)?;
+    let journal = Journal { conn };
+    journal.bind(binding)?;
+    Ok(journal)
+  }
+
+  /// Refuse an overlay that belongs to a different mount.
+  fn bind(&self, binding: &Binding) -> Result<()> {
+    let stored_repo: Option<String> = self.meta("repository_id")?;
+    let stored_commit: Option<String> = self.meta("base_commit")?;
+    match (stored_repo, stored_commit) {
+      (None, None) => {
+        self.set_meta("repository_id", &binding.repository_id)?;
+        self.set_meta("base_commit", &binding.base_commit)?;
+        self.set_meta("format_version", &OVERLAY_FORMAT_VERSION.to_string())?;
+        self.set_meta("next_ino", &crate::OVERLAY_INO_BASE.to_string())?;
+        self.set_meta("next_content_id", "1")?;
+        Ok(())
+      }
+      (Some(repo), Some(commit)) => {
+        if repo != binding.repository_id || commit != binding.base_commit {
+          return Err(OverlayError::new(
+            crate::error::Condition::Invalid,
+            format!(
+              "this overlay holds edits against {repo}@{commit} and cannot be reopened \
+               against {}@{}; export or discard them first",
+              binding.repository_id, binding.base_commit
+            ),
+          ));
+        }
+        Ok(())
+      }
+      _ => Err(OverlayError::io(
+        "the overlay journal is missing its binding; it is damaged",
+      )),
+    }
+  }
+
+  pub fn meta(&self, key: &str) -> Result<Option<String>> {
+    self
+      .conn
+      .query_row("SELECT value FROM meta WHERE key = ?1", [key], |r| r.get(0))
+      .optional()
+      .map_err(db)
+  }
+
+  pub fn set_meta(&self, key: &str, value: &str) -> Result<()> {
+    self
+      .conn
+      .execute(
+        "INSERT INTO meta (key, value) VALUES (?1, ?2)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        (key, value),
+      )
+      .map_err(db)?;
+    Ok(())
+  }
+
+  fn counter(&self, key: &str, floor: u64) -> Result<u64> {
+    Ok(
+      self
+        .meta(key)?
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(floor),
+    )
+  }
+
+  pub fn next_ino(&self) -> Result<u64> {
+    self.counter("next_ino", crate::OVERLAY_INO_BASE)
+  }
+
+  pub fn next_content_id(&self) -> Result<u64> {
+    self.counter("next_content_id", 1)
+  }
+
+  /// Every row, for the in-memory index built at open.
+  pub fn load(&self) -> Result<Vec<OverlayEntry>> {
+    let mut stmt = self.conn.prepare(SELECT_ALL).map_err(db)?;
+    let rows = stmt
+      .query_map([], |r| {
+        Ok(Row {
+          path: r.get(0)?,
+          parent: r.get(1)?,
+          present: r.get(2)?,
+          kind: r.get(3)?,
+          opaque: r.get(4)?,
+          ino: r.get(5)?,
+          content_kind: r.get(6)?,
+          content_id: r.get(7)?,
+          content_oid: r.get(8)?,
+          symlink_target: r.get(9)?,
+          size: r.get(10)?,
+          mtime_secs: r.get(11)?,
+          mtime_nanos: r.get(12)?,
+          ctime_secs: r.get(13)?,
+          ctime_nanos: r.get(14)?,
+          renamed_from: r.get(15)?,
+          base_oid: r.get(16)?,
+          base_mode: r.get(17)?,
+          base_size: r.get(18)?,
+        })
+      })
+      .map_err(db)?;
+
+    let mut out = Vec::new();
+    for row in rows {
+      let row = row.map_err(db)?;
+      out.push(
+        row
+          .decode()
+          .map_err(|e| OverlayError::io(format!("an overlay row is undecodable: {e}")))?,
+      );
+    }
+    Ok(out)
+  }
+
+  /// Apply a mutation atomically, advancing the persisted allocators with it.
+  ///
+  /// The allocators travel in the same transaction on purpose. A crash between
+  /// "the row that uses content id 7 is committed" and "the counter says 8" would
+  /// hand id 7 out twice, and the second use would rename a new file over the
+  /// bytes the first one is still serving.
+  pub fn apply(&mut self, changes: &[Change], next_ino: u64, next_content_id: u64) -> Result<()> {
+    let tx = self.conn.transaction().map_err(db)?;
+    for change in changes {
+      match change {
+        Change::Put(entry) => {
+          let row = Row::of(entry);
+          tx.execute(
+            INSERT,
+            rusqlite::params![
+              row.path,
+              row.parent,
+              row.present,
+              row.kind,
+              row.opaque,
+              row.ino,
+              row.content_kind,
+              row.content_id,
+              row.content_oid,
+              row.symlink_target,
+              row.size,
+              row.mtime_secs,
+              row.mtime_nanos,
+              row.ctime_secs,
+              row.ctime_nanos,
+              row.renamed_from,
+              row.base_oid,
+              row.base_mode,
+              row.base_size,
+            ],
+          )
+          .map_err(db)?;
+        }
+        Change::Delete(path) => {
+          tx.execute("DELETE FROM entries WHERE path = ?1", [path.as_bytes()])
+            .map_err(db)?;
+        }
+      }
+    }
+    tx.execute(
+      "INSERT INTO meta (key, value) VALUES ('next_ino', ?1)
+       ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+      [next_ino.to_string()],
+    )
+    .map_err(db)?;
+    tx.execute(
+      "INSERT INTO meta (key, value) VALUES ('next_content_id', ?1)
+       ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+      [next_content_id.to_string()],
+    )
+    .map_err(db)?;
+    tx.commit().map_err(db)?;
+    Ok(())
+  }
+
+  /// Force everything committed so far onto stable storage.
+  ///
+  /// What `fsync(2)` on a mounted file ultimately reaches. A checkpoint rather
+  /// than a pragma flip because `synchronous` is a connection setting and
+  /// changing it per call would race any other statement on this connection.
+  pub fn sync(&self) -> Result<()> {
+    self
+      .conn
+      .execute_batch("PRAGMA wal_checkpoint(FULL);")
+      .map_err(db)
+  }
+}
+
+fn configure(conn: &Connection) -> Result<()> {
+  conn
+    .execute_batch(
+      "PRAGMA journal_mode = WAL;
+       PRAGMA synchronous = NORMAL;
+       PRAGMA busy_timeout = 5000;",
+    )
+    .map_err(db)
+}
+
+fn migrate(conn: &Connection) -> Result<()> {
+  let current: i64 = conn
+    .query_row("PRAGMA user_version", [], |r| r.get(0))
+    .map_err(db)?;
+  if current > SCHEMA_VERSION {
+    return Err(OverlayError::new(
+      crate::error::Condition::Invalid,
+      format!(
+        "overlay schema version {current} was written by a newer XVFS \
+         (this build speaks {SCHEMA_VERSION}); refusing to read it"
+      ),
+    ));
+  }
+  if current == SCHEMA_VERSION {
+    return Ok(());
+  }
+  if current < 1 {
+    conn.execute_batch(V1).map_err(db)?;
+  }
+  conn
+    .execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))
+    .map_err(db)?;
+  Ok(())
+}
+
+const V1: &str = r#"
+CREATE TABLE meta (
+  key   TEXT PRIMARY KEY,
+  value TEXT NOT NULL
+) STRICT;
+
+CREATE TABLE entries (
+  -- The byte path, with no leading slash. Bytes rather than text because a Git
+  -- path is not required to be UTF-8 and a lossy round trip renames a file.
+  path           BLOB PRIMARY KEY,
+  parent         BLOB NOT NULL,
+  present        INTEGER NOT NULL,
+  kind           INTEGER NOT NULL,
+  opaque         INTEGER NOT NULL,
+  ino            INTEGER NOT NULL,
+  content_kind   INTEGER NOT NULL,
+  content_id     INTEGER,
+  content_oid    TEXT,
+  symlink_target BLOB,
+  size           INTEGER NOT NULL,
+  mtime_secs     INTEGER NOT NULL,
+  mtime_nanos    INTEGER NOT NULL,
+  ctime_secs     INTEGER NOT NULL,
+  ctime_nanos    INTEGER NOT NULL,
+  renamed_from   BLOB,
+  base_oid       TEXT,
+  base_mode      INTEGER,
+  base_size      INTEGER
+) STRICT;
+
+CREATE INDEX entries_parent ON entries(parent);
+"#;
+
+/// The column order every `Row` encode/decode pair depends on. Written once and
+/// referenced by both statements, so an added column cannot be forgotten in one.
+const SELECT_ALL: &str =
+  "SELECT path, parent, present, kind, opaque, ino, content_kind, content_id, \
+   content_oid, symlink_target, size, mtime_secs, mtime_nanos, ctime_secs, ctime_nanos, \
+   renamed_from, base_oid, base_mode, base_size FROM entries";
+
+const INSERT: &str = "INSERT OR REPLACE INTO entries (path, parent, present, kind, opaque, ino, \
+   content_kind, content_id, content_oid, symlink_target, size, mtime_secs, mtime_nanos, \
+   ctime_secs, ctime_nanos, renamed_from, base_oid, base_mode, base_size) \
+   VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)";
+
+fn db(e: rusqlite::Error) -> OverlayError {
+  OverlayError::io(format!("overlay journal: {e}"))
+}

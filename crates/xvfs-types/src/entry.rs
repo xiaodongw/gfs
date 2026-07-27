@@ -43,6 +43,22 @@ impl EntryKind {
     }
   }
 
+  /// The Git mode this kind was made from.
+  ///
+  /// Exact for every kind, including [`EntryKind::Unsupported`], which carries
+  /// its own mode precisely so a round trip through the enum cannot quietly
+  /// rewrite a mode Git recorded into the nearest one XVFS understands.
+  pub fn as_mode(self) -> u32 {
+    match self {
+      EntryKind::Regular => mode::REGULAR,
+      EntryKind::Executable => mode::EXECUTABLE,
+      EntryKind::Symlink => mode::SYMLINK,
+      EntryKind::Directory => mode::DIRECTORY,
+      EntryKind::Gitlink => mode::GITLINK,
+      EntryKind::Unsupported(m) => m,
+    }
+  }
+
   /// Whether the entry is listable as a directory. A gitlink counts: it is
   /// presented as an empty directory, which is a listing that returns nothing
   /// rather than an error.
