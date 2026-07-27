@@ -148,6 +148,13 @@ The shim itself is not yet rewired to these tools, so `git log` and
 cost what they cost. See [`docs/agent-search.md`](../agent-search.md) and
 [`benchmarks/agent-workflow.md`](../../benchmarks/agent-workflow.md).
 
+Whether those tools should *also* occupy the standard names on `PATH` — and
+whether `find` and `grep` should be intercepted the way `git` is — is
+[ADR 0007](0007-tool-surface-in-the-agent-image.md), open and owned by M6.1. It
+records one correction due to this ADR either way: the shim exits 128 outside a
+workspace rather than forwarding to the real `git`, which this ADR chose to avoid
+crippling ordinary Git, but which makes a `PATH`-wide install unsafe.
+
 ## Alternatives considered
 
 **Shallow blobless partial clone.** Rejected on the measurement above: a 9.7 MiB

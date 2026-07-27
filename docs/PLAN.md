@@ -913,8 +913,17 @@ Duration: 3–4 weeks
 - Create/mount before the job and unmount/archive after the job.
 - Pass repository, revision, job identity, limits, and credentials securely.
 - Bind-mount into an unprivileged container with the expected ownership.
-- Install CLI, `xvfs-rg`, the `git` shim, agent instructions, and optional MCP tool,
-  and verify shim precedence in `PATH` inside the real agent image.
+- Install CLI, `xvfs-rg`, `xvfs-find`, `xvfs-log`, the `git` shim, agent
+  instructions, and optional MCP tool, and verify shim precedence in `PATH`
+  inside the real agent image.
+- **Decide the tool surface**: same-name shims (`git`, `rg`, `find`, `grep`
+  intercepting on `PATH`) against distinct names the agent is told to use.
+  [ADR 0007](adr/0007-tool-surface-in-the-agent-image.md) records the trade-off
+  and does not decide it. Two things it flags are due here regardless: the `git`
+  shim needs a fall-through when it is outside a workspace, because it currently
+  exits 128 and would break ordinary `git` everywhere else in the image; and the
+  tool names get pinned by this milestone, so a rename to `xrg`/`xfind`/`xgit`
+  is cheap now and a compatibility problem afterwards.
 - Collect patch/export as a job artifact and feed it into the existing review/commit
   pipeline.
 - Handle cancellation, timeout, node drain, orphan mounts, and cleanup retries,
