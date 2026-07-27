@@ -32,6 +32,7 @@
 //! rest.
 
 pub mod attr;
+pub mod blobs;
 pub mod cache;
 pub mod client;
 pub mod control;

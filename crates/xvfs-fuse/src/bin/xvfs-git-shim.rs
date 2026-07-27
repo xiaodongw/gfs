@@ -22,22 +22,25 @@
 //!
 //! # No network, no credential
 //!
-//! Everything is answered from the mount and from `.git/xvfs.json`, including the
-//! commit metadata `log -1` needs, which the daemon embedded at mount time. A
-//! shim that called the server would need the mount capability, and putting a
-//! credential in a `PATH`-installed wrapper that any process can invoke is a
-//! worse trade than one JSON read.
+//! Everything is answered from the mount, from `.git/xvfs.json`, and from the
+//! daemon's local control socket. Nothing here holds a token: `log -1` reads the
+//! commit metadata the daemon embedded at mount time, and `status` and `diff` ask
+//! the daemon — over a `SOCK_STREAM` at mode 0600 on the same host — for the
+//! overlay journal it already owns. A shim that called the *server* would need
+//! the mount capability, and putting a credential in a `PATH`-installed wrapper
+//! that any process can invoke is a worse trade than a local socket.
 //!
-//! # M2 versus M3
+//! # `status` is cheap because it is not a scan
 //!
-//! `status` and `diff` report a clean tree here. That is the *correct* answer for
-//! a read-only mount of an immutable commit, not a stub: there is no overlay yet
-//! to differ from the base. M3.3 rewires both to the overlay journal, and
-//! `ls-files` with it.
+//! ADR 0005 measured stock `git status` against a partial clone of the Linux
+//! kernel stat'ing all 94 850 index entries; inside a mount that is a full
+//! metadata sweep of the monorepo, and an agent runs `git status` constantly.
+//! This one is a single control round trip and touches no base metadata at all.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
+use xvfs_fuse::control::{self, Request, Response};
 use xvfs_types::path::b64url_decode;
 
 const SUPPORTED: &str = "\
@@ -94,6 +97,7 @@ struct Workspace {
   commit: String,
   ref_name: Option<String>,
   commit_meta: Option<serde_json::Value>,
+  control_socket: Option<PathBuf>,
 }
 
 impl Workspace {
@@ -120,6 +124,7 @@ impl Workspace {
           commit: value["commit"].as_str().unwrap_or_default().to_owned(),
           ref_name: value["ref"].as_str().map(str::to_owned),
           commit_meta: value.get("commit_meta").cloned().filter(|v| !v.is_null()),
+          control_socket: value["control_socket"].as_str().map(PathBuf::from),
         });
       }
       current = directory.parent();
@@ -141,6 +146,31 @@ impl Workspace {
       .ref_name
       .as_deref()
       .and_then(|name| name.strip_prefix("refs/heads/"))
+  }
+}
+
+impl Workspace {
+  /// Ask the daemon a question. The one place the shim talks to anything.
+  fn ask(&self, request: Request) -> Result<Response, Failure> {
+    let Some(socket) = &self.control_socket else {
+      return fatal("this workspace predates the control socket; status and diff are unavailable");
+    };
+    control::call(socket, &request)
+      .and_then(control::Response::into_result)
+      .map_err(|e| {
+        Failure::Fatal(format!(
+          "the XVFS daemon did not answer ({}): {}",
+          e.code.as_str(),
+          e.message
+        ))
+      })
+  }
+
+  fn status(&self) -> Result<control::StatusReport, Failure> {
+    match self.ask(Request::Status)? {
+      Response::Status(report) => Ok(*report),
+      _ => fatal("the daemon answered a status request with something else"),
+    }
   }
 }
 
@@ -193,36 +223,186 @@ fn status(workspace: &Workspace, args: &[String]) -> Result<(), Failure> {
       other => return unsupported(format!("`git status {other}`")),
     }
   }
+
+  let report = workspace.status()?;
+  let stdout = std::io::stdout();
+  let mut out = stdout.lock();
+
   if porcelain {
-    // Empty: no entries, and with `-z` not even a newline.
-    let _ = nul;
+    for change in &report.status.changes {
+      // `XY path`. The change is in the X column -- the one that means "differs
+      // from HEAD" -- because that is what an XVFS change *is*: there is no
+      // index, and every recorded change is relative to the pinned commit.
+      // Putting it in the worktree column instead would tell an agent its work
+      // is unstaged and invite a `git add` the shim cannot answer.
+      let _ = out.write_all(&[change.kind.porcelain(), b' ', b' ']);
+      match (&change.from, nul) {
+        // Git's two rename forms, and they are not the same order. Plain
+        // `--porcelain` writes `old -> new`; `-z` writes the *new* path in the
+        // record and the old one in a second NUL-terminated field, because a
+        // path containing " -> " would otherwise be unparseable.
+        (Some(from), false) => {
+          let _ = out.write_all(from.as_bytes());
+          let _ = out.write_all(b" -> ");
+          let _ = out.write_all(change.path.as_bytes());
+        }
+        (Some(from), true) => {
+          let _ = out.write_all(change.path.as_bytes());
+          let _ = out.write_all(&[0]);
+          let _ = out.write_all(from.as_bytes());
+        }
+        (None, _) => {
+          let _ = out.write_all(change.path.as_bytes());
+        }
+      }
+      let _ = out.write_all(if nul { &[0] } else { b"\n" });
+    }
     return Ok(());
   }
+
   match workspace.branch() {
     Some(branch) => println!("On branch {branch}"),
     None => println!("HEAD detached at {}", short(workspace.commit_hex())),
   }
-  println!("nothing to commit, working tree clean");
+  if report.status.is_clean() {
+    println!("nothing to commit, working tree clean");
+    return Ok(());
+  }
+  println!("Changes not staged for commit:");
+  for change in &report.status.changes {
+    let label = match change.kind {
+      xvfs_overlay::ChangeKind::Added => "new file",
+      xvfs_overlay::ChangeKind::Modified => "modified",
+      xvfs_overlay::ChangeKind::Deleted => "deleted",
+      xvfs_overlay::ChangeKind::TypeChanged => "typechange",
+      xvfs_overlay::ChangeKind::ModeChanged => "mode",
+      xvfs_overlay::ChangeKind::Renamed => "renamed",
+    };
+    let _ = write!(out, "\t{label}:   ");
+    if let Some(from) = &change.from {
+      let _ = out.write_all(from.as_bytes());
+      let _ = out.write_all(b" -> ");
+    }
+    let _ = out.write_all(change.path.as_bytes());
+    let _ = out.write_all(b"\n");
+  }
   Ok(())
 }
 
 fn diff(workspace: &Workspace, args: &[String]) -> Result<(), Failure> {
+  let mut mode = DiffMode::Patch;
+  let mut pathspecs: Vec<String> = Vec::new();
   let mut saw_separator = false;
   for arg in args {
     if saw_separator {
       reject_magic_pathspec(arg)?;
+      pathspecs.push(arg.clone());
       continue;
     }
     match arg.as_str() {
-      "--stat" | "--name-only" | "--name-status" | "--cached" => {}
+      "--stat" => mode = DiffMode::Stat,
+      "--name-only" => mode = DiffMode::NameOnly,
+      "--name-status" => mode = DiffMode::NameStatus,
+      // XVFS has no index, so there is nothing staged and `--cached` is empty by
+      // definition. Accepted rather than refused because build tooling passes it
+      // reflexively, and "no staged changes" is the true answer.
+      "--cached" => mode = DiffMode::Cached,
       "--" => saw_separator = true,
       other => return unsupported(format!("`git diff {other}`")),
     }
   }
-  // No overlay in M2, so there is nothing to differ from the base. Exit 0 with
-  // no output, which is what "no changes" means to every caller.
-  let _ = workspace;
+  if mode == DiffMode::Cached {
+    return Ok(());
+  }
+
+  let report = workspace.status()?;
+  let selected: Vec<&xvfs_overlay::status::Change> = report
+    .status
+    .changes
+    .iter()
+    .filter(|change| {
+      pathspecs.is_empty()
+        || pathspecs
+          .iter()
+          .any(|spec| matches(spec.as_bytes(), change.path.as_bytes()))
+    })
+    .collect();
+
+  let stdout = std::io::stdout();
+  let mut out = stdout.lock();
+  match mode {
+    DiffMode::NameOnly => {
+      for change in selected {
+        let _ = out.write_all(change.path.as_bytes());
+        let _ = out.write_all(b"\n");
+      }
+    }
+    DiffMode::NameStatus => {
+      for change in selected {
+        let _ = out.write_all(&[change.kind.porcelain(), b'\t']);
+        let _ = out.write_all(change.path.as_bytes());
+        let _ = out.write_all(b"\n");
+      }
+    }
+    DiffMode::Stat => {
+      for change in &selected {
+        let _ = write!(out, " ");
+        let _ = out.write_all(change.path.as_bytes());
+        let _ = writeln!(out, " | {} bytes", change.new_size);
+      }
+      let _ = writeln!(out, " {} file(s) changed", selected.len());
+    }
+    DiffMode::Patch => {
+      // The whole patch, then filtered by pathspec if one was given. Filtering
+      // the *sections* rather than asking for a narrower diff keeps the daemon's
+      // side to one shape, and a pathspec on a workspace's edit set is small.
+      let Response::Diff { patch_b64url } = workspace.ask(Request::Diff)? else {
+        return fatal("the daemon answered a diff request with something else");
+      };
+      let patch = b64url_decode(&patch_b64url).map_err(|e| {
+        Failure::Fatal(format!(
+          "the daemon returned an undecodable patch: {}",
+          e.message
+        ))
+      })?;
+      if pathspecs.is_empty() {
+        let _ = out.write_all(&patch);
+      } else {
+        let _ = out.write_all(&filter_patch(&patch, &selected));
+      }
+    }
+    DiffMode::Cached => unreachable!("returned above"),
+  }
   Ok(())
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DiffMode {
+  Patch,
+  Stat,
+  NameOnly,
+  NameStatus,
+  Cached,
+}
+
+/// Keep only the `diff --git` sections whose destination path was selected.
+fn filter_patch(patch: &[u8], selected: &[&xvfs_overlay::status::Change]) -> Vec<u8> {
+  let wanted: Vec<&[u8]> = selected.iter().map(|c| c.path.as_bytes()).collect();
+  let mut out = Vec::new();
+  let mut keep = false;
+  for line in patch.split_inclusive(|b| *b == b'\n') {
+    if line.starts_with(b"diff --git ") {
+      keep = wanted.iter().any(|path| {
+        let mut needle = b" b/".to_vec();
+        needle.extend_from_slice(path);
+        line.windows(needle.len()).any(|w| w == needle.as_slice())
+      });
+    }
+    if keep {
+      out.extend_from_slice(line);
+    }
+  }
+  out
 }
 
 // ---------------------------------------------------------------------------
@@ -297,11 +477,16 @@ fn symbolic_ref(workspace: &Workspace, args: &[String]) -> Result<(), Failure> {
 // ls-files
 // ---------------------------------------------------------------------------
 
-/// Every path in the pinned commit, from a walk of the mount.
+/// Every path the workspace has, from a walk of the mount.
 ///
 /// A full listing is inherent to what `ls-files` means, so this one *is* a tree
 /// walk. It costs metadata and no blob content, and it is still the correct
 /// answer where stock Git against this surface reports nothing at all.
+///
+/// The walk goes through the *mount*, which is already the merged view: a file
+/// the job created is there, one it deleted is not, and a renamed one is under
+/// its new name. Reading the journal instead and merging it here would be a
+/// second implementation of the merge, which is how the two come to disagree.
 fn ls_files(workspace: &Workspace, args: &[String]) -> Result<(), Failure> {
   let mut nul = false;
   let mut pathspecs: Vec<String> = Vec::new();

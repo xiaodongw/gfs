@@ -81,6 +81,13 @@ pub struct GitDirFacts {
   pub http_endpoint: String,
   /// The mount generation `xvfs refresh` produced this surface for.
   pub generation: u64,
+  /// The daemon's control socket.
+  ///
+  /// The shim's `status`, `diff`, and `ls-files` need the overlay journal, which
+  /// only the daemon has. A local `SOCK_STREAM` at mode 0600 is not a credential
+  /// and does not make the shim one -- it carries no token, and a process that
+  /// can open it can already read the workspace.
+  pub control_socket: std::path::PathBuf,
   /// The pinned commit's metadata, fetched once at mount time.
   ///
   /// Embedded rather than fetched on demand so that the `git` shim's bounded
@@ -245,7 +252,10 @@ fn xvfs_json(facts: &GitDirFacts) -> Vec<u8> {
     "snapshot_time": { "secs": facts.snapshot_time.secs, "nanos": facts.snapshot_time.nanos },
     "grpc_endpoint": facts.grpc_endpoint,
     "http_endpoint": facts.http_endpoint,
+    // The `.git` surface is read-only; the workspace around it is not.
     "read_only": true,
+    "workspace_writable": true,
+    "control_socket": facts.control_socket.display().to_string(),
     "surface": "synthesized",
     "adr": "docs/adr/0005-git-command-surface.md",
     "commit_meta": facts.commit_meta.as_ref().map(commit_json),
@@ -267,6 +277,7 @@ mod tests {
       tree: ObjectId::from_raw(HashAlgorithm::Sha1, &[0xcd; 20]).unwrap(),
       ref_name: ref_name.map(str::to_owned),
       mount_id: MountId::parse("m-1").unwrap(),
+      control_socket: std::path::PathBuf::from("/run/xvfs/control.sock"),
       snapshot_time: Timestamp::from_secs(1_600_000_000),
       grpc_endpoint: "http://127.0.0.1:8431".to_owned(),
       http_endpoint: "http://127.0.0.1:8430".to_owned(),

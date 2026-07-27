@@ -38,12 +38,15 @@
 //! the journal row that named it is gone. See [`store`] for the sequence and the
 //! invariant it maintains.
 
+pub mod diff;
 pub mod error;
+pub mod export;
 pub mod hash;
 pub mod journal;
 pub mod merge;
 pub mod model;
 pub mod state;
+pub mod status;
 pub mod store;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -53,11 +56,13 @@ use std::sync::Mutex;
 use xvfs_types::{BytePath, Timestamp};
 
 pub use error::{Condition, OverlayError, Result};
+pub use export::{ExportReport, Exporter};
 pub use journal::{Binding, Change, Journal, OVERLAY_FORMAT_VERSION};
 pub use merge::{BaseChild, Resolution};
 pub use state::{
   ancestors_of, is_within, parent_of, BaseFacts, Content, OverlayEntry, OverlayKind,
 };
+pub use status::{ChangeKind, Status};
 pub use store::{ContentStore, SweepReport};
 
 /// Where overlay inode numbers start.
@@ -1050,14 +1055,17 @@ impl Overlay {
         release.push(id);
       }
     }
-    // Removing a directory removes every row underneath it too. The rows are
-    // unreachable once the whiteout is in place, and leaving them would make a
-    // later re-creation of the same path resurrect its old children.
+    // Removing a directory drops the rows underneath it, but **not** the
+    // whiteouts. A directory can only be removed once it is empty, so the only
+    // rows under it are whiteouts -- and those are the record of which base files
+    // the job deleted. Dropping them would make `rm -rf src/` indistinguishable
+    // from "the directory was never there", and an export would then have to walk
+    // the base subtree to find out what to delete.
     if is_dir {
       let doomed: Vec<BytePath> = inner
         .entries
         .values()
-        .filter(|e| e.path != *path && is_within(&e.path, path))
+        .filter(|e| e.present && e.path != *path && is_within(&e.path, path))
         .map(|e| e.path.clone())
         .collect();
       for victim in doomed {
@@ -1237,14 +1245,18 @@ impl Overlay {
         )));
       }
       for row in movers {
+        // Whiteouts stay where they are. They record base files the job deleted
+        // *before* the rename, and those deletions are still deletions -- the
+        // files were never moved. Carrying them across would instead punch holes
+        // in the moved subtree.
+        if !row.present {
+          continue;
+        }
         let suffix = &row.path.as_bytes()[from.as_bytes().len()..];
         let mut target = to.as_bytes().to_vec();
         target.extend_from_slice(suffix);
         changes.push(Change::Delete(row.path.clone()));
-        // Whiteouts are not carried across. They exist to hide base children,
-        // and the destination directory is opaque, so the base is already hidden
-        // there; copying them would only make the moved subtree unlistable.
-        if row.present {
+        {
           changes.push(Change::Put(OverlayEntry {
             path: BytePath::new(target),
             ctime: now,

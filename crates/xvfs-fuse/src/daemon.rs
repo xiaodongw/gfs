@@ -378,6 +378,88 @@ impl Daemon {
     })
   }
 
+  /// The change set, from the journal alone.
+  pub async fn status(&self) -> Result<crate::control::StatusReport, XvfsError> {
+    let (overlay, commit, ref_name) = {
+      let current = self.current.lock().expect("current generation");
+      (
+        Arc::clone(&current.overlay),
+        current.commit.clone(),
+        current.ref_name.clone(),
+      )
+    };
+    let algorithm = commit.algorithm();
+    let status = tokio::task::spawn_blocking(move || overlay.status(algorithm))
+      .await
+      .map_err(|e| XvfsError::internal(format!("the status task failed: {e}")))?
+      .map_err(crate::fs::overlay_as_service_error)?;
+    Ok(crate::control::StatusReport {
+      base_commit: commit.to_qualified(),
+      ref_name,
+      status,
+    })
+  }
+
+  pub async fn diff(&self) -> Result<Vec<u8>, XvfsError> {
+    let (status, base, overlay, commit) = self.export_inputs().await?;
+    let exporter = xvfs_overlay::Exporter::new(
+      &overlay,
+      &base,
+      commit.algorithm(),
+      self.config.repository_id.as_str(),
+      commit.to_qualified(),
+    );
+    exporter
+      .patch(&status)
+      .map_err(crate::fs::overlay_as_service_error)
+  }
+
+  pub async fn export(&self, bundle: &Path) -> Result<xvfs_overlay::ExportReport, XvfsError> {
+    let (status, base, overlay, commit) = self.export_inputs().await?;
+    let exporter = xvfs_overlay::Exporter::new(
+      &overlay,
+      &base,
+      commit.algorithm(),
+      self.config.repository_id.as_str(),
+      commit.to_qualified(),
+    );
+    exporter
+      .write_bundle(&status, bundle)
+      .map_err(crate::fs::overlay_as_service_error)
+  }
+
+  /// Compute the status and pre-fetch every base blob a diff or export needs.
+  ///
+  /// The fetch happens here, in async code, because the exporter is synchronous
+  /// and the blob path is not. Pre-fetching *only the changed paths* is the
+  /// property DESIGN.md section 8.5 asks for -- "diff reads only changed overlay
+  /// files and their base blobs" -- and doing it in one place makes that
+  /// checkable rather than incidental.
+  async fn export_inputs(
+    &self,
+  ) -> Result<
+    (
+      xvfs_overlay::Status,
+      crate::blobs::PreloadedBase,
+      Arc<Overlay>,
+      ObjectId,
+    ),
+    XvfsError,
+  > {
+    let report = self.status().await?;
+    let (overlay, client, commit) = {
+      let current = self.current.lock().expect("current generation");
+      (
+        Arc::clone(&current.overlay),
+        Arc::clone(&current.client),
+        current.commit.clone(),
+      )
+    };
+    let base =
+      crate::blobs::PreloadedBase::fetch(&client, &self.cache, &report.status, &overlay).await?;
+    Ok((report.status, base, overlay, commit))
+  }
+
   /// Whether the published generation's overlay holds anything.
   fn overlay_is_empty(&self) -> bool {
     self
@@ -530,6 +612,20 @@ impl Daemon {
         Ok(report) => Response::Refresh(report),
         Err(e) => Response::from_error(&e),
       },
+      Request::Status => match self.status().await {
+        Ok(report) => Response::Status(Box::new(report)),
+        Err(e) => Response::from_error(&e),
+      },
+      Request::Diff => match self.diff().await {
+        Ok(patch) => Response::Diff {
+          patch_b64url: xvfs_types::path::b64url_encode(&patch),
+        },
+        Err(e) => Response::from_error(&e),
+      },
+      Request::Export { bundle } => match self.export(&bundle).await {
+        Ok(report) => Response::Export(report),
+        Err(e) => Response::from_error(&e),
+      },
       Request::Unmount => {
         self.shutdown().await;
         Response::Unmounted
@@ -611,6 +707,7 @@ async fn mount_generation(
     tree: tree.clone(),
     ref_name: grant.ref_name.clone(),
     mount_id: mount_id.clone(),
+    control_socket: MountState::control_socket(&config.state_dir),
     snapshot_time,
     grpc_endpoint: config.grpc_endpoint.clone(),
     http_endpoint: config.http_endpoint.clone(),

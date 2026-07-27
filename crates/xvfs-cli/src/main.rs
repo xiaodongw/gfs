@@ -159,6 +159,43 @@ enum Command {
     state_dir: Option<PathBuf>,
   },
 
+  /// What the workspace has changed, from the overlay journal.
+  ///
+  /// Derived from the journal and not from a scan, so the cost is proportional to
+  /// the edit set rather than to the repository (DESIGN.md section 8.5).
+  Status {
+    #[arg(long)]
+    workspace: PathBuf,
+    #[arg(long)]
+    state_dir: Option<PathBuf>,
+    /// Machine-readable output, for an orchestrator.
+    #[arg(long)]
+    json: bool,
+  },
+
+  /// The same change set as a Git-compatible patch on stdout.
+  Diff {
+    #[arg(long)]
+    workspace: PathBuf,
+    #[arg(long)]
+    state_dir: Option<PathBuf>,
+  },
+
+  /// Write an atomic, checksummed export bundle.
+  ///
+  /// The bundle carries the pinned base commit, so a downstream applier can
+  /// reject or three-way merge stale work rather than clobbering a branch that
+  /// moved while the job ran.
+  Export {
+    #[arg(long)]
+    workspace: PathBuf,
+    #[arg(long)]
+    state_dir: Option<PathBuf>,
+    /// The bundle directory. Replaced atomically if it already exists.
+    #[arg(long)]
+    bundle: PathBuf,
+  },
+
   /// Install the `git` shim as `git` in a directory, and print that directory.
   ///
   /// The shim is a `PATH` measure, not a security boundary (DESIGN.md section
@@ -451,6 +488,38 @@ fn print_report(report: &xvfs_fuse::control::MountReport) {
   }
 }
 
+/// `git status --short`'s shape, because that is what an agent reading this has
+/// already learned to parse.
+fn print_status(report: &xvfs_fuse::control::StatusReport) {
+  use std::io::Write;
+  match &report.ref_name {
+    Some(name) => println!("On {} at {}", name, report.base_commit),
+    None => println!("Detached at {}", report.base_commit),
+  }
+  if report.status.is_clean() {
+    println!("nothing to commit, working tree clean");
+    return;
+  }
+  let stdout = std::io::stdout();
+  let mut out = stdout.lock();
+  for change in &report.status.changes {
+    let _ = write!(out, "{} ", change.kind.porcelain() as char);
+    if let Some(from) = &change.from {
+      let _ = out.write_all(from.as_bytes());
+      let _ = out.write_all(b" -> ");
+    }
+    let _ = out.write_all(change.path.as_bytes());
+    let _ = out.write_all(b"\n");
+  }
+  for path in &report.status.directory_deletions {
+    // Named separately because the patch cannot carry them: the journal knows
+    // the directory went but not which base files were under it.
+    let _ = write!(out, "D  ");
+    let _ = out.write_all(path.as_bytes());
+    let _ = out.write_all(b"/ (directory; not expanded)\n");
+  }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
   let cli = Cli::parse();
@@ -668,6 +737,55 @@ async fn main() -> Result<()> {
       if report.unchanged {
         println!("           (unchanged; the selector still resolves to the same commit)");
       }
+    }
+
+    Command::Status {
+      workspace,
+      state_dir,
+      json,
+    } => {
+      let state_dir = state_dir_for(workspace, state_dir);
+      let Response::Status(report) = call(&state_dir, &Request::Status)? else {
+        bail!("the daemon answered a status request with something else");
+      };
+      if *json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+      } else {
+        print_status(&report);
+      }
+      // Non-zero for a dirty workspace would collide with `git status`'s own
+      // convention of exiting 0 either way, so this exits 0 and says so in the
+      // output instead.
+    }
+
+    Command::Diff {
+      workspace,
+      state_dir,
+    } => {
+      let state_dir = state_dir_for(workspace, state_dir);
+      let Response::Diff { patch_b64url } = call(&state_dir, &Request::Diff)? else {
+        bail!("the daemon answered a diff request with something else");
+      };
+      let patch = xvfs_types::path::b64url_decode(&patch_b64url)
+        .map_err(|e| anyhow::anyhow!("the daemon returned an undecodable patch: {}", e.message))?;
+      std::io::Write::write_all(&mut std::io::stdout(), &patch)?;
+    }
+
+    Command::Export {
+      workspace,
+      state_dir,
+      bundle,
+    } => {
+      let state_dir = state_dir_for(workspace, state_dir);
+      let bundle = std::path::absolute(bundle)?;
+      let Response::Export(report) = call(&state_dir, &Request::Export { bundle })? else {
+        bail!("the daemon answered an export request with something else");
+      };
+      println!("bundle     {}", report.bundle.display());
+      println!("changes    {}", report.changes);
+      println!("patch      {} bytes", report.patch_bytes);
+      println!("content    {} bytes", report.content_bytes);
+      println!("manifest   sha256:{}", report.manifest_sha256);
     }
 
     Command::InstallShim {

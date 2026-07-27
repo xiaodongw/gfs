@@ -222,6 +222,9 @@ impl Mount {
       tree: tree.clone(),
       ref_name: grant.ref_name.clone(),
       mount_id: mount_id.clone(),
+      // No daemon here, so no control socket. The shim subcommands that need one
+      // are covered against a real `Job` in `tests/export.rs`.
+      control_socket: mount_dir_placeholder(),
       snapshot_time,
       grpc_endpoint: backend.grpc.clone(),
       http_endpoint: backend.http.clone(),
@@ -296,6 +299,97 @@ impl Drop for Mount {
     // Before the temporary directories go, or the unmount races the removal of
     // its own mount point.
     self.unmount();
+  }
+}
+
+fn mount_dir_placeholder() -> PathBuf {
+  PathBuf::from("/nonexistent/xvfs-harness/control.sock")
+}
+
+/// A daemon-backed job: the whole client, in process.
+///
+/// The daemon runs in-process rather than as a subprocess because what it is
+/// accountable for -- ordering, generations, the control protocol -- is not a
+/// property of process boundaries. `scripts/dev-stack.sh` exercises the
+/// subprocess path.
+pub struct Job {
+  pub daemon: Arc<xvfs_fuse::Daemon>,
+  pub workspace: PathBuf,
+  pub state_dir: PathBuf,
+  _tmp: tempfile::TempDir,
+  _cache: tempfile::TempDir,
+}
+
+impl Job {
+  pub async fn start(backend: &Backend, revision: &str) -> Job {
+    Job::with_overlay(backend, revision, xvfs_overlay::OverlayConfig::default()).await
+  }
+
+  pub async fn with_overlay(
+    backend: &Backend,
+    revision: &str,
+    overlay: xvfs_overlay::OverlayConfig,
+  ) -> Job {
+    use std::time::Duration;
+    use xvfs_fuse::control;
+    use xvfs_fuse::daemon::{Daemon, DaemonConfig};
+    use xvfs_fuse::state::MountState;
+    use xvfs_types::LeasePolicy;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    let workspace = tmp.path().join("ws");
+    let state_dir = tmp.path().join("ws.xvfs");
+
+    let daemon = Daemon::start(DaemonConfig {
+      state_dir: state_dir.clone(),
+      workspace: workspace.clone(),
+      cache_dir: cache.path().to_path_buf(),
+      grpc_endpoint: backend.grpc.clone(),
+      http_endpoint: backend.http.clone(),
+      token: TOKEN.to_owned(),
+      repository_id: backend.repo_id.clone(),
+      revision_selector: revision.to_owned(),
+      cache_quota_bytes: 1 << 30,
+      fs: FsConfig::default(),
+      overlay,
+      mount: MountConfig::default(),
+      lease_policy: LeasePolicy::adr_0006(),
+      // Short, so the retirement case does not take five minutes to fail.
+      retire_timeout: Duration::from_secs(5),
+    })
+    .await
+    .unwrap();
+
+    tokio::spawn(Arc::clone(&daemon).serve_control());
+    // The socket exists only once `serve_control` has bound it.
+    let socket = MountState::control_socket(&state_dir);
+    for _ in 0..200 {
+      if control::is_live(&socket) {
+        break;
+      }
+      tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    Job {
+      daemon,
+      workspace,
+      state_dir,
+      _tmp: tmp,
+      _cache: cache,
+    }
+  }
+
+  pub fn socket(&self) -> PathBuf {
+    xvfs_fuse::state::MountState::control_socket(&self.state_dir)
+  }
+
+  pub async fn call(&self, request: xvfs_fuse::control::Request) -> xvfs_fuse::control::Response {
+    let socket = self.socket();
+    on_fs(move || xvfs_fuse::control::call(&socket, &request).unwrap())
+      .await
+      .into_result()
+      .unwrap()
   }
 }
 

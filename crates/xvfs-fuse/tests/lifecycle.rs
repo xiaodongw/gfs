@@ -7,79 +7,14 @@
 
 mod harness;
 
-use std::path::PathBuf;
-use std::sync::Arc;
 use std::time::Duration;
 
-use harness::{on_fs, Backend};
+use harness::{on_fs, Backend, Job};
 use xvfs_fuse::control::{self, Request, Response};
 use xvfs_fuse::daemon::{Daemon, DaemonConfig};
 use xvfs_fuse::state::MountState;
 use xvfs_fuse::{FsConfig, MountConfig};
 use xvfs_types::{LeasePolicy, RepositoryId};
-
-struct Job {
-  daemon: Arc<Daemon>,
-  workspace: PathBuf,
-  state_dir: PathBuf,
-  _tmp: tempfile::TempDir,
-  _cache: tempfile::TempDir,
-}
-
-impl Job {
-  async fn start(backend: &Backend, revision: &str) -> Job {
-    let tmp = tempfile::tempdir().unwrap();
-    let cache = tempfile::tempdir().unwrap();
-    let workspace = tmp.path().join("ws");
-    let state_dir = tmp.path().join("ws.xvfs");
-
-    let daemon = Daemon::start(DaemonConfig {
-      state_dir: state_dir.clone(),
-      workspace: workspace.clone(),
-      cache_dir: cache.path().to_path_buf(),
-      grpc_endpoint: backend.grpc.clone(),
-      http_endpoint: backend.http.clone(),
-      token: harness::TOKEN.to_owned(),
-      repository_id: backend.repo_id.clone(),
-      revision_selector: revision.to_owned(),
-      cache_quota_bytes: 1 << 30,
-      fs: FsConfig::default(),
-      overlay: xvfs_overlay::OverlayConfig::default(),
-      mount: MountConfig::default(),
-      lease_policy: LeasePolicy::adr_0006(),
-      // Short, so the retirement case does not take five minutes to fail.
-      retire_timeout: Duration::from_secs(5),
-    })
-    .await
-    .unwrap();
-
-    tokio::spawn(Arc::clone(&daemon).serve_control());
-    // The socket exists only once `serve_control` has bound it.
-    let socket = MountState::control_socket(&state_dir);
-    for _ in 0..200 {
-      if control::is_live(&socket) {
-        break;
-      }
-      tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-
-    Job {
-      daemon,
-      workspace,
-      state_dir,
-      _tmp: tmp,
-      _cache: cache,
-    }
-  }
-
-  async fn call(&self, request: Request) -> Response {
-    let socket = MountState::control_socket(&self.state_dir);
-    on_fs(move || control::call(&socket, &request).unwrap())
-      .await
-      .into_result()
-      .unwrap()
-  }
-}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_mounted_workspace_is_published_and_described() {

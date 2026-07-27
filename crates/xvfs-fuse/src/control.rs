@@ -37,6 +37,12 @@ pub enum Request {
   Health,
   /// Replace the published generation with a freshly resolved one.
   Refresh,
+  /// What the workspace has changed, from the journal alone.
+  Status,
+  /// The same change set, rendered as a Git-compatible patch.
+  Diff,
+  /// Write an atomic, checksummed export bundle.
+  Export { bundle: std::path::PathBuf },
   /// Release the lease, unmount, and exit.
   Unmount,
 }
@@ -81,14 +87,37 @@ pub struct RefreshReport {
   pub unchanged: bool,
 }
 
+/// A change set plus the commit it is relative to.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct StatusReport {
+  pub base_commit: String,
+  pub ref_name: Option<String>,
+  #[serde(flatten)]
+  pub status: xvfs_overlay::Status,
+}
+
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "result", rename_all = "snake_case")]
 pub enum Response {
   Inspect(Box<MountReport>),
   Health(LeaseHealth),
   Refresh(RefreshReport),
+  Status(Box<StatusReport>),
+  /// The patch, base64url-encoded.
+  ///
+  /// A patch is bytes -- it contains the workspace's file content, which is not
+  /// required to be UTF-8, and paths that are not either. Encoding it keeps the
+  /// one-JSON-object-per-line protocol intact without a lossy conversion in the
+  /// middle of the one artifact that has to be byte-exact.
+  Diff {
+    patch_b64url: String,
+  },
+  Export(xvfs_overlay::ExportReport),
   Unmounted,
-  Error { code: String, message: String },
+  Error {
+    code: String,
+    message: String,
+  },
 }
 
 impl Response {

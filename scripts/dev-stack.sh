@@ -215,9 +215,41 @@ if [ -c /dev/fuse ] && command -v fusermount3 >/dev/null 2>&1; then
   echo "  unsupported subcommands are refused, not approximated"
 
   say "hydration accounting"
-  $XVFS inspect --workspace "$WS" | grep -E 'hydration|generation|lease'
+  $XVFS inspect --workspace "$WS" | grep -E 'hydration|generation|lease|overlay'
 
-  say "refresh publishes a new generation atomically"
+  say "the workspace is writable, and the overlay records what changed"
+  echo "a new file" >"$WS/added.txt"
+  printf '\nan appended line\n' >>"$WS/README.md"
+  rm -f "$WS/src/lib/util.rs"
+  mv "$WS/src/main.rs" "$WS/src/entry.rs"
+  $XVFS status --workspace "$WS"
+
+  say "the same change set as a patch, from the journal (no tree scan)"
+  $XVFS diff --workspace "$WS" | head -20
+
+  say "the shim answers status and diff from the overlay too"
+  (cd "$WS" && PATH="$SHIM_BIN:$PATH" git status --porcelain)
+
+  say "export is atomic and checksummed"
+  $XVFS export --workspace "$WS" --bundle "$STATE_DIR/export"
+  ls -A "$STATE_DIR/export"
+
+  say "refresh refuses a dirty workspace (three-way refresh is out of scope)"
+  if $XVFS refresh --workspace "$WS" 2>/dev/null; then
+    echo "FAILED: refresh accepted a workspace with local changes" >&2
+    exit 1
+  fi
+  echo "  refused, as PLAN.md M2.1 requires"
+
+  say "the overlay survives a daemon restart: the job's edits are still there"
+  $XVFS unmount --workspace "$WS" >/dev/null
+  $XVFS mount --repo basic --rev main --workspace "$WS" >/dev/null
+  $XVFS status --workspace "$WS" | tail -n +2
+
+  say "discard the workspace, and refresh publishes a new generation atomically"
+  $XVFS unmount --workspace "$WS" >/dev/null
+  rm -rf "$WS.xvfs"
+  $XVFS mount --repo basic --rev main --workspace "$WS" >/dev/null
   $XVFS refresh --workspace "$WS"
 
   say "health"

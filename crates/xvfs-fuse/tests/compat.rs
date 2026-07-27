@@ -363,18 +363,9 @@ async fn the_shim_answers_the_frozen_grammar() {
       "the synthesized surface is not tracked content: {listed:?}"
     );
 
-    let (ok, out, _) = run_in(&root, git, &["diff"]);
-    assert!(ok);
-    assert!(out.is_empty(), "a read-only mount has no changes");
-
-    let (ok, out, _) = run_in(&root, git, &["status", "--porcelain"]);
-    assert!(ok);
-    assert!(out.is_empty());
-
-    let (ok, out, _) = run_in(&root, git, &["status"]);
-    assert!(ok);
-    assert!(out.contains("On branch main"), "{out}");
-    assert!(out.contains("working tree clean"), "{out}");
+    // `status` and `diff` are covered in `tests/export.rs` instead: from M3 they
+    // read the overlay journal through the daemon's control socket, and this
+    // harness mounts a filesystem without running a daemon.
 
     // rev-parse and symbolic-ref, which stock Git also answers -- checked so the
     // shim cannot silently disagree with the thing it shadows.
