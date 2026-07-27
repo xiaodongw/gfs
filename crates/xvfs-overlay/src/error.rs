@@ -36,6 +36,20 @@ pub enum Condition {
   /// malformed.
   NameTooLong,
   /// `EPERM` — refused for the life of the MVP rather than not yet implemented.
+  ///
+  /// Used for the object types XVFS does not model: FIFOs, block and character
+  /// device nodes, UNIX domain sockets, and hard links. `EPERM` is not a
+  /// stand-in for a better errno — it is the one Linux documents for exactly
+  /// this condition:
+  ///
+  /// * `mknod(2)`: EPERM is "also returned if the filesystem containing *path*
+  ///   does not support the type of node requested";
+  /// * `link(2)`: EPERM is "The filesystem containing *oldpath* and *newpath*
+  ///   does not support the creation of hard links".
+  ///
+  /// `EOPNOTSUPP` appears in neither page's ERRORS section, and was proposed and
+  /// rejected once already; `ENOTSUP` belongs to xattrs, where POSIX puts it and
+  /// where `fs.rs` uses it. Do not "fix" this one.
   NotPermitted,
   /// `EDQUOT` — the per-job overlay quota.
   QuotaExceeded,

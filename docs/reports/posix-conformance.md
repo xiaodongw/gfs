@@ -80,9 +80,28 @@ ext4 control too and the diff excludes them. Every failure here is a setup step 
 `rmdir_01` is labelled "rmdir returns ENOTDIR" but fails only where it first
 creates a FIFO.
 
-**Assessment: by design, and already stated.** DESIGN.md section 12 lists special
-files as out of scope. Worth confirming `EPERM` is the errno the design intends,
-since `EOPNOTSUPP` is the more usual answer for "this filesystem cannot".
+**Assessment: by design, already stated, and the errno is the right one.**
+DESIGN.md section 12 lists special files as out of scope.
+
+An earlier revision of this report suggested `EOPNOTSUPP` would be the more usual
+answer for "this filesystem cannot". **That was wrong**, and it is corrected here
+rather than quietly dropped, because it was close to being acted on. Linux
+documents `EPERM` for precisely this condition:
+
+> **`mknod(2)`, EPERM** — "…also returned if the filesystem containing *path*
+> does not support the type of node requested."
+>
+> **`link(2)`, EPERM** — "The filesystem containing *oldpath* and *newpath* does
+> not support the creation of hard links."
+
+`EOPNOTSUPP` appears nowhere in either page's ERRORS section. Changing these to
+`EOPNOTSUPP` would make XVFS the only filesystem answering a kernel-documented
+condition with a different errno, and would move it away from conformance rather
+than toward it. `EPERM` stays.
+
+The codebase already draws this line in the right place: `ENOTSUP` **is** used,
+for xattrs, where POSIX does put it — with the reasoning that `cp -a`, `tar` and
+`rsync` read it as "this filesystem has none" and carry on.
 
 ### 2. Hard links — 1 file
 
@@ -296,9 +315,13 @@ clock, so `utimensat/08` is the same decision rather than a separate one.
 
 ### Three more to state rather than fix
 
-The `EPERM` errno for unsupported object types where `EOPNOTSUPP` is more usual;
-`chmod` returning success while rounding to Git's two modes; and directory
+`chmod` returning success while rounding to Git's two modes, and directory
 `nlink` always reading 2.
+
+The `EPERM` errno for unsupported object types was on this list and has been
+taken off it: it is not a question. See section 1 — Linux documents `EPERM` for
+"the filesystem does not support the type of node requested", and this report
+previously claimed the opposite.
 
 ## xfstests is still not run
 
