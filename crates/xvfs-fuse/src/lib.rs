@@ -1,9 +1,9 @@
-//! The XVFS FUSE client: a pinned Git commit presented as a lazy, read-only
-//! workspace.
+//! The XVFS FUSE client: a pinned Git commit presented as a lazy workspace with
+//! a crash-safe copy-on-write overlay over it.
 //!
-//! Owned by M2. The shape of the crate follows the three constraints M0 measured
-//! and M1 left in place, and each is enforced in one identifiable module rather
-//! than distributed as a convention:
+//! Owned by M2, extended by M3. The shape of the crate follows the constraints
+//! M0 measured and M1 left in place, and each is enforced in one identifiable
+//! module rather than distributed as a convention:
 //!
 //! * **[`fs`] never blocks a FUSE callback.** ADR 0003 measured a blocking
 //!   callback turning 64 parallel reads into 64 serial ones (1321 ms against
@@ -18,14 +18,18 @@
 //!   DESIGN.md's list does not form a repository at all, and that the shim is a
 //!   correctness requirement because `ls-files` and `diff` against the raw
 //!   surface exit 0 with empty output.
+//! * **the overlay is the only writer.** Nothing in this crate mutates the base:
+//!   a write copies the blob into `xvfs-overlay`'s journal and content store and
+//!   every later read of that path comes from there. That is what makes the
+//!   pinned commit safe to share between mounts and what makes `status` derivable
+//!   without scanning the tree.
 //!
-//! # What M2 deliberately does not do
+//! # What is deliberately not here
 //!
-//! Nothing here is writable. Every mutation is `EROFS`, and a `git diff` through
-//! the shim is empty — both correct answers for a read-only mount of an immutable
-//! commit, and both of which M3 rewires to the overlay journal. The overlay quota
-//! is *reported* by `statfs` and not yet enforced, because there is nothing yet
-//! to write.
+//! Hard links (`EPERM`, because Git has no hard links to model), device nodes and
+//! xattrs (documented unsupported in DESIGN.md section 8.2), and any permission
+//! bit other than `+x` — Git records one, and an export could not reproduce the
+//! rest.
 
 pub mod attr;
 pub mod cache;

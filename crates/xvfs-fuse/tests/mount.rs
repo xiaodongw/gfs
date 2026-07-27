@@ -176,14 +176,17 @@ async fn git_modes_survive_the_round_trip() {
   let root = mount.path.clone();
 
   on_fs(move || {
+    // Writable, because the overlay is behind every base path: reporting 0444
+    // would make `test -w` fail and an editor open the file read-only for a
+    // write that would in fact succeed.
     let plain = std::fs::symlink_metadata(root.join("plain.txt")).unwrap();
     assert!(plain.is_file());
-    assert_eq!(plain.permissions().mode() & 0o777, 0o444);
+    assert_eq!(plain.permissions().mode() & 0o777, 0o644);
 
     let script = std::fs::symlink_metadata(root.join("script.sh")).unwrap();
     assert_eq!(
       script.permissions().mode() & 0o777,
-      0o555,
+      0o755,
       "the executable bit is what tells a build the script can run"
     );
 
@@ -339,28 +342,45 @@ async fn repeated_stats_of_one_path_do_not_reach_the_server() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn the_mount_is_read_only() {
+async fn only_the_synthesized_git_surface_is_read_only() {
+  // The mount became writable in M3, but `.git` did not: ADR 0005 fixes it as a
+  // synthesized read-only surface, and there is no overlay content behind it to
+  // copy up. `EROFS` and specifically not `ENOSYS`, because the operation is
+  // understood and refused rather than unimplemented.
   let backend = Backend::start("basic").await;
   let mount = Mount::new(&backend, "main").await;
   let root = mount.path.clone();
 
   on_fs(move || {
-    // `EROFS`, and specifically not `ENOSYS`: the operation is understood and
-    // refused, which is a different claim from unimplemented.
-    let e = std::fs::write(root.join("new.txt"), b"x").unwrap_err();
-    assert_eq!(e.raw_os_error(), Some(libc::EROFS), "create");
+    // `EACCES` rather than `EROFS` for these three, and that is the mount option
+    // `DefaultPermissions` doing its job: the surface reports 0444 files inside
+    // a 0555 directory, so the kernel refuses before the request becomes an
+    // upcall. The handlers below answer `EROFS` if it ever reaches them, which is
+    // the second line of the same defence rather than the first.
+    for (label, error) in [
+      (
+        "write into .git",
+        std::fs::write(root.join(".git/HEAD"), b"x").unwrap_err(),
+      ),
+      (
+        "mkdir in .git",
+        std::fs::create_dir(root.join(".git/newdir")).unwrap_err(),
+      ),
+      (
+        "unlink in .git",
+        std::fs::remove_file(root.join(".git/config")).unwrap_err(),
+      ),
+    ] {
+      assert!(
+        matches!(error.raw_os_error(), Some(libc::EACCES) | Some(libc::EROFS)),
+        "{label}: {error}"
+      );
+    }
 
-    let e = std::fs::create_dir(root.join("newdir")).unwrap_err();
-    assert_eq!(e.raw_os_error(), Some(libc::EROFS), "mkdir");
-
-    let e = std::fs::remove_file(root.join("README.md")).unwrap_err();
-    assert_eq!(e.raw_os_error(), Some(libc::EROFS), "unlink");
-
-    let e = std::fs::OpenOptions::new()
-      .write(true)
-      .open(root.join("README.md"))
-      .unwrap_err();
-    assert_eq!(e.raw_os_error(), Some(libc::EROFS), "open for write");
+    // And the boundary Git itself never gets to cross: a hard link is `EPERM`
+    // for the life of the MVP, not a consequence of read-only.
+    let e = std::fs::hard_link(root.join("README.md"), root.join("linked")).unwrap_err();
+    assert_eq!(e.raw_os_error(), Some(libc::EPERM), "hard link");
   })
   .await;
 }
@@ -375,12 +395,13 @@ async fn statfs_reports_the_overlay_quota_not_the_host_filesystem() {
   // by, not the host's spare terabyte.
   let backend = Backend::start("basic").await;
   let quota = 256 * 1024 * 1024;
-  let mount = Mount::with_config(
+  let mount = Mount::with_configs(
     &backend,
     "main",
-    FsConfig {
-      overlay_quota_bytes: quota,
-      ..FsConfig::default()
+    FsConfig::default(),
+    xvfs_overlay::OverlayConfig {
+      quota_bytes: quota,
+      ..xvfs_overlay::OverlayConfig::default()
     },
   )
   .await;

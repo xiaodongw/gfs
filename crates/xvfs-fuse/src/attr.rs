@@ -12,10 +12,20 @@
 //!
 //! # Permissions
 //!
-//! The base is read-only in M2 and the overlay arrives in M3, so nothing here is
-//! writable. Executability is the one bit Git records, and it is preserved
+//! Everything the overlay can copy up reports as writable — `0644`, or `0755`
+//! when Git records the executable bit — because with a copy-on-write overlay
+//! behind it, everything is. Reporting the base as `0444` would make `test -w`
+//! fail, `sed -i` refuse, and an editor open the file read-only, none of which
+//! reflects what happens when the write actually arrives.
+//!
+//! Executability is the one permission bit Git records, and it is preserved
 //! exactly: a checked-out build script that lost its `+x` fails in a way that
-//! looks like a missing file.
+//! looks like a missing file. The other bits are not stored, which is a
+//! documented MVP boundary rather than an oversight — an exported tree could not
+//! reproduce them.
+//!
+//! The synthesized `.git` surface stays read-only. It is not overlay content and
+//! there is nothing to copy it up into.
 //!
 //! # Ownership
 //!
@@ -35,6 +45,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use fuser::{FileAttr, FileType, INodeNo};
 use xvfs_types::error::{ErrorCode, XvfsError};
 use xvfs_types::{EntryKind, Timestamp};
+
+use xvfs_overlay::{Condition, OverlayError, OverlayKind};
 
 use crate::gitdir::SynthNode;
 use crate::inode::{Node, Record};
@@ -88,8 +100,8 @@ pub fn to_system_time(t: Timestamp) -> SystemTime {
 pub fn attr_of(record: &Record, snapshot_time: Timestamp, owner: Ownership) -> FileAttr {
   let (kind, perm, size, nlink) = match &record.node {
     Node::Base(entry) => match entry.kind {
-      EntryKind::Regular => (FileType::RegularFile, 0o444, entry.size, 1),
-      EntryKind::Executable => (FileType::RegularFile, 0o555, entry.size, 1),
+      EntryKind::Regular => (FileType::RegularFile, 0o644, entry.size, 1),
+      EntryKind::Executable => (FileType::RegularFile, 0o755, entry.size, 1),
       EntryKind::Symlink => (
         FileType::Symlink,
         0o777,
@@ -99,7 +111,7 @@ pub fn attr_of(record: &Record, snapshot_time: Timestamp, owner: Ownership) -> F
           .map_or(entry.size, |t| t.len() as u64),
         1,
       ),
-      EntryKind::Directory => (FileType::Directory, 0o555, 0, 2),
+      EntryKind::Directory => (FileType::Directory, 0o755, 0, 2),
       // A submodule: an empty, read-only directory with inspectable XVFS
       // metadata (DESIGN.md section 8.2). ADR 0006 measured 12 of these in the
       // Rust repository, so this is a live case for the pilot.
@@ -108,13 +120,29 @@ pub fn attr_of(record: &Record, snapshot_time: Timestamp, owner: Ownership) -> F
       // and `open` refuses it explicitly where the kernel does not.
       EntryKind::Unsupported(_) => (FileType::RegularFile, 0o000, entry.size, 1),
     },
+    // The overlay's own timestamps, not the snapshot's: an acknowledged edit is
+    // strictly newer than the base by construction (ADR 0006's logical clock),
+    // and reporting the base time here would undo that in the one place a build
+    // system looks.
+    Node::Overlay(entry) => match entry.kind {
+      OverlayKind::Regular => (FileType::RegularFile, 0o644, entry.size, 1),
+      OverlayKind::Executable => (FileType::RegularFile, 0o755, entry.size, 1),
+      OverlayKind::Symlink => (FileType::Symlink, 0o777, entry.size, 1),
+      OverlayKind::Directory => (FileType::Directory, 0o755, 0, 2),
+    },
     Node::Synth(node) => match node {
       SynthNode::Dir => (FileType::Directory, 0o555, 0, 2),
       SynthNode::File(bytes) => (FileType::RegularFile, 0o444, bytes.len() as u64, 1),
     },
   };
 
-  let time = to_system_time(snapshot_time);
+  let (mtime, ctime) = match &record.node {
+    Node::Overlay(entry) => (to_system_time(entry.mtime), to_system_time(entry.ctime)),
+    _ => {
+      let time = to_system_time(snapshot_time);
+      (time, time)
+    }
+  };
   FileAttr {
     ino: INodeNo(record.ino),
     size,
@@ -122,10 +150,10 @@ pub fn attr_of(record: &Record, snapshot_time: Timestamp, owner: Ownership) -> F
     // reports the logical size rather than zero, which is what a build's disk
     // accounting expects.
     blocks: size.div_ceil(512),
-    atime: time,
-    mtime: time,
-    ctime: time,
-    crtime: time,
+    atime: mtime,
+    mtime,
+    ctime,
+    crtime: mtime,
     kind,
     perm,
     nlink,
@@ -165,6 +193,28 @@ pub fn errno_of(error: &XvfsError) -> fuser::Errno {
   }
 }
 
+/// Map an overlay refusal onto its POSIX condition.
+///
+/// The one place the translation happens, so a condition added to the overlay
+/// cannot reach the kernel as a plausible-but-wrong `EIO`.
+pub fn errno_of_overlay(error: &OverlayError) -> fuser::Errno {
+  use fuser::Errno;
+  match error.condition {
+    Condition::Exists => Errno::EEXIST,
+    Condition::NoEntry => Errno::ENOENT,
+    Condition::NotDirectory => Errno::ENOTDIR,
+    Condition::IsDirectory => Errno::EISDIR,
+    Condition::NotEmpty => Errno::ENOTEMPTY,
+    Condition::Invalid => Errno::EINVAL,
+    Condition::NotPermitted => Errno::EPERM,
+    // `EDQUOT`, not `ENOSPC`: the host filesystem is not full, the *job's* quota
+    // is, and ADR 0006's hydration policy uses the same distinction so an
+    // operator reading a failing build can tell a budget from a disk.
+    Condition::QuotaExceeded => Errno::EDQUOT,
+    Condition::Io => Errno::EIO,
+  }
+}
+
 #[cfg(test)]
 mod tests {
   use super::*;
@@ -195,8 +245,10 @@ mod tests {
   };
 
   #[test]
-  fn the_executable_bit_survives() {
-    // A build script that lost `+x` fails in a way that looks like a missing file.
+  fn the_executable_bit_survives_and_the_base_reports_as_writable() {
+    // A build script that lost `+x` fails in a way that looks like a missing
+    // file. And with the overlay behind it, a base file *is* writable: reporting
+    // 0444 would make `test -w` and `sed -i` refuse work that would succeed.
     assert_eq!(
       attr_of(
         &record(EntryKind::Regular, 10),
@@ -204,7 +256,7 @@ mod tests {
         OWNER
       )
       .perm,
-      0o444
+      0o644
     );
     assert_eq!(
       attr_of(
@@ -213,7 +265,7 @@ mod tests {
         OWNER
       )
       .perm,
-      0o555
+      0o755
     );
   }
 

@@ -494,13 +494,30 @@ impl Op {
 
     let result = match self {
       Op::CreateFile(path) => overlay
-        .create_file(path, base.facts(path), parent_facts(base, path), false)
+        .create_file(
+          path,
+          base.facts(path),
+          parent_facts(base, path),
+          ino_for(path),
+          false,
+        )
         .map(|_| ()),
       Op::Mkdir(path) => overlay
-        .mkdir(path, base.facts(path), parent_facts(base, path))
+        .mkdir(
+          path,
+          base.facts(path),
+          parent_facts(base, path),
+          ino_for(path),
+        )
         .map(|_| ()),
       Op::Symlink(path, target) => overlay
-        .symlink(path, target, base.facts(path), parent_facts(base, path))
+        .symlink(
+          path,
+          target,
+          base.facts(path),
+          parent_facts(base, path),
+          ino_for(path),
+        )
         .map(|_| ()),
       Op::Write(path, offset, data) => materialize(overlay, base, path, ino_for(path))
         .and_then(|_| overlay.write_at(path, *offset, data))
@@ -520,6 +537,7 @@ impl Op {
         let empty = overlay.merged_dir_is_empty(to, &base.child_names(to));
         overlay.rename(
           from,
+          ino_for(from),
           base.facts(from),
           to,
           base.facts(to),

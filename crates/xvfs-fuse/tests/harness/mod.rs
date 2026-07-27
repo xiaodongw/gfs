@@ -17,6 +17,7 @@ use std::sync::Arc;
 
 use xvfs_fuse::client::MountBinding;
 use xvfs_fuse::{BlobCache, FsConfig, GitDir, GitDirFacts, MountConfig, SnapshotClient, Xvfs};
+use xvfs_overlay::{Binding, Overlay, OverlayConfig};
 use xvfs_proto::v1;
 use xvfs_server::auth::{AllowList, CapabilityKey, StaticTokens};
 use xvfs_server::catalog::repositories::NewRepository;
@@ -126,11 +127,13 @@ impl Backend {
 pub struct Mount {
   pub path: PathBuf,
   pub fs: Arc<Xvfs>,
+  pub overlay: Arc<Overlay>,
   pub commit: ObjectId,
   pub mount_id: MountId,
   pub capability: String,
   session: Option<fuser::BackgroundSession>,
   _cache_dir: tempfile::TempDir,
+  _overlay_dir: tempfile::TempDir,
   _mount_dir: tempfile::TempDir,
 }
 
@@ -160,6 +163,15 @@ impl Mount {
   }
 
   pub async fn with_config(backend: &Backend, revision: &str, config: FsConfig) -> Mount {
+    Mount::with_configs(backend, revision, config, OverlayConfig::default()).await
+  }
+
+  pub async fn with_configs(
+    backend: &Backend,
+    revision: &str,
+    config: FsConfig,
+    overlay_config: OverlayConfig,
+  ) -> Mount {
     Mount::require_fuse();
     let mut grpc = backend.grpc_client().await;
     let mut request = tonic::Request::new(v1::CreateMountRequest {
@@ -219,7 +231,28 @@ impl Mount {
       commit_meta: client.get_commit().await.ok(),
     }));
 
-    let fs = Xvfs::new(client, cache, gitdir, xvfs_fuse::root_entry(tree), config);
+    let overlay_dir = tempfile::tempdir().unwrap();
+    let overlay = Arc::new(
+      Overlay::open(
+        overlay_dir.path(),
+        &Binding {
+          repository_id: backend.repo_id.as_str().to_owned(),
+          base_commit: commit.to_qualified(),
+        },
+        snapshot_time,
+        overlay_config,
+      )
+      .unwrap(),
+    );
+
+    let fs = Xvfs::new(
+      client,
+      cache,
+      gitdir,
+      Arc::clone(&overlay),
+      xvfs_fuse::root_entry(tree),
+      config,
+    );
 
     let mount_dir = tempfile::tempdir().unwrap();
     let path = mount_dir.path().join("workspace");
@@ -235,11 +268,13 @@ impl Mount {
     Mount {
       path,
       fs,
+      overlay,
       commit,
       mount_id,
       capability: grant.mount_capability,
       session: Some(session),
       _cache_dir: cache_dir,
+      _overlay_dir: overlay_dir,
       _mount_dir: mount_dir,
     }
   }

@@ -60,7 +60,10 @@ pub struct MountReport {
   /// The UID the mount reports as owner. An operator comparing this with the
   /// job's UID is the fastest way to diagnose a `safe.directory` refusal.
   pub owner_uid: u32,
+  /// False from M3 onwards. Kept in the report because an orchestrator reading
+  /// it should not have to infer writability from the absence of a field.
   pub read_only: bool,
+  pub overlay: xvfs_overlay::OverlayStats,
   pub health: LeaseHealth,
   pub stats: crate::fs::FsStats,
   pub cache: crate::cache::CacheStats,

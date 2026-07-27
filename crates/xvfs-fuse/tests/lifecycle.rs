@@ -44,6 +44,7 @@ impl Job {
       revision_selector: revision.to_owned(),
       cache_quota_bytes: 1 << 30,
       fs: FsConfig::default(),
+      overlay: xvfs_overlay::OverlayConfig::default(),
       mount: MountConfig::default(),
       lease_policy: LeasePolicy::adr_0006(),
       // Short, so the retirement case does not take five minutes to fail.
@@ -99,7 +100,8 @@ async fn a_mounted_workspace_is_published_and_described() {
     panic!("expected an inspect report");
   };
   assert_eq!(report.generation, 1);
-  assert!(report.read_only);
+  assert!(!report.read_only, "the workspace is writable from M3");
+  assert_eq!(report.overlay.entries, 0, "a fresh mount has no edits");
   assert!(report.retiring_generations.is_empty());
   assert!(report.publication.starts_with("symlink("));
   assert_eq!(report.commit, job.daemon.inspect().commit);
@@ -282,6 +284,7 @@ async fn a_second_daemon_over_one_state_directory_is_refused() {
     revision_selector: "main".to_owned(),
     cache_quota_bytes: 1 << 20,
     fs: FsConfig::default(),
+    overlay: xvfs_overlay::OverlayConfig::default(),
     mount: MountConfig::default(),
     lease_policy: LeasePolicy::adr_0006(),
     retire_timeout: Duration::from_secs(5),
@@ -311,6 +314,7 @@ async fn an_unknown_repository_fails_before_anything_is_mounted() {
     revision_selector: "main".to_owned(),
     cache_quota_bytes: 1 << 20,
     fs: FsConfig::default(),
+    overlay: xvfs_overlay::OverlayConfig::default(),
     mount: MountConfig::default(),
     lease_policy: LeasePolicy::adr_0006(),
     retire_timeout: Duration::from_secs(5),

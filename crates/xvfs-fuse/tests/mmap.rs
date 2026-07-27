@@ -7,12 +7,17 @@
 //!
 //! # Why the write side needs a second filesystem
 //!
-//! The XVFS mount is read-only and `open` refuses anything but `O_RDONLY`, so a
-//! writable mapping fails at `open(2)` and never reaches `mmap(2)`. Measuring
-//! against it would only re-measure that XVFS is read-only, which is already
-//! covered. The question M3.2 actually needs answered is a property of *FUSE*:
-//! does the kernel permit a shared writable mapping of a FUSE file, and does that
-//! depend on `FUSE_WRITEBACK_CACHE`?
+//! When this was written the XVFS mount was read-only, so a writable mapping
+//! failed at `open(2)` and never reached `mmap(2)`. The question it had to answer
+//! is a property of *FUSE* rather than of XVFS: does the kernel permit a shared
+//! writable mapping of a FUSE file, and does that depend on
+//! `FUSE_WRITEBACK_CACHE`? A one-file probe answers it in isolation, and the
+//! answer -- yes, and no -- is what let ADR 0006 decline the writeback cache.
+//!
+//! M3 made the mount writable, so the same case can now be measured against
+//! XVFS itself as well, and it is: see
+//! `a_writable_shared_mapping_of_a_mounted_file_reaches_the_overlay`. The probe
+//! stays, because it is what isolates the kernel's behaviour from ours.
 //!
 //! `Probe` below is the smallest filesystem that can answer it — one file, held
 //! in memory, mounted twice: once with the capability requested and once without.
@@ -128,24 +133,42 @@ async fn a_read_only_shared_mapping_of_a_mounted_file_reads_correctly() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_writable_mapping_of_a_mounted_file_is_refused_at_open() {
-  // Recorded for completeness: on the XVFS mount the refusal happens at `open`,
-  // before `mmap` is reached, so the FUSE-level question is answered by the
-  // probe below rather than here.
+async fn a_writable_shared_mapping_of_a_mounted_file_reaches_the_overlay() {
+  // The measurement ADR 0006's amendment rests on, now made against XVFS rather
+  // than against the probe: a shared writable mapping of a base file works
+  // *without* `FUSE_WRITEBACK_CACHE`, and the bytes land in the overlay rather
+  // than anywhere near the pinned commit.
   let backend = Backend::start("basic").await;
   let mount = Mount::new(&backend, "main").await;
   let path = mount.join("README.md");
+  let read_back = path.clone();
 
-  let errno = on_fs(move || {
-    std::fs::OpenOptions::new()
+  on_fs(move || {
+    let file = std::fs::OpenOptions::new()
       .read(true)
       .write(true)
       .open(&path)
-      .unwrap_err()
-      .raw_os_error()
+      .expect("a read-write open copies the blob up");
+    let len = file.metadata().unwrap().len() as usize;
+    let pointer = map(
+      &file,
+      len,
+      libc::PROT_READ | libc::PROT_WRITE,
+      libc::MAP_SHARED,
+    )
+    .expect("writable MAP_SHARED must work without the writeback cache");
+    write_mapping(pointer, b"# EDITED");
+    sync_and_unmap(pointer, len);
   })
   .await;
-  assert_eq!(errno, Some(libc::EROFS));
+
+  let bytes = on_fs(move || std::fs::read(&read_back).unwrap()).await;
+  assert_eq!(bytes, b"# EDITED", "the mapping's writes are visible");
+  assert_eq!(
+    mount.overlay.stats().entries,
+    1,
+    "exactly one path diverged from the base"
+  );
 }
 
 // ---------------------------------------------------------------------------

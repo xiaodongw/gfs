@@ -21,6 +21,7 @@ path = "src/bin/xvfs-git-shim.rs"
 [dependencies]
 xvfs-types = { workspace = true }
 xvfs-proto = { workspace = true }
+xvfs-overlay = { workspace = true }
 
 fuser = { workspace = true }
 libc = { workspace = true }

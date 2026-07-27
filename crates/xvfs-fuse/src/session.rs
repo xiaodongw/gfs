@@ -58,10 +58,13 @@ impl MountConfig {
     let mut mount_options = vec![
       MountOption::FSName("xvfs".to_owned()),
       MountOption::Subtype("xvfs".to_owned()),
-      // The base is immutable and M2 has no overlay. `RO` makes the kernel
-      // refuse writes before they become upcalls, which is both faster and a
-      // clearer error than one produced per operation.
-      MountOption::RO,
+      // Deliberately **not** `MountOption::RO`. M2 set it because the base is
+      // immutable and there was no overlay; the kernel then refused every write
+      // before it became an upcall, which was both faster and clearer. From M3
+      // the overlay makes the workspace writable, and leaving `RO` on would make
+      // every mutation fail with `EROFS` without the filesystem ever seeing it --
+      // including the ones that are supposed to fail differently, like the
+      // `EPERM` a hard link gets.
       MountOption::NoSuid,
       MountOption::NoDev,
       // Nothing here has a meaningful access time: every entry reports the
@@ -138,9 +141,13 @@ mod tests {
   }
 
   #[test]
-  fn the_mount_is_read_only_and_enforces_permissions() {
+  fn the_mount_is_writable_and_still_enforces_permissions() {
+    // `RO` would make the kernel refuse every mutation before the overlay saw
+    // it, which is exactly how M3's write path could look implemented and be
+    // unreachable. `DefaultPermissions` stays: an entry reported as mode 0 must
+    // still be unopenable without every callback re-checking.
     let options = MountConfig::default().to_fuser_config().mount_options;
-    assert!(options.contains(&MountOption::RO));
+    assert!(!options.contains(&MountOption::RO));
     assert!(options.contains(&MountOption::DefaultPermissions));
     assert!(options.contains(&MountOption::NoSuid));
   }

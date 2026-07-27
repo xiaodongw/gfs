@@ -38,6 +38,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use xvfs_overlay::{Binding, Overlay, OverlayConfig};
 use xvfs_proto::v1;
 use xvfs_types::error::{ErrorCode, XvfsError};
 use xvfs_types::{
@@ -66,6 +67,7 @@ pub struct DaemonConfig {
   pub revision_selector: String,
   pub cache_quota_bytes: u64,
   pub fs: FsConfig,
+  pub overlay: OverlayConfig,
   pub mount: MountConfig,
   pub lease_policy: LeasePolicy,
   /// How long a retiring generation may keep handles open before it is torn down
@@ -78,7 +80,9 @@ pub struct DaemonConfig {
 struct Generation {
   number: u64,
   mountpoint: PathBuf,
+  overlay_dir: PathBuf,
   fs: Arc<Xvfs>,
+  overlay: Arc<Overlay>,
   client: Arc<SnapshotClient>,
   monitor: Arc<LeaseMonitor>,
   session: Option<fuser::BackgroundSession>,
@@ -113,6 +117,12 @@ impl Generation {
       tracing::warn!(generation = self.number, error = %e.message, "releasing the lease failed");
     }
     let _ = std::fs::remove_dir(&self.mountpoint);
+    // A retired generation's overlay is empty by construction -- `xvfs refresh`
+    // refuses a dirty workspace -- so removing it discards nothing. Leaving it
+    // would accumulate one SQLite database per refresh for the life of the job.
+    if self.overlay.is_empty() {
+      let _ = std::fs::remove_dir_all(&self.overlay_dir);
+    }
   }
 }
 
@@ -250,7 +260,8 @@ impl Daemon {
       state_dir: self.config.state_dir.display().to_string(),
       daemon_pid: std::process::id(),
       owner_uid: crate::attr::Ownership::current().uid,
-      read_only: true,
+      read_only: false,
+      overlay: current.overlay.stats(),
       health: current.monitor.health(),
       stats: current.fs.stats(),
       cache: self.cache.stats(),
@@ -328,8 +339,9 @@ impl Daemon {
   /// Replace the published generation with a freshly resolved one.
   pub async fn refresh(self: &Arc<Self>) -> Result<RefreshReport, XvfsError> {
     // PLAN.md M2.1: refuse when the overlay is non-empty; three-way refresh is
-    // out of scope. M2 has no overlay, so the check is trivially satisfied --
-    // written as a check rather than omitted so M3 has one place to make it real.
+    // out of scope. A new generation is a new pinned commit, and an overlay is
+    // bound to the commit it diverged from -- carrying edits across would make
+    // every `status` answer be about a base that is no longer mounted.
     if !self.overlay_is_empty() {
       return Err(XvfsError::new(
         ErrorCode::FailedPrecondition,
@@ -366,9 +378,14 @@ impl Daemon {
     })
   }
 
-  /// Whether the overlay holds anything. Always true in M2; M3 replaces it.
+  /// Whether the published generation's overlay holds anything.
   fn overlay_is_empty(&self) -> bool {
-    true
+    self
+      .current
+      .lock()
+      .expect("current generation")
+      .overlay
+      .is_empty()
   }
 
   /// Keep a generation alive until its last handle closes, then tear it down.
@@ -521,6 +538,11 @@ impl Daemon {
   }
 }
 
+/// Where one generation's overlay lives.
+fn overlay_dir(state_dir: &Path, generation: u64) -> PathBuf {
+  state_dir.join("overlay").join(generation.to_string())
+}
+
 /// Make a path absolute without requiring it to exist.
 ///
 /// `canonicalize` would be stronger but demands that every component already
@@ -596,10 +618,47 @@ async fn mount_generation(
     commit_meta,
   }));
 
+  // One overlay per generation, in its own directory. The binding check inside
+  // `Overlay::open` then does real work: a daemon restarted against a moved
+  // branch cannot silently adopt the previous generation's edits.
+  let overlay_dir = overlay_dir(&config.state_dir, number);
+  let overlay = Arc::new(
+    Overlay::open(
+      &overlay_dir,
+      &Binding {
+        repository_id: config.repository_id.as_str().to_owned(),
+        base_commit: commit.to_qualified(),
+      },
+      snapshot_time,
+      config.overlay.clone(),
+    )
+    .map_err(crate::fs::overlay_as_service_error)?,
+  );
+  let recovery = overlay.recovery();
+  if !recovery.is_clean() {
+    tracing::warn!(
+      orphan_files = recovery.orphan_files_removed,
+      orphan_bytes = recovery.orphan_bytes_removed,
+      temporaries = recovery.temporary_files_removed,
+      missing = recovery.missing_content.len(),
+      "recovered an overlay left behind by a previous process"
+    );
+  }
+  if !recovery.missing_content.is_empty() {
+    // The store's invariant says this cannot happen. Reported at `error` because
+    // it means bytes a job was told were written are not on disk, and continuing
+    // quietly would serve an empty file in their place.
+    tracing::error!(
+      ids = ?recovery.missing_content,
+      "overlay content referenced by the journal is missing"
+    );
+  }
+
   let fs = Xvfs::new(
     Arc::clone(&client),
     Arc::clone(cache),
     gitdir,
+    Arc::clone(&overlay),
     crate::fs::root_entry(tree.clone()),
     config.fs.clone(),
   );
@@ -617,7 +676,9 @@ async fn mount_generation(
   Ok(Generation {
     number,
     mountpoint,
+    overlay_dir,
     fs,
+    overlay,
     client,
     monitor: LeaseMonitor::new(mount_id, expiry, interval, config.lease_policy),
     session: Some(session),

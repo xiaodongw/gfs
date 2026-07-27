@@ -130,10 +130,30 @@ pub struct BaseDescendant {
   pub symlink_target: Option<Vec<u8>>,
 }
 
+/// Drop a content id's owner only if it is still the path being removed.
+///
+/// A rename is one transaction of `Put(new)` then `Delete(old)`, and both mention
+/// the same content id. Removing the index entry unconditionally on the delete
+/// would erase the mapping the put had just established, and every subsequent
+/// write through the still-open descriptor would land in a content file no row
+/// could be found for -- so the size would stop advancing and a read through a
+/// fresh descriptor would stop short.
+fn release_content(index: &mut HashMap<u64, Vec<u8>>, id: u64, path: &[u8]) {
+  if index.get(&id).is_some_and(|owner| owner == path) {
+    index.remove(&id);
+  }
+}
+
 struct Inner {
   journal: Journal,
   entries: BTreeMap<Vec<u8>, OverlayEntry>,
   children: HashMap<Vec<u8>, BTreeSet<Vec<u8>>>,
+  /// Content id to the path that owns it.
+  ///
+  /// A write arrives with a descriptor, not a path — that is what makes an open
+  /// file survive a rename, and what makes an unlinked one still writable — so
+  /// the journal has to be reachable from the content id alone.
+  by_content: HashMap<u64, Vec<u8>>,
   next_ino: u64,
   next_content_id: u64,
   local_bytes: u64,
@@ -180,6 +200,7 @@ impl Overlay {
 
     let mut entries = BTreeMap::new();
     let mut children: HashMap<Vec<u8>, BTreeSet<Vec<u8>>> = HashMap::new();
+    let mut by_content: HashMap<u64, Vec<u8>> = HashMap::new();
     // The clock never runs backwards across a restart. Seeded from the highest
     // time any surviving entry carries, so a mutation after recovery is still
     // newer than every mutation before it even if the host clock moved back.
@@ -190,6 +211,9 @@ impl Overlay {
         .entry(entry.parent().into_bytes())
         .or_default()
         .insert(entry.name());
+      if let Some(id) = entry.content.local_id() {
+        by_content.insert(id, entry.path.as_bytes().to_vec());
+      }
       entries.insert(entry.path.as_bytes().to_vec(), entry);
     }
 
@@ -201,6 +225,7 @@ impl Overlay {
         journal,
         entries,
         children,
+        by_content,
         next_ino,
         next_content_id,
         local_bytes,
@@ -378,12 +403,16 @@ impl Overlay {
       match change {
         Change::Put(entry) => {
           if let Some(previous) = inner.entries.get(entry.path.as_bytes()) {
-            if previous.content.local_id().is_some() {
+            if let Some(id) = previous.content.local_id() {
               inner.local_bytes = inner.local_bytes.saturating_sub(previous.size);
+              if Some(id) != entry.content.local_id() {
+                release_content(&mut inner.by_content, id, entry.path.as_bytes());
+              }
             }
           }
-          if entry.content.local_id().is_some() {
+          if let Some(id) = entry.content.local_id() {
             inner.local_bytes = inner.local_bytes.saturating_add(entry.size);
+            inner.by_content.insert(id, entry.path.as_bytes().to_vec());
           }
           inner
             .children
@@ -396,8 +425,9 @@ impl Overlay {
         }
         Change::Delete(path) => {
           if let Some(previous) = inner.entries.remove(path.as_bytes()) {
-            if previous.content.local_id().is_some() {
+            if let Some(id) = previous.content.local_id() {
               inner.local_bytes = inner.local_bytes.saturating_sub(previous.size);
+              release_content(&mut inner.by_content, id, path.as_bytes());
             }
             if let Some(set) = inner.children.get_mut(previous.parent().as_bytes()) {
               set.remove(&previous.name());
@@ -421,9 +451,22 @@ impl Overlay {
     t
   }
 
+  /// Allocate an inode number for a row the overlay creates on its own.
+  ///
+  /// Only a directory rename does that, for the base descendants it materializes.
+  /// Everything else is told a number by the caller, because the caller owns the
+  /// live inode table and the kernel's dentries are keyed on it.
   fn allocate_ino(inner: &mut Inner) -> u64 {
     let ino = inner.next_ino;
     inner.next_ino += 1;
+    ino
+  }
+
+  /// Take the caller's number, or allocate one if it did not supply one.
+  fn adopt_ino(inner: &mut Inner, ino: u64) -> u64 {
+    if ino == 0 {
+      return Self::allocate_ino(inner);
+    }
     ino
   }
 
@@ -487,6 +530,7 @@ impl Overlay {
     path: &BytePath,
     base: Option<BaseFacts>,
     parent_base: Option<BaseFacts>,
+    ino: u64,
     executable: bool,
   ) -> Result<OverlayEntry> {
     path.validate()?;
@@ -497,7 +541,7 @@ impl Overlay {
     }
     self.check_quota(&inner, 0)?;
 
-    let ino = Self::allocate_ino(&mut inner);
+    let ino = Self::adopt_ino(&mut inner, ino);
     let content_id = Self::allocate_content_id(&mut inner);
     self.store.create_empty(content_id)?;
     let now = self.next_time(&mut inner);
@@ -528,6 +572,7 @@ impl Overlay {
     path: &BytePath,
     base: Option<BaseFacts>,
     parent_base: Option<BaseFacts>,
+    ino: u64,
   ) -> Result<OverlayEntry> {
     path.validate()?;
     let mut inner = self.lock();
@@ -535,7 +580,7 @@ impl Overlay {
     if Self::existing(&inner, path, base.as_ref()).is_some() {
       return Err(OverlayError::exists(path.escaped()));
     }
-    let ino = Self::allocate_ino(&mut inner);
+    let ino = Self::adopt_ino(&mut inner, ino);
     let now = self.next_time(&mut inner);
     let entry = OverlayEntry {
       path: path.clone(),
@@ -564,6 +609,7 @@ impl Overlay {
     target: &[u8],
     base: Option<BaseFacts>,
     parent_base: Option<BaseFacts>,
+    ino: u64,
   ) -> Result<OverlayEntry> {
     path.validate()?;
     if target.is_empty() || target.contains(&0) {
@@ -574,7 +620,7 @@ impl Overlay {
     if Self::existing(&inner, path, base.as_ref()).is_some() {
       return Err(OverlayError::exists(path.escaped()));
     }
-    let ino = Self::allocate_ino(&mut inner);
+    let ino = Self::adopt_ino(&mut inner, ino);
     let now = self.next_time(&mut inner);
     let entry = OverlayEntry {
       path: path.clone(),
@@ -750,6 +796,67 @@ impl Overlay {
       ..entry
     };
     self.commit(&mut inner, vec![Change::Put(updated)], Vec::new())?;
+    Ok(written)
+  }
+
+  /// Write through an open descriptor rather than through a path.
+  ///
+  /// The descriptor is what POSIX says a write goes to, and it is why an open
+  /// file keeps working after its name is renamed or removed. A row that no
+  /// longer exists — the file was unlinked while open — still accepts the write:
+  /// the bytes land in a content file the kernel keeps alive until the last
+  /// descriptor closes, and there is simply no journal row left to update.
+  pub fn write_content(
+    &self,
+    content_id: u64,
+    file: &std::fs::File,
+    offset: u64,
+    data: &[u8],
+  ) -> Result<usize> {
+    use std::os::unix::fs::FileExt;
+
+    let mut inner = self.lock();
+    let entry = inner
+      .by_content
+      .get(&content_id)
+      .and_then(|path| inner.entries.get(path.as_slice()))
+      .cloned();
+
+    // `local_bytes` already counts this file at its current size, so the only
+    // thing the quota has to admit is the growth. An unlinked file is not
+    // counted at all, so it is bounded by the quota's remaining headroom.
+    let current = entry.as_ref().map_or(0, |e| e.size);
+    let end = offset.saturating_add(data.len() as u64);
+    let growth = end.saturating_sub(current);
+    let headroom = self.config.quota_bytes.saturating_sub(inner.local_bytes);
+    let data = if growth > headroom {
+      let allowed = (data.len() as u64).saturating_sub(growth - headroom) as usize;
+      if allowed == 0 {
+        return Err(OverlayError::quota(format!(
+          "the overlay quota of {} bytes is exhausted",
+          self.config.quota_bytes
+        )));
+      }
+      &data[..allowed]
+    } else {
+      data
+    };
+
+    let written = file
+      .write_at(data, offset)
+      .map_err(|e| OverlayError::io(format!("writing overlay content {content_id}: {e}")))?;
+
+    if let Some(entry) = entry {
+      let size = entry.size.max(offset.saturating_add(written as u64));
+      let now = self.next_time(&mut inner);
+      let updated = OverlayEntry {
+        size,
+        mtime: now,
+        ctime: now,
+        ..entry
+      };
+      self.commit(&mut inner, vec![Change::Put(updated)], Vec::new())?;
+    }
     Ok(written)
   }
 
@@ -999,6 +1106,7 @@ impl Overlay {
   pub fn rename(
     &self,
     from: &BytePath,
+    from_ino: u64,
     from_base: Option<BaseFacts>,
     to: &BytePath,
     to_base: Option<BaseFacts>,
@@ -1092,7 +1200,10 @@ impl Overlay {
           // A base directory arriving at a new path must hide whatever the base
           // has at *that* path; its own children arrive as explicit rows below.
           opaque: kind.is_dir(),
-          ino: Self::allocate_ino(&mut inner),
+          // The number the caller's inode table already has for the source. A
+          // rename moves a name, not a file, and the kernel keeps the dentry it
+          // has rather than looking the destination up again.
+          ino: Self::adopt_ino(&mut inner, from_ino),
           content: if kind.is_dir() {
             Content::None
           } else {
@@ -1161,7 +1272,7 @@ impl Overlay {
         let mut source = from.as_bytes().to_vec();
         source.push(b'/');
         source.extend_from_slice(descendant.relative.as_bytes());
-        if merge::resolve(&inner.entries, &BytePath::new(source)) != Resolution::Base {
+        if merge::resolve(&inner.entries, &BytePath::new(source.clone())) != Resolution::Base {
           continue;
         }
         let Some(kind) = OverlayKind::from_entry_kind(descendant.facts.kind) else {
@@ -1182,7 +1293,11 @@ impl Overlay {
           size: descendant.facts.size,
           mtime: now,
           ctime: now,
-          renamed_from: None,
+          // Where the blob still lives in the pinned commit. A row whose content
+          // is `Content::Base` is served by fetching that blob, and the fetch
+          // needs a path the base actually has -- which is no longer this row's
+          // own path once it has moved.
+          renamed_from: Some(BytePath::new(source)),
           base: None,
         }));
       }

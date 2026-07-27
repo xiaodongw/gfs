@@ -35,6 +35,8 @@ use std::collections::HashMap;
 
 use xvfs_types::{BytePath, TreeEntryInfo};
 
+use xvfs_overlay::OverlayEntry;
+
 use crate::gitdir::SynthNode;
 
 /// The FUSE root inode. Fixed by the protocol, not by us.
@@ -45,6 +47,9 @@ pub const ROOT_INO: u64 = 1;
 pub enum Node {
   /// An entry of the pinned commit's tree.
   Base(TreeEntryInfo),
+  /// An entry the overlay supplies: created, copied up, renamed, or with a mode
+  /// the base does not have.
+  Overlay(Box<OverlayEntry>),
   /// Part of the synthesized read-only `.git` surface (ADR 0005).
   Synth(SynthNode),
 }
@@ -52,6 +57,18 @@ pub enum Node {
 impl Node {
   pub fn is_synth(&self) -> bool {
     matches!(self, Node::Synth(_))
+  }
+
+  /// The inode number the node insists on, if it has one of its own.
+  ///
+  /// An overlay row carries its number in the journal, so it survives a daemon
+  /// restart and a rename. Base entries have no opinion and take whatever the
+  /// table's counter hands them.
+  pub fn preferred_ino(&self) -> Option<u64> {
+    match self {
+      Node::Overlay(entry) => Some(entry.ino),
+      _ => None,
+    }
   }
 }
 
@@ -118,9 +135,92 @@ impl InodeTable {
     ino
   }
 
+  /// The stable inode number for a path, assigning one on first sight.
+  ///
+  /// Public because a mutation has to know the number *before* it writes the
+  /// journal row: the row records it so a restarted daemon can hand out the same
+  /// one, and a row that disagreed with the live table would make a path change
+  /// identity across a restart for no reason.
+  pub fn number_for_path(&mut self, path: &BytePath) -> u64 {
+    self.number_for(path)
+  }
+
+  /// Adopt a number a node brought with it, unless the path already has one.
+  ///
+  /// Advisory rather than authoritative, and that direction matters: the kernel
+  /// keeps a dentry's inode across a `rename(2)` without ever asking, so a live
+  /// number always outranks a number recorded in the journal. The journal's copy
+  /// is what a restart falls back to, when there are no dentries left to disagree
+  /// with.
+  fn bind_if_absent(&mut self, path: &BytePath, ino: u64) {
+    if self.by_path.contains_key(path.as_bytes()) {
+      return;
+    }
+    self.by_path.insert(path.as_bytes().to_vec(), ino);
+    if ino >= self.next && ino < xvfs_overlay::OVERLAY_INO_BASE {
+      self.next = ino + 1;
+    }
+  }
+
+  /// Move a path and everything under it, keeping every inode number.
+  ///
+  /// The kernel does not re-look-up after a `rename(2)`: it relinks the dentry it
+  /// already has, so the inode it will send in the *next* request for the new
+  /// name is the one it learned under the old one. A table that did not follow
+  /// would answer `readdir` for the destination out of the source's record, which
+  /// is exactly what a moved directory listing empty looks like.
+  /// Returns the moved `(inode, new path)` pairs, so the caller can refresh the
+  /// node behind each one: the record still holds whatever the path *used* to be
+  /// backed by, and a moved directory whose record still says "base entry" makes
+  /// `opendir` page a base listing that no longer describes it.
+  pub fn rename_subtree(&mut self, from: &BytePath, to: &BytePath) -> Vec<(u64, BytePath)> {
+    let moving: Vec<(Vec<u8>, u64)> = self
+      .by_path
+      .iter()
+      .filter(|(path, _)| {
+        let path = BytePath::new((*path).clone());
+        xvfs_overlay::is_within(&path, from)
+      })
+      .map(|(path, ino)| (path.clone(), *ino))
+      .collect();
+    let mut moved = Vec::new();
+    for (path, ino) in moving {
+      let mut target = to.as_bytes().to_vec();
+      target.extend_from_slice(&path[from.as_bytes().len()..]);
+      self.by_path.remove(&path);
+      self.by_path.insert(target.clone(), ino);
+      let target = BytePath::new(target);
+      if let Some(record) = self.records.get_mut(&ino) {
+        record.path = target.clone();
+      }
+      moved.push((ino, target));
+    }
+    moved
+  }
+
+  /// Replace what a live inode is backed by, keeping its number and its counts.
+  pub fn refresh(&mut self, ino: u64, node: Node) {
+    if let Some(record) = self.records.get_mut(&ino) {
+      record.node = node;
+    }
+  }
+
+  /// Restore the numbers a previous process handed out.
+  ///
+  /// Without this a restarted daemon would re-issue a low number that a surviving
+  /// journal row already claims, and two paths would share an inode.
+  pub fn seed(&mut self, entries: &[OverlayEntry]) {
+    for entry in entries {
+      self.bind_if_absent(&entry.path, entry.ino);
+    }
+  }
+
   /// Record a successful lookup, refreshing the node and incrementing the
   /// kernel's reference count.
   pub fn insert_lookup(&mut self, path: BytePath, node: Node) -> Record {
+    if let Some(ino) = node.preferred_ino() {
+      self.bind_if_absent(&path, ino);
+    }
     let ino = self.number_for(&path);
     let record = self.records.entry(ino).or_insert_with(|| Record {
       ino,

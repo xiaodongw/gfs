@@ -38,7 +38,7 @@ fn a_created_file_survives_a_restart_with_its_bytes_and_its_inode() {
   let (ino, size) = {
     let overlay = open(tmp.path());
     overlay
-      .create_file(&path("new.txt"), None, None, false)
+      .create_file(&path("new.txt"), None, None, 100, false)
       .unwrap();
     overlay.write_at(&path("new.txt"), 0, b"hello").unwrap();
     let entry = overlay.get(&path("new.txt")).unwrap();
@@ -125,7 +125,7 @@ fn the_quota_short_writes_rather_than_endangering_what_is_already_there() {
     },
   );
   overlay
-    .create_file(&path("a.txt"), None, None, false)
+    .create_file(&path("a.txt"), None, None, 101, false)
     .unwrap();
   assert_eq!(
     overlay.write_at(&path("a.txt"), 0, &[b'x'; 10]).unwrap(),
@@ -158,7 +158,7 @@ fn content_a_crash_left_unreferenced_is_collected_on_the_next_open() {
   {
     let overlay = open(tmp.path());
     overlay
-      .create_file(&path("keep.txt"), None, None, false)
+      .create_file(&path("keep.txt"), None, None, 102, false)
       .unwrap();
     overlay.write_at(&path("keep.txt"), 0, b"kept").unwrap();
     // What a crash between "content published" and "journal committed" leaves:
@@ -191,7 +191,7 @@ fn an_overlay_from_another_commit_is_refused_rather_than_merged() {
   {
     let overlay = open(tmp.path());
     overlay
-      .create_file(&path("a.txt"), None, None, false)
+      .create_file(&path("a.txt"), None, None, 101, false)
       .unwrap();
   }
   let other = xvfs_overlay::Binding {
@@ -247,7 +247,7 @@ fn every_overlay_timestamp_is_newer_than_the_base_even_with_a_skewed_clock() {
   for index in 0..8 {
     let name = format!("f{index}.txt");
     let entry = overlay
-      .create_file(&path(&name), None, None, false)
+      .create_file(&path(&name), None, None, 200 + index, false)
       .unwrap();
     assert!(
       entry.mtime > future,
@@ -269,7 +269,7 @@ fn every_overlay_timestamp_is_newer_than_the_base_even_with_a_skewed_clock() {
   )
   .unwrap();
   let entry = overlay
-    .create_file(&path("after-restart.txt"), None, None, false)
+    .create_file(&path("after-restart.txt"), None, None, 300, false)
     .unwrap();
   assert!(entry.mtime > previous, "the clock survived the restart");
 }
@@ -279,7 +279,7 @@ fn an_explicit_timestamp_below_the_floor_is_clamped() {
   let tmp = tempfile::tempdir().unwrap();
   let overlay = open(tmp.path());
   overlay
-    .create_file(&path("a.txt"), None, None, false)
+    .create_file(&path("a.txt"), None, None, 101, false)
     .unwrap();
   let entry = overlay
     .set_times(
@@ -300,6 +300,7 @@ fn renaming_a_base_directory_moves_metadata_and_fetches_nothing() {
   overlay
     .rename(
       &path("src"),
+      400,
       base.facts(&path("src")),
       &path("lib"),
       None,
@@ -337,6 +338,7 @@ fn a_rename_larger_than_the_configured_bound_is_refused() {
   let error = overlay
     .rename(
       &path("src"),
+      400,
       base.facts(&path("src")),
       &path("lib"),
       None,
@@ -359,7 +361,7 @@ fn a_symlink_is_never_copied_into_a_content_file() {
   let tmp = tempfile::tempdir().unwrap();
   let overlay = open(tmp.path());
   overlay
-    .symlink(&path("l"), b"README.md", None, None)
+    .symlink(&path("l"), b"README.md", None, None, 103)
     .unwrap();
   let error = overlay
     .materialize(&path("l"), None, 1, Source::Empty)

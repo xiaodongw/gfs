@@ -103,9 +103,10 @@ async fn main() -> Result<()> {
     repository_id: RepositoryId::parse(&args.repo).context("invalid repository id")?,
     revision_selector: args.rev,
     cache_quota_bytes: args.cache_quota,
-    fs: FsConfig {
-      overlay_quota_bytes: args.overlay_quota,
-      ..FsConfig::default()
+    fs: FsConfig::default(),
+    overlay: xvfs_overlay::OverlayConfig {
+      quota_bytes: args.overlay_quota,
+      ..xvfs_overlay::OverlayConfig::default()
     },
     mount: MountConfig {
       threads: args.fuse_threads,

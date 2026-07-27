@@ -437,6 +437,15 @@ fn print_report(report: &xvfs_fuse::control::MountReport) {
     "hydration  {} blobs, {} bytes, {} cache hits",
     report.cache.fetches, report.cache.bytes_fetched, report.cache.hits
   );
+  // The overlay line answers the two questions an operator actually has about a
+  // running job: has it changed anything, and how close is it to its quota.
+  println!(
+    "overlay    {} changed paths ({} deleted), {} of {} bytes used",
+    report.overlay.entries - report.overlay.whiteouts,
+    report.overlay.whiteouts,
+    report.overlay.local_bytes,
+    report.overlay.quota_bytes
+  );
   if !report.retiring_generations.is_empty() {
     println!("retiring   {:?}", report.retiring_generations);
   }
