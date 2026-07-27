@@ -261,6 +261,30 @@ else
   say "FUSE is unavailable (need /dev/fuse and fuse3); the mount demo is SKIPPED"
 fi
 
+say "stock git clones the same repository over smart HTTP"
+# M5: the gateway is on the HTTP listener, so a clone URL is the repository's
+# API path. Verified against real `git`, because the gateway's protocol engine
+# *is* stock git and cannot be its own oracle.
+CLONE_DIR="$STATE_DIR/clone"
+rm -rf "$CLONE_DIR"
+if git -c "http.extraHeader=Authorization: Bearer $TOKEN" \
+  -c protocol.version=2 \
+  clone -q "http://$HTTP_ADDR/v1/repos/basic" "$CLONE_DIR" 2>&1 | sed 's/^/  /'; then
+  echo "  cloned $(git -C "$CLONE_DIR" rev-parse --short HEAD), $(git -C "$CLONE_DIR" ls-files | wc -l) files"
+  git -C "$CLONE_DIR" fsck --no-progress >/dev/null 2>&1 && echo "  git fsck clean"
+else
+  echo "FAILED: stock git could not clone through the gateway" >&2
+  exit 1
+fi
+
+say "the internal lease namespace is absent from the advertisement"
+if git -c "http.extraHeader=Authorization: Bearer $TOKEN" \
+  ls-remote "http://$HTTP_ADDR/v1/repos/basic" 2>/dev/null | grep -q 'refs/xvfs/'; then
+  echo "FAILED: refs/xvfs/ was advertised" >&2
+  exit 1
+fi
+echo "  ok: no refs/xvfs/ in ls-remote"
+
 say "a revision expression is refused, not interpreted"
 if $XVFS resolve --repo basic 'main^{tree}' 2>/dev/null; then
   echo "FAILED: a revision expression was accepted" >&2
@@ -282,6 +306,7 @@ $(say "stack is up")
 
   gRPC     $XVFS_ENDPOINT
   HTTP     $XVFS_HTTP_ENDPOINT
+  git      $XVFS_HTTP_ENDPOINT/v1/repos/<id>
   token    $TOKEN
   state    $STATE_DIR
 
@@ -289,6 +314,7 @@ Try:
   export XVFS_ENDPOINT=$XVFS_ENDPOINT XVFS_HTTP_ENDPOINT=$XVFS_HTTP_ENDPOINT XVFS_TOKEN=$TOKEN
   ./target/debug/xvfs ls --repo bigdir --rev main many | head
   ./target/debug/xvfs mount --repo basic --rev main
+  git -c "http.extraHeader=Authorization: Bearer $TOKEN" clone $XVFS_HTTP_ENDPOINT/v1/repos/basic
 
 Ctrl-C to stop.
 EOF

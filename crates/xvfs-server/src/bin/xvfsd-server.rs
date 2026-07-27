@@ -142,7 +142,9 @@ async fn main() -> anyhow::Result<()> {
   tokio::spawn(Arc::clone(&server).run_lease_sweeper(shutdown_rx.clone()));
 
   let http = tokio::net::TcpListener::bind(&args.http_addr).await?;
-  tracing::info!(addr = %args.http_addr, "http listening");
+  // One listener for blobs, health, webhooks, and the Git gateway. A clone URL
+  // is `http://<http-addr>/v1/repos/<repository-id>`.
+  tracing::info!(addr = %args.http_addr, "http and git smart-HTTP listening");
   let http_router = server.http_router();
   let mut http_shutdown = shutdown_rx.clone();
   let http_task = tokio::spawn(async move {

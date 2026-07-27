@@ -50,6 +50,10 @@ pub struct Server {
   pub authz: Arc<Authorizer>,
   pub search: Arc<crate::search::IndexManager>,
   pub policy: LeasePolicy,
+  /// The Git gateway's state, built once because its admission semaphore is a
+  /// process-wide bound: rebuilding it per router would silently multiply the
+  /// concurrent-upload-pack limit by the number of routers.
+  pub gateway: Arc<crate::gateway::GatewayState>,
 }
 
 impl std::fmt::Debug for Server {
@@ -101,6 +105,12 @@ impl Server {
       Arc::clone(&registry),
     ));
 
+    let gateway = Arc::new(crate::gateway::GatewayState::new(
+      Arc::clone(&registry),
+      Arc::clone(&authz),
+      crate::gateway::UploadPackPolicy::default(),
+    ));
+
     Server {
       catalog,
       registry,
@@ -108,7 +118,23 @@ impl Server {
       authz,
       search,
       policy: lease_policy,
+      gateway,
     }
+  }
+
+  /// Replace the Git gateway's policy.
+  ///
+  /// Called before the server is shared. The default serves `blob:none` and
+  /// nothing else; a deployment that has measured a need for another filter
+  /// family changes it here rather than in the repository's Git configuration,
+  /// which is exactly the layer the gateway refuses to trust.
+  pub fn with_git_policy(mut self, policy: crate::gateway::UploadPackPolicy) -> Self {
+    self.gateway = Arc::new(crate::gateway::GatewayState::new(
+      Arc::clone(&self.registry),
+      Arc::clone(&self.authz),
+      policy,
+    ));
+    self
   }
 
   /// Keep the search index on disk instead of in memory.
@@ -143,12 +169,30 @@ impl Server {
     }
   }
 
+  /// The HTTP surface: blobs, files, health, webhooks, **and** the Git gateway.
+  ///
+  /// Merged rather than built as one router. Both halves need layers the other
+  /// must not have -- the blob and webhook routes carry a 64 KiB body limit and
+  /// a request timeout, and a `git clone` violates both by design -- and in axum
+  /// a layer applies to the routes of the router it was added to. Merging keeps
+  /// each set of bounds attached to the routes they were reasoned about for.
+  ///
+  /// One listener rather than a third port: smart HTTP exists to work with the
+  /// TLS, proxies, and bearer credentials a deployment already has, and asking
+  /// for another port would work against that.
   pub fn http_router(&self) -> axum::Router {
-    http::router(http::HttpState {
+    let base = http::router(http::HttpState {
       registry: Arc::clone(&self.registry),
       catalog: Arc::clone(&self.catalog),
       authz: Arc::clone(&self.authz),
-    })
+    });
+    base.merge(self.git_router())
+  }
+
+  /// The Git gateway's routes on their own, for a deployment that wants them on
+  /// a separate listener.
+  pub fn git_router(&self) -> axum::Router {
+    crate::gateway::router((*self.gateway).clone())
   }
 
   /// Reconcile leases and refs after a restart.
