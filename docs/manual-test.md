@@ -1,98 +1,140 @@
 # Manual testing: driving GFS by hand
 
-Every command here was run against a live Django workspace on 2026-07-27, and the
-expected output is quoted so you can tell a pass from a failure without guessing.
+One command to start a gateway, then `gfs` works with no configuration. Ctrl+C
+when you are done.
 
-For an automated smoke test instead, `scripts/dev-stack.sh --smoke` brings up the
-same stack against small fixtures and exits non-zero if anything is broken. This
-document is for poking at it yourself with a real repository.
+```sh
+scripts/dev-server.sh
+```
+
+In another terminal:
+
+```sh
+export PATH="$PWD/target/debug:$PATH"
+cd ~/.gfs-lab
+
+gfs clone https://github.com/pallets/flask.git
+cd flask
+gfs status
+gfs log -10 --oneline
+gfs switch -c my-change
+echo "a change" >> README.md
+gfs commit -m "a change"
+gfs push
+```
+
+That is the whole loop. Everything below is detail about what each step is doing
+and what is worth looking at while you do it.
+
+For an automated check instead, `scripts/dev-stack.sh --smoke` brings a stack up
+against fixtures and exits non-zero if anything is broken. This document is for
+poking at it yourself.
+
+## What the one command does
+
+`scripts/dev-server.sh` starts a gateway on the ports `gfs` already defaults to
+(`127.0.0.1:8430` and `:8431`), with a fixed capability key and an **empty** dev
+token. `gfs` sends no `Authorization` header when it has no token, so the two
+agree and nothing has to be exported — which is the only reason the block above
+has no `export GFS_*` lines in it.
+
+That also means **anyone who can reach those ports is `dev`**. It binds to
+loopback only and prints the warning on startup. Do not point it at anything you
+care about.
+
+Its lab directory is `~/.gfs-lab` (override with `GFS_LAB`). Ctrl+C stops the
+gateway *and* unmounts every workspace under it — a `gfs clone` starts a
+`gfs-fuse` daemon that outlives the gateway by design, and an orphaned one
+holding a FUSE mount is what makes the next run fail confusingly.
+
+**Keep the lab path short.** The daemon's control socket is
+`<workspace>.gfs/control.sock` and a Unix socket path cannot exceed 108 bytes.
+The default is short; a lab under a deep scratch directory fails to serve, and
+the failure reads as something else entirely.
 
 ## Prerequisites
 
-- A release build: `scripts/build-release.sh`, or
+- `cargo build` — the script builds for you if `target/debug/gfs-server` is
+  missing, but a release build is faster to poke at:
   `cargo build --release -p gfs-cli -p gfs-fuse -p gfs-server`.
 - FUSE: `/dev/fuse` present and `fusermount3` on `PATH` (ADR 0003).
-- A repository mirror. `./spikes/corpus/fetch-corpus.sh django` fetches one to
-  `$HOME/gfs-corpus/mirrors/django.git` (788 MiB). Any bare repository works;
-  Django is used below because it is small enough to be quick and high-ref enough
-  to be interesting.
+- Network access to whatever you clone. Any URL `git clone` accepts works; a
+  local `file:///path/to/bare.git` works too and is the fastest way to try the
+  write path without touching a real forge.
 
-## 0. Shell setup
+## The write path, step by step
 
-Needed in **every** terminal you use, including a second one opened later.
+### `gfs clone`
 
-```sh
-cd /path/to/gfs
-export L=$HOME/gfs-lab                       # the lab directory
-export X=$PWD/target/release
-export GFS_ENDPOINT=http://127.0.0.1:8801
-export GFS_HTTP_ENDPOINT=http://127.0.0.1:8800
-export GFS_TOKEN=lab-token
-```
+Fetches the repository into the **gateway's** mirror and mounts a view of it.
+The mirror is the clone; the workspace is a view onto it, the way `git worktree`
+is a view onto a repository except that no working files are materialized. That
+is why a second `gfs clone` of the same URL is a *sync* rather than a second
+copy, and why thousands of views over one mirror is the expected shape.
 
-**Keep `$L` short.** The daemon's control socket is `<workspace>.gfs/control.sock`
-and a Unix socket path cannot exceed 108 bytes. A workspace under a long
-scratch path fails to serve, and the failure is easy to misread.
-
-## 1. Start a server
-
-```sh
-rm -rf $L && mkdir -p $L
-# Copied, never served in place: the server writes `refs/gfs/*` lease anchors
-# into whatever repository it serves, and a mirror is an input.
-cp -a $HOME/gfs-corpus/mirrors/django.git $L/repo.git
-
-KEY=$(printf 'gfs-manual-lab-key-not-for-production-use!!!!!!' \
-  | od -An -tx1 | tr -d ' \n' | cut -c1-64)
-
-$X/gfs-server --state-dir $L/server \
-  --http-addr 127.0.0.1:8800 --grpc-addr 127.0.0.1:8801 \
-  --capability-key "$KEY" --dev-token "$GFS_TOKEN" \
-  --import "django=$L/repo.git" > $L/server.log 2>&1 &
-echo $! > $L/server.pid
-
-until curl -fsS http://127.0.0.1:8800/readyz; do sleep 0.5; done
-```
-
-**The first start takes about 50 seconds**, almost all of it reconciling
-Django's 29 298 refs. Restarting against the same `--state-dir` takes 0.2 s. Wait
-for `readyz` rather than assuming the server is up — everything after this fails
-confusingly if it is not.
-
-## 2. Mount
-
-```sh
-$X/gfs mount --repo django --rev HEAD --workspace $L/ws --cache-dir $L/cache
-$X/gfs inspect --workspace $L/ws
-```
-
-Expect the mount in well under a second and:
+The mount should appear in well under a second regardless of repository size,
+and:
 
 ```
 hydration  0 blobs, 0 bytes, 0 cache hits
 overlay    0 changed paths (0 deleted), 0 of 1073741824 bytes used
 ```
 
-**Watch the `hydration` line for the rest of this document.** It is the number
-that says whether an operation actually avoided reading the repository, and it is
-the one thing a plausible-looking result cannot fake.
+**Watch the `hydration` line for the rest of this document.** It says whether an
+operation actually avoided reading the repository, and it is the one thing a
+plausible-looking result cannot fake. Check it any time with `gfs inspect`.
 
-## 3. The three server-answered tools
+### `gfs switch -c <branch>`
 
-An agent asks three questions that want to touch every path. All three are
-answered by the server; none of them reads the mount.
+Creates the branch **on the gateway** and re-points this view at it. Unpushed
+work lands in `refs/gfs/work/<you>/<branch>`, not `refs/heads/`, because the
+mirror's fetch runs `--prune` over `refs/heads/*` — a branch there that upstream
+does not have is deleted by the next sync, taking every commit on it.
+
+You can see where it went:
 
 ```sh
-cd $L/ws
-$X/gfs log -5 --oneline
-$X/gfs find '*options.py'
-$X/gfs rg -F 'ImproperlyConfigured' -m 5
-$X/gfs inspect --workspace $L/ws | grep hydration     # still 0 blobs, 0 bytes
+git --git-dir=~/.gfs-lab/repos/*.git for-each-ref refs/gfs/work
 ```
 
-`gfs log` prints five real commits and then, on stderr,
-`more history follows; continue with --skip 5`. `gfs find '*options.py'` finds
-3 files. `gfs rg` prints matches plus a coverage note on stderr about binary
+### `gfs commit -m`
+
+Builds the tree from the overlay journal, makes the commit in the mirror, and
+re-pins the view to it. There is no staging area and no local-only commit: the
+commit is durable on the gateway the moment it is made, which is what lets
+`gfs log` show it.
+
+**Your shell's directory goes stale here.** The workspace is a symlink into
+`<workspace>.gfs/generations/<n>`, and committing publishes a new generation and
+retires the old one — so a shell standing in the old one gets `ENOENT` on its
+next command. `cd $(pwd)` recovers. The same applies to `gfs switch` and
+`gfs refresh`. This is inherent to the generation model: PLAN.md M2.1 requires
+that a refresh never mutate the pinned base under existing kernel dentries.
+
+### `gfs push`
+
+The gateway pushes outward to the real Git server with **your** credential
+(`--credential`, or `GFS_UPSTREAM_CREDENTIAL`), so upstream sees you and not the
+service. `refs/gfs/work/<you>/<branch>` is mapped to `refs/heads/<branch>` there.
+
+Pushing *to* the gateway with stock `git push` is still refused, deliberately —
+this is the mirror acting as a Git client against the real server, not the
+gateway accepting a push.
+
+## The three server-answered tools
+
+An agent asks three questions that want to touch every path. All three are
+answered by the gateway; none reads the mount.
+
+```sh
+gfs log -5 --oneline
+gfs find '*.py'
+gfs rg -F 'some-symbol' -m 5
+gfs inspect | grep hydration     # still 0 blobs, 0 bytes
+```
+
+`gfs log` prints and then, on stderr, `more history follows; continue with
+--skip 5`. `gfs rg` prints matches plus a coverage note on stderr about binary
 files skipped — that note is deliberate, not a warning of failure.
 
 ### Glob syntax is gitignore's, and this is the part that surprises people
@@ -103,119 +145,74 @@ files skipped — that note is deliberate, not a warning of failure.
 | `*` | zero or more bytes, **none of them `/`** |
 | `**` | zero or more path components, `/` included |
 
-**A pattern with no `/` in it matches the file name, not the whole path.** So:
+**A pattern with no `/` in it matches the file name, not the whole path.** On a
+Django checkout, where `admin/options.py` exists:
 
 ```sh
-$X/gfs find '*options.py'            # 3   -- basename match
-$X/gfs find '*/admin/options.py'     # 0   -- `*` cannot cross `/`
-$X/gfs find '**/admin/options.py'    # 2   -- `**` can
+gfs find '*options.py'            # 3   -- basename match
+gfs find '*/admin/options.py'     # 0   -- `*` cannot cross `/`
+gfs find '**/admin/options.py'    # 2   -- `**` can
 ```
 
 ### The comparison worth making yourself
 
+Needs a repository big enough for the difference to show; Django is a good size.
+
 ```sh
-rg -F 'ImproperlyConfigured' .                          # the wrong way
-$X/gfs inspect --workspace $L/ws | grep hydration      # look at what it cost
+rg -F 'ImproperlyConfigured' .    # the wrong way
+gfs inspect | grep hydration      # look at what it cost
 ```
 
-Real ripgrep gives the same answer in about 24 seconds and downloads the entire
-tree — roughly 6 200 blobs and 47 MB. `gfs rg` answers in tens of milliseconds
-and downloads nothing. That difference is the whole product.
+Recorded on Django, 2026-07-27: real ripgrep gives the same answer in about 24
+seconds and downloads the entire tree — roughly 6 200 blobs and 47 MB. `gfs rg`
+answers in tens of milliseconds and downloads nothing. That difference is the
+whole product.
 
-## 4. The `git` shim
+## The `git` shim
 
 ```sh
-export PATH="$($X/gfs install-shim --workspace $L/ws):$PATH"
+export PATH="$(gfs install-shim):$PATH"
 git rev-parse HEAD          # works
-git ls-files | wc -l        # 7077
+git ls-files | wc -l        # the tracked set
 git log -3 --oneline        # REFUSED, exit 2, prints the supported grammar
 git rev-parse --short HEAD  # also refused: the grammar is frozen and narrow
 ```
 
-The refusals are the designed behaviour. Without the shim, stock
-`git ls-files` inside a mount exits **0 with empty output** — it reports that
-nothing is tracked — which is why ADR 0005 calls the shim a correctness measure
-rather than a convenience. Try it if you want to see it:
+The refusals are the designed behaviour. Without the shim, stock `git ls-files`
+inside a mount exits **0 with empty output** — it reports that nothing is
+tracked — which is why ADR 0005 calls the shim a correctness measure rather than
+a convenience:
 
 ```sh
 /usr/bin/git ls-files | wc -l   # 0 files, exit 0 -- reports nothing is tracked
 ```
 
-For history and filenames, use `gfs log` and `gfs find`; the shim is not wired
-to them yet.
+For history and filenames use `gfs log` and `gfs find`; the shim is not wired to
+them.
 
-## 5. Edit, status, diff, export
+## The smart-HTTP gateway
 
-```sh
-cd $L/ws
-printf '\n# manual test\n' >> README.rst
-echo 'notes' > NOTES.md
-rm -f django/utils/lorem_ipsum.py
-
-$X/gfs status --workspace $L/ws
-```
-
-```
-On refs/heads/main at sha1:c2517faff335f683e1cbe55d9844910b3fb40670
-A NOTES.md
-M README.rst
-D django/utils/lorem_ipsum.py
-```
-
-Status comes from the overlay journal, not a tree scan, so it costs the size of
-your edit set rather than the size of the repository. Search reflects the edits
-immediately:
+Stock Git, with no GFS on the client at all. `<repo-id>` is what `gfs clone`
+printed, and `gfs inspect` repeats it:
 
 ```sh
-$X/gfs rg -F 'manual test'     # finds your new line in README.rst
-$X/gfs find 'NOTES.md'         # finds the created file
-$X/gfs diff --workspace $L/ws | head
-$X/gfs export --workspace $L/ws --bundle $L/bundle
+git -c protocol.version=2 clone --depth 1 \
+  http://127.0.0.1:8430/v1/repos/<repo-id> /tmp/clone
+git -C /tmp/clone fsck --no-progress && echo "fsck clean"
 ```
 
-The bundle holds `manifest.json`, `changes.patch`, `content/` and `CHECKSUMS`.
-
-## 6. Land the change server-side
-
-There is no `git commit` in a workspace. The export is applied where the objects
-are — with a temporary index and no worktree, which is what a server would do:
+The internal namespace must not be visible, including the work branch you just
+made:
 
 ```sh
-BASE=$(git --git-dir=$L/repo.git rev-parse HEAD)
-GIT_INDEX_FILE=$L/idx git --git-dir=$L/repo.git read-tree $BASE
-GIT_INDEX_FILE=$L/idx git --git-dir=$L/repo.git apply --cached \
-  --whitespace=nowarn $L/bundle/changes.patch
-TREE=$(GIT_INDEX_FILE=$L/idx git --git-dir=$L/repo.git write-tree)
-CMT=$(git --git-dir=$L/repo.git -c user.name=lab -c user.email=lab@example.com \
-  commit-tree $TREE -p $BASE -m "manual test")
-git --git-dir=$L/repo.git update-ref refs/heads/manual $CMT
-git --git-dir=$L/repo.git diff --stat $BASE manual
+git ls-remote http://127.0.0.1:8430/v1/repos/<repo-id> | grep -c 'refs/gfs/'   # 0
 ```
 
-Expect exactly the three changes you made. This takes about 30 ms.
+On a server with a real token, an unauthenticated clone gets `401`, and a clone
+of a repository you cannot see gets `404` rather than `403` — a distinct status
+would answer the existence question.
 
-## 7. The smart-HTTP gateway
-
-Stock Git, with no GFS on the client at all:
-
-```sh
-git -c "http.extraHeader=Authorization: Bearer $GFS_TOKEN" -c protocol.version=2 \
-  clone --depth 1 http://127.0.0.1:8800/v1/repos/django $L/clone
-git -C $L/clone fsck --no-progress && echo "fsck clean"
-```
-
-And the internal namespace must not be visible:
-
-```sh
-git -c "http.extraHeader=Authorization: Bearer $GFS_TOKEN" \
-  ls-remote http://127.0.0.1:8800/v1/repos/django | grep -c 'refs/gfs/'   # 0
-```
-
-An unauthenticated clone gets `401`; a clone of a repository you cannot see gets
-`404` rather than `403`, because a distinct status would answer the existence
-question.
-
-## 8. Two behaviours worth checking by hand
+## Two behaviours worth checking by hand
 
 Both were defects found by `spikes/conformance/pjdfstest.sh` and fixed on
 2026-07-27; see [`reports/posix-conformance.md`](reports/posix-conformance.md).
@@ -224,18 +221,15 @@ Both were defects found by `spikes/conformance/pjdfstest.sh` and fixed on
 watchers rely on this.
 
 ```sh
-cd $L/ws && mkdir -p dtest
+mkdir -p dtest
 a=$(stat -c %Y dtest); sleep 1.1; touch dtest/x; b=$(stat -c %Y dtest)
 [ "$b" -gt "$a" ] && echo "advanced" || echo "INERT -- regression"
 ```
 
-**A path too long for the filesystem is `ENAMETOOLONG`, not `EIO`.** The trick is
-a path that is short relative to the current directory but long measured from the
-workspace root — GFS caps the latter at 4 096 bytes, while POSIX caps the
-pathname handed to the syscall:
+**A too-long path component fails with `ENAMETOOLONG`, not `EIO`.** The limit is
+per component (255 bytes), not on the whole path:
 
 ```sh
-cd $L/ws && rm -rf deep && mkdir deep && cd deep
 c=$(printf 'a%.0s' $(seq 1 250)); p=""
 for i in $(seq 1 16); do p="$p$c/"; done
 mkdir -p "${p%/}" && cd "${p%/}"          # now 4022 bytes from the workspace root
@@ -243,33 +237,36 @@ touch "$(printf 'b%.0s' $(seq 1 250))"    # File name too long
 touch short                               # still works at the same depth
 ```
 
-## 9. Teardown
+## Teardown
 
-```sh
-$X/gfs unmount --workspace $L/ws
-kill $(cat $L/server.pid)
-```
+Ctrl+C in the terminal running `scripts/dev-server.sh`. That stops the gateway
+and unmounts every workspace under the lab directory.
 
-Unmount before deleting anything. `rm -rf` over a live mount is both wrong and
-slow: the base is read-only so every removal fails, and ADR 0003 measured that a
-mount point outlives its daemon and answers `ENOTCONN` until something unmounts
-it.
+Unmount before deleting anything by hand. `rm -rf` over a live mount is both
+wrong and slow: the base is read-only so every removal fails, and ADR 0003
+measured that a mount point outlives its daemon and answers `ENOTCONN` until
+something unmounts it.
+
+To start from nothing, `rm -rf ~/.gfs-lab` after the server has stopped.
 
 ## Traps
 
 Each of these produced a plausible-looking wrong answer during development.
 
-- **Long workspace paths fail the control socket.** See section 0. Under 108
-  bytes for `<workspace>.gfs/control.sock`.
-- **Do not `pkill -f gfs-fuse`.** The pattern can match the shell running it. Kill
-  by PID: `kill $(cat $L/server.pid)`.
+- **Long lab paths fail the control socket.** Under 108 bytes for
+  `<workspace>.gfs/control.sock`. The default lab directory is short; a deep
+  `GFS_LAB` is not.
+- **Your shell's directory goes stale after `switch`, `commit` and `refresh`.**
+  `cd $(pwd)`.
+- **Do not `pkill -f gfs-fuse`.** The pattern can match the shell running it, and
+  `pgrep -c` counts that match too — which reads as a daemon that will not die.
+  Kill by PID.
 - **`du` on a live mount walks the FUSE tree** and reports ~45 MiB for Django.
   The real client-side state is around 100 KiB, most of it the installed shim
-  binary: `du -sb --exclude=generations $L/ws.gfs`. A workspace with no shim
-  installed and no edits is under 30 KiB.
+  binary: `du -sb --exclude=generations <workspace>.gfs`.
 - **`core.autocrlf=true`** in your global Git config makes anything you clone
   with shell scripts in it arrive with CRLF endings and fail in ways that look
   like the cloned project is broken. It also corrupts `git apply`.
-- **Wait for `/readyz`.** A high-ref repository takes tens of seconds to import
-  the first time.
-- **A second terminal needs the section 0 exports again**, `PATH` shim included.
+- **A high-ref repository takes tens of seconds to import the first time.**
+  Django's 29 298 refs take about 50 seconds; restarting against the same lab
+  takes 0.2 s.
