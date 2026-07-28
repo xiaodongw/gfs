@@ -17,7 +17,10 @@ use gfs_types::{
 
 use crate::format::{self, RepositoryFormat};
 use crate::pool::{PooledRepo, RepoPool};
-use crate::repository::{DirectoryPage, EntryLookup, GitRepository, TreeDelta, WalkEntry};
+use crate::repository::{
+  CommitSignature, DirectoryPage, EntryLookup, GitRepository, TreeChange, TreeChangeKind,
+  TreeDelta, WalkEntry,
+};
 use crate::tree::{DecodedEntry, DecodedTree, TreeCache, TreeCacheStats};
 
 /// The tree containing a path, plus that path's final component.
@@ -1001,6 +1004,250 @@ impl GitRepository for Libgit2Repository {
   fn tree_cache_stats(&self) -> TreeCacheStats {
     self.trees.stats()
   }
+
+  fn write_tree(
+    &self,
+    base: Option<&ObjectId>,
+    changes: &[TreeChange],
+  ) -> Result<ObjectId, GfsError> {
+    let pooled = self.checkout()?;
+    let repo: &git2::Repository = &pooled;
+
+    let mut builder = git2::build::TreeUpdateBuilder::new();
+    // Blobs are written first and in one pass, because `TreeUpdateBuilder` needs
+    // an object ID per upsert and writing a blob mid-build would interleave
+    // object writes with tree construction for no benefit.
+    for change in changes {
+      let path = std::path::Path::new(
+        std::str::from_utf8(change.path.as_bytes())
+          // libgit2's tree builder takes a `Path`, which on this platform is
+          // bytes -- but the API is `&str`-shaped, so a non-UTF-8 path cannot go
+          // through it. Refused by name rather than lossily converted, which
+          // would write the file to a *different* path than the caller asked
+          // for and report success.
+          .map_err(|_| {
+            GfsError::invalid(format!(
+              "cannot commit the non-UTF-8 path {:?}; this is a known limitation",
+              String::from_utf8_lossy(change.path.as_bytes())
+            ))
+          })?,
+      );
+      match &change.kind {
+        TreeChangeKind::Upsert { mode, content } => {
+          let filemode = to_filemode(*mode)?;
+          let blob = repo.blob(content).map_err(|e| {
+            GfsError::new(
+              ErrorCode::Internal,
+              format!("cannot write blob: {}", e.message()),
+            )
+          })?;
+          builder.upsert(path, blob, filemode);
+        }
+        TreeChangeKind::Delete => {
+          builder.remove(path);
+        }
+      }
+    }
+
+    let baseline = match base {
+      Some(commit) => {
+        let oid = self.git_oid(commit)?;
+        self.find_commit(repo, oid)?.tree().map_err(|e| {
+          GfsError::new(
+            ErrorCode::Internal,
+            format!("cannot read the base tree: {}", e.message()),
+          )
+        })?
+      }
+      None => {
+        let empty = repo
+          .treebuilder(None)
+          .and_then(|b| b.write())
+          .map_err(|e| {
+            GfsError::new(
+              ErrorCode::Internal,
+              format!("cannot write the empty tree: {}", e.message()),
+            )
+          })?;
+        repo.find_tree(empty).map_err(|e| {
+          GfsError::new(
+            ErrorCode::Internal,
+            format!("cannot read the empty tree: {}", e.message()),
+          )
+        })?
+      }
+    };
+
+    let written = builder.create_updated(repo, &baseline).map_err(|e| {
+      GfsError::new(
+        ErrorCode::Internal,
+        format!("cannot write tree: {}", e.message()),
+      )
+    })?;
+    self.to_oid(written)
+  }
+
+  fn create_commit(
+    &self,
+    tree: &ObjectId,
+    parents: &[ObjectId],
+    author: &CommitSignature,
+    committer: &CommitSignature,
+    message: &str,
+  ) -> Result<ObjectId, GfsError> {
+    let pooled = self.checkout()?;
+    let repo: &git2::Repository = &pooled;
+
+    let tree_oid = self.git_oid(tree)?;
+    let tree = repo.find_tree(tree_oid).map_err(|e| {
+      GfsError::new(
+        ErrorCode::Internal,
+        format!("cannot read tree: {}", e.message()),
+      )
+    })?;
+
+    let parent_commits = parents
+      .iter()
+      .map(|p| {
+        let oid = self.git_oid(p)?;
+        self.find_commit(repo, oid)
+      })
+      .collect::<Result<Vec<_>, _>>()?;
+    let parent_refs: Vec<&git2::Commit<'_>> = parent_commits.iter().collect();
+
+    let author = to_signature(author)?;
+    let committer = to_signature(committer)?;
+
+    // `None` for the ref: the commit is created detached, and moving a branch to
+    // it is a separate compare-and-swap. Doing both here would make the update
+    // unconditional, which is the lost-commit race `update_work_ref` exists to
+    // prevent.
+    let oid = repo
+      .commit(None, &author, &committer, message, &tree, &parent_refs)
+      .map_err(|e| {
+        GfsError::new(
+          ErrorCode::Internal,
+          format!("cannot write commit: {}", e.message()),
+        )
+      })?;
+    self.to_oid(oid)
+  }
+
+  fn update_work_ref(
+    &self,
+    name: &str,
+    new: &ObjectId,
+    expected: Option<&ObjectId>,
+  ) -> Result<(), GfsError> {
+    if !revision::is_reserved_ref(name) {
+      // The rule that keeps a work branch alive. `refs/heads/*` is a fetch
+      // destination and the mirror fetch prunes it, so a branch written there
+      // that upstream does not have is deleted by the next sync -- taking the
+      // reachability of every commit on it.
+      return Err(GfsError::invalid(format!(
+        "{name} is outside the reserved namespace; unpushed work must live \
+         there or the next upstream fetch prunes it"
+      )));
+    }
+    let pooled = self.checkout()?;
+    let repo: &git2::Repository = &pooled;
+
+    let new_oid = self.git_oid(new)?;
+    // The object must exist before a ref names it, for the same reason a lease
+    // anchor checks: a dangling ref keeps nothing reachable while looking as
+    // though it does.
+    self.find_commit(repo, new_oid)?;
+
+    match expected {
+      Some(old) => {
+        let old_oid = self.git_oid(old)?;
+        repo
+          .reference_matching(name, new_oid, true, old_oid, "gfs: commit")
+          .map_err(|e| match e.code() {
+            // libgit2 reports a failed match as a generic error; the caller
+            // needs to tell "someone else committed" from "the repository is
+            // broken", because the first is retryable and the second is not.
+            git2::ErrorCode::NotFound | git2::ErrorCode::Modified => GfsError::new(
+              ErrorCode::Conflict,
+              format!("{name} moved while this commit was being made; retry"),
+            ),
+            _ => GfsError::new(
+              ErrorCode::Internal,
+              format!("cannot update {name}: {}", e.message()),
+            ),
+          })?;
+      }
+      None => {
+        if repo.find_reference(name).is_ok() {
+          return Err(GfsError::new(
+            ErrorCode::Conflict,
+            format!("{name} already exists"),
+          ));
+        }
+        repo
+          .reference(name, new_oid, false, "gfs: create")
+          .map_err(|e| {
+            GfsError::new(
+              ErrorCode::Internal,
+              format!("cannot create {name}: {}", e.message()),
+            )
+          })?;
+      }
+    }
+    Ok(())
+  }
+
+  fn read_ref(&self, name: &str) -> Result<Option<ObjectId>, GfsError> {
+    let pooled = self.checkout()?;
+    // The inner scope this file's header describes: every libgit2 borrow ends
+    // before the pooled handle's `Drop` returns it, and only owned values leave.
+    let found = {
+      let repo: &git2::Repository = &pooled;
+      match repo.find_reference(name) {
+        Ok(reference) => {
+          let object = reference.peel(git2::ObjectType::Commit).map_err(|e| {
+            GfsError::new(
+              ErrorCode::Internal,
+              format!("cannot peel {name}: {}", e.message()),
+            )
+          })?;
+          Some(self.to_oid(object.id())?)
+        }
+        Err(e) if e.code() == git2::ErrorCode::NotFound => None,
+        Err(e) => {
+          return Err(GfsError::new(
+            ErrorCode::Internal,
+            format!("cannot read {name}: {}", e.message()),
+          ))
+        }
+      }
+    };
+    Ok(found)
+  }
+}
+
+/// A Git file mode as libgit2's enum, refusing what a commit cannot carry.
+fn to_filemode(mode: u32) -> Result<git2::FileMode, GfsError> {
+  match mode {
+    gfs_types::mode::REGULAR => Ok(git2::FileMode::Blob),
+    gfs_types::mode::EXECUTABLE => Ok(git2::FileMode::BlobExecutable),
+    gfs_types::mode::SYMLINK => Ok(git2::FileMode::Link),
+    gfs_types::mode::GITLINK => Ok(git2::FileMode::Commit),
+    // Not `Tree`: a directory is implied by the paths under it, and accepting
+    // one here would let a caller replace a subtree with an empty entry.
+    other => Err(GfsError::invalid(format!(
+      "{other:o} is not a file mode a commit can carry"
+    ))),
+  }
+}
+
+fn to_signature(sig: &CommitSignature) -> Result<git2::Signature<'static>, GfsError> {
+  let when = git2::Time::new(sig.when_secs, sig.offset_minutes);
+  git2::Signature::new(&sig.name, &sig.email, &when).map_err(|e| {
+    // Git forbids `<`, `>` and newlines in these fields, and a name that carried
+    // one would produce a commit object that stock Git refuses to parse.
+    GfsError::invalid(format!("not a usable Git identity: {}", e.message()))
+  })
 }
 
 /// Peel an object to a commit, refusing anything that does not reach one.

@@ -220,6 +220,84 @@ pub trait GitRepository: Send + Sync + std::fmt::Debug {
   fn read_lease_anchor(&self, anchor_ref: &str) -> Result<Option<ObjectId>, GfsError>;
 
   fn tree_cache_stats(&self) -> TreeCacheStats;
+
+  // ---- The write half ----
+  //
+  // Everything above reads history. The four below create objects, and they are
+  // the only way anything in GFS does. Two rules bound them, both enforced here
+  // rather than by the callers:
+  //
+  // * a ref may only be written inside the reserved namespace, because a branch
+  //   under `refs/heads/` that upstream does not have is deleted by the next
+  //   mirror fetch -- it runs `--prune`, silently, as routine maintenance;
+  // * a ref update is a compare-and-swap, because two views of one mirror may be
+  //   committing to the same work branch at the same moment, and last-write-wins
+  //   would drop a commit while reporting success.
+
+  /// Build a tree by applying `changes` to `base`'s tree.
+  ///
+  /// `base` is `None` for an orphan tree. Intermediate directories are created
+  /// and emptied ones removed, so a caller supplies only the paths that changed.
+  fn write_tree(
+    &self,
+    base: Option<&ObjectId>,
+    changes: &[TreeChange],
+  ) -> Result<ObjectId, GfsError>;
+
+  /// Create a commit object. Updates no ref; [`GitRepository::update_work_ref`]
+  /// does that, so the caller can decide what to do if the branch moved.
+  fn create_commit(
+    &self,
+    tree: &ObjectId,
+    parents: &[ObjectId],
+    author: &CommitSignature,
+    committer: &CommitSignature,
+    message: &str,
+  ) -> Result<ObjectId, GfsError>;
+
+  /// Point a reserved-namespace ref at a commit, if it still holds `expected`.
+  ///
+  /// `expected` is `None` to *create* the ref, and the creation fails if it
+  /// already exists. Anything outside the reserved namespace is refused.
+  fn update_work_ref(
+    &self,
+    name: &str,
+    new: &ObjectId,
+    expected: Option<&ObjectId>,
+  ) -> Result<(), GfsError>;
+
+  /// The commit a ref points at, or `None` when it does not exist.
+  fn read_ref(&self, name: &str) -> Result<Option<ObjectId>, GfsError>;
+}
+
+/// One path's new state when building a tree.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TreeChange {
+  pub path: BytePath,
+  pub kind: TreeChangeKind,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TreeChangeKind {
+  /// Create or replace the path with this content and mode.
+  Upsert { mode: u32, content: Vec<u8> },
+  /// Remove the path.
+  Delete,
+}
+
+/// An author or committer.
+///
+/// Carries its own timestamp rather than taking "now" inside the repository
+/// layer, so a commit is a pure function of its inputs and a test can assert an
+/// exact object ID.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CommitSignature {
+  pub name: String,
+  pub email: String,
+  /// Seconds since the Unix epoch.
+  pub when_secs: i64,
+  /// Offset from UTC in minutes, as Git records it.
+  pub offset_minutes: i32,
 }
 
 /// An async facade that applies admission control before touching libgit2.
@@ -396,5 +474,43 @@ impl AsyncRepository {
 
   pub async fn is_visible(&self, commit: ObjectId) -> Result<bool, GfsError> {
     self.run(move |r| r.is_visible(&commit)).await
+  }
+
+  pub async fn write_tree(
+    &self,
+    base: Option<ObjectId>,
+    changes: Vec<TreeChange>,
+  ) -> Result<ObjectId, GfsError> {
+    self
+      .run(move |r| r.write_tree(base.as_ref(), &changes))
+      .await
+  }
+
+  pub async fn create_commit(
+    &self,
+    tree: ObjectId,
+    parents: Vec<ObjectId>,
+    author: CommitSignature,
+    committer: CommitSignature,
+    message: String,
+  ) -> Result<ObjectId, GfsError> {
+    self
+      .run(move |r| r.create_commit(&tree, &parents, &author, &committer, &message))
+      .await
+  }
+
+  pub async fn update_work_ref(
+    &self,
+    name: String,
+    new: ObjectId,
+    expected: Option<ObjectId>,
+  ) -> Result<(), GfsError> {
+    self
+      .run(move |r| r.update_work_ref(&name, &new, expected.as_ref()))
+      .await
+  }
+
+  pub async fn read_ref(&self, name: String) -> Result<Option<ObjectId>, GfsError> {
+    self.run(move |r| r.read_ref(&name)).await
   }
 }

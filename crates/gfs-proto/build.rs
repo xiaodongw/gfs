@@ -15,6 +15,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     "proto/gfs/v1/common.proto",
     "proto/gfs/v1/snapshot.proto",
     "proto/gfs/v1/search.proto",
+    "proto/gfs/v1/repository.proto",
   ];
 
   // Emit the descriptor set as well as the Rust code. `golden.rs` reads it to

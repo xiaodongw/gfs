@@ -28,7 +28,7 @@ use std::path::PathBuf;
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use gfs_cli::search_output;
-use gfs_cli::workspace::{call, state_dir_for};
+use gfs_cli::workspace::{call, locate, state_dir_for};
 use gfs_mount::control::{Request, Response};
 use gfs_proto::v1;
 
@@ -95,6 +95,40 @@ enum Command {
     path: String,
   },
 
+  /// Cache a repository on the gateway and mount it, the way `git clone` does.
+  ///
+  /// `gfs clone <url>` mounts at the directory `git clone` would have created;
+  /// `gfs clone <url> <dir>` mounts at `<dir>`. Cloning a URL the gateway
+  /// already holds is a **sync**, not a second copy: the gateway keeps one clone
+  /// per upstream and every mount is a view onto it, so the second caller pays
+  /// for a fetch rather than for a repository.
+  Clone {
+    /// The upstream URL, as `git clone` takes it.
+    url: String,
+    /// Where to mount. Defaults to the name `git clone` would choose.
+    directory: Option<PathBuf>,
+    /// Mount this revision instead of the upstream's default branch.
+    #[arg(long)]
+    rev: Option<String>,
+    /// A credential for the upstream, used for this call and never stored.
+    #[arg(long, env = "GFS_UPSTREAM_CREDENTIAL", hide_env_values = true)]
+    credential: Option<String>,
+    #[arg(long)]
+    state_dir: Option<PathBuf>,
+    #[arg(long)]
+    cache_dir: Option<PathBuf>,
+    #[arg(long)]
+    allow_other: bool,
+    #[arg(long, default_value_t = 8 * 1024 * 1024 * 1024)]
+    cache_quota: u64,
+    #[arg(long, default_value_t = 1024 * 1024 * 1024)]
+    overlay_quota: u64,
+    #[arg(long)]
+    foreground: bool,
+    #[arg(long, default_value_t = 30)]
+    timeout_seconds: u64,
+  },
+
   /// Mount a pinned commit as a workspace.
   Mount {
     #[arg(long)]
@@ -129,7 +163,7 @@ enum Command {
   /// Release the lease, unmount, and stop the daemon.
   Unmount {
     #[arg(long)]
-    workspace: PathBuf,
+    workspace: Option<PathBuf>,
     #[arg(long)]
     state_dir: Option<PathBuf>,
   },
@@ -137,7 +171,7 @@ enum Command {
   /// Everything about a mounted workspace.
   Inspect {
     #[arg(long)]
-    workspace: PathBuf,
+    workspace: Option<PathBuf>,
     #[arg(long)]
     state_dir: Option<PathBuf>,
     #[arg(long)]
@@ -147,7 +181,7 @@ enum Command {
   /// Daemon and lease health. Exits non-zero when the lease is not renewing.
   Health {
     #[arg(long)]
-    workspace: PathBuf,
+    workspace: Option<PathBuf>,
     #[arg(long)]
     state_dir: Option<PathBuf>,
     #[arg(long)]
@@ -160,7 +194,7 @@ enum Command {
   /// old generation until they close.
   Refresh {
     #[arg(long)]
-    workspace: PathBuf,
+    workspace: Option<PathBuf>,
     #[arg(long)]
     state_dir: Option<PathBuf>,
   },
@@ -171,7 +205,7 @@ enum Command {
   /// the edit set rather than to the repository (DESIGN.md section 8.5).
   Status {
     #[arg(long)]
-    workspace: PathBuf,
+    workspace: Option<PathBuf>,
     #[arg(long)]
     state_dir: Option<PathBuf>,
     /// Machine-readable output, for an orchestrator.
@@ -187,7 +221,7 @@ enum Command {
   /// 3 truncated, 4 a coverage gap under `--require-exhaustive`.
   Search {
     #[arg(long)]
-    workspace: PathBuf,
+    workspace: Option<PathBuf>,
     #[arg(long)]
     state_dir: Option<PathBuf>,
     /// The pattern. A regex unless `--fixed-strings`.
@@ -231,7 +265,7 @@ enum Command {
   /// The same change set as a Git-compatible patch on stdout.
   Diff {
     #[arg(long)]
-    workspace: PathBuf,
+    workspace: Option<PathBuf>,
     #[arg(long)]
     state_dir: Option<PathBuf>,
   },
@@ -243,7 +277,7 @@ enum Command {
   /// moved while the job ran.
   Export {
     #[arg(long)]
-    workspace: PathBuf,
+    workspace: Option<PathBuf>,
     #[arg(long)]
     state_dir: Option<PathBuf>,
     /// The bundle directory. Replaced atomically if it already exists.
@@ -260,7 +294,7 @@ enum Command {
   /// that precedence inside the real agent image.
   InstallShim {
     #[arg(long)]
-    workspace: PathBuf,
+    workspace: Option<PathBuf>,
     #[arg(long)]
     state_dir: Option<PathBuf>,
     /// Defaults to `<state-dir>/bin`.
@@ -293,6 +327,27 @@ enum Command {
     args: Vec<String>,
   },
 
+  /// Move this view to another branch, creating it with `-c`.
+  ///
+  /// The branch is created on the **gateway**, not locally: the gateway's mirror
+  /// is the clone and this workspace is a view onto it. Unpushed branches live
+  /// in the reserved ref namespace, because a branch under `refs/heads/` that
+  /// upstream does not have is deleted by the next mirror fetch.
+  Switch {
+    /// The branch to move to.
+    branch: String,
+    /// Create the branch first, the way `git switch -c` does.
+    #[arg(short = 'c', long)]
+    create: bool,
+    /// What the new branch starts from. Defaults to the current view.
+    #[arg(long)]
+    start_point: Option<String>,
+    #[arg(long)]
+    workspace: Option<PathBuf>,
+    #[arg(long)]
+    state_dir: Option<PathBuf>,
+  },
+
   /// Retention leases, without a mount. Used by the development stack.
   #[command(subcommand)]
   Lease(LeaseCommand),
@@ -322,14 +377,23 @@ enum LeaseCommand {
 }
 
 type Client = v1::snapshot_service_client::SnapshotServiceClient<tonic::transport::Channel>;
+type RepoClient = v1::repository_service_client::RepositoryServiceClient<tonic::transport::Channel>;
 
-async fn connect(cli: &Cli) -> Result<Client> {
-  let channel = tonic::transport::Endpoint::from_shared(cli.endpoint.clone())
+async fn channel(cli: &Cli) -> Result<tonic::transport::Channel> {
+  tonic::transport::Endpoint::from_shared(cli.endpoint.clone())
     .context("invalid endpoint")?
     .connect()
     .await
-    .with_context(|| format!("connecting to {}", cli.endpoint))?;
-  Ok(Client::new(channel))
+    .with_context(|| format!("connecting to {}", cli.endpoint))
+}
+
+async fn connect(cli: &Cli) -> Result<Client> {
+  Ok(Client::new(channel(cli).await?))
+}
+
+/// The write half of the API: clone, branch, commit, push.
+async fn connect_repository(cli: &Cli) -> Result<RepoClient> {
+  Ok(RepoClient::new(channel(cli).await?))
 }
 
 /// Attach the bearer token to a request.
@@ -712,6 +776,70 @@ async fn main() -> Result<()> {
       std::io::stdout().write_all(&bytes)?;
     }
 
+    Command::Clone {
+      url,
+      directory,
+      rev,
+      credential,
+      state_dir,
+      cache_dir,
+      allow_other,
+      cache_quota,
+      overlay_quota,
+      foreground,
+      timeout_seconds,
+    } => {
+      let mut client = connect_repository(&cli).await?;
+      let response = client
+        .clone_repository(authed(
+          &cli,
+          v1::CloneRepositoryRequest {
+            upstream_url: url.clone(),
+            credential: credential.clone().unwrap_or_default(),
+          },
+        )?)
+        .await?
+        .into_inner();
+
+      // The gateway's name for the directory is a fallback, not an override: a
+      // caller who named one meant it.
+      let workspace = directory
+        .clone()
+        .unwrap_or_else(|| PathBuf::from(&response.directory));
+      if response.created {
+        eprintln!(
+          "cloned {} into the gateway as {}",
+          url, response.repository_id
+        );
+      } else {
+        eprintln!(
+          "{} is already on the gateway as {}; synced",
+          url, response.repository_id
+        );
+      }
+
+      let rev = rev
+        .clone()
+        .unwrap_or_else(|| response.default_branch.clone());
+      tokio::task::block_in_place(|| {
+        do_mount(
+          &cli,
+          MountArgs {
+            repo: response.repository_id.clone(),
+            rev,
+            workspace,
+            state_dir: state_dir.clone(),
+            cache_dir: cache_dir.clone(),
+            allow_other: *allow_other,
+            cache_quota: *cache_quota,
+            overlay_quota: *overlay_quota,
+            foreground: *foreground,
+            timeout_seconds: *timeout_seconds,
+          },
+        )
+      })?;
+    }
+
     Command::Mount {
       repo,
       rev,
@@ -750,7 +878,7 @@ async fn main() -> Result<()> {
       workspace,
       state_dir,
     } => {
-      let state_dir = state_dir_for(workspace, state_dir);
+      let (workspace, state_dir) = locate(&workspace.clone(), state_dir)?;
       match call(&state_dir, &Request::Unmount)? {
         Response::Unmounted => println!("unmounted {}", workspace.display()),
         other => bail!("unexpected daemon response: {other:?}"),
@@ -762,7 +890,7 @@ async fn main() -> Result<()> {
       state_dir,
       json,
     } => {
-      let state_dir = state_dir_for(workspace, state_dir);
+      let (_workspace, state_dir) = locate(workspace, state_dir)?;
       let Response::Inspect(report) = call(&state_dir, &Request::Inspect)? else {
         bail!("the daemon answered an inspect request with something else");
       };
@@ -778,7 +906,7 @@ async fn main() -> Result<()> {
       state_dir,
       json,
     } => {
-      let state_dir = state_dir_for(workspace, state_dir);
+      let (_workspace, state_dir) = locate(workspace, state_dir)?;
       let Response::Health(health) = call(&state_dir, &Request::Health)? else {
         bail!("the daemon answered a health request with something else");
       };
@@ -805,7 +933,7 @@ async fn main() -> Result<()> {
       workspace,
       state_dir,
     } => {
-      let state_dir = state_dir_for(workspace, state_dir);
+      let (_workspace, state_dir) = locate(workspace, state_dir)?;
       let Response::Refresh(report) = call(&state_dir, &Request::Refresh)? else {
         bail!("the daemon answered a refresh request with something else");
       };
@@ -824,7 +952,7 @@ async fn main() -> Result<()> {
       state_dir,
       json,
     } => {
-      let state_dir = state_dir_for(workspace, state_dir);
+      let (_workspace, state_dir) = locate(workspace, state_dir)?;
       let Response::Status(report) = call(&state_dir, &Request::Status)? else {
         bail!("the daemon answered a status request with something else");
       };
@@ -855,7 +983,7 @@ async fn main() -> Result<()> {
       json,
       require_exhaustive,
     } => {
-      let state_dir = state_dir_for(workspace, state_dir);
+      let (_workspace, state_dir) = locate(workspace, state_dir)?;
       let request = gfs_mount::search::SearchRequest {
         pattern: pattern.clone(),
         literal: *fixed_strings,
@@ -905,7 +1033,7 @@ async fn main() -> Result<()> {
       workspace,
       state_dir,
     } => {
-      let state_dir = state_dir_for(workspace, state_dir);
+      let (_workspace, state_dir) = locate(workspace, state_dir)?;
       let Response::Diff { patch_b64url } = call(&state_dir, &Request::Diff)? else {
         bail!("the daemon answered a diff request with something else");
       };
@@ -919,7 +1047,7 @@ async fn main() -> Result<()> {
       state_dir,
       bundle,
     } => {
-      let state_dir = state_dir_for(workspace, state_dir);
+      let (_workspace, state_dir) = locate(workspace, state_dir)?;
       let bundle = std::path::absolute(bundle)?;
       let Response::Export(report) = call(&state_dir, &Request::Export { bundle })? else {
         bail!("the daemon answered an export request with something else");
@@ -936,7 +1064,7 @@ async fn main() -> Result<()> {
       state_dir,
       bin_dir,
     } => {
-      let state_dir = state_dir_for(workspace, state_dir);
+      let (_workspace, state_dir) = locate(workspace, state_dir)?;
       let bin_dir = bin_dir.clone().unwrap_or_else(|| state_dir.join("bin"));
       std::fs::create_dir_all(&bin_dir)
         .with_context(|| format!("creating {}", bin_dir.display()))?;
@@ -962,6 +1090,71 @@ async fn main() -> Result<()> {
 
       println!("{}", bin_dir.display());
       eprintln!("prepend that directory to PATH so `git` resolves to the shim first");
+    }
+
+    Command::Switch {
+      branch,
+      create,
+      start_point,
+      workspace,
+      state_dir,
+    } => {
+      let (_workspace, state_dir) = locate(workspace, state_dir)?;
+      // The repository this view is on, read from the daemon rather than asked
+      // for: a caller standing in a workspace should not have to name it again.
+      let Response::Inspect(report) = call(&state_dir, &Request::Inspect)? else {
+        bail!("the daemon answered an inspect request with something else");
+      };
+
+      let mut client = connect_repository(&cli).await?;
+      let created = if *create {
+        Some(
+          client
+            .create_branch(authed(
+              &cli,
+              v1::CreateBranchRequest {
+                repository_id: report.repository_id.clone(),
+                branch: branch.clone(),
+                // Defaults to what this view is pinned to, so `-c` branches
+                // from where the caller is standing, as `git switch -c` does.
+                start_point: start_point.clone().unwrap_or_else(|| report.commit.clone()),
+                authorization: None,
+              },
+            )?)
+            .await?
+            .into_inner(),
+        )
+      } else {
+        None
+      };
+
+      // The view is re-pinned to a *commit*, not to the branch name: ADR 0006
+      // forbids naming the reserved namespace as a revision, and a work branch
+      // lives there. The branch travels alongside so reports can name it.
+      let (selector, work_branch) = match &created {
+        Some(response) => (response.commit_oid.clone(), Some(branch.clone())),
+        // Without `-c` this is an ordinary revision, so the daemon resolves it
+        // itself and the view is not on a work branch.
+        None => (branch.clone(), None),
+      };
+
+      let Response::Refresh(refresh) = call(
+        &state_dir,
+        &Request::Switch {
+          selector,
+          branch: work_branch,
+        },
+      )?
+      else {
+        bail!("the daemon answered a switch request with something else");
+      };
+      if *create {
+        println!("switched to a new branch {branch}");
+      } else {
+        println!("switched to {branch}");
+      }
+      println!("commit     {}", refresh.commit);
+      println!("generation {}", refresh.generation);
     }
 
     // These three never come back: their exit code *is* their answer, and the

@@ -350,6 +350,80 @@ const PINNED: &[(&str, &[Field])] = &[
       (9, "elapsed_ms", "uint64"),
     ],
   ),
+  // RepositoryService: the write half. Added whole, so nothing here can have
+  // been renumbered yet -- but pinning it now is what makes that true later.
+  (
+    "CloneRepositoryRequest",
+    &[(1, "upstream_url", "string"), (2, "credential", "string")],
+  ),
+  (
+    "CloneRepositoryResponse",
+    &[
+      (1, "repository_id", "string"),
+      (2, "created", "bool"),
+      (3, "default_branch", "string"),
+      (4, "directory", "string"),
+      (5, "summary", "string"),
+    ],
+  ),
+  (
+    "CreateBranchRequest",
+    &[
+      (1, "repository_id", "string"),
+      (2, "branch", "string"),
+      (3, "start_point", "string"),
+      (4, "authorization", ".gfs.v1.SnapshotAuthorization"),
+    ],
+  ),
+  (
+    "CreateBranchResponse",
+    &[(1, "ref_name", "string"), (2, "commit_oid", "string")],
+  ),
+  (
+    "FileChange",
+    &[
+      (1, "path", "bytes"),
+      (2, "kind", ".gfs.v1.ChangeKind"),
+      (3, "mode", "uint32"),
+      (4, "content", "bytes"),
+    ],
+  ),
+  (
+    "CommitChangesRequest",
+    &[
+      (1, "repository_id", "string"),
+      (2, "base_commit_oid", "string"),
+      (3, "branch", "string"),
+      (4, "message", "string"),
+      (5, "author_name", "string"),
+      (6, "author_email", "string"),
+      (7, "changes", ".gfs.v1.FileChange"),
+      (8, "authorization", ".gfs.v1.SnapshotAuthorization"),
+    ],
+  ),
+  (
+    "CommitChangesResponse",
+    &[
+      (1, "commit_oid", "string"),
+      (2, "tree_oid", "string"),
+      (3, "ref_name", "string"),
+    ],
+  ),
+  (
+    "PushBranchRequest",
+    &[
+      (1, "repository_id", "string"),
+      (2, "branch", "string"),
+      (3, "remote_branch", "string"),
+      (4, "credential", "string"),
+      (5, "force", "bool"),
+      (6, "authorization", ".gfs.v1.SnapshotAuthorization"),
+    ],
+  ),
+  (
+    "PushBranchResponse",
+    &[(1, "summary", "string"), (2, "remote_ref", "string")],
+  ),
 ];
 
 /// The pinned enum values. Repurposing one is the change this catches.
@@ -389,6 +463,18 @@ const PINNED_ENUMS: &[(&str, &[(i32, &str)])] = &[
       (0, "EXECUTION_STATUS_UNSPECIFIED"),
       (1, "EXECUTION_STATUS_COMPLETE"),
       (2, "EXECUTION_STATUS_TRUNCATED"),
+    ],
+  ),
+  (
+    // Mirrors `gfs_overlay::ChangeKind`. Renumbering one of these would make a
+    // client's "deleted" arrive as the server's "modified", which is a data-loss
+    // bug rather than a compatibility inconvenience.
+    "ChangeKind",
+    &[
+      (0, "CHANGE_KIND_UNSPECIFIED"),
+      (1, "CHANGE_KIND_ADDED"),
+      (2, "CHANGE_KIND_MODIFIED"),
+      (3, "CHANGE_KIND_DELETED"),
     ],
   ),
 ];
@@ -508,6 +594,10 @@ fn service_methods_are_stable() {
   // Removing or renaming a method breaks a deployed client outright; the gRPC
   // path is built from the service and method names.
   let expected = [
+    "RepositoryService/CloneRepository(.gfs.v1.CloneRepositoryRequest) -> .gfs.v1.CloneRepositoryResponse",
+    "RepositoryService/CommitChanges(.gfs.v1.CommitChangesRequest) -> .gfs.v1.CommitChangesResponse",
+    "RepositoryService/CreateBranch(.gfs.v1.CreateBranchRequest) -> .gfs.v1.CreateBranchResponse",
+    "RepositoryService/PushBranch(.gfs.v1.PushBranchRequest) -> .gfs.v1.PushBranchResponse",
     "SearchService/Search(.gfs.v1.SearchRequest) -> .gfs.v1.SearchResponse",
     "SnapshotService/BatchGetEntry(.gfs.v1.BatchGetEntryRequest) -> .gfs.v1.BatchGetEntryResponse",
     "SnapshotService/CreateMount(.gfs.v1.CreateMountRequest) -> .gfs.v1.CreateMountResponse",

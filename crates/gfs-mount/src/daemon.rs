@@ -169,6 +169,20 @@ impl Generation {
 
 pub struct Daemon {
   config: DaemonConfig,
+  /// The selector the next generation resolves.
+  ///
+  /// Held here rather than in `config` because `switch` changes it: a view is
+  /// re-pointed at another branch by resolving a *different* selector and
+  /// publishing the result, which is the same machinery `refresh` uses. The
+  /// config's value is the starting one.
+  selector: Mutex<String>,
+  /// The work branch this view is on, when it is on one.
+  ///
+  /// Separate from `selector` because the selector is a resolved commit -- the
+  /// reserved namespace cannot be named as a revision -- so the branch name
+  /// would otherwise be lost the moment it was resolved, and `gfs commit` needs
+  /// to know which ref to advance.
+  work_branch: Mutex<Option<String>>,
   cache: Arc<BlobCache>,
   publisher: Box<dyn MountPublisher>,
   current: Mutex<Generation>,
@@ -211,7 +225,8 @@ impl Daemon {
     let publisher: Box<dyn MountPublisher> =
       Box::new(SymlinkPublisher::new(config.workspace.clone())?);
 
-    let generation = mount_generation(&config, &cache, 1).await?;
+    let generation =
+      mount_generation(&config, &config.revision_selector.clone(), &cache, 1).await?;
     publisher.publish(&generation.mountpoint)?;
 
     let daemon = Arc::new(Daemon {
@@ -220,6 +235,8 @@ impl Daemon {
       current: Mutex::new(generation),
       retiring: Mutex::new(Vec::new()),
       shutting_down: AtomicBool::new(false),
+      selector: Mutex::new(config.revision_selector.clone()),
+      work_branch: Mutex::new(None),
       config,
     });
     daemon.persist()?;
@@ -242,7 +259,7 @@ impl Daemon {
       api_version: gfs_types::API_VERSION.to_owned(),
       mount_id: current.monitor.mount_id().as_str().to_owned(),
       repository_id: self.config.repository_id.as_str().to_owned(),
-      revision_selector: self.config.revision_selector.clone(),
+      revision_selector: self.selector.lock().expect("selector").clone(),
       commit: current.commit.to_qualified(),
       tree: current.tree.to_qualified(),
       ref_name: current.ref_name.clone(),
@@ -289,7 +306,7 @@ impl Daemon {
     MountReport {
       mount_id: current.monitor.mount_id().as_str().to_owned(),
       repository_id: self.config.repository_id.as_str().to_owned(),
-      revision_selector: self.config.revision_selector.clone(),
+      revision_selector: self.selector.lock().expect("selector").clone(),
       commit: current.commit.to_qualified(),
       tree: current.tree.to_qualified(),
       ref_name: current.ref_name.clone(),
@@ -421,7 +438,8 @@ impl Daemon {
       (current.number, current.commit.clone())
     };
     let next_number = previous_number + 1;
-    let fresh = mount_generation(&self.config, &self.cache, next_number).await?;
+    let selector = self.selector.lock().expect("selector").clone();
+    let fresh = mount_generation(&self.config, &selector, &self.cache, next_number).await?;
     let commit = fresh.commit.clone();
 
     // Published before the old generation is retired, so there is never a moment
@@ -442,6 +460,42 @@ impl Daemon {
       commit: commit.to_qualified(),
       unchanged: previous_commit == commit,
     })
+  }
+
+  /// Re-point this view at another revision, and remember it.
+  ///
+  /// `refresh` re-resolves the *same* selector; this changes which one is
+  /// resolved and is what `gfs switch` and the re-pin after `gfs commit` both
+  /// use. The generation machinery underneath is identical -- publish the new
+  /// generation, then retire the old one as its handles drain -- because a view
+  /// changing branch and a view following a moved branch are the same operation
+  /// with a different selector.
+  ///
+  /// Refuses a dirty workspace for the reason `refresh` does: an overlay is
+  /// bound to the commit it diverged from, and carrying edits to a different
+  /// base would make every later `status` describe a base that is not mounted.
+  /// A future `gfs commit` will not hit this: committing empties the overlay
+  /// before re-pinning, so by the time it switches there is nothing to carry.
+  pub async fn switch_to(
+    self: &Arc<Self>,
+    selector: &str,
+    branch: Option<String>,
+  ) -> Result<RefreshReport, GfsError> {
+    if !self.overlay_is_empty() {
+      return Err(GfsError::new(
+        ErrorCode::FailedPrecondition,
+        "the workspace has local changes; commit or discard them before switching",
+      ));
+    }
+    {
+      let mut current = self.selector.lock().expect("selector");
+      *current = selector.to_owned();
+    }
+    {
+      let mut current = self.work_branch.lock().expect("work branch");
+      *current = branch;
+    }
+    self.refresh().await
   }
 
   /// The change set, from the journal alone.
@@ -772,6 +826,12 @@ impl Daemon {
         Ok(report) => Response::Refresh(report),
         Err(e) => Response::from_error(&e),
       },
+      Request::Switch { selector, branch } => {
+        match self.switch_to(selector.as_str(), branch.clone()).await {
+          Ok(report) => Response::Refresh(report),
+          Err(e) => Response::from_error(&e),
+        }
+      }
       Request::Status => match self.status().await {
         Ok(report) => Response::Status(Box::new(report)),
         Err(e) => Response::from_error(&e),
@@ -824,10 +884,11 @@ fn absolute(path: &Path) -> Result<PathBuf, GfsError> {
 /// Create a lease and mount it, in that order.
 async fn mount_generation(
   config: &DaemonConfig,
+  selector: &str,
   cache: &Arc<BlobCache>,
   number: u64,
 ) -> Result<Generation, GfsError> {
-  let grant = create_mount(config).await?;
+  let grant = create_mount(config, selector).await?;
 
   let commit = ObjectId::parse_qualified(&grant.commit_oid)
     .map_err(|e| GfsError::internal(format!("server returned an unparseable commit: {e}")))?;
@@ -958,7 +1019,10 @@ async fn mount_generation(
   })
 }
 
-async fn create_mount(config: &DaemonConfig) -> Result<v1::CreateMountResponse, GfsError> {
+async fn create_mount(
+  config: &DaemonConfig,
+  selector: &str,
+) -> Result<v1::CreateMountResponse, GfsError> {
   let channel = tonic::transport::Endpoint::from_shared(config.grpc_endpoint.clone())
     .map_err(|e| GfsError::invalid(format!("invalid gRPC endpoint: {e}")))?
     .connect()
@@ -972,7 +1036,7 @@ async fn create_mount(config: &DaemonConfig) -> Result<v1::CreateMountResponse, 
   let mut client = v1::snapshot_service_client::SnapshotServiceClient::new(channel);
   let mut request = tonic::Request::new(v1::CreateMountRequest {
     repository_id: config.repository_id.as_str().to_owned(),
-    revision_selector: config.revision_selector.clone(),
+    revision_selector: selector.to_owned(),
     requested_ttl_seconds: 0,
   });
   if !config.token.is_empty() {

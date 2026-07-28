@@ -7,6 +7,7 @@
 //! line of configuration.
 
 pub mod http;
+pub mod repository;
 pub mod search;
 pub mod snapshot;
 
@@ -54,6 +55,14 @@ pub struct Server {
   /// process-wide bound: rebuilding it per router would silently multiply the
   /// concurrent-upload-pack limit by the number of routers.
   pub gateway: Arc<crate::gateway::GatewayState>,
+  /// Where `gfs clone` puts mirrors, when the deployment allows cloning at all.
+  ///
+  /// `None` means this server serves only repositories that were imported into
+  /// it, and every write method refuses with a stated reason. That is the safe
+  /// default: a server that has not been told where to put a mirror must not
+  /// invent a location, and a deployment that never wants callers creating
+  /// repositories gets that by saying nothing.
+  pub ingest: Option<Arc<crate::ingest::IngestConfig>>,
 }
 
 impl std::fmt::Debug for Server {
@@ -119,7 +128,16 @@ impl Server {
       search,
       policy: lease_policy,
       gateway,
+      ingest: None,
     }
+  }
+
+  /// Allow `gfs clone`, and say where mirrors go.
+  ///
+  /// Called before the server is shared, like the other builders.
+  pub fn with_ingest(mut self, config: crate::ingest::IngestConfig) -> Self {
+    self.ingest = Some(Arc::new(config));
+    self
   }
 
   /// Replace the Git gateway's policy.
@@ -158,6 +176,15 @@ impl Server {
       mounts: Arc::clone(&self.mounts),
       authz: Arc::clone(&self.authz),
       search: Arc::clone(&self.search),
+    }
+  }
+
+  pub fn repository_api(&self) -> repository::RepositoryApi {
+    repository::RepositoryApi {
+      catalog: Arc::clone(&self.catalog),
+      registry: Arc::clone(&self.registry),
+      authz: Arc::clone(&self.authz),
+      ingest: self.ingest.clone(),
     }
   }
 

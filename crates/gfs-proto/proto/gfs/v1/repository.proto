@@ -1,0 +1,153 @@
+syntax = "proto3";
+
+package gfs.v1;
+
+import "gfs/v1/common.proto";
+
+// The write half of the API.
+//
+// `SnapshotService` reads pinned history and never changes it. Everything here
+// *creates* something -- a mirror, a branch, a commit, a push -- and the split is
+// deliberate rather than cosmetic: ADR 0002 reasons about which objects may be
+// *served*, and these methods raise the different question of which objects a
+// caller may cause to *exist*. Keeping them in one service means that question
+// has one place to be answered.
+//
+// # The mirror is the clone
+//
+// A GFS mount is a *view* onto the gateway's mirror, the way `git worktree` is a
+// view onto a repository -- except that a view materializes no working files, so
+// thousands of them over one mirror is the expected shape. Every method here acts
+// on the mirror, and the views follow. There is no local-only state to
+// reconcile, which is why there is no "local commit": a commit exists on the
+// gateway the moment it is made.
+//
+// ADR 0006's versioning policy applies: additive-only within a major version, no
+// field renumbering, removed fields reserved and never reused.
+service RepositoryService {
+  // Bring an upstream under management, or sync it if it is already here.
+  //
+  // Keyed by upstream URL, so cloning the same URL twice is a sync and not a
+  // second mirror. This is the only method that does not name a repository_id,
+  // because it is the method that assigns one.
+  rpc CloneRepository(CloneRepositoryRequest) returns (CloneRepositoryResponse);
+
+  // Create a branch for work that has not been pushed yet.
+  //
+  // The ref lands in the reserved namespace, *not* `refs/heads/`. A branch under
+  // `refs/heads/` that upstream does not have is deleted by the next mirror
+  // fetch, which runs `--prune` -- silently, as routine maintenance, taking the
+  // reachability of every commit on it. The reserved namespace is never a fetch
+  // destination, so it survives.
+  rpc CreateBranch(CreateBranchRequest) returns (CreateBranchResponse);
+
+  // Turn a set of workspace changes into a commit on a work branch.
+  //
+  // The commit is made in the mirror and is durable immediately; the caller's
+  // mount then re-pins to it. There is deliberately no staging area -- the
+  // overlay journal already knows exactly what changed.
+  rpc CommitChanges(CommitChangesRequest) returns (CommitChangesResponse);
+
+  // Push a work branch to the upstream's `refs/heads/<branch>`.
+  //
+  // The credential travels per-call and is never stored: it is the caller's own,
+  // used the way `git push` would use it, so upstream sees the user rather than
+  // the service.
+  rpc PushBranch(PushBranchRequest) returns (PushBranchResponse);
+}
+
+message CloneRepositoryRequest {
+  string upstream_url = 1;
+  // Optional. Used for this call only and never written to the catalog.
+  string credential = 2;
+}
+
+message CloneRepositoryResponse {
+  string repository_id = 1;
+  // False when the repository was already present and this call only synced it.
+  bool created = 2;
+  // The upstream's HEAD branch, which is what a fresh mount should show.
+  string default_branch = 3;
+  // The directory `git clone` would have created, for a client with no opinion.
+  string directory = 4;
+  // Stock Git's fetch summary, already bounded.
+  string summary = 5;
+}
+
+message CreateBranchRequest {
+  string repository_id = 1;
+  string branch = 2;
+  // A revision selector for the starting commit. Empty means the repository's
+  // default branch.
+  string start_point = 3;
+  SnapshotAuthorization authorization = 4;
+}
+
+message CreateBranchResponse {
+  // The full ref that was created, inside the reserved namespace.
+  string ref_name = 1;
+  // The commit the branch starts at.
+  string commit_oid = 2;
+}
+
+// What one path changed to. Mirrors `gfs_overlay::ChangeKind`.
+enum ChangeKind {
+  CHANGE_KIND_UNSPECIFIED = 0;
+  CHANGE_KIND_ADDED = 1;
+  CHANGE_KIND_MODIFIED = 2;
+  CHANGE_KIND_DELETED = 3;
+}
+
+message FileChange {
+  // Repository-relative, and bytes rather than a string: a Git path is not
+  // required to be UTF-8.
+  bytes path = 1;
+  ChangeKind kind = 2;
+  // The Git file mode for an added or modified path.
+  uint32 mode = 3;
+  // The new content, for an added or modified path.
+  //
+  // Inline, which bounds a commit by the message size limit. That is a
+  // prototype's simplification: a production shape uploads blobs first and sends
+  // object IDs here. The server enforces the bound and says so.
+  bytes content = 4;
+}
+
+message CommitChangesRequest {
+  string repository_id = 1;
+  // The commit the workspace was pinned to. The server refuses if the branch has
+  // moved since, rather than silently committing on top of someone else's work.
+  string base_commit_oid = 2;
+  // The work branch to advance.
+  string branch = 3;
+  string message = 4;
+  string author_name = 5;
+  string author_email = 6;
+  repeated FileChange changes = 7;
+  SnapshotAuthorization authorization = 8;
+}
+
+message CommitChangesResponse {
+  string commit_oid = 1;
+  string tree_oid = 2;
+  string ref_name = 3;
+}
+
+message PushBranchRequest {
+  string repository_id = 1;
+  // The work branch to push.
+  string branch = 2;
+  // The branch name to create or update upstream. Empty means the same name.
+  string remote_branch = 3;
+  // The caller's credential, used for this call and never stored.
+  string credential = 4;
+  bool force = 5;
+  SnapshotAuthorization authorization = 6;
+}
+
+message PushBranchResponse {
+  // Stock Git's push summary, already bounded.
+  string summary = 1;
+  // The upstream ref that was updated.
+  string remote_ref = 2;
+}

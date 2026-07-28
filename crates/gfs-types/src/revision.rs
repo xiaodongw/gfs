@@ -229,6 +229,80 @@ pub fn is_reserved_ref(name: &str) -> bool {
   name.starts_with(RESERVED_REF_PREFIX)
 }
 
+/// Whether a user-supplied branch name can safely become a ref.
+///
+/// `gfs switch` and `gfs clone` take a branch name from a command line and turn
+/// it into `refs/heads/<name>` or a work ref, so this is a trust boundary rather
+/// than a tidiness check. Git's own rules, kept to the ones that matter here:
+///
+/// * the characters Git forbids outright, because `git check-ref-format` would
+///   reject the name and the failure would surface as an opaque subprocess error
+///   several layers down;
+/// * `..` and `@{`, because both are *revision expression* syntax — a branch
+///   named `a..b` turns a later selector into a range;
+/// * a leading `-`, because the name reaches a `git` command line and would be
+///   read as a flag.
+///
+/// Deliberately not a check for the reserved namespace: this validates a *branch*
+/// name, and the caller decides which namespace it lands in.
+pub fn is_valid_branch_name(name: &str) -> bool {
+  if name.is_empty() || name.len() > 255 {
+    return false;
+  }
+  if name.starts_with('-') || name.starts_with('/') || name.ends_with('/') {
+    return false;
+  }
+  if name.ends_with('.') || name == "@" {
+    return false;
+  }
+  if name.contains("..") || name.contains("@{") || name.contains("//") {
+    return false;
+  }
+  if name
+    .chars()
+    .any(|c| c.is_ascii_control() || " ~^:?*[\\".contains(c))
+  {
+    return false;
+  }
+  name
+    .split('/')
+    .all(|part| !part.is_empty() && !part.starts_with('.') && !part.ends_with(".lock"))
+}
+
+/// The ref an unpushed branch lives on.
+///
+/// Inside the reserved namespace, and that placement is the whole point: the
+/// mirror fetch maps `+refs/heads/*:refs/heads/*` and runs `--prune`, so a
+/// branch written under `refs/heads/` that upstream does not have is deleted by
+/// the next sync -- silently, as routine maintenance, taking the reachability of
+/// every commit on it. Nothing fetches into `refs/gfs/`, so work survives there
+/// until it is pushed.
+///
+/// The subject is folded to ref-safe characters rather than validated, because
+/// a subject id comes from an identity provider and may legitimately contain a
+/// `/`, a space, or an `@` -- none of which can appear in this position without
+/// changing the ref's shape.
+pub fn work_ref(subject: &str, branch: &str) -> String {
+  let mut folded = String::with_capacity(subject.len());
+  let mut last_was_sep = false;
+  for c in subject.chars() {
+    if c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_' {
+      folded.push(c);
+      last_was_sep = false;
+    } else if !last_was_sep {
+      folded.push('_');
+      last_was_sep = true;
+    }
+  }
+  let folded = folded.trim_matches('_').trim_matches('.');
+  let owner = if folded.is_empty() {
+    "anonymous"
+  } else {
+    folded
+  };
+  format!("{RESERVED_REF_PREFIX}work/{owner}/{branch}")
+}
+
 /// The lease anchor ref name for a mount (DESIGN.md section 7.1).
 pub fn lease_anchor_ref(mount_id: &str) -> String {
   format!("{RESERVED_REF_PREFIX}mounts/{mount_id}")

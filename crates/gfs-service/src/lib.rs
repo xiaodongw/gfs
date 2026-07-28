@@ -20,6 +20,7 @@ pub mod audit;
 pub mod auth;
 pub mod catalog;
 pub mod gateway;
+pub mod ingest;
 pub mod locks;
 pub mod mirror;
 pub mod mounts;

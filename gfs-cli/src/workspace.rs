@@ -112,6 +112,45 @@ pub fn resolve(explicit: &Option<PathBuf>) -> Result<(PathBuf, PathBuf)> {
   }
 }
 
+/// Find the workspace a mount subcommand should act on, honouring `--state-dir`.
+///
+/// [`resolve`] is the standalone-tool rule and knows nothing about
+/// `--state-dir`, because the tools that use it do not offer one. The mount
+/// subcommands do, and a state directory placed explicitly at `gfs mount` time
+/// has to be nameable again afterwards -- otherwise `--state-dir` would work
+/// once and then strand the mount.
+///
+/// The three cases, in the order they are checked:
+///
+/// * an explicit state directory is an answer on its own, and the workspace is
+///   its name without the `.gfs` suffix (or, for a directory placed somewhere
+///   unrelated, the state directory itself);
+/// * an explicit `--workspace` gives the default `<workspace>.gfs`;
+/// * neither means "discover from where I am standing", which is what makes
+///   `cd flask && gfs status` work the way `git status` does.
+pub fn locate(
+  workspace: &Option<PathBuf>,
+  state_dir: &Option<PathBuf>,
+) -> Result<(PathBuf, PathBuf)> {
+  match (workspace, state_dir) {
+    (_, Some(explicit)) => {
+      if !MountState::control_socket(explicit).exists() {
+        anyhow::bail!(
+          "no GFS daemon state at {} (given with --state-dir). Is the workspace mounted?",
+          explicit.display()
+        );
+      }
+      let workspace = workspace
+        .clone()
+        .or_else(|| strip_state_suffix(explicit))
+        .unwrap_or_else(|| explicit.clone());
+      Ok((workspace, explicit.clone()))
+    }
+    (Some(_), None) => resolve(workspace),
+    (None, None) => resolve(&None),
+  }
+}
+
 /// `/jobs/42/ws.gfs` -> `/jobs/42/ws`, and `None` when the suffix is absent.
 ///
 /// Operates on the whole path rather than the file name because the result has

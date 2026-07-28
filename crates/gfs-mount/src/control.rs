@@ -37,6 +37,16 @@ pub enum Request {
   Health,
   /// Replace the published generation with a freshly resolved one.
   Refresh,
+  /// Re-point the view at another revision and publish it.
+  ///
+  /// The selector is a *commit* rather than a branch name, because unpushed
+  /// work lives in the reserved namespace and ADR 0006 forbids naming that as a
+  /// revision. The CLI resolves the branch through the gateway and sends what it
+  /// resolved to; `branch` travels alongside only so reports can name it.
+  Switch {
+    selector: String,
+    branch: Option<String>,
+  },
   /// What the workspace has changed, from the journal alone.
   Status,
   /// The same change set, rendered as a Git-compatible patch.

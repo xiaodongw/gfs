@@ -23,6 +23,8 @@ pub mod v1 {
 }
 
 pub use v1::{
+  repository_service_client::RepositoryServiceClient,
+  repository_service_server::{RepositoryService, RepositoryServiceServer},
   search_service_client::SearchServiceClient,
   search_service_server::{SearchService, SearchServiceServer},
   snapshot_service_client::SnapshotServiceClient,

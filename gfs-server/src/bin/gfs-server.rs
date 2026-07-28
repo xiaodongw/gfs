@@ -55,6 +55,19 @@ struct Args {
   #[arg(long = "import", value_name = "ID=PATH")]
   imports: Vec<String>,
 
+  /// Where `gfs clone` puts the mirrors it creates.
+  ///
+  /// Absent, the server serves only the repositories it was started with and
+  /// every write method refuses. There is deliberately no default: a server that
+  /// was not told where to put a bare repository must not pick a location, since
+  /// the choice decides what a caller can cause to be written to disk.
+  #[arg(long, env = "GFS_REPOS_ROOT")]
+  repos_root: Option<PathBuf>,
+
+  /// The `git` to run for fetches, pushes, and mirror creation.
+  #[arg(long, env = "GFS_GIT_BINARY", default_value = "git")]
+  git_binary: PathBuf,
+
   /// Development bearer token, granting read access to every repository.
   ///
   /// Present because M1.5's OIDC integration is a declared seam. A deployment must
@@ -121,11 +134,22 @@ async fn main() -> anyhow::Result<()> {
   };
 
   let index_path = args.state_dir.join("search.sqlite");
-  let server = Arc::new(
-    Server::new(catalog, authenticator, policy, key, LeasePolicy::adr_0006())
-      .with_search_index(&index_path)?,
-  );
+  let mut server = Server::new(catalog, authenticator, policy, key, LeasePolicy::adr_0006())
+    .with_search_index(&index_path)?;
   tracing::info!(index = %index_path.display(), "search index opened");
+
+  if let Some(root) = &args.repos_root {
+    std::fs::create_dir_all(root)
+      .map_err(|e| anyhow::anyhow!("cannot create {}: {e}", root.display()))?;
+    server = server.with_ingest(gfs_service::ingest::IngestConfig {
+      repos_root: root.clone(),
+      git_binary: args.git_binary.clone(),
+    });
+    tracing::info!(repos_root = %root.display(), "clone enabled");
+  } else {
+    tracing::info!("clone disabled; no --repos-root");
+  }
+  let server = Arc::new(server);
 
   for spec in &args.imports {
     let (id, path) = spec
@@ -162,6 +186,9 @@ async fn main() -> anyhow::Result<()> {
     tonic::transport::Server::builder()
       .add_service(gfs_proto::SnapshotServiceServer::new(server.snapshot_api()))
       .add_service(gfs_proto::SearchServiceServer::new(server.search_api()))
+      .add_service(gfs_proto::RepositoryServiceServer::new(
+        server.repository_api(),
+      ))
       .serve_with_shutdown(grpc_addr, async move {
         let _ = grpc_shutdown.changed().await;
       }),

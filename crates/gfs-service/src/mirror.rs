@@ -185,6 +185,113 @@ pub fn init_bare(repo_path: &Path, git_binary: &Path) -> Result<(), GfsError> {
   Ok(())
 }
 
+/// Ask the upstream which branch its `HEAD` points at.
+///
+/// A bare mirror created by [`init_bare`] has a `HEAD` pointing at whatever this
+/// Git version calls a default branch, which need not be the upstream's: cloning
+/// a `master` repository with a Git that defaults to `main` leaves `HEAD`
+/// dangling, and every later `HEAD` selector then resolves to nothing. Asking is
+/// one extra round trip and removes the guess.
+///
+/// `--symref` rather than parsing `git remote show`, because `remote show` is
+/// porcelain and its output is localized.
+pub fn default_branch(
+  upstream_url: &str,
+  credential: Option<&str>,
+  git_binary: &Path,
+) -> Result<String, GfsError> {
+  let mut cmd = Command::new(git_binary);
+  cmd
+    .env_clear()
+    .env("GIT_CONFIG_GLOBAL", "/dev/null")
+    .env("GIT_CONFIG_SYSTEM", "/dev/null")
+    .env("GIT_TERMINAL_PROMPT", "0")
+    .env("GIT_ASKPASS", "/bin/true")
+    .env("PATH", "/usr/bin:/bin");
+  if let Some(secret) = credential {
+    cmd.env("GFS_UPSTREAM_CREDENTIAL", secret);
+  }
+  let out = cmd
+    .args(["ls-remote", "--symref"])
+    .arg("--")
+    .arg(upstream_url)
+    .arg("HEAD")
+    .output()
+    .map_err(|e| {
+      GfsError::new(
+        ErrorCode::Unavailable,
+        format!("cannot run git ls-remote: {e}"),
+      )
+    })?;
+  if !out.status.success() {
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let bounded: String = stderr.chars().take(2000).collect();
+    return Err(GfsError::new(
+      ErrorCode::Unavailable,
+      format!(
+        "cannot read the upstream's default branch: {}",
+        bounded.trim()
+      ),
+    ));
+  }
+  // `ref: refs/heads/main\tHEAD`, followed by the resolved object line.
+  let text = String::from_utf8_lossy(&out.stdout);
+  for line in text.lines() {
+    let Some(rest) = line.strip_prefix("ref: ") else {
+      continue;
+    };
+    let Some(target) = rest.split('\t').next() else {
+      continue;
+    };
+    if let Some(branch) = target.strip_prefix("refs/heads/") {
+      if !branch.is_empty() {
+        return Ok(branch.to_owned());
+      }
+    }
+  }
+  // An empty upstream advertises no symref. That is not an error -- there is
+  // simply nothing to mount yet -- so the caller decides what to do about it.
+  Err(GfsError::new(
+    ErrorCode::FailedPrecondition,
+    "the upstream advertises no default branch; it may be empty",
+  ))
+}
+
+/// Point a bare mirror's `HEAD` at one of its branches.
+pub fn set_head(repo_path: &Path, branch: &str, git_binary: &Path) -> Result<(), GfsError> {
+  // Built here rather than taken as a full ref, so a caller cannot aim `HEAD`
+  // at the reserved namespace and make internal work refs the default view.
+  let target = format!("refs/heads/{branch}");
+  if !gfs_types::revision::is_valid_branch_name(branch) {
+    return Err(GfsError::invalid(format!(
+      "not a usable branch name: {branch:?}"
+    )));
+  }
+  let out = Command::new(git_binary)
+    .env_clear()
+    .env("GIT_CONFIG_GLOBAL", "/dev/null")
+    .env("GIT_CONFIG_SYSTEM", "/dev/null")
+    .env("PATH", "/usr/bin:/bin")
+    .current_dir(repo_path)
+    .args(["symbolic-ref", "HEAD"])
+    .arg(&target)
+    .output()
+    .map_err(|e| {
+      GfsError::new(
+        ErrorCode::Internal,
+        format!("cannot run git symbolic-ref: {e}"),
+      )
+    })?;
+  if !out.status.success() {
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    return Err(GfsError::new(
+      ErrorCode::Internal,
+      format!("cannot set HEAD: {}", stderr.trim()),
+    ));
+  }
+  Ok(())
+}
+
 /// Verify a mirror with `git fsck`.
 ///
 /// Used by the verify step of the lifecycle state machine. A failure is a reason to
