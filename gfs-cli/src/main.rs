@@ -3,9 +3,11 @@
 //! Two families of command, and the split matters:
 //!
 //! * **Workspace commands** — `mount`, `unmount`, `inspect`, `health`,
-//!   `refresh` — act on a *mounted workspace*. They start `gfs-fuse` or talk to a
-//!   running one over its control socket, and they are what an orchestrator and
-//!   an agent use.
+//!   `refresh` — act on a *mounted workspace*, over the control socket beside it.
+//!   They are what an orchestrator and an agent use.
+//! * **`daemon`** — the `gfs-fuse` host process itself, which serves every mount
+//!   on the machine (ADR 0008). `mount` and `clone` start it on demand and ask it
+//!   for a workspace; nothing else in this file knows it exists.
 //! * **Snapshot commands** — `resolve`, `ls`, `cat` — read the server directly,
 //!   with no mount involved. They are how the API is demonstrated and debugged.
 //! * **Tool substitutes** — `rg`, `find`, `log` — answer from the server's index
@@ -28,7 +30,7 @@ use std::path::PathBuf;
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use gfs_cli::search_output;
-use gfs_cli::workspace::{call, locate, state_dir_for};
+use gfs_cli::workspace::{call, call_host, locate, state_dir_for};
 use gfs_mount::control::{Request, Response};
 use gfs_proto::v1;
 
@@ -50,6 +52,11 @@ struct Cli {
   /// Bearer token.
   #[arg(long, env = "GFS_TOKEN", hide_env_values = true, default_value = "")]
   token: String,
+
+  /// Where the `gfs-fuse` host listens. One host serves every mount on the
+  /// machine; `gfs clone` and `gfs mount` start it on demand.
+  #[arg(long, env = "GFS_HOST_SOCKET", global = true)]
+  host_socket: Option<PathBuf>,
 
   #[command(subcommand)]
   command: Command,
@@ -160,12 +167,21 @@ enum Command {
     timeout_seconds: u64,
   },
 
-  /// Release the lease, unmount, and stop the daemon.
+  /// Release the lease, unmount, and drop the workspace from its host.
+  ///
+  /// The host stays up: it may be serving other workspaces, and it is the thing
+  /// the next `gfs clone` reuses.
   Unmount {
     #[arg(long)]
     workspace: Option<PathBuf>,
     #[arg(long)]
     state_dir: Option<PathBuf>,
+  },
+
+  /// The `gfs-fuse` host process, and the mounts it is serving.
+  Daemon {
+    #[command(subcommand)]
+    command: DaemonCommand,
   },
 
   /// Everything about a mounted workspace.
@@ -416,6 +432,17 @@ enum LeaseCommand {
   },
 }
 
+#[derive(Subcommand, Debug)]
+enum DaemonCommand {
+  /// Which host is running, and what it is serving. Exits non-zero when none is.
+  Status {
+    #[arg(long)]
+    json: bool,
+  },
+  /// Unmount every workspace this host serves, then stop it.
+  Stop,
+}
+
 type Client = v1::snapshot_service_client::SnapshotServiceClient<tonic::transport::Channel>;
 type RepoClient = v1::repository_service_client::RepositoryServiceClient<tonic::transport::Channel>;
 
@@ -567,98 +594,170 @@ fn sibling_binary(name: &str, override_var: &str) -> PathBuf {
   PathBuf::from(name)
 }
 
-#[allow(clippy::too_many_arguments)]
-fn do_mount(cli: &Cli, args: MountArgs) -> Result<()> {
-  let state_dir = state_dir_for(&args.workspace, &args.state_dir);
-  let cache_dir = args.cache_dir.clone().unwrap_or_else(default_cache_dir);
-  std::fs::create_dir_all(&state_dir)
-    .with_context(|| format!("creating {}", state_dir.display()))?;
-  let ready = state_dir.join("ready");
-  let _ = std::fs::remove_file(&ready);
+/// Where this invocation's host daemon listens.
+///
+/// `--foreground` gets a private socket inside the state directory rather than
+/// the shared one. That is what makes the flag mean what it says: a debugging run
+/// that attached itself to whatever host happened to be running would neither show
+/// that host's logs in this terminal nor stop it on Ctrl-C.
+fn host_socket(cli: &Cli, state_dir: &std::path::Path, foreground: bool) -> PathBuf {
+  if foreground {
+    return state_dir.join("host.sock");
+  }
+  cli
+    .host_socket
+    .clone()
+    .unwrap_or_else(gfs_mount::host::default_socket)
+}
 
+/// Start a host on `socket`.
+///
+/// In the background its stderr goes to a log file, because the host outlives
+/// this process and none of its descriptors may stay tied to this terminal: a
+/// backgrounded daemon holding the inherited stderr keeps the write end of a pipe
+/// open, so `gfs clone | tee` never sees EOF and appears to hang long after the
+/// command finished. In the foreground the terminal *is* the log, which is the
+/// whole reason to ask for it.
+fn spawn_host(
+  cli: &Cli,
+  socket: &std::path::Path,
+  foreground: bool,
+) -> Result<std::process::Child> {
   let mut command = std::process::Command::new(daemon_binary());
   command
-    .arg("--state-dir")
-    .arg(&state_dir)
-    .arg("--workspace")
-    .arg(&args.workspace)
-    .arg("--cache-dir")
-    .arg(&cache_dir)
+    .arg("--socket")
+    .arg(socket)
     .arg("--endpoint")
     .arg(&cli.endpoint)
     .arg("--http-endpoint")
     .arg(&cli.http_endpoint)
     .arg("--token")
-    .arg(&cli.token)
-    .arg("--repo")
-    .arg(&args.repo)
-    .arg("--rev")
-    .arg(&args.rev)
-    .arg("--cache-quota")
-    .arg(args.cache_quota.to_string())
-    .arg("--overlay-quota")
-    .arg(args.overlay_quota.to_string());
-  if args.allow_other {
-    command.arg("--allow-other");
-  }
+    .arg(&cli.token);
 
-  if args.foreground {
-    let status = command.status().context("running gfs-fuse")?;
-    if !status.success() {
-      bail!("gfs-fuse exited with {status}");
+  if !foreground {
+    let log_path = host_log_path(socket);
+    if let Some(parent) = log_path.parent() {
+      std::fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
     }
-    return Ok(());
+    let log = std::fs::OpenOptions::new()
+      .create(true)
+      .append(true)
+      .open(&log_path)
+      .with_context(|| format!("opening {}", log_path.display()))?;
+    command
+      .stdin(std::process::Stdio::null())
+      .stdout(std::process::Stdio::null())
+      .stderr(std::process::Stdio::from(log));
   }
 
-  command.arg("--ready-file").arg(&ready);
-  // The daemon outlives this process, so none of its descriptors may stay tied
-  // to this terminal. This is not tidiness: a backgrounded daemon holding the
-  // inherited stderr keeps the write end of a pipe open, so `gfs mount | tee`
-  // never sees EOF and appears to hang long after the command finished.
-  //
-  // A supervisor that wants the logs elsewhere reads this file or runs
-  // `--foreground`.
-  let log_path = state_dir.join("gfs-fuse.log");
-  let log = std::fs::OpenOptions::new()
-    .create(true)
-    .append(true)
-    .open(&log_path)
-    .with_context(|| format!("opening {}", log_path.display()))?;
-  command
-    .stdin(std::process::Stdio::null())
-    .stdout(std::process::Stdio::null())
-    .stderr(std::process::Stdio::from(log));
-  let mut child = command.spawn().with_context(|| {
+  command.spawn().with_context(|| {
     format!(
       "starting {} (set GFS_DAEMON if it is elsewhere)",
       daemon_binary().display()
     )
-  })?;
+  })
+}
 
-  let deadline = std::time::Instant::now() + std::time::Duration::from_secs(args.timeout_seconds);
+/// Wait for a just-started host to bind its socket.
+///
+/// A child that exited is checked against the socket once more before it is
+/// called a failure: racing callers are expected, and the loser of the `flock`
+/// exits cleanly while the winner is listening.
+fn await_host(
+  child: &mut std::process::Child,
+  socket: &std::path::Path,
+  timeout_seconds: u64,
+) -> Result<()> {
+  let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_seconds);
   loop {
-    if ready.is_file() {
-      break;
+    if gfs_mount::control::is_live(socket) {
+      return Ok(());
     }
-    // A daemon that exited is a failure to report now, not a timeout to wait out.
     if let Some(status) = child.try_wait().context("waiting for gfs-fuse")? {
-      bail!("gfs-fuse exited before the workspace was ready ({status})");
+      if gfs_mount::control::is_live(socket) {
+        return Ok(());
+      }
+      bail!(
+        "gfs-fuse exited before the host was listening ({status}); see {}",
+        host_log_path(socket).display()
+      );
     }
     if std::time::Instant::now() >= deadline {
       let _ = child.kill();
-      bail!(
-        "the workspace was not ready within {}s",
-        args.timeout_seconds
-      );
+      bail!("the GFS host was not listening within {timeout_seconds}s");
     }
-    std::thread::sleep(std::time::Duration::from_millis(50));
+    std::thread::sleep(std::time::Duration::from_millis(20));
   }
+}
 
-  let Response::Inspect(report) = call(&state_dir, &Request::Inspect)? else {
-    bail!("the daemon answered an inspect request with something else");
+/// Start a background host unless one is already listening.
+fn ensure_host(cli: &Cli, socket: &std::path::Path, timeout_seconds: u64) -> Result<()> {
+  if gfs_mount::control::is_live(socket) {
+    return Ok(());
+  }
+  let mut child = spawn_host(cli, socket, false)?;
+  await_host(&mut child, socket, timeout_seconds)
+}
+
+/// Beside the socket, because that is what identifies a host.
+fn host_log_path(socket: &std::path::Path) -> PathBuf {
+  socket.with_extension("log")
+}
+
+fn do_mount(cli: &Cli, args: MountArgs) -> Result<()> {
+  let state_dir = state_dir_for(&args.workspace, &args.state_dir);
+  let cache_dir = args.cache_dir.clone().unwrap_or_else(default_cache_dir);
+  std::fs::create_dir_all(&state_dir)
+    .with_context(|| format!("creating {}", state_dir.display()))?;
+
+  let socket = host_socket(cli, &state_dir, args.foreground);
+  // In the foreground the host is this command's child, so its exit is what ends
+  // the wait at the bottom. In the background it is shared and may already exist.
+  let mut foreground_host = if args.foreground {
+    let mut child = spawn_host(cli, &socket, true)?;
+    await_host(&mut child, &socket, args.timeout_seconds)?;
+    Some(child)
+  } else {
+    ensure_host(cli, &socket, args.timeout_seconds)?;
+    None
+  };
+
+  let request = gfs_mount::control::MountRequest {
+    state_format_version: gfs_types::STATE_FORMAT_VERSION,
+    workspace: args.workspace.clone(),
+    state_dir: state_dir.clone(),
+    cache_dir,
+    repository_id: args.repo.clone(),
+    revision_selector: args.rev.clone(),
+    cache_quota_bytes: args.cache_quota,
+    overlay_quota_bytes: args.overlay_quota,
+    allow_other: args.allow_other,
+    fuse_threads: None,
+    grpc_endpoint: Some(cli.endpoint.clone()),
+    http_endpoint: Some(cli.http_endpoint.clone()),
+    token: Some(cli.token.clone()),
+  };
+  let response = call_host(
+    &socket,
+    &gfs_mount::control::HostRequest::CreateMount(Box::new(request)),
+  )?;
+  let gfs_mount::control::HostResponse::Mounted(report) = response else {
+    bail!("the host answered a mount request with something else");
   };
   print_report(&report);
-  println!("log        {}", log_path.display());
+  println!("host       {}", socket.display());
+  println!("log        {}", host_log_path(&socket).display());
+
+  if let Some(child) = &mut foreground_host {
+    // Ctrl-C reaches the host through the process group, and the host's SIGINT
+    // handler unmounts before it exits. Waiting on the child rather than polling
+    // the socket means this command's exit status is the host's.
+    println!("\nthe workspace is ready; press Ctrl-C to unmount and stop the host");
+    let status = child.wait().context("waiting for gfs-fuse")?;
+    if !status.success() {
+      bail!("gfs-fuse exited with {status}");
+    }
+  }
   Ok(())
 }
 
@@ -971,6 +1070,66 @@ async fn main() -> Result<()> {
       match call(&state_dir, &Request::Unmount)? {
         Response::Unmounted => println!("unmounted {}", workspace.display()),
         other => bail!("unexpected daemon response: {other:?}"),
+      }
+    }
+
+    Command::Daemon { command } => {
+      use gfs_mount::control::{HostRequest, HostResponse};
+
+      let socket = cli
+        .host_socket
+        .clone()
+        .unwrap_or_else(gfs_mount::host::default_socket);
+      match command {
+        DaemonCommand::Status { json } => {
+          // Not started on demand: "is a host running" is the question, and
+          // starting one to answer it would make the answer always yes.
+          if !gfs_mount::control::is_live(&socket) {
+            bail!("no GFS host is listening on {}", socket.display());
+          }
+          let HostResponse::Info(info) = call_host(&socket, &HostRequest::Info)? else {
+            bail!("the host answered an info request with something else");
+          };
+          let HostResponse::Mounts { mounts } = call_host(&socket, &HostRequest::ListMounts)?
+          else {
+            bail!("the host answered a list request with something else");
+          };
+          if *json {
+            println!(
+              "{}",
+              serde_json::to_string_pretty(&serde_json::json!({
+                "host": info,
+                "mounts": mounts,
+              }))?
+            );
+          } else {
+            println!("socket     {}", info.socket.display());
+            println!("pid        {}", info.pid);
+            println!("version    {}", info.version);
+            println!("endpoint   {}", info.grpc_endpoint);
+            println!("log        {}", host_log_path(&socket).display());
+            println!("mounts     {}", mounts.len());
+            for mount in &mounts {
+              println!(
+                "  {}  {}  {}  gen {}  {:?}",
+                mount.workspace.display(),
+                mount.repository_id,
+                mount.commit,
+                mount.generation,
+                mount.health
+              );
+            }
+          }
+        }
+        DaemonCommand::Stop => {
+          if !gfs_mount::control::is_live(&socket) {
+            bail!("no GFS host is listening on {}", socket.display());
+          }
+          let HostResponse::ShuttingDown = call_host(&socket, &HostRequest::Shutdown)? else {
+            bail!("the host answered a shutdown request with something else");
+          };
+          println!("stopping the host on {}", socket.display());
+        }
       }
     }
 

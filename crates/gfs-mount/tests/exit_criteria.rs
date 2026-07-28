@@ -11,10 +11,9 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
-use gfs_mount::daemon::{Daemon, DaemonConfig};
-use gfs_mount::{FsConfig, MountConfig};
-use gfs_test::mount::{on_fs, Backend, Mount};
-use gfs_types::LeasePolicy;
+use gfs_mount::FsConfig;
+use gfs_mount::MountHost;
+use gfs_test::mount::{host_config, mount_spec, on_fs, Backend, Mount};
 
 /// ADR 0006's performance gate: cold mount to a usable root.
 const COLD_MOUNT_TARGET: Duration = Duration::from_secs(2);
@@ -29,25 +28,23 @@ async fn criterion_1_cold_mount_meets_the_startup_and_download_target() {
   let cache = tempfile::tempdir().unwrap();
   let workspace = tmp.path().join("ws");
 
+  // The host is bound outside the measurement: an orchestrator pays for it once
+  // per machine, not once per mount, which is the point of hosting many.
+  let (host, listener) = MountHost::bind(host_config(&backend, tmp.path())).unwrap();
+  tokio::spawn(Arc::clone(&host).serve(listener));
+
   let started = Instant::now();
-  let daemon = Daemon::start(DaemonConfig {
-    state_dir: tmp.path().join("ws.gfs"),
-    workspace: workspace.clone(),
-    cache_dir: cache.path().to_path_buf(),
-    grpc_endpoint: backend.grpc.clone(),
-    http_endpoint: backend.http.clone(),
-    token: gfs_test::mount::TOKEN.to_owned(),
-    repository_id: backend.repo_id.clone(),
-    revision_selector: "main".to_owned(),
-    cache_quota_bytes: 1 << 30,
-    fs: FsConfig::default(),
-    overlay: gfs_overlay::OverlayConfig::default(),
-    mount: MountConfig::default(),
-    lease_policy: LeasePolicy::adr_0006(),
-    retire_timeout: Duration::from_secs(5),
-  })
-  .await
-  .unwrap();
+  let daemon = host
+    .mount(mount_spec(
+      &backend,
+      "main",
+      &workspace,
+      &tmp.path().join("ws.gfs"),
+      cache.path(),
+      gfs_overlay::OverlayConfig::default(),
+    ))
+    .await
+    .unwrap();
 
   let w = workspace.clone();
   let root_entries = on_fs(move || std::fs::read_dir(&w).unwrap().count()).await;
@@ -221,7 +218,7 @@ async fn criterion_4_base_timestamps_are_identical_across_remounts() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn criterion_6_daemon_failure_does_not_corrupt_the_shared_cache() {
-  // "Daemon or server failure does not corrupt the shared cache." The cache is
+  // "Mount or server failure does not corrupt the shared cache." The cache is
   // shared between mounts of one repository on a host, so a daemon that dies
   // mid-fetch must leave nothing a later daemon can mistake for a complete
   // object.
@@ -231,24 +228,19 @@ async fn criterion_6_daemon_failure_does_not_corrupt_the_shared_cache() {
   // A first daemon warms the cache, then dies without a clean shutdown.
   let expected = {
     let tmp = tempfile::tempdir().unwrap();
-    let daemon = Daemon::start(DaemonConfig {
-      state_dir: tmp.path().join("ws.gfs"),
-      workspace: tmp.path().join("ws"),
-      cache_dir: cache_dir.path().to_path_buf(),
-      grpc_endpoint: backend.grpc.clone(),
-      http_endpoint: backend.http.clone(),
-      token: gfs_test::mount::TOKEN.to_owned(),
-      repository_id: backend.repo_id.clone(),
-      revision_selector: "main".to_owned(),
-      cache_quota_bytes: 1 << 30,
-      fs: FsConfig::default(),
-      overlay: gfs_overlay::OverlayConfig::default(),
-      mount: MountConfig::default(),
-      lease_policy: LeasePolicy::adr_0006(),
-      retire_timeout: Duration::from_secs(5),
-    })
-    .await
-    .unwrap();
+    let (host, listener) = MountHost::bind(host_config(&backend, tmp.path())).unwrap();
+    tokio::spawn(Arc::clone(&host).serve(listener));
+    let daemon = host
+      .mount(mount_spec(
+        &backend,
+        "main",
+        &tmp.path().join("ws"),
+        &tmp.path().join("ws.gfs"),
+        cache_dir.path(),
+        gfs_overlay::OverlayConfig::default(),
+      ))
+      .await
+      .unwrap();
 
     let workspace = tmp.path().join("ws");
     let content = on_fs(move || std::fs::read(workspace.join("README.md")).unwrap()).await;
@@ -285,24 +277,19 @@ async fn criterion_6_daemon_failure_does_not_corrupt_the_shared_cache() {
   .unwrap();
   let adopted = cache.bytes_on_disk();
 
-  let daemon = Daemon::start(DaemonConfig {
-    state_dir: tmp.path().join("ws.gfs"),
-    workspace: tmp.path().join("ws"),
-    cache_dir: cache_dir.path().to_path_buf(),
-    grpc_endpoint: backend.grpc.clone(),
-    http_endpoint: backend.http.clone(),
-    token: gfs_test::mount::TOKEN.to_owned(),
-    repository_id: backend.repo_id.clone(),
-    revision_selector: "main".to_owned(),
-    cache_quota_bytes: 1 << 30,
-    fs: FsConfig::default(),
-    overlay: gfs_overlay::OverlayConfig::default(),
-    mount: MountConfig::default(),
-    lease_policy: LeasePolicy::adr_0006(),
-    retire_timeout: Duration::from_secs(5),
-  })
-  .await
-  .unwrap();
+  let (host, listener) = MountHost::bind(host_config(&backend, tmp.path())).unwrap();
+  tokio::spawn(Arc::clone(&host).serve(listener));
+  let daemon = host
+    .mount(mount_spec(
+      &backend,
+      "main",
+      &tmp.path().join("ws"),
+      &tmp.path().join("ws.gfs"),
+      cache_dir.path(),
+      gfs_overlay::OverlayConfig::default(),
+    ))
+    .await
+    .unwrap();
 
   let workspace = tmp.path().join("ws");
   let again = on_fs(move || std::fs::read(workspace.join("README.md")).unwrap()).await;

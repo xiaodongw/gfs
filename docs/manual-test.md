@@ -43,14 +43,46 @@ loopback only and prints the warning on startup. Do not point it at anything you
 care about.
 
 Its lab directory is `~/.gfs-lab` (override with `GFS_LAB`). Ctrl+C stops the
-gateway *and* unmounts every workspace under it — a `gfs clone` starts a
-`gfs-fuse` daemon that outlives the gateway by design, and an orphaned one
-holding a FUSE mount is what makes the next run fail confusingly.
+gateway *and* unmounts every workspace under it — the `gfs-fuse` host outlives
+the gateway by design, and an orphaned mount is what makes the next run fail
+confusingly. The host itself is stopped only if the lab's workspaces were the
+last ones it was serving, so a mount you made elsewhere survives.
 
-**Keep the lab path short.** The daemon's control socket is
+**Keep the lab path short.** A workspace's control socket is
 `<workspace>.gfs/control.sock` and a Unix socket path cannot exceed 108 bytes.
 The default is short; a lab under a deep scratch directory fails to serve, and
 the failure reads as something else entirely.
+
+## One host, many workspaces
+
+`gfs clone` does not start a daemon per workspace. The first one starts a
+`gfs-fuse` **host** on `$XDG_RUNTIME_DIR/gfs/host.sock`, and every later clone
+asks that host for another mount:
+
+```sh
+gfs clone file:///path/to/one.git
+gfs clone file:///path/to/two.git
+pgrep -a gfs-fuse        # one process
+gfs daemon status        # two mounts
+```
+
+```
+socket     /run/user/1000/gfs/host.sock
+pid        1669729
+mounts     2
+  /tmp/lab/one  tmp_lab_one  sha1:8b0b4b68…  gen 1  Healthy
+  /tmp/lab/two  tmp_lab_two  sha1:5d71e4de…  gen 1  Healthy
+```
+
+Each workspace still has its own control socket beside it, so every command
+below — `gfs status`, `gfs rg`, the `git` shim — works from inside the tree with
+no flags, exactly as it did when each mount had its own process. `gfs unmount`
+drops one workspace and leaves the rest of the host running; `gfs daemon stop`
+unmounts everything and stops the process. See ADR 0008.
+
+Two mounts of the *same* repository share one blob cache, so the second one pays
+nothing for blobs the first already fetched and `--cache-quota` is a per-host
+budget rather than a per-mount one.
 
 ## Prerequisites
 

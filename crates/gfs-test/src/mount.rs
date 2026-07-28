@@ -336,14 +336,63 @@ fn mount_dir_placeholder() -> PathBuf {
   PathBuf::from("/nonexistent/gfs-harness/control.sock")
 }
 
-/// A daemon-backed job: the whole client, in process.
+/// A host of its own, on a socket inside `socket_dir`.
 ///
-/// The daemon runs in-process rather than as a subprocess because what it is
+/// Never the default socket: a test that attached to the developer's own running
+/// host would mount into their session and, worse, tear it down on drop.
+pub fn host_config(backend: &Backend, socket_dir: &Path) -> gfs_mount::HostConfig {
+  gfs_mount::HostConfig {
+    socket: socket_dir.join("host.sock"),
+    grpc_endpoint: backend.grpc.clone(),
+    http_endpoint: backend.http.clone(),
+    token: TOKEN.to_owned(),
+    lease_policy: gfs_types::LeasePolicy::adr_0006(),
+    // Short, so the retirement case does not take five minutes to fail.
+    retire_timeout: std::time::Duration::from_secs(5),
+    fs: FsConfig::default(),
+  }
+}
+
+/// The spec a job mounts with, so a test that varies one field does not restate
+/// the other thirteen.
+pub fn mount_spec(
+  backend: &Backend,
+  revision: &str,
+  workspace: &Path,
+  state_dir: &Path,
+  cache_dir: &Path,
+  overlay: gfs_overlay::OverlayConfig,
+) -> gfs_mount::MountSpec {
+  gfs_mount::MountSpec {
+    state_dir: state_dir.to_path_buf(),
+    workspace: workspace.to_path_buf(),
+    cache_dir: cache_dir.to_path_buf(),
+    grpc_endpoint: backend.grpc.clone(),
+    http_endpoint: backend.http.clone(),
+    token: TOKEN.to_owned(),
+    repository_id: backend.repo_id.clone(),
+    revision_selector: revision.to_owned(),
+    cache_quota_bytes: 1 << 30,
+    fs: FsConfig::default(),
+    overlay,
+    mount: MountConfig::default(),
+    lease_policy: gfs_types::LeasePolicy::adr_0006(),
+    retire_timeout: std::time::Duration::from_secs(5),
+  }
+}
+
+/// A host-backed job: the whole client, in process.
+///
+/// The host runs in-process rather than as a subprocess because what it is
 /// accountable for -- ordering, generations, the control protocol -- is not a
 /// property of process boundaries. `scripts/dev-stack.sh` exercises the
 /// subprocess path.
+///
+/// Each `Job` gets its own host on its own socket, so tests stay independent;
+/// [`Job::alongside`] is how a test asks for a *second* mount on the same host.
 pub struct Job {
-  pub daemon: Arc<gfs_mount::Daemon>,
+  pub host: Arc<gfs_mount::MountHost>,
+  pub daemon: Arc<gfs_mount::Mount>,
   pub workspace: PathBuf,
   pub state_dir: PathBuf,
   _tmp: tempfile::TempDir,
@@ -390,54 +439,64 @@ impl Job {
     overlay: gfs_overlay::OverlayConfig,
     existing_state: Option<PathBuf>,
   ) -> Job {
-    use gfs_mount::control;
-    use gfs_mount::daemon::{Daemon, DaemonConfig};
-    use gfs_mount::state::MountState;
-    use gfs_types::LeasePolicy;
-    use std::time::Duration;
-
     let tmp = tempfile::tempdir().unwrap();
     let cache = tempfile::tempdir().unwrap();
     let workspace = tmp.path().join("ws");
     let state_dir = existing_state.unwrap_or_else(|| tmp.path().join("ws.gfs"));
 
-    let daemon = Daemon::start(DaemonConfig {
-      state_dir: state_dir.clone(),
-      workspace: workspace.clone(),
-      cache_dir: cache.path().to_path_buf(),
-      grpc_endpoint: backend.grpc.clone(),
-      http_endpoint: backend.http.clone(),
-      token: TOKEN.to_owned(),
-      repository_id: backend.repo_id.clone(),
-      revision_selector: revision.to_owned(),
-      cache_quota_bytes: 1 << 30,
-      fs: FsConfig::default(),
-      overlay,
-      mount: MountConfig::default(),
-      lease_policy: LeasePolicy::adr_0006(),
-      // Short, so the retirement case does not take five minutes to fail.
-      retire_timeout: Duration::from_secs(5),
-    })
-    .await
-    .unwrap();
+    let (host, listener) = gfs_mount::MountHost::bind(host_config(backend, tmp.path())).unwrap();
+    tokio::spawn(Arc::clone(&host).serve(listener));
 
-    tokio::spawn(Arc::clone(&daemon).serve_control());
-    // The socket exists only once `serve_control` has bound it.
-    let socket = MountState::control_socket(&state_dir);
-    for _ in 0..200 {
-      if control::is_live(&socket) {
-        break;
-      }
-      tokio::time::sleep(Duration::from_millis(10)).await;
-    }
+    // No polling for the control socket: the host binds it before `mount`
+    // returns, which is the property `Mount::bind_control` exists to give.
+    let daemon = host
+      .mount(mount_spec(
+        backend,
+        revision,
+        &workspace,
+        &state_dir,
+        cache.path(),
+        overlay,
+      ))
+      .await
+      .unwrap();
 
     Job {
+      host,
       daemon,
       workspace,
       state_dir,
       _tmp: tmp,
       _cache: cache,
     }
+  }
+
+  /// A second workspace on the *same* host, which is what one `gfs-fuse` process
+  /// serving two clones looks like.
+  ///
+  /// Returns the mount and its paths rather than a `Job`, because the host and
+  /// the temporary directories belong to the job this was called on.
+  pub async fn alongside(
+    &self,
+    backend: &Backend,
+    revision: &str,
+    name: &str,
+  ) -> (Arc<gfs_mount::Mount>, PathBuf, PathBuf) {
+    let workspace = self._tmp.path().join(name);
+    let state_dir = self._tmp.path().join(format!("{name}.gfs"));
+    let mount = self
+      .host
+      .mount(mount_spec(
+        backend,
+        revision,
+        &workspace,
+        &state_dir,
+        self._cache.path(),
+        gfs_overlay::OverlayConfig::default(),
+      ))
+      .await
+      .unwrap();
+    (mount, workspace, state_dir)
   }
 
   pub fn socket(&self) -> PathBuf {

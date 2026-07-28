@@ -3,7 +3,7 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use gfs_mount::control::{self, Request, Response};
+use gfs_mount::control::{self, HostRequest, HostResponse, Request, Response};
 use gfs_mount::state::MountState;
 
 /// Where a workspace keeps its state.
@@ -23,6 +23,19 @@ pub fn state_dir_for(workspace: &Path, explicit: &Option<PathBuf>) -> PathBuf {
 pub fn call(state_dir: &Path, request: &Request) -> Result<Response> {
   let socket = MountState::control_socket(state_dir);
   let response = control::call(&socket, request)
+    .map_err(|e| anyhow::anyhow!("{}: {}", e.code.as_str(), e.message))?;
+  response
+    .into_result()
+    .map_err(|e| anyhow::anyhow!("{}: {}", e.code.as_str(), e.message))
+}
+
+/// One request, one response, over a host socket.
+///
+/// Separate from [`call`] because the two speak different vocabularies over the
+/// same framing: [`call`] asks a workspace about itself, this asks the `gfs-fuse`
+/// process about the mounts it is serving.
+pub fn call_host(socket: &Path, request: &HostRequest) -> Result<HostResponse> {
+  let response = control::call_host(socket, request)
     .map_err(|e| anyhow::anyhow!("{}: {}", e.code.as_str(), e.message))?;
   response
     .into_result()

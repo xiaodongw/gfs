@@ -8,11 +8,10 @@
 use std::time::Duration;
 
 use gfs_mount::control::{self, Request, Response};
-use gfs_mount::daemon::{Daemon, DaemonConfig};
 use gfs_mount::state::MountState;
-use gfs_mount::{FsConfig, MountConfig};
-use gfs_test::mount::{on_fs, Backend, Job};
-use gfs_types::{LeasePolicy, RepositoryId};
+use gfs_mount::MountHost;
+use gfs_test::mount::{host_config, mount_spec, on_fs, Backend, Job};
+use gfs_types::RepositoryId;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_mounted_workspace_is_published_and_described() {
@@ -198,32 +197,55 @@ async fn unmount_unpublishes_releases_and_leaves_no_live_mount_behind() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_second_daemon_over_one_state_directory_is_refused() {
-  // Two daemons would each believe they own the lease, and each would release it
+async fn a_second_host_over_one_state_directory_is_refused() {
+  // Two mounts would each believe they owned the lease, and each would release it
   // on teardown -- so the first teardown would unpin a commit the second is
-  // still serving.
+  // still serving. Across *processes* this is caught by the live control socket
+  // beside the workspace, which is the only evidence one host has of another.
+  let backend = Backend::start("basic").await;
+  let job = Job::start(&backend, "main").await;
+
+  let tmp = tempfile::tempdir().unwrap();
+  let cache = tempfile::tempdir().unwrap();
+  let (other, listener) = MountHost::bind(host_config(&backend, tmp.path())).unwrap();
+  tokio::spawn(std::sync::Arc::clone(&other).serve(listener));
+
+  let error = other
+    .mount(mount_spec(
+      &backend,
+      "main",
+      &job.workspace.with_extension("second"),
+      &job.state_dir,
+      cache.path(),
+      gfs_overlay::OverlayConfig::default(),
+    ))
+    .await
+    .unwrap_err();
+  assert_eq!(error.code, gfs_types::ErrorCode::Conflict);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn one_host_refuses_to_mount_the_same_state_directory_twice() {
+  // The same conflict from inside one process, where the registry answers before
+  // anything touches the filesystem. Worth its own test because the two checks
+  // are independent: the socket check cannot see a mount this host is still
+  // creating, and the registry cannot see another process at all.
   let backend = Backend::start("basic").await;
   let job = Job::start(&backend, "main").await;
 
   let cache = tempfile::tempdir().unwrap();
-  let error = Daemon::start(DaemonConfig {
-    state_dir: job.state_dir.clone(),
-    workspace: job.workspace.with_extension("second"),
-    cache_dir: cache.path().to_path_buf(),
-    grpc_endpoint: backend.grpc.clone(),
-    http_endpoint: backend.http.clone(),
-    token: gfs_test::mount::TOKEN.to_owned(),
-    repository_id: backend.repo_id.clone(),
-    revision_selector: "main".to_owned(),
-    cache_quota_bytes: 1 << 20,
-    fs: FsConfig::default(),
-    overlay: gfs_overlay::OverlayConfig::default(),
-    mount: MountConfig::default(),
-    lease_policy: LeasePolicy::adr_0006(),
-    retire_timeout: Duration::from_secs(5),
-  })
-  .await
-  .unwrap_err();
+  let error = job
+    .host
+    .mount(mount_spec(
+      &backend,
+      "main",
+      &job.workspace.with_extension("second"),
+      &job.state_dir,
+      cache.path(),
+      gfs_overlay::OverlayConfig::default(),
+    ))
+    .await
+    .unwrap_err();
   assert_eq!(error.code, gfs_types::ErrorCode::Conflict);
 }
 
@@ -236,24 +258,19 @@ async fn an_unknown_repository_fails_before_anything_is_mounted() {
   let cache = tempfile::tempdir().unwrap();
   let state_dir = tmp.path().join("ws.gfs");
 
-  let error = Daemon::start(DaemonConfig {
-    state_dir: state_dir.clone(),
-    workspace: tmp.path().join("ws"),
-    cache_dir: cache.path().to_path_buf(),
-    grpc_endpoint: backend.grpc.clone(),
-    http_endpoint: backend.http.clone(),
-    token: gfs_test::mount::TOKEN.to_owned(),
-    repository_id: RepositoryId::parse("r-absent").unwrap(),
-    revision_selector: "main".to_owned(),
-    cache_quota_bytes: 1 << 20,
-    fs: FsConfig::default(),
-    overlay: gfs_overlay::OverlayConfig::default(),
-    mount: MountConfig::default(),
-    lease_policy: LeasePolicy::adr_0006(),
-    retire_timeout: Duration::from_secs(5),
-  })
-  .await
-  .unwrap_err();
+  let (host, listener) = MountHost::bind(host_config(&backend, tmp.path())).unwrap();
+  tokio::spawn(std::sync::Arc::clone(&host).serve(listener));
+
+  let mut spec = mount_spec(
+    &backend,
+    "main",
+    &tmp.path().join("ws"),
+    &state_dir,
+    cache.path(),
+    gfs_overlay::OverlayConfig::default(),
+  );
+  spec.repository_id = RepositoryId::parse("r-absent").unwrap();
+  let error = host.mount(spec).await.unwrap_err();
 
   assert!(
     matches!(

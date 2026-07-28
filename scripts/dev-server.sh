@@ -60,6 +60,13 @@ cleanup() {
     fusermount3 -u -z "$gen" >/dev/null 2>&1 || true
   done
   shopt -u nullglob
+  # One `gfs-fuse` host serves every mount on the machine, so it is stopped only
+  # once it has nothing left to serve. A developer with a workspace outside the
+  # lab keeps both it and the host, which is the same promise the loop above
+  # makes about workspaces.
+  if ./target/debug/gfs daemon status 2>/dev/null | grep -qE '^mounts +0$'; then
+    ./target/debug/gfs daemon stop >/dev/null 2>&1 || true
+  fi
   if [ -n "${SERVER:-}" ]; then
     kill "$SERVER" 2>/dev/null || true
     wait "$SERVER" 2>/dev/null || true

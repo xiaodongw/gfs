@@ -1,4 +1,10 @@
-//! `gfs-fuse`: the client daemon that owns a mount.
+//! One mounted workspace: its lease, its generations, and its control socket.
+//!
+//! A [`Mount`] is everything that belongs to one workspace and nothing that
+//! belongs to the process. [`crate::host`] owns however many of these a
+//! `gfs-fuse` process is serving, which is why none of the state here is global:
+//! every lock, cache handle, and generation list is per-instance, so a mount that
+//! fails does so alone.
 //!
 //! # Ordering is the whole design
 //!
@@ -56,7 +62,7 @@ use crate::session::MountConfig;
 use crate::state::{prepare_state_dir, LeaseRecord, MountState};
 
 #[derive(Clone, Debug)]
-pub struct DaemonConfig {
+pub struct MountSpec {
   pub state_dir: PathBuf,
   pub workspace: PathBuf,
   pub cache_dir: PathBuf,
@@ -214,8 +220,8 @@ impl Generation {
   }
 }
 
-pub struct Daemon {
-  config: DaemonConfig,
+pub struct Mount {
+  config: MountSpec,
   /// The selector the next generation resolves.
   ///
   /// Held here rather than in `config` because `switch` changes it: a view is
@@ -238,23 +244,29 @@ pub struct Daemon {
   shutting_down: AtomicBool,
 }
 
-impl std::fmt::Debug for Daemon {
+impl std::fmt::Debug for Mount {
   fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-    f.debug_struct("Daemon")
+    f.debug_struct("Mount")
       .field("workspace", &self.config.workspace)
       .finish_non_exhaustive()
   }
 }
 
-impl Daemon {
+impl Mount {
   /// Create the lease, mount, and publish. Returns once the workspace is usable.
-  pub async fn start(config: DaemonConfig) -> Result<Arc<Self>, GfsError> {
+  ///
+  /// The blob cache is passed in rather than opened here because it is the one
+  /// thing a mount does *not* own alone: two mounts of the same repository on one
+  /// host share it, and a cache opened per mount would make `--cache-quota` mean
+  /// "per mount" rather than "per host". [`crate::host::MountHost`] keeps the
+  /// registry that decides which mounts get the same handle.
+  pub async fn start(config: MountSpec, cache: Arc<BlobCache>) -> Result<Arc<Self>, GfsError> {
     // Absolute before anything else. The workspace is published as a symlink,
     // and a symlink target is resolved relative to the *link's* directory, not
     // to the daemon's working directory -- so a relative `--state-dir` produces
     // a link that points at a path that does not exist. It also means the daemon
     // keeps working if something later changes its working directory.
-    let config = DaemonConfig {
+    let config = MountSpec {
       state_dir: absolute(&config.state_dir)?,
       workspace: absolute(&config.workspace)?,
       cache_dir: absolute(&config.cache_dir)?,
@@ -263,12 +275,6 @@ impl Daemon {
     prepare_state_dir(&config.state_dir)?;
     adopt_or_refuse_state_dir(&config.state_dir)?;
 
-    let cache = BlobCache::open(
-      &config.cache_dir,
-      &config.repository_id,
-      HashAlgorithm::Sha1,
-      config.cache_quota_bytes,
-    )?;
     let publisher: Box<dyn MountPublisher> =
       Box::new(SymlinkPublisher::new(config.workspace.clone())?);
 
@@ -276,7 +282,7 @@ impl Daemon {
       mount_generation(&config, &config.revision_selector.clone(), &cache, 1).await?;
     publisher.publish(&generation.mountpoint)?;
 
-    let daemon = Arc::new(Daemon {
+    let mount = Arc::new(Mount {
       cache,
       publisher,
       current: Mutex::new(generation),
@@ -286,12 +292,27 @@ impl Daemon {
       work_branch: Mutex::new(None),
       config,
     });
-    daemon.persist()?;
-    Ok(daemon)
+    mount.persist()?;
+    Ok(mount)
   }
 
-  pub fn config(&self) -> &DaemonConfig {
+  pub fn config(&self) -> &MountSpec {
     &self.config
+  }
+
+  /// A one-line view of this mount, for the host's `ListMounts`.
+  pub fn summary(&self) -> crate::control::MountSummary {
+    let current = self.current.lock().expect("current generation");
+    crate::control::MountSummary {
+      workspace: self.config.workspace.clone(),
+      state_dir: self.config.state_dir.clone(),
+      repository_id: self.config.repository_id.as_str().to_owned(),
+      mount_id: current.monitor.mount_id().as_str().to_owned(),
+      revision_selector: self.selector.lock().expect("selector").clone(),
+      commit: current.commit.to_qualified(),
+      generation: current.number,
+      health: current.monitor.health().state,
+    }
   }
 
   pub fn control_socket(&self) -> PathBuf {
@@ -993,11 +1014,19 @@ impl Daemon {
     let _ = std::fs::remove_file(self.control_socket());
   }
 
-  /// Serve the control socket until `Unmount` is received or the future is
-  /// dropped.
-  pub async fn serve_control(self: Arc<Self>) -> Result<(), GfsError> {
+  /// Bind the control socket, without serving it.
+  ///
+  /// Separate from [`Mount::serve_control`] because the two have to happen at
+  /// different times: the host must be able to tell a caller "your workspace is
+  /// ready" only once the socket it will use is *bound*, while serving it is an
+  /// endless loop that has to run on its own task.
+  ///
+  /// Binding inside the serve loop instead left a race that the test harness had
+  /// to poll around — `gfs mount` returned as soon as the daemon said it was
+  /// ready and then sent `Inspect` to a socket the spawned task had not reached
+  /// yet. Handing the bound listener back makes readiness mean what it says.
+  pub fn bind_control(&self) -> Result<tokio::net::UnixListener, GfsError> {
     use std::os::unix::fs::PermissionsExt;
-    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
     let path = self.control_socket();
     let _ = std::fs::remove_file(&path);
@@ -1007,6 +1036,16 @@ impl Daemon {
     // window is one syscall wide and inside a 0700 directory.
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
       .map_err(|e| GfsError::internal(format!("restricting the control socket: {e}")))?;
+    Ok(listener)
+  }
+
+  /// Serve the control socket until `Unmount` is received or the future is
+  /// dropped.
+  pub async fn serve_control(
+    self: Arc<Self>,
+    listener: tokio::net::UnixListener,
+  ) -> Result<(), GfsError> {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
     loop {
       let Ok((stream, _)) = listener.accept().await else {
@@ -1025,11 +1064,19 @@ impl Daemon {
         ))),
       };
       let stop = matches!(response, Response::Unmounted);
-      if let Ok(mut encoded) = serde_json::to_string(&response) {
-        encoded.push('\n');
-        let _ = writer.write_all(encoded.as_bytes()).await;
-        let _ = writer.flush().await;
-      }
+      // A response that will not encode still has to produce a line. Dropping it
+      // silently closes the connection, and the caller sees only "the daemon
+      // closed the control connection without replying" — which names the
+      // transport for a fault that is entirely in the payload.
+      let encoded = serde_json::to_string(&response).unwrap_or_else(|e| {
+        tracing::error!(error = %e, "a control response could not be encoded");
+        serde_json::to_string(&Response::from_error(&GfsError::internal(format!(
+          "the daemon could not encode its response: {e}"
+        ))))
+        .expect("an error response encodes")
+      });
+      let _ = writer.write_all(format!("{encoded}\n").as_bytes()).await;
+      let _ = writer.flush().await;
       if stop {
         return Ok(());
       }
@@ -1109,7 +1156,7 @@ fn absolute(path: &Path) -> Result<PathBuf, GfsError> {
 
 /// Create a lease and mount it, in that order.
 async fn mount_generation(
-  config: &DaemonConfig,
+  config: &MountSpec,
   selector: &str,
   cache: &Arc<BlobCache>,
   number: u64,
@@ -1246,7 +1293,7 @@ async fn mount_generation(
 }
 
 async fn create_mount(
-  config: &DaemonConfig,
+  config: &MountSpec,
   selector: &str,
 ) -> Result<v1::CreateMountResponse, GfsError> {
   let channel = tonic::transport::Endpoint::from_shared(config.grpc_endpoint.clone())

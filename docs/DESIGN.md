@@ -565,8 +565,11 @@ dependency update and compatibility testing.
 
 ### 8.1 Processes and deployment
 
-`gfs` is the user CLI. `gfs-fuse` owns the FUSE session, caches, network clients, and
-overlay.
+`gfs` is the user CLI. `gfs-fuse` owns the FUSE sessions, caches, network clients, and
+overlays. One `gfs-fuse` host process serves many mounts (ADR 0008): `gfs clone` and
+`gfs mount` start it on demand and ask it for a workspace over a host socket. Each
+workspace keeps its own control socket beside it, so everything a job runs inside its
+tree is unaware of how many mounts the process owns.
 
 FUSE inside a container generally requires `/dev/fuse` and additional privilege.
 The preferred hosted deployment runs `gfs-fuse` as a trusted host service or Kubernetes

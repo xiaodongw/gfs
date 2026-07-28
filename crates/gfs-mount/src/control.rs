@@ -19,13 +19,28 @@
 //! closes. Line-delimited rather than length-prefixed because the messages are
 //! small, the peer is on the same host, and a protocol a human can drive with
 //! `socat` is worth something during an incident.
+//!
+//! # Two sockets, two vocabularies
+//!
+//! [`Request`] is what a job asks *its own workspace*, and it is answered on the
+//! per-mount socket at `<workspace>.gfs/control.sock`. It carries no mount
+//! selector because the socket it arrives on is the selector — which is what lets
+//! `gfs rg` work by walking up from the current directory with no flags at all.
+//!
+//! [`HostRequest`] is what the CLI asks the `gfs-fuse` *process*: create a mount,
+//! list them, tear one down. It is answered on a single host socket shared by
+//! every mount, because none of those questions belong to a workspace.
+//!
+//! Keeping them apart is what makes one process able to serve many mounts without
+//! a protocol change: a host binds N per-mount sockets, and everything that speaks
+//! [`Request`] is unaware there was ever one process per mount.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use gfs_types::error::{ErrorCode, GfsError};
 use gfs_types::Timestamp;
 
-use crate::lease::LeaseHealth;
+use crate::lease::{HealthState, LeaseHealth};
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "command", rename_all = "snake_case")]
@@ -233,6 +248,120 @@ impl Response {
   }
 }
 
+/// Everything a host needs to create one mount.
+///
+/// A flattened wire form of `MountSpec` rather than the spec itself: the spec
+/// holds a `LeasePolicy` and an `FsConfig`, which are the host's business and not
+/// a caller's, and letting a client set them over a socket would put policy on
+/// the wrong side of the boundary.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct MountRequest {
+  /// Refused rather than misread when it does not match the host's build. The
+  /// state directory format is the thing a CLI and a host have to agree about,
+  /// and a long-lived host is exactly where a version skew shows up.
+  pub state_format_version: u32,
+  pub workspace: PathBuf,
+  pub state_dir: PathBuf,
+  pub cache_dir: PathBuf,
+  pub repository_id: String,
+  pub revision_selector: String,
+  pub cache_quota_bytes: u64,
+  pub overlay_quota_bytes: u64,
+  pub allow_other: bool,
+  /// `None` takes the host's default, which is where ADR 0003's "more than one
+  /// event-loop thread" rule is expressed. A caller overrides it only to
+  /// experiment.
+  pub fuse_threads: Option<usize>,
+  /// Where this mount's gateway is. `None` means the host's own default, which
+  /// is the ordinary case; a caller sends one only to reach a different gateway
+  /// than the host was started against.
+  pub grpc_endpoint: Option<String>,
+  pub http_endpoint: Option<String>,
+  pub token: Option<String>,
+}
+
+/// What the CLI asks the `gfs-fuse` process, as opposed to one workspace.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "command", rename_all = "snake_case")]
+pub enum HostRequest {
+  /// Which host is this, and what is it serving. Also the liveness probe.
+  Info,
+  /// Mount a repository and publish it. Answers once the workspace is usable and
+  /// its per-mount control socket is bound.
+  CreateMount(Box<MountRequest>),
+  ListMounts,
+  /// Tear one mount down. `gfs unmount` reaches the same code through the mount's
+  /// own socket; this exists for an orchestrator holding only the host socket.
+  DestroyMount {
+    workspace: PathBuf,
+  },
+  /// Tear down every mount and exit.
+  Shutdown,
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct HostInfo {
+  pub version: String,
+  pub state_format_version: u32,
+  pub api_version: String,
+  pub pid: u32,
+  pub socket: PathBuf,
+  pub grpc_endpoint: String,
+  pub http_endpoint: String,
+  pub mounts: usize,
+}
+
+/// One mount, as the host lists it.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct MountSummary {
+  pub workspace: PathBuf,
+  pub state_dir: PathBuf,
+  pub repository_id: String,
+  pub mount_id: String,
+  pub revision_selector: String,
+  pub commit: String,
+  pub generation: u64,
+  pub health: HealthState,
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "result", rename_all = "snake_case")]
+pub enum HostResponse {
+  Info(Box<HostInfo>),
+  /// The same report `gfs inspect` prints, so `gfs mount` needs no second round
+  /// trip to say what it just created.
+  Mounted(Box<MountReport>),
+  /// A struct variant rather than `Mounts(Vec<_>)`: this enum is internally
+  /// tagged, and serde cannot put a tag on a newtype variant wrapping a sequence
+  /// — it fails at serialization time, where the only symptom is a reply that
+  /// never arrives.
+  Mounts {
+    mounts: Vec<MountSummary>,
+  },
+  Destroyed,
+  ShuttingDown,
+  Error {
+    code: String,
+    message: String,
+  },
+}
+
+impl HostResponse {
+  pub fn from_error(e: &GfsError) -> Self {
+    HostResponse::Error {
+      code: e.code.as_str().to_owned(),
+      message: e.message.clone(),
+    }
+  }
+
+  pub fn into_result(self) -> Result<HostResponse, GfsError> {
+    match self {
+      HostResponse::Error { code, message } => Err(GfsError::new(code_from_wire(&code), message)),
+      other => Ok(other),
+    }
+  }
+}
+
 fn code_from_wire(s: &str) -> ErrorCode {
   match s {
     "INVALID_ARGUMENT" => ErrorCode::InvalidArgument,
@@ -250,11 +379,26 @@ fn code_from_wire(s: &str) -> ErrorCode {
   }
 }
 
-/// Send one request to a daemon and read its reply.
+/// Send one request to a mount's own socket and read its reply.
 ///
 /// Synchronous and dependency-free on purpose: this is what the CLI calls, and
 /// the CLI should not need a runtime to ask a local daemon a question.
 pub fn call(socket: &Path, request: &Request) -> Result<Response, GfsError> {
+  roundtrip(socket, request)
+}
+
+/// Send one request to a host socket and read its reply.
+pub fn call_host(socket: &Path, request: &HostRequest) -> Result<HostResponse, GfsError> {
+  roundtrip(socket, request)
+}
+
+/// One line out, one line back. Shared by both vocabularies because the framing
+/// is the protocol — the only thing that differs is what the line decodes to.
+fn roundtrip<Req, Res>(socket: &Path, request: &Req) -> Result<Res, GfsError>
+where
+  Req: serde::Serialize,
+  Res: serde::de::DeserializeOwned,
+{
   use std::io::{BufRead, BufReader, Write};
 
   let mut stream = std::os::unix::net::UnixStream::connect(socket).map_err(|e| {
@@ -301,7 +445,7 @@ pub fn call(socket: &Path, request: &Request) -> Result<Response, GfsError> {
       "the daemon closed the control connection without replying",
     ));
   }
-  serde_json::from_str::<Response>(&reply)
+  serde_json::from_str::<Res>(&reply)
     .map_err(|e| GfsError::internal(format!("decoding a control response: {e}")))
 }
 
