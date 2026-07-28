@@ -1,0 +1,44 @@
+[package]
+name = "gfs-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+description = "The gfs user and orchestrator command-line interface"
+
+[lib]
+name = "gfs_cli"
+path = "src/lib.rs"
+
+# One binary. `rg`, `find` and `log` were binaries of their own -- the safe
+# substitutes an agent is given for tools that would otherwise walk the mount --
+# and are `gfs rg`, `gfs find` and `gfs log` now. Their flag handling is
+# unchanged; only the way they are spelled moved.
+[[bin]]
+name = "gfs"
+path = "src/main.rs"
+
+[dependencies]
+gfs-types = { workspace = true }
+gfs-proto = { workspace = true }
+# For the control-socket protocol and the state-directory layout. The CLI is a
+# front end to `gfs-fuse`, so it shares the daemon's vocabulary rather than
+# re-declaring it and drifting.
+gfs-mount = { workspace = true }
+gfs-search = { workspace = true }
+anyhow = { workspace = true }
+clap = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tonic = { workspace = true }
+http = { workspace = true }
+http-body-util = { workspace = true }
+hyper = { workspace = true, features = ["client", "http1"] }
+hyper-util = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[lints]
+workspace = true

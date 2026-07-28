@@ -18,9 +18,9 @@ Decisions are in [ADR 0001](../../docs/adr/0001-git-integration.md) and
 cd spikes
 cargo test                                    # unit tests
 cargo run -p git-probe -- versions
-cargo run -p git-probe -- conformance --root "$XVFS_CORPUS_DIR/fixtures"
-cargo run -p git-probe -- repo "$XVFS_CORPUS_DIR/mirrors/linux.git"
-cargo run -p gateway-probe -- check --root "$XVFS_CORPUS_DIR/fixtures/bare" --repo packed
+cargo run -p git-probe -- conformance --root "$GFS_CORPUS_DIR/fixtures"
+cargo run -p git-probe -- repo "$GFS_CORPUS_DIR/mirrors/linux.git"
+cargo run -p gateway-probe -- check --root "$GFS_CORPUS_DIR/fixtures/bare" --repo packed
 ./git-probe/sha256-support-check.sh
 ```
 
@@ -67,7 +67,7 @@ object — the property the FUSE `getattr` path depends on.
 | v2 advertisement starts at `version 2`, no preamble | pass |
 | `filter` advertised only when policy enables it | pass |
 | Content type and `Cache-Control: no-cache` | pass |
-| `refs/xvfs/` absent from v0 and v2 advertisements | pass |
+| `refs/gfs/` absent from v0 and v2 advertisements | pass |
 | `clone` v0, v2, `--depth 1`, `--filter=blob:none` | pass — `git fsck` clean, HEAD and tree equal to a direct filesystem clone |
 | `--filter=` `tree:0`, `blob:limit=1k`, `combine:`, `object:type=` | rejected (designed) |
 | gzip request body round-trip; 1029:1 bomb refused | pass |
@@ -87,7 +87,7 @@ gates out under that feature. The pre-production SHA-256 commitment in
 DESIGN.md section 12 depends on `git2-rs`, not only libgit2.
 `git-probe/sha256-support-check.sh` fails when this changes.
 
-### 2. Hiding `refs/xvfs/` prevents discovery, not access
+### 2. Hiding `refs/gfs/` prevents discovery, not access
 
 Protocol v2 serves any object in the object database by OID regardless of
 `uploadpack.allowAnySHA1InWant`; protocol v0 enforces it correctly. This

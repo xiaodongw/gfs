@@ -14,7 +14,7 @@ DESIGN.md section 7.1 states, of retention leases:
 > present that capability; repository access alone does not grant access to
 > every commit retained for another mount.
 
-The retention-lease design anchors a mounted commit under `refs/xvfs/mounts/*`,
+The retention-lease design anchors a mounted commit under `refs/gfs/mounts/*`,
 hides that namespace from `upload-pack` with `transfer.hideRefs`, and disables
 `uploadpack.allowAnySHA1InWant`. The intent is that a repository reader cannot
 reach another mount's retained commit.
@@ -23,13 +23,13 @@ M0.3 tested whether that holds. It does not.
 
 ## Measurement
 
-With `transfer.hideRefs=refs/xvfs/`, `uploadpack.allowAnySHA1InWant=false`,
+With `transfer.hideRefs=refs/gfs/`, `uploadpack.allowAnySHA1InWant=false`,
 `uploadpack.allowReachableSHA1InWant=false`, and
 `uploadpack.allowTipSHA1InWant=false` on Git 2.53.0:
 
 | Object | protocol v0 | protocol v2 |
 | --- | --- | --- |
-| reachable only from a hidden `refs/xvfs/` ref | refused | **served** |
+| reachable only from a hidden `refs/gfs/` ref | refused | **served** |
 | reachable from no ref at all (dangling) | refused | **served** |
 
 Control, varying only the configuration, with a dangling commit:
@@ -47,7 +47,7 @@ readable — the probe reads the file content back out of the client's clone.
 
 Hiding a ref prevents **discovery**. It does not prevent **access**.
 
-This is not specific to the XVFS gateway: it reproduces identically over plain
+This is not specific to the GFS gateway: it reproduces identically over plain
 `file://` transport with stock Git on both ends.
 
 ## Decision
@@ -60,12 +60,12 @@ only by another subject's mount lease.
 Three things follow.
 
 1. **DESIGN.md's claim is corrected, not implemented.** The sentence quoted
-   above is true of the snapshot/search API, where XVFS controls authorization,
+   above is true of the snapshot/search API, where GFS controls authorization,
    and false of the Git gateway path, where stock `upload-pack` does. It must be
    restated with that scope.
 
 2. **Mount capabilities remain required on the snapshot API.** They still do
-   real work: they stop the *XVFS* API from serving an unreachable commit to a
+   real work: they stop the *GFS* API from serving an unreachable commit to a
    caller who has not been issued a lease, and they are what binds a mount to a
    subject, repository, commit, and expiry. They are simply not a defence
    against a Git client on the same repository.

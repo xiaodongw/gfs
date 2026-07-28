@@ -16,7 +16,7 @@ BIN="${FUSE_PROBE_BIN:-$here/../target/debug/fuse-probe}"
 WORK="$(mktemp -d)"
 # Needs fuse3 installed: without fusermount3 a non-CAP_SYS_ADMIN mount fails
 # with ENOENT, which reads exactly like a permission failure and is not one.
-IMAGE="${FUSE_PROBE_IMAGE:-xvfs-fuse-probe:latest}"
+IMAGE="${FUSE_PROBE_IMAGE:-gfs-fuse-probe:latest}"
 trap 'cleanup' EXIT
 
 results=()
@@ -57,7 +57,7 @@ echo
 echo "== 2. failure modes on that mount =="
 # ---------------------------------------------------------------------------
 # An open file descriptor across daemon death. This is what an agent's compiler
-# experiences when xvfsd is OOM-killed mid-build, and the errno it sees decides
+# experiences when gfs-fuse is OOM-killed mid-build, and the errno it sees decides
 # whether the build fails loudly or silently reads short.
 exec 9<"$mnt/file-0000" 2>/dev/null
 if [ -e /proc/self/fd/9 ]; then
@@ -182,7 +182,7 @@ else
         record no_allow_other_cross_uid INFO "$(echo "$out" | tail -1)"
     fi
 
-    # 4d. The host-daemon model XVFS actually proposes: the daemon owns the
+    # 4d. The host-daemon model GFS actually proposes: the daemon owns the
     # mount on the host, the job container only receives a bind mount.
     # Docker refuses to bind-mount a path it cannot stat, so the mount point is
     # created before the daemon claims it and Docker is pointed at it directly.

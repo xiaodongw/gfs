@@ -581,6 +581,211 @@ dependencies = [
 ]
 
 [[package]]
+name = "gfs-cli"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "gfs-mount",
+ "gfs-proto",
+ "gfs-search",
+ "gfs-types",
+ "http",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tonic",
+]
+
+[[package]]
+name = "gfs-fuse"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "clap",
+ "gfs-mount",
+ "gfs-overlay",
+ "gfs-service",
+ "gfs-test",
+ "gfs-types",
+ "libc",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tokio-stream",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "gfs-git"
+version = "0.1.0"
+dependencies = [
+ "gfs-test",
+ "gfs-types",
+ "git2",
+ "serde",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
+name = "gfs-mount"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "bytes",
+ "fuser",
+ "gfs-overlay",
+ "gfs-proto",
+ "gfs-search",
+ "gfs-service",
+ "gfs-test",
+ "gfs-types",
+ "http",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "libc",
+ "serde",
+ "serde_json",
+ "sha1",
+ "tempfile",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+ "tracing",
+]
+
+[[package]]
+name = "gfs-overlay"
+version = "0.1.0"
+dependencies = [
+ "gfs-types",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sha1",
+ "sha2",
+ "tempfile",
+]
+
+[[package]]
+name = "gfs-proto"
+version = "0.1.0"
+dependencies = [
+ "gfs-types",
+ "prost",
+ "prost-types",
+ "protoc-bin-vendored",
+ "tonic",
+ "tonic-prost",
+ "tonic-prost-build",
+]
+
+[[package]]
+name = "gfs-search"
+version = "0.1.0"
+dependencies = [
+ "gfs-types",
+ "memchr",
+ "regex",
+ "regex-syntax",
+ "roaring",
+ "rusqlite",
+ "serde",
+ "sha2",
+ "tracing",
+]
+
+[[package]]
+name = "gfs-server"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "clap",
+ "gfs-git",
+ "gfs-proto",
+ "gfs-service",
+ "gfs-test",
+ "gfs-types",
+ "tempfile",
+ "tokio",
+ "tonic",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "gfs-service"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "flate2",
+ "gfs-git",
+ "gfs-proto",
+ "gfs-search",
+ "gfs-test",
+ "gfs-types",
+ "hmac",
+ "http",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "metrics",
+ "metrics-exporter-prometheus",
+ "prost",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sha2",
+ "subtle",
+ "tempfile",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+ "tower",
+ "tower-http",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "gfs-test"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "fuser",
+ "gfs-mount",
+ "gfs-overlay",
+ "gfs-proto",
+ "gfs-service",
+ "gfs-types",
+ "serde_json",
+ "sha1",
+ "tempfile",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+]
+
+[[package]]
+name = "gfs-types"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "git2"
 version = "0.20.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2575,166 +2780,6 @@ name = "writeable"
 version = "0.6.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1ffae5123b2d3fc086436f8834ae3ab053a283cfac8fe0a0b8eaae044768a4c4"
-
-[[package]]
-name = "xvfs-cli"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "clap",
- "http",
- "http-body-util",
- "hyper",
- "hyper-util",
- "serde_json",
- "tempfile",
- "tokio",
- "tonic",
- "xvfs-fuse",
- "xvfs-proto",
- "xvfs-search",
- "xvfs-types",
-]
-
-[[package]]
-name = "xvfs-fuse"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "axum",
- "bytes",
- "clap",
- "fuser",
- "http",
- "http-body-util",
- "hyper",
- "hyper-util",
- "libc",
- "serde",
- "serde_json",
- "sha1",
- "tempfile",
- "tokio",
- "tokio-stream",
- "tonic",
- "tracing",
- "tracing-subscriber",
- "xvfs-overlay",
- "xvfs-proto",
- "xvfs-search",
- "xvfs-server",
- "xvfs-test",
- "xvfs-types",
-]
-
-[[package]]
-name = "xvfs-git"
-version = "0.1.0"
-dependencies = [
- "git2",
- "serde",
- "tempfile",
- "tokio",
- "xvfs-test",
- "xvfs-types",
-]
-
-[[package]]
-name = "xvfs-overlay"
-version = "0.1.0"
-dependencies = [
- "rusqlite",
- "serde",
- "serde_json",
- "sha1",
- "sha2",
- "tempfile",
- "xvfs-types",
-]
-
-[[package]]
-name = "xvfs-proto"
-version = "0.1.0"
-dependencies = [
- "prost",
- "prost-types",
- "protoc-bin-vendored",
- "tonic",
- "tonic-prost",
- "tonic-prost-build",
- "xvfs-types",
-]
-
-[[package]]
-name = "xvfs-search"
-version = "0.1.0"
-dependencies = [
- "memchr",
- "regex",
- "regex-syntax",
- "roaring",
- "rusqlite",
- "serde",
- "sha2",
- "tracing",
- "xvfs-types",
-]
-
-[[package]]
-name = "xvfs-server"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "axum",
- "clap",
- "flate2",
- "hmac",
- "http",
- "http-body-util",
- "hyper",
- "hyper-util",
- "metrics",
- "metrics-exporter-prometheus",
- "prost",
- "rusqlite",
- "serde",
- "serde_json",
- "sha2",
- "subtle",
- "tempfile",
- "tokio",
- "tokio-stream",
- "tonic",
- "tower",
- "tower-http",
- "tracing",
- "tracing-subscriber",
- "xvfs-git",
- "xvfs-proto",
- "xvfs-search",
- "xvfs-test",
- "xvfs-types",
-]
-
-[[package]]
-name = "xvfs-test"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "serde_json",
- "sha1",
- "tempfile",
- "xvfs-overlay",
- "xvfs-types",
-]
-
-[[package]]
-name = "xvfs-types"
-version = "0.1.0"
-dependencies = [
- "serde",
- "serde_json",
-]
 
 [[package]]
 name = "yoke"

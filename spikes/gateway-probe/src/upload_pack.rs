@@ -12,10 +12,10 @@ use anyhow::{bail, Result};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-/// The partial-clone filters XVFS is willing to serve.
+/// The partial-clone filters GFS is willing to serve.
 ///
 /// DESIGN.md section 7.2: the initial target is exactly `blob:none`. Git's own
-/// `uploadpackfilter.<filter>.allow` granularity is coarser than XVFS policy —
+/// `uploadpackfilter.<filter>.allow` granularity is coarser than GFS policy —
 /// allowing the `blob` family permits `blob:limit=<n>` too — so the gateway
 /// validates the exact requested filter in addition to configuring Git.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -51,7 +51,7 @@ impl Default for UploadPackPolicy {
   fn default() -> Self {
     UploadPackPolicy {
       filter: FilterPolicy::BlobNoneOnly,
-      hidden_ref_prefixes: vec!["refs/xvfs/".to_string()],
+      hidden_ref_prefixes: vec!["refs/gfs/".to_string()],
       max_body_bytes: 16 * 1024 * 1024,
       max_decompressed_bytes: 128 * 1024 * 1024,
       max_decompression_ratio: 100,
@@ -72,7 +72,7 @@ impl GitProtocol {
   /// The header is a colon-separated list of key[=value] items and is fully
   /// attacker-controlled, so it is never forwarded verbatim: only a
   /// recognized `version=N` produces an environment variable, and the value
-  /// written is reconstructed by XVFS rather than copied.
+  /// written is reconstructed by GFS rather than copied.
   pub fn from_header(header: Option<&str>) -> Self {
     let Some(h) = header else {
       return GitProtocol::V0;
@@ -424,7 +424,7 @@ mod tests {
     assert!(cfg.contains("uploadpack.allowAnySHA1InWant=false"));
     assert!(cfg.contains("uploadpack.allowReachableSHA1InWant=false"));
     assert!(cfg.contains("uploadpack.allowTipSHA1InWant=false"));
-    assert!(cfg.contains("transfer.hideRefs=refs/xvfs/"));
+    assert!(cfg.contains("transfer.hideRefs=refs/gfs/"));
     // Colon-bearing subsection names; see the comment in protected_config.
     assert!(cfg.contains("uploadpackfilter.blob:none.allow=true"));
     assert!(cfg.contains("uploadpackfilter.blob:limit.allow=false"));

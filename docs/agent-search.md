@@ -1,10 +1,10 @@
-# Searching an XVFS workspace: instructions for agents and tools
+# Searching a GFS workspace: instructions for agents and tools
 
-Status: current as of M4, extended after M5 with `xvfs-find` and `xvfs-log`  
+Status: current as of M4, extended after M5 with `gfs find` and `gfs log`  
 Companion: [DESIGN.md](DESIGN.md) section 7.5, [ADR 0004](adr/0004-search-representation.md),
 [ADR 0005](adr/0005-git-command-surface.md)
 
-An XVFS workspace looks like an ordinary directory tree, and almost every tool
+An GFS workspace looks like an ordinary directory tree, and almost every tool
 that reads it works. **Asking a question about the whole repository is the
 exception**, and this document is why.
 
@@ -13,9 +13,9 @@ look like they should, because each one wants to touch every path:
 
 | Question | Do not run | Run |
 | --- | --- | --- |
-| what does this content say? | `rg pattern` | `xvfs-rg pattern` |
-| which files are called this? | `find . -name` / `git ls-files` | `xvfs-find '<glob>'` |
-| what changed recently? | `git log` | `xvfs-log` |
+| what does this content say? | `rg pattern` | `gfs rg pattern` |
+| which files are called this? | `find . -name` / `git ls-files` | `gfs find '<glob>'` |
+| what changed recently? | `git log` | `gfs log` |
 
 All three are answered by the **server**, which has the object database and the
 search index; none of them reads the mount. A warm run of all three against
@@ -26,7 +26,7 @@ measurements, including what the workflow cost before these tools existed.
 Each accepts `--workspace <path>` for an orchestrator that is not standing in the
 mount, and finds the workspace on its own otherwise.
 
-## Use `xvfs-rg`, not `rg`
+## Use `gfs rg`, not `rg`
 
 Running `rg` inside the mount walks every directory and reads every file. On the
 worst-case repository in the M0.1 corpus that is 94 751 first-time filesystem
@@ -34,19 +34,19 @@ lookups and a download of the entire tree — it turns the operation an agent ru
 most often into the most expensive thing available, and there is no partial
 version of that cost.
 
-`xvfs-rg` answers the same question from the server's index of the pinned commit
+`gfs rg` answers the same question from the server's index of the pinned commit
 plus the workspace's own edits. It downloads nothing from the base.
 
 ```
-xvfs-rg 'fn authorize' src/
-xvfs-rg -F 'TODO(' --json
-xvfs-rg -i needle -g '*.rs'
+gfs rg 'fn authorize' src/
+gfs rg -F 'TODO(' --json
+gfs rg -i needle -g '*.rs'
 ```
 
-`xvfs search --workspace <path> <pattern>` is the same search with an explicit
+`gfs search --workspace <path> <pattern>` is the same search with an explicit
 workspace, for an orchestrator that is not standing inside the mount.
 
-## Use `xvfs-find`, not `find` or `git ls-files`
+## Use `gfs find`, not `find` or `git ls-files`
 
 `find` inside the mount walks every directory, for the same reason `rg` does.
 `git ls-files` through the shim avoids the walk but replaces it with one
@@ -54,10 +54,10 @@ snapshot-API round trip per directory — measured at 28.9–53.7 s on django's
 7 077 files, for a question the server answers in one request.
 
 ```
-xvfs-find '*.py'
-xvfs-find '*admin*' django/contrib      # a glob, then an optional scope
-xvfs-find -g '*.rs' -g '*.toml' --exclude '*/tests/*'
-xvfs-find '*.py' -0 | xargs -0 wc -l
+gfs find '*.py'
+gfs find '*admin*' django/contrib      # a glob, then an optional scope
+gfs find -g '*.rs' -g '*.toml' --exclude '*/tests/*'
+gfs find '*.py' -0 | xargs -0 wc -l
 ```
 
 The result set is `git ls-files`'s: files, symlinks, and gitlinks, with
@@ -69,17 +69,17 @@ Your edits are merged the same way they are for content search: a file you
 created is found, a deleted one is not, and a renamed one is found at its **new**
 path and no longer matches a glob that only matched its old name.
 
-## Use `xvfs-log`, not `git log`
+## Use `gfs log`, not `git log`
 
 The workspace has no object database — [ADR 0005](adr/0005-git-command-surface.md)
 chose a synthesized `.git` over a real partial clone — so the shim's `log` is
 frozen at `-1`. A `--depth 1` clone, the raw-Git equivalent, has the same single
-commit. `xvfs-log` asks the server to walk instead.
+commit. `gfs log` asks the server to walk instead.
 
 ```
-xvfs-log -10 --oneline
-xvfs-log -n 50 --format='%h %an %s'
-xvfs-log --skip 20 -20                  # paging
+gfs log -10 --oneline
+gfs log -n 50 --format='%h %an %s'
+gfs log --skip 20 -20                  # paging
 ```
 
 Two behaviours worth knowing:
@@ -94,12 +94,12 @@ Two behaviours worth knowing:
   identical to Git's. `%H` is the full ID and always matches.
 
 Local edits do not create commits, so they never appear in a log. Use
-`xvfs status` for what the workspace changed.
+`gfs status` for what the workspace changed.
 
 `-p`, `-S`, `--follow`, `--stat` and `--graph` are **refused**, not
 approximated: each needs a tree or blob per commit, which is the unbounded
 download ADR 0005 rejected the partial clone for. To search content use
-`xvfs-rg`; for tooling that genuinely needs full history, clone through the
+`gfs rg`; for tooling that genuinely needs full history, clone through the
 smart-HTTP gateway.
 
 ## The answer has two dimensions, and both matter
@@ -108,7 +108,7 @@ An empty result from an ordinary search tool is ambiguous: it could mean the
 symbol is absent, or that the query was cut short. An agent that cannot tell
 those apart will conclude a symbol does not exist and act on it.
 
-Every XVFS search therefore reports two independent facts:
+Every GFS search therefore reports two independent facts:
 
 **Execution status** — did the query finish evaluating the searchable corpus?
 `COMPLETE` or `TRUNCATED`. A budget, or a pattern the index cannot bound, makes
@@ -164,9 +164,9 @@ Search always reflects the **merged** workspace:
   extra, because the bytes did not change;
 - a `chmod +x` changes nothing about the results.
 
-## `xvfs-rg` refuses flags it does not implement
+## `gfs rg` refuses flags it does not implement
 
-Ripgrep has flags that change what counts as a match. `xvfs-rg` implements a
+Ripgrep has flags that change what counts as a match. `gfs rg` implements a
 subset and **rejects the rest with an error** rather than ignoring them, because
 a silently dropped `-w` returns matches you did not ask for and the wrong answer
 looks exactly like a right one.
@@ -232,8 +232,8 @@ any, are not an answer.
 
 ```json
 {
-  "name": "xvfs_search",
-  "description": "Search an XVFS workspace: the pinned commit's index plus local edits, without downloading the repository. Reports execution status and coverage separately, so an empty result is never ambiguous.",
+  "name": "gfs_search",
+  "description": "Search a GFS workspace: the pinned commit's index plus local edits, without downloading the repository. Reports execution status and coverage separately, so an empty result is never ambiguous.",
   "inputSchema": {
     "type": "object",
     "required": ["pattern"],

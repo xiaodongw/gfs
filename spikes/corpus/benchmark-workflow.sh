@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 #
-# The agent edit workflow, end to end, raw Git against XVFS.
+# The agent edit workflow, end to end, raw Git against GFS.
 #
 #   acquire a workspace -> read recent history -> start a branch ->
 #   find by name -> grep by content -> edit files -> status -> commit
 #
 # `benchmark-clone.sh` measures the *clone*, which is only the first step. This
 # measures the whole task, because the ranking changes once search is in it: the
-# clone is where XVFS wins and search is where it can lose everything back.
+# clone is where GFS wins and search is where it can lose everything back.
 #
 # Every step is timed separately and every step's *result* is recorded next to
 # its time. A faster search that returns a different answer is not a faster
@@ -24,30 +24,30 @@ set -uo pipefail
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 root="$(cd "$here/../.." && pwd)"
 
-CORPUS_DIR="${XVFS_CORPUS_DIR:-$HOME/xvfs-corpus}"
+CORPUS_DIR="${GFS_CORPUS_DIR:-$HOME/gfs-corpus}"
 MIRROR_DIR="$CORPUS_DIR/mirrors"
-WORK="${XVFS_WORKFLOW_WORK:-$CORPUS_DIR/workflow}"
+WORK="${GFS_WORKFLOW_WORK:-$CORPUS_DIR/workflow}"
 BIN="$root/target/release"
-HTTP_ADDR="${XVFS_BENCH_HTTP_ADDR:-127.0.0.1:8630}"
-GRPC_ADDR="${XVFS_BENCH_GRPC_ADDR:-127.0.0.1:8631}"
+HTTP_ADDR="${GFS_BENCH_HTTP_ADDR:-127.0.0.1:8630}"
+GRPC_ADDR="${GFS_BENCH_GRPC_ADDR:-127.0.0.1:8631}"
 TOKEN=workflow-bench
-CAP_KEY="$(printf 'xvfs-workflow-benchmark-key-not-for-production!!' | od -An -tx1 | tr -d ' \n' | cut -c1-64)"
+CAP_KEY="$(printf 'gfs-workflow-benchmark-key-not-for-production!!' | od -An -tx1 | tr -d ' \n' | cut -c1-64)"
 
 # Never `rg`: in at least one developer environment that is a shell function
 # wrapping another tool, which made an earlier harness report 0 hits in 0.05 s
 # for every variant -- a plausible-looking number rather than an obvious failure.
-RG="${XVFS_RG_BINARY:-}"
+RG="${GFS_RG_BINARY:-}"
 if [ -z "$RG" ]; then
   for candidate in "$HOME/.cargo/bin/rg" /usr/bin/rg /usr/local/bin/rg; do
     [ -x "$candidate" ] && RG="$candidate" && break
   done
 fi
 if [ -z "$RG" ] || ! "$RG" --version >/dev/null 2>&1; then
-  echo "no ripgrep binary found; set XVFS_RG_BINARY" >&2
+  echo "no ripgrep binary found; set GFS_RG_BINARY" >&2
   exit 2
 fi
 
-for tool in xvfs xvfsd xvfsd-server xvfs-rg xvfs-find xvfs-log; do
+for tool in gfs gfs-fuse gfs-server; do
   if [ ! -x "$BIN/$tool" ]; then
     echo "missing $BIN/$tool; run scripts/build-release.sh" >&2
     exit 2
@@ -73,7 +73,7 @@ mib() { du -sm --apparent-size "$1" 2>/dev/null | cut -f1; }
 # that looked plausible: `find` walks in filesystem order, which is ext4's hash
 # order in a clone and Git's tree order in the mount, so the two flows edited
 # *different files* and the trees disagreed for a reason that had nothing to do
-# with XVFS. The comparison's whole value is that both sides did the same work.
+# with GFS. The comparison's whole value is that both sides did the same work.
 #
 # Regular files only (mode 100644): a delete or rename targeting a symlink would
 # still be a valid test, but not the one the other flow ran.
@@ -92,7 +92,7 @@ choose_edit_paths() { # $1 = served bare repo
 apply_edits() { # $1 = worktree, $2..$5 = the four chosen paths
   local w="$1" m1="$2" m2="$3" del="$4" ren="$5"
   [ -n "$m1" ] && printf '\n# benchmark: appended by the agent\n' >>"$w/$m1"
-  [ -n "$m2" ] && printf '\nBENCH_MARKER = "xvfs-benchmark"\n' >>"$w/$m2"
+  [ -n "$m2" ] && printf '\nBENCH_MARKER = "gfs-benchmark"\n' >>"$w/$m2"
   printf 'agent scratch notes\nline two\n' >"$w/AGENT_NOTES.md"
   [ -n "$del" ] && rm -f "$w/$del"
   [ -n "$ren" ] && mv "$w/$ren" "$w/$ren.renamed"
@@ -109,7 +109,7 @@ run_one() { # $1 = repository id
 
   rm -rf "$WORK/$repo"; mkdir -p "$WORK/$repo"
   local served="$WORK/$repo/served.git"
-  # Copied, never served in place: the server writes `refs/xvfs/*` lease anchors
+  # Copied, never served in place: the server writes `refs/gfs/*` lease anchors
   # into whatever repository it serves, and the mirror is an input.
   cp -a "$mirror" "$served"
   local base; base=$(git --git-dir="$served" rev-parse HEAD)
@@ -117,14 +117,14 @@ run_one() { # $1 = repository id
   # A glob and a literal. Both default to something present in any source tree
   # rather than being derived from the repository's own content: an earlier
   # version picked the pattern from a path and landed on the project's own name,
-  # which matched 26 779 lines -- past `xvfs-rg`'s result cap, so the two sides
+  # which matched 26 779 lines -- past `gfs rg`'s result cap, so the two sides
   # were measuring different questions.
-  local find_glob="${XVFS_BENCH_FIND_GLOB:-*test*}"
-  local grep_pat="${XVFS_BENCH_GREP_PATTERN:-TODO}"
+  local find_glob="${GFS_BENCH_FIND_GLOB:-*test*}"
+  local grep_pat="${GFS_BENCH_GREP_PATTERN:-TODO}"
   # Raised well above the expected hit count on both sides. Left at the default,
-  # a truncated XVFS answer would be compared against an untruncated `rg` one and
+  # a truncated GFS answer would be compared against an untruncated `rg` one and
   # the difference read as a correctness failure.
-  local max_results="${XVFS_BENCH_MAX_RESULTS:-200000}"
+  local max_results="${GFS_BENCH_MAX_RESULTS:-200000}"
 
   local m1 m2 del ren
   { read -r m1; read -r m2; read -r del; read -r ren; } < <(choose_edit_paths "$served")
@@ -134,7 +134,7 @@ run_one() { # $1 = repository id
   echo "find glob: $find_glob   grep pattern: $grep_pat"
   echo "edits: modify $m1, modify $m2, delete $del, rename $ren"
   echo
-  printf '| step | raw git full | raw git --depth 10 | XVFS | raw result | XVFS result |\n'
+  printf '| step | raw git full | raw git --depth 10 | GFS | raw result | GFS result |\n'
   printf '| --- | ---: | ---: | ---: | --- | --- |\n'
 
   # ---- raw git ----
@@ -160,15 +160,15 @@ run_one() { # $1 = repository id
   t1=$(now); local a_cmt; a_cmt=$(el "$t0" "$t1")
   local a_tree; a_tree=$(git -C "$d" rev-parse HEAD^{tree})
 
-  # ---- XVFS ----
+  # ---- GFS ----
   local state="$WORK/$repo/server-state"; mkdir -p "$state"
-  "$BIN/xvfsd-server" --state-dir "$state" --http-addr "$HTTP_ADDR" --grpc-addr "$GRPC_ADDR" \
+  "$BIN/gfs-server" --state-dir "$state" --http-addr "$HTTP_ADDR" --grpc-addr "$GRPC_ADDR" \
     --capability-key "$CAP_KEY" --dev-token "$TOKEN" --import "$repo=$served" \
     >"$WORK/$repo/server.log" 2>&1 &
   local server_pid=$!
   # shellcheck disable=SC2317
   stop_server() {
-    "$BIN/xvfs" unmount --workspace "$WORK/$repo/ws" >/dev/null 2>&1
+    "$BIN/gfs" unmount --workspace "$WORK/$repo/ws" >/dev/null 2>&1
     kill "$server_pid" 2>/dev/null; wait "$server_pid" 2>/dev/null
   }
   trap stop_server RETURN
@@ -181,28 +181,28 @@ run_one() { # $1 = repository id
   done
   if [ "$ready" -eq 0 ]; then echo "[$repo] server did not become ready" >&2; return 1; fi
 
-  export XVFS_ENDPOINT="http://$GRPC_ADDR" XVFS_HTTP_ENDPOINT="http://$HTTP_ADDR" XVFS_TOKEN="$TOKEN"
+  export GFS_ENDPOINT="http://$GRPC_ADDR" GFS_HTTP_ENDPOINT="http://$HTTP_ADDR" GFS_TOKEN="$TOKEN"
   local ws="$WORK/$repo/ws"
-  t0=$(now); "$BIN/xvfs" mount --repo "$repo" --rev HEAD --workspace "$ws" \
+  t0=$(now); "$BIN/gfs" mount --repo "$repo" --rev HEAD --workspace "$ws" \
     --cache-dir "$WORK/$repo/cache" >/dev/null 2>&1; t1=$(now)
   local c_acq; c_acq=$(el "$t0" "$t1")
 
-  t0=$(now); local c_log; c_log=$(cd "$ws" && "$BIN/xvfs-log" -10 --oneline 2>/dev/null | wc -l); t1=$(now)
+  t0=$(now); local c_log; c_log=$(cd "$ws" && "$BIN/gfs" log -10 --oneline 2>/dev/null | wc -l); t1=$(now)
   local c_log_s; c_log_s=$(el "$t0" "$t1")
-  t0=$(now); local c_find; c_find=$(cd "$ws" && "$BIN/xvfs-find" "$find_glob" --max-results "$max_results" 2>/dev/null | wc -l); t1=$(now)
+  t0=$(now); local c_find; c_find=$(cd "$ws" && "$BIN/gfs" find "$find_glob" --max-results "$max_results" 2>/dev/null | wc -l); t1=$(now)
   local c_find_s; c_find_s=$(el "$t0" "$t1")
-  t0=$(now); local c_grep; c_grep=$(cd "$ws" && "$BIN/xvfs-rg" -F "$grep_pat" -m "$max_results" 2>/dev/null | wc -l); t1=$(now)
+  t0=$(now); local c_grep; c_grep=$(cd "$ws" && "$BIN/gfs" rg -F "$grep_pat" -m "$max_results" 2>/dev/null | wc -l); t1=$(now)
   local c_grep_s; c_grep_s=$(el "$t0" "$t1")
   t0=$(now); apply_edits "$ws" "$m1" "$m2" "$del" "$ren"; t1=$(now)
   local c_edit; c_edit=$(el "$t0" "$t1")
-  t0=$(now); "$BIN/xvfs" status --workspace "$ws" >/dev/null 2>&1; t1=$(now)
+  t0=$(now); "$BIN/gfs" status --workspace "$ws" >/dev/null 2>&1; t1=$(now)
   local c_stat; c_stat=$(el "$t0" "$t1")
 
-  t0=$(now); "$BIN/xvfs" export --workspace "$ws" --bundle "$WORK/$repo/bundle" >/dev/null 2>&1; t1=$(now)
+  t0=$(now); "$BIN/gfs" export --workspace "$ws" --bundle "$WORK/$repo/bundle" >/dev/null 2>&1; t1=$(now)
   local c_exp; c_exp=$(el "$t0" "$t1")
   # The commit lands where the objects are. No worktree: a temporary index and
   # `commit-tree` is what a server would do, and it is the honest cost -- an
-  # earlier harness cloned the repository here and charged XVFS for it.
+  # earlier harness cloned the repository here and charged GFS for it.
   t0=$(now)
   local idx="$WORK/$repo/index"
   GIT_INDEX_FILE="$idx" git --git-dir="$served" "${GITC[@]}" read-tree "$base"
@@ -213,7 +213,7 @@ run_one() { # $1 = repository id
   t1=$(now); local c_cmt; c_cmt=$(el "$t0" "$t1")
 
   local hydration
-  hydration=$("$BIN/xvfs" inspect --workspace "$ws" | grep hydration | sed 's/^hydration *//')
+  hydration=$("$BIN/gfs" inspect --workspace "$ws" | grep hydration | sed 's/^hydration *//')
 
   printf '| acquire | %.3f s | %.3f s | %.3f s | clone | mount |\n' "$a_acq" "$a10_acq" "$c_acq"
   printf '| `log -10` | %.3f s | %.3f s | %.3f s | %s commits | %s commits |\n' \
@@ -231,12 +231,12 @@ run_one() { # $1 = repository id
     "$(echo "$a10_acq+$a_log_s+$a_find_s+$a_grep_s+$a_edit+$a_stat+$a_cmt" | bc)" \
     "$(echo "$c_acq+$c_log_s+$c_find_s+$c_grep_s+$c_edit+$c_stat+$c_exp+$c_cmt" | bc)"
   echo
-  printf 'disk: raw full %s MiB, raw --depth 10 %s MiB, XVFS %s bytes state + %s bytes cache\n' \
+  printf 'disk: raw full %s MiB, raw --depth 10 %s MiB, GFS %s bytes state + %s bytes cache\n' \
     "$(mib "$d")" "$(mib "$d10")" \
-    "$(du -sb --exclude=generations "$ws.xvfs" | cut -f1)" \
+    "$(du -sb --exclude=generations "$ws.gfs" | cut -f1)" \
     "$(du -sb "$WORK/$repo/cache" | cut -f1)"
   printf 'hydration: %s\n' "$hydration"
-  printf 'tree(raw)  %s\ntree(XVFS) %s\n' "$a_tree" "$c_tree"
+  printf 'tree(raw)  %s\ntree(GFS) %s\n' "$a_tree" "$c_tree"
   if [ "$a_tree" = "$c_tree" ]; then
     printf 'COMMIT CORRECTNESS: PASS -- the two flows produced the same tree\n\n'
   else

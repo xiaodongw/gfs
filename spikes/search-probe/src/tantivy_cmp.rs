@@ -26,7 +26,7 @@ pub fn build(repo_path: &Path, rev: &str) -> Result<()> {
   let blob_key = builder.add_u64_field("blob_key", FAST | STORED);
   let schema = builder.build();
 
-  let dir = std::env::temp_dir().join(format!("xvfs-tantivy-{}", std::process::id()));
+  let dir = std::env::temp_dir().join(format!("gfs-tantivy-{}", std::process::id()));
   let _ = std::fs::remove_dir_all(&dir);
   std::fs::create_dir_all(&dir)?;
   let index = tantivy::Index::create_in_dir(&dir, schema)?;

@@ -5,7 +5,7 @@ Milestone: M3 (PLAN.md section 6)
 Status: **Complete**, with two recorded gaps carried into M6.1.
 
 M2 delivered a lazy read-only mount of one pinned commit. Every mutation
-answered `EROFS`, `xvfs status` did not exist, and the `git` shim reported a
+answered `EROFS`, `gfs status` did not exist, and the `git` shim reported a
 clean tree because there was nothing that could make it dirty. M3 makes the
 workspace writable: a crash-safe copy-on-write overlay, every FUSE mutation
 wired to it, status and diff derived from the journal without scanning the base,
@@ -19,9 +19,9 @@ PLAN.md section 6 states three criteria.
 
 | # | Criterion | Verified by | Result |
 | --- | --- | --- | --- |
-| 1 | Random mutation sequences match the reference in-memory filesystem model | `xvfs-overlay/tests/state_machine.rs` | **Met** — 64 seeds × 200 operations, compared on outcome *and* full merged tree after every step |
-| 2 | An export applied to the pinned Git commit produces the same tree as the mounted workspace | `xvfs-fuse/tests/export.rs::an_export_applied_to_the_pinned_commit_reproduces_the_workspace_tree` | **Met** — stock `git apply` onto a stock-Git checkout, trees compared with the M2 raw-tree materializer |
-| 3 | Fault injection meets the no-lost-acknowledged-mutation goal | `xvfs-test/tests/overlay_crash.rs` | **Met** — 5 boundaries × 3 mutation shapes, plus rename |
+| 1 | Random mutation sequences match the reference in-memory filesystem model | `gfs-overlay/tests/state_machine.rs` | **Met** — 64 seeds × 200 operations, compared on outcome *and* full merged tree after every step |
+| 2 | An export applied to the pinned Git commit produces the same tree as the mounted workspace | `gfs-fuse/tests/export.rs::an_export_applied_to_the_pinned_commit_reproduces_the_workspace_tree` | **Met** — stock `git apply` onto a stock-Git checkout, trees compared with the M2 raw-tree materializer |
+| 3 | Fault injection meets the no-lost-acknowledged-mutation goal | `gfs-test/tests/overlay_crash.rs` | **Met** — 5 boundaries × 3 mutation shapes, plus rename |
 
 ### What criterion 3 actually guarantees
 
@@ -222,7 +222,7 @@ not implement, and callers already handle it.
 ## What M3 deliberately did not build
 
 Commit and push. The export is the handoff, and M8 owns the direct-write path.
-Three-way refresh: `xvfs refresh` refuses a non-empty overlay, because an overlay
+Three-way refresh: `gfs refresh` refuses a non-empty overlay, because an overlay
 is bound to the commit it diverged from and carrying edits across would make
 every subsequent `status` be about a base that is no longer mounted.
 
@@ -239,17 +239,17 @@ separate work with no consumer yet.
 
 | Suite | Cases | Covers |
 | --- | ---: | --- |
-| `xvfs-overlay` unit tests | 28 | row encoding, resolution and masking, the content store's ordering and sweep, Git blob hashing, Myers hunks and quoting, the fault-point table |
-| `xvfs-overlay/tests/overlay.rs` | 14 | restart, copy-up laziness, quota short-writes, orphan collection, binding and schema refusal, the overlay clock, rename bounds |
-| `xvfs-overlay/tests/state_machine.rs` | 2 | 64 seeds × 200 operations against the reference model, plus the same across reopens |
-| `xvfs-test/tests/overlay_crash.rs` | 5 | 5 transaction boundaries × 3 mutation shapes, rename atomicity, orphan collection, recovery idempotence |
-| `xvfs-fuse/tests/mutations.rs` | 20 | the whole mutation surface through real syscalls: copy-up, `O_TRUNC`, whiteouts, opacity, rename identity, open-file semantics, quota, `statfs`, paged readdir merge |
-| `xvfs-fuse/tests/export.rs` | 9 | status shapes, undone edits, diff cost, bundle atomicity and checksums, the apply-and-compare verifier, the shim against the journal |
-| `xvfs-fuse/tests/faults.rs` | 10 | quota exhaustion, server loss, 16 and 8 concurrent writers, rename cycles, repeated directory replacement, unwritable overlay, cache churn, unmount with open handles, daemon restart |
-| `xvfs-fuse/tests/compat.rs` | 22 | M2's read-only subset plus the writable POSIX errno matrix and `rename`'s refusals |
-| `xvfs-fuse` others | 51 unit + 66 integration | M2's suites, still green |
+| `gfs-overlay` unit tests | 28 | row encoding, resolution and masking, the content store's ordering and sweep, Git blob hashing, Myers hunks and quoting, the fault-point table |
+| `gfs-overlay/tests/overlay.rs` | 14 | restart, copy-up laziness, quota short-writes, orphan collection, binding and schema refusal, the overlay clock, rename bounds |
+| `gfs-overlay/tests/state_machine.rs` | 2 | 64 seeds × 200 operations against the reference model, plus the same across reopens |
+| `gfs-test/tests/overlay_crash.rs` | 5 | 5 transaction boundaries × 3 mutation shapes, rename atomicity, orphan collection, recovery idempotence |
+| `gfs-fuse/tests/mutations.rs` | 20 | the whole mutation surface through real syscalls: copy-up, `O_TRUNC`, whiteouts, opacity, rename identity, open-file semantics, quota, `statfs`, paged readdir merge |
+| `gfs-fuse/tests/export.rs` | 9 | status shapes, undone edits, diff cost, bundle atomicity and checksums, the apply-and-compare verifier, the shim against the journal |
+| `gfs-fuse/tests/faults.rs` | 10 | quota exhaustion, server loss, 16 and 8 concurrent writers, rename cycles, repeated directory replacement, unwritable overlay, cache churn, unmount with open handles, daemon restart |
+| `gfs-fuse/tests/compat.rs` | 22 | M2's read-only subset plus the writable POSIX errno matrix and `rename`'s refusals |
+| `gfs-fuse` others | 51 unit + 66 integration | M2's suites, still green |
 
 `scripts/dev-stack.sh` now demonstrates the writable path end to end: edit,
-delete, rename, `xvfs status`, `xvfs diff`, the shim's porcelain output, an
+delete, rename, `gfs status`, `gfs diff`, the shim's porcelain output, an
 export bundle, a refresh refused for a dirty workspace, a daemon restart that
 resumes the job's edits, and a clean refresh afterwards.

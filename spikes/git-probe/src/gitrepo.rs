@@ -319,11 +319,11 @@ impl GitRepository for Libgit2Repository {
   }
 
   fn resolve_revision(&self, selector: &str) -> Result<ResolvedRevision> {
-    // `refs/xvfs/` is an internal reachability namespace, never a user
+    // `refs/gfs/` is an internal reachability namespace, never a user
     // revision (DESIGN.md section 7.1). Rejecting it here, at the lowest
     // layer, means no caller can forget to.
-    if selector.starts_with("refs/xvfs/") || selector.contains("/xvfs/mounts/") {
-      bail!("selector names the reserved internal namespace refs/xvfs/");
+    if selector.starts_with("refs/gfs/") || selector.contains("/gfs/mounts/") {
+      bail!("selector names the reserved internal namespace refs/gfs/");
     }
     let repo = self.pool.checkout()?;
     let object = repo
@@ -428,7 +428,7 @@ impl GitRepository for Libgit2Repository {
             // empty, read-only directory. Returning an empty page
             // here rather than an error keeps that rule in one
             // place instead of making every caller special-case it,
-            // and XVFS has no objects to list for it in any case —
+            // and GFS has no objects to list for it in any case —
             // submodule contents live in another repository.
             0o160000 => return Ok((Vec::new(), None)),
             _ => bail!("not a directory"),
@@ -498,7 +498,7 @@ impl GitRepository for Libgit2Repository {
         let Some(name) = r.name() else { continue };
         // The internal namespace never appears in an enumeration a
         // caller can see, matching the upload-pack hideRefs policy.
-        if name.starts_with("refs/xvfs/") {
+        if name.starts_with("refs/gfs/") {
           continue;
         }
         if let Some(t) = r.target() {

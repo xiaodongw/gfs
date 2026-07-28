@@ -4,7 +4,7 @@
 
 M2 delivered a read-only lazy mount of one pinned commit: a FUSE filesystem, a
 verified blob cache, the synthesized `.git` surface, and the mount lifecycle
-around them. Every mutation answers `EROFS`, `xvfs status` does not exist, and
+around them. Every mutation answers `EROFS`, `gfs status` does not exist, and
 the `git` shim reports a clean tree because there is nothing yet that could make
 it dirty.
 
@@ -24,11 +24,11 @@ PLAN.md section 6 states three exit criteria:
 
 Four phases, one commit each, then a completion report.
 
-### M3.1 — `xvfs-overlay`: the data model
+### M3.1 — `gfs-overlay`: the data model
 
 The crate is a declared placeholder today. It becomes a synchronous,
 network-free library that owns the overlay's durable state, in the same shape as
-`xvfs-server`'s `Catalog`: SQLite behind a mutex, called from async code through
+`gfs-server`'s `Catalog`: SQLite behind a mutex, called from async code through
 `spawn_blocking`.
 
 - `journal.rs` — `overlay.sqlite`: schema, versioning, migration, open/recovery.
@@ -50,7 +50,7 @@ overlay usage.
 ### M3.3 — Status, diff, and export
 
 Status and diff derived from the journal. Deterministic JSON and Git-patch
-export with an atomic bundle and checksums. `xvfs status|diff|export` on the
+export with an atomic bundle and checksums. `gfs status|diff|export` on the
 CLI, the same three over the control socket, and the `git` shim's `status`,
 `diff`, and `ls-files` rewired to the journal. A verifier that applies an export
 to a clean checkout of the pinned commit and compares trees.
@@ -172,6 +172,6 @@ forever. Job cleanup falls back to a lazy unmount after a timeout.
     files/<shard>/<id>  content
 ```
 
-One overlay per mount generation, bound to that generation's commit. `xvfs
+One overlay per mount generation, bound to that generation's commit. `gfs
 refresh` refuses a non-empty overlay, and a retired generation's (empty) overlay
 directory is removed with it.

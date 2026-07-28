@@ -32,20 +32,20 @@ unique tracked content, 8.6 GiB of history.
 | Blobless (`--filter=blob:none`) | 181 s | 3 854 MiB | yes |
 | Shallow (`--depth 1`) | 15 s | 1 832 MiB | yes |
 | **Shallow + blobless** (best) | **19.5 s** | **1 839 MiB** | yes |
-| **XVFS target** | **< 2 s** | **< 10 MiB + overlay** | yes, server-side |
+| **GFS target** | **< 2 s** | **< 10 MiB + overlay** | yes, server-side |
 
 Against the strongest existing option, the projected improvement is roughly
 **10× on startup and ~180× on local disk**, and the disk figure is the more
 important one: a shallow blobless clone still materializes the entire 1540 MiB
 working tree, because a checkout hydrates every blob it writes. That is the cost
-XVFS removes by not materializing files nobody opens.
+GFS removes by not materializing files nobody opens.
 
 Two honesty notes on these numbers:
 
 - **Clone times are local `file://` and exclude network transfer entirely.**
   A real shallow+blobless clone also moves 289 MiB over the network. The gap in
   a hosted environment is therefore *wider* than shown, not narrower.
-- **The XVFS column is a target, not a measurement.** The probe mounted in
+- **The GFS column is a target, not a measurement.** The probe mounted in
   18.7 ms and served files lazily, but against a synthetic tree, not the Linux
   kernel. M2 is where this becomes a measurement.
 
@@ -58,7 +58,7 @@ the milestone was worth running.
    fails to compile against a SHA-256 libgit2. The pre-production commitment
    cannot be met by libgit2 maturing alone, so SHA-256 moves out of scope.
 
-2. **Hiding `refs/xvfs/` prevents discovery, not access** (ADR 0002). Protocol
+2. **Hiding `refs/gfs/` prevents discovery, not access** (ADR 0002). Protocol
    v2 serves any object in the ODB by OID regardless of
    `uploadpack.allowAnySHA1InWant`; v0 enforces it. A documented security claim
    in DESIGN.md section 7.1 is false for the Git path and is re-scoped to the

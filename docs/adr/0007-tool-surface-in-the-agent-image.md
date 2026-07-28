@@ -3,30 +3,30 @@
 - Status: **Proposed. Not decided; the decision belongs to M6.1**, which owns the
   agent image, `PATH` precedence, and the agent instructions.
 - Date: 2026-07-27
-- Milestone: M6.1 (raised while building `xvfs-log` and `xvfs-find`)
+- Milestone: M6.1 (raised while building `gfs log` and `gfs find`)
 - Evidence: [ADR 0005](0005-git-command-surface.md),
   [`benchmarks/agent-workflow.md`](../../benchmarks/agent-workflow.md),
   [`docs/agent-search.md`](../agent-search.md),
-  `crates/xvfs-fuse/src/bin/xvfs-git-shim.rs`
+  `gfs-fuse/src/bin/gfs-git-shim.rs`
 
 ## Context
 
 Three questions an agent asks constantly want to touch every path in the
 repository: what does this content say, which files are called this, and what
-changed recently. XVFS answers all three from the server —
-[`xvfs-rg`](../agent-search.md), `xvfs-find`, `xvfs-log` — and none of them reads
+changed recently. GFS answers all three from the server —
+[`gfs rg`](../agent-search.md), `gfs find`, `gfs log` — and none of them reads
 the mount.
 
 The tools existing is not the same as the tools being *used*. An agent that runs
-`rg` out of habit gets the cost XVFS exists to remove, and a build script that
+`rg` out of habit gets the cost GFS exists to remove, and a build script that
 runs `git ls-files` gets a wrong answer. So the open question is what occupies
 `PATH` inside the hosted image:
 
 - **Same-name shims** — `git`, `rg`, `find`, `grep` on `PATH` ahead of the real
-  binaries, each detecting whether it is running inside an XVFS mount and either
+  binaries, each detecting whether it is running inside a GFS mount and either
   answering from the server or forwarding to the real command.
 - **Distinct names** — `xgit`, `xrg`, `xfind`, `xgrep` (or the current
-  `xvfs-*`), with the agent instructed to use them and the standard commands left
+  `gfs-*`), with the agent instructed to use them and the standard commands left
   entirely alone.
 
 This ADR records the trade-off. It does not decide it.
@@ -50,7 +50,7 @@ keeps that a live test rather than a historical note.
 
 The third row is different in kind. Nothing lies. The cost is real — `rg` inside
 the django mount took 23.9 s and hydrated 6 251 blobs / 46.6 MB, against 0.043 s
-and zero bytes for `xvfs-rg` — but a job that pays it still finishes with the
+and zero bytes for `gfs rg` — but a job that pays it still finishes with the
 right answer.
 
 **Consequence: `git` is not a candidate for the distinct-name option.** The
@@ -72,8 +72,8 @@ The rest of this ADR is therefore about `rg`, `find`, and `grep`.
   servers, and any MCP or subagent tool that shells out. None of these read the
   agent instructions.
 - **A refusal arrives at the moment of the mistake**, which teaches better than a
-  document read earlier, and is the pattern XVFS already uses everywhere: the
-  `git` shim prints its whole supported grammar when it refuses; `xvfs-rg`
+  document read earlier, and is the pattern GFS already uses everywhere: the
+  `git` shim prints its whole supported grammar when it refuses; `gfs rg`
   rejects an unknown flag by naming what to do instead.
 - **Already half-built and proven** for `git`.
 
@@ -108,7 +108,7 @@ The rest of this ADR is therefore about `rg`, `find`, and `grep`.
 **For.**
 
 - **No emulation debt, therefore no wrong-answer surface.** This is the strongest
-  argument and it is not about ergonomics. `xvfs-find` does not have to decide
+  argument and it is not about ergonomics. `gfs find` does not have to decide
   what `-mtime -7` means, because nobody can type it. The tool gets the interface
   the data actually supports rather than one it must partially fake — which is
   the naming-level form of the rule this codebase already applies everywhere:
@@ -129,7 +129,7 @@ The rest of this ADR is therefore about `rg`, `find`, and `grep`.
   is not the agent keeps sweeping the mount.
 - **The benefit is invisible when it works and invisible when it does not**,
   which makes the failure hard to notice in a pilot: jobs still succeed, they
-  just cost what a clone would have cost, and XVFS's value quietly evaporates.
+  just cost what a clone would have cost, and GFS's value quietly evaporates.
 
 ## A third shape, which may be the real answer
 
@@ -144,14 +144,14 @@ by what they are, shim by what the failure is**:
    replacements**. They do not translate flags. They detect the expensive
    whole-repository shape inside a mount, refuse, and name the tool that answers
    it — plus the explicit opt-in for paying the cost deliberately, which
-   `xvfs-rg --hydrate` already is.
+   `gfs rg --hydrate` already is.
 
 Point 3 keeps Option A's behavioural correction while giving up none of Option
 B's safety, because a guard that never translates can never answer a different
 question. It is also much less code than partial emulation.
 
 `rg` is the one case where full same-name delegation is low-risk, because
-`xvfs-rg` already implements ripgrep's flag names and exit codes and fails closed
+`gfs rg` already implements ripgrep's flag names and exit codes and fails closed
 on anything it does not implement. `find` and `grep` are where the emulation risk
 lives.
 
@@ -168,17 +168,17 @@ narrow subtree) is workable or fragile.
 ## Consequences, whichever is chosen
 
 - **The `git` shim must gain a fall-through.** It currently exits 128 with "not
-  an XVFS workspace" outside a mount (`xvfs-git-shim.rs:132`). ADR 0005 chose
+  a GFS workspace" outside a mount (`gfs-git-shim.rs:132`). ADR 0005 chose
   that to avoid "replacing a working `git` with a crippled one", but the effect
   is that installing it on `PATH` breaks ordinary `git` everywhere else in the
   image. Forwarding to the real binary when the workspace is absent is strictly
   better and is required before any `PATH`-wide install.
-- **Naming is about to be pinned.** `xvfs-rg` already appears in
+- **Naming is about to be pinned.** `gfs rg` already appears in
   `docs/agent-search.md`, ADR 0005's amendment, and PLAN.md M6.1's deliverable
-  list; `xvfs-find` and `xvfs-log` now join it. M6.1 bakes these names into the
+  list; `gfs find` and `gfs log` now join it. M6.1 bakes these names into the
   agent image and the agent instructions, after which changing them is a
   compatibility problem rather than an edit. If short names (`xrg`, `xfind`,
-  `xgit`) are wanted, decide before M6.1 ships. A cheap middle: keep `xvfs-*` as
+  `xgit`) are wanted, decide before M6.1 ships. A cheap middle: keep `gfs-*` as
   the canonical, self-describing namespace and ship short names as symlinks.
 - **The MCP tool changes what the CLI is for.** M6.1 already lists an optional
   MCP tool. A tool definition sits in the agent's tool list with a description

@@ -1,6 +1,6 @@
 # M0.1 — Workload and clone baseline
 
-The deliverable PLAN.md M0.1 asks for: what the workflows XVFS competes with
+The deliverable PLAN.md M0.1 asks for: what the workflows GFS competes with
 cost today, so that "materially lower startup time, network transfer, and local
 disk" has a denominator.
 
@@ -96,7 +96,7 @@ search (`TODO`) over whatever the workflow materialized.
 | **linux** | **bare full** | **373.7** | **6537.2** | **0** | 6537.1 | 0 | – | – |
 
 `--filter=tree:0` failed against the mirrors, correctly: the corpus mirrors
-carry XVFS's own filter policy, which permits only `blob:none`. The variant is
+carry GFS's own filter policy, which permits only `blob:none`. The variant is
 kept in the harness so the denial is visible rather than absent.
 
 ## What the numbers say
@@ -104,7 +104,7 @@ kept in the harness so the denial is visible rather than absent.
 **Partial clone does not avoid materializing the working tree.** Every blobless
 variant still checked out the full tree — 1540 MiB for linux — because a
 checkout hydrates every blob it writes. `--filter=blob:none` saves *history*
-transfer, not working-set cost. This is the gap XVFS targets, and it is the
+transfer, not working-set cost. This is the gap GFS targets, and it is the
 single most important line in this document.
 
 **Shallow is the cheapest existing option, and it is not cheap.** Linux
@@ -120,7 +120,7 @@ section 1 describes: it helps when paths are known, and agents usually need
 repository-wide discovery before they know them.
 
 **Search over a materialized tree is fast** (0.13 s for linux) once you have
-paid to materialize it. XVFS's server-side search has to beat the *total*, not
+paid to materialize it. GFS's server-side search has to beat the *total*, not
 the `rg` time alone.
 
 ### The comparison the go/no-go turns on
@@ -129,7 +129,7 @@ the `rg` time alone.
 | --- | ---: | ---: |
 | linux full clone | 383 s | 8 087 MiB |
 | linux shallow + blobless (best existing) | 19.5 s | 1 839 MiB |
-| XVFS target | < 2 s | < 10 MiB + overlay |
+| GFS target | < 2 s | < 10 MiB + overlay |
 
 Roughly **10× on startup and ~180× on disk** against the strongest existing
 option — and wider in a hosted environment, since these clone times exclude
@@ -137,7 +137,7 @@ network transfer of 289 MiB.
 
 ## Caveats
 
-- **The XVFS column is a target, not a measurement.** M0 built no mount capable
+- **The GFS column is a target, not a measurement.** M0 built no mount capable
   of serving the Linux tree; M2 turns it into a measurement.
 - Clone wall times exclude network transfer entirely.
 - The 20–50 replayable agent tasks PLAN.md M0.1 also asks for were **not**

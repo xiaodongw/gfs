@@ -4,7 +4,7 @@
 
 M0 is complete with a conditional go. Nothing exists yet outside `spikes/`, which is
 deliberately throwaway measurement code. M1 builds the first production workspace:
-the `xvfs-*` Cargo workspace, a repository catalog with crash-consistent mount
+the `gfs-*` Cargo workspace, a repository catalog with crash-consistent mount
 retention leases, the libgit2-backed Git object service, the snapshot/blob APIs, and
 uniform repository plus object authorization over them.
 
@@ -30,25 +30,25 @@ grace, 24 h prune delay, 24 h maximum age, alert at 2 failures).
 Seven phases, one commit each, each verified with `cargo build`, `cargo test`, and
 `cargo clippy -- -D warnings` before committing.
 
-### Phase 1 — M1.1a: workspace and `xvfs-types`
+### Phase 1 — M1.1a: workspace and `gfs-types`
 
-- Root Cargo workspace with the nine crates PLAN.md lists. `xvfs-search`,
-  `xvfs-overlay`, and `xvfs-fuse` land as declared placeholders owned by M4/M3/M2.
-- `xvfs-types`: `HashAlgorithm`, `ObjectId`, `BytePath`, `EntryKind` re-homed from
+- Root Cargo workspace with the nine crates PLAN.md lists. `gfs-search`,
+  `gfs-overlay`, and `gfs-fuse` land as declared placeholders owned by M4/M3/M2.
+- `gfs-types`: `HashAlgorithm`, `ObjectId`, `BytePath`, `EntryKind` re-homed from
   `spikes/git-probe/src/model.rs`, plus revision selectors, repository IDs, mount
   IDs, structured error codes, and limits.
 - Tooling: `xtask`-style scripts for fmt, clippy, test, `cargo-deny`, SBOM, and
   secret scanning. The license check asserts ADR 0001's dependency table directly,
   including the statically linked GPL-2.0 libgit2 that crate metadata misses.
 
-### Phase 2 — M1.1b: `xvfs-proto`
+### Phase 2 — M1.1b: `gfs-proto`
 
 - Protobuf definitions for the snapshot, mount, and search services from DESIGN.md
   section 7.3. Paths are `bytes`, object IDs are qualified strings.
 - `tonic`/`prost` codegen driven by `protoc-bin-vendored` so `protoc` is not a host
   prerequisite and cannot drift between local and CI.
 
-### Phase 3 — M1.3: `xvfs-git` object service
+### Phase 3 — M1.3: `gfs-git` object service
 
 - `GitRepository` trait and libgit2 implementation re-homed from the spike, with the
   bounded handle pool, format gate, byte-safe traversal, and `/`-suffix directory
@@ -62,10 +62,10 @@ Seven phases, one commit each, each verified with `cargo build`, `cargo test`, a
 - Create/import/mirror, fetch, verify, quarantine, delete state machines with
   per-repository locking and restart reconciliation.
 - Leases as the crash-consistent state machine ADR 0006 fixes: under the repository
-  lock, resolve and authorize, persist `PREPARING`, create the `refs/xvfs/mounts/*`
+  lock, resolve and authorize, persist `PREPARING`, create the `refs/gfs/mounts/*`
   anchor, persist `ACTIVE`, then return the capability.
 - Mirror fetch uses explicit refspecs plus `--prune`, never `--mirror`, so upstream
-  pruning cannot reach `refs/xvfs/`.
+  pruning cannot reach `refs/gfs/`.
 - Webhook and polling ingestion emitting ref events idempotent on
   `(repository_id, ref_name, old_oid, new_oid)`.
 
@@ -92,7 +92,7 @@ Seven phases, one commit each, each verified with `cargo build`, `cargo test`, a
 
 - One-command stack: server, seeded fixtures of several sizes, pinned libgit2 and
   stock Git versions asserted at startup.
-- `xvfs-test`: fixture matrix re-homed from the spike, plus the million-entry
+- `gfs-test`: fixture matrix re-homed from the spike, plus the million-entry
   generator.
 - Exit-criteria tests: million-entry paging, force-push/branch-delete/`git gc`
   survival, lease expiry and renewal, hidden-ref advertisement and prune survival,
@@ -102,8 +102,8 @@ Seven phases, one commit each, each verified with `cargo build`, `cargo test`, a
 
 ### Placeholder crates for M2–M4 are created now
 
-PLAN.md M1.1 lists nine crates as the deliverable. `xvfs-search`, `xvfs-overlay`, and
-`xvfs-fuse` have no M1 content. They are created as declared placeholders rather than
+PLAN.md M1.1 lists nine crates as the deliverable. `gfs-search`, `gfs-overlay`, and
+`gfs-fuse` have no M1 content. They are created as declared placeholders rather than
 omitted so the workspace shape matches the plan and later milestones have a home;
 each states which milestone fills it. The alternative — adding them when first needed
 — was rejected because the workspace layout is itself the reviewable artifact of
@@ -116,10 +116,10 @@ risk in exactly the place M1.1 is supposed to remove one. `protoc-bin-vendored`
 supplies the compiler through Cargo, matching how ADR 0001 vendors libgit2 and for
 the same reason: the build has to be ours.
 
-### The catalog lives in `xvfs-server`, not its own crate
+### The catalog lives in `gfs-server`, not its own crate
 
-PLAN.md's crate list has no `xvfs-catalog`. The catalog, lease state machine, and
-ref-event outbox are server-process concerns and go in `xvfs-server` as modules.
+PLAN.md's crate list has no `gfs-catalog`. The catalog, lease state machine, and
+ref-event outbox are server-process concerns and go in `gfs-server` as modules.
 Splitting them out is a refactor to do when a second binary needs them.
 
 ### OIDC integration is a seam, not an implementation
@@ -187,7 +187,7 @@ front, and two ports costs a line of configuration.
 
 ### Things a later milestone will need to know
 
-* **The capability key must be persistent.** `xvfsd-server` generates an ephemeral
+* **The capability key must be persistent.** `gfs-server` generates an ephemeral
   one when `--capability-key` is absent and warns loudly. A restart with a fresh key
   invalidates every outstanding capability, which breaks live mounts.
 * **`PrepareSnapshot` returns `READY` unconditionally** in M1, because there is no
@@ -196,6 +196,6 @@ front, and two ports costs a line of configuration.
 * **Authenticated upstream fetch is untested.** The refspec and sandbox behaviour is
   verified against local `file://` upstreams, which need no credential. M6.1 wires
   the secret store, and `mirror::fetch` marks the spot.
-* **`xvfs mount` creates a lease, not a filesystem.** M2.1 adds the FUSE half. The
+* **`gfs mount` creates a lease, not a filesystem.** M2.1 adds the FUSE half. The
   CLI deliberately does not offer `unmount`, `status`, `diff`, or `search` yet, so
   `--help` does not advertise something that would fail.

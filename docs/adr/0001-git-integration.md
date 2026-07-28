@@ -11,7 +11,7 @@
 
 DESIGN.md section 5.1 accepted libgit2 via `git2-rs` for repository access and
 stock `git upload-pack` behind a Rust gateway for clone/fetch. M0.3 was tasked
-with confirming that the two agree on the repositories XVFS intends to host, and
+with confirming that the two agree on the repositories GFS intends to host, and
 with establishing the supported-format boundary explicitly rather than by
 assumption.
 
@@ -65,14 +65,14 @@ Two facts carry the packaging decision:
    `COPYING` grants "unlimited permission to link the compiled version of this
    library into combinations with other programs, and to distribute those
    combinations without any restriction coming from the use of this file." So
-   linking libgit2 into an XVFS binary under a different license is permitted.
+   linking libgit2 into a GFS binary under a different license is permitted.
    Modifying libgit2 itself is still governed by GPL-2.0, so **the vendored
    libgit2 must not be patched** without accepting that obligation. If a patch
    ever becomes necessary, that is a licensing decision, not a build decision.
 
 2. **Stock Git is executed, never linked.** DESIGN.md section 7.2's choice to
    run `upload-pack` as a sandboxed child process is, in addition to its
-   security rationale, what keeps Git's GPL-2.0 off the XVFS binary: process
+   security rationale, what keeps Git's GPL-2.0 off the GFS binary: process
    invocation is not a derived work. This is a further reason not to
    reimplement upload-pack by linking Git's internals.
 
@@ -81,7 +81,7 @@ Packaging obligations:
 - ship libgit2's `COPYING` (including the linking exception and the bundled
   zlib/PCRE2 notices) with any binary distribution;
 - distribute stock Git as its own package or container layer with its own
-  license text and a source offer, not vendored into the XVFS binary;
+  license text and a source offer, not vendored into the GFS binary;
 - one crate offers `MIT OR Apache-2.0 OR LGPL-2.1-or-later` — select MIT or
   Apache-2.0 explicitly in the SBOM so no LGPL obligation is inherited by
   default;
@@ -108,7 +108,7 @@ it must produce a verdict even for repositories libgit2 cannot open at all.
 
 DESIGN.md section 5.1 says libgit2's SHA-256 support "is experimental and
 requires a non-default build". Measurement shows the situation is worse for
-XVFS, because XVFS reaches libgit2 through `git2-rs`:
+GFS, because GFS reaches libgit2 through `git2-rs`:
 
 - `libgit2-sys` 0.18.7 **does** build with `unstable-sha256`
   (`GIT_EXPERIMENTAL_SHA256`), and `GIT_OID_MAX_SIZE` becomes 32.
@@ -182,7 +182,7 @@ security subtly wrong is a data-leak bug rather than a compatibility bug.
 property of the deployment environment.
 
 **Convert `reftable` mirrors to `files` on ingest.** Deferred, not rejected.
-Cheap to do with stock Git, but it makes XVFS's mirror diverge from upstream in
+Cheap to do with stock Git, but it makes GFS's mirror diverge from upstream in
 a way that has to be maintained on every fetch. Revisit if a target repository
 actually uses `reftable`; DESIGN.md open question 9 tracks it.
 

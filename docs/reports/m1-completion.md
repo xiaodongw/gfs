@@ -11,11 +11,11 @@ claim can be checked rather than taken.
 
 | # | Criterion | Verified by | Result |
 | --- | --- | --- | --- |
-| 1 | Resolve a revision, list a million-entry snapshot one directory at a time, fetch one file without cloning | `xvfs-server/tests/exit_criteria.rs::a_million_entry_snapshot_can_be_paged_one_directory_at_a_time` | **Met, measured** |
+| 1 | Resolve a revision, list a million-entry snapshot one directory at a time, fetch one file without cloning | `gfs-server/tests/exit_criteria.rs::a_million_entry_snapshot_can_be_paged_one_directory_at_a_time` | **Met, measured** |
 | 2 | Concurrent ref movement cannot produce mixed-commit responses | `exit_criteria.rs::concurrent_ref_movement_cannot_produce_a_mixed_commit_response`, `::a_mount_is_unaffected_by_ref_movement_after_it_was_created` | Met |
-| 3 | A leased commit survives force push, branch deletion, and full `gc`; an expired lease stops protecting it; resolution and lease creation have no race window; a renewed live lease survives past its original TTL | `xvfs-git/tests/repository.rs::a_leased_commit_survives_a_force_push_a_branch_deletion_and_a_full_gc`, `xvfs-server/tests/mounts.rs` (16 tests), `catalog::leases` unit tests | Met |
+| 3 | A leased commit survives force push, branch deletion, and full `gc`; an expired lease stops protecting it; resolution and lease creation have no race window; a renewed live lease survives past its original TTL | `gfs-git/tests/repository.rs::a_leased_commit_survives_a_force_push_a_branch_deletion_and_a_full_gc`, `gfs-server/tests/mounts.rs` (16 tests), `catalog::leases` unit tests | Met |
 | 4 | Lease refs absent from all Git advertisements and survive upstream fetch/prune | `exit_criteria.rs::lease_refs_are_absent_from_advertisements_and_survive_a_pruning_fetch`, `mirror::tests` | Met |
-| 5 | Unauthorized users cannot infer blob existence through status, timing within a defined tolerance, cache, or error differences | `xvfs-server/tests/authorization.rs` (14 tests), `exit_criteria.rs::a_blob_ticket_cannot_be_used_to_probe_for_blobs_in_another_snapshot` | Met |
+| 5 | Unauthorized users cannot infer blob existence through status, timing within a defined tolerance, cache, or error differences | `gfs-server/tests/authorization.rs` (14 tests), `exit_criteria.rs::a_blob_ticket_cannot_be_used_to_probe_for_blobs_in_another_snapshot` | Met |
 
 ### Criterion 1, measured
 
@@ -74,9 +74,9 @@ Four findings altered something rather than confirming it.
    expects a commit. The grammar is now closed to four shapes before libgit2 sees
    anything.
 
-3. **Hiding `refs/xvfs/` needs two spellings, not one.** Git resolves a short name
-   by trying `refs/<name>`, so the selector `xvfs/mounts/<id>` reaches
-   `refs/xvfs/mounts/<id>` — a live lease anchor — while looking nothing like the
+3. **Hiding `refs/gfs/` needs two spellings, not one.** Git resolves a short name
+   by trying `refs/<name>`, so the selector `gfs/mounts/<id>` reaches
+   `refs/gfs/mounts/<id>` — a live lease anchor — while looking nothing like the
    reserved prefix. Both spellings are rejected, and the check also runs against the
    *resolved* ref name so it holds for a spelling the parser did not anticipate.
 
@@ -144,7 +144,7 @@ patch export suffices for the first integration — also remain open.
 Stated so nobody mistakes silence for coverage.
 
 - **No FUSE client.** M1 is a server milestone; nothing has been mounted.
-- **No Git smart-HTTP gateway.** M5. The `refs/xvfs/` hiding configuration is
+- **No Git smart-HTTP gateway.** M5. The `refs/gfs/` hiding configuration is
   tested with a directly-invoked `upload-pack`, not through a gateway.
 - **No search.** M4. `PrepareSnapshot` exists; no manifest or index does.
 - **No overlay.** M3.
@@ -165,10 +165,10 @@ Stated so nobody mistakes silence for coverage.
 
 | Crate | Tests | Covers |
 | --- | ---: | --- |
-| `xvfs-types` | 52 | OIDs, byte paths, the closed selector grammar, error codes, ADR 0006's lease and timestamp policies |
-| `xvfs-proto` | 17 | wire conversions and the schema compatibility goldens |
-| `xvfs-git` | 51 | the format gate, tree ordering and paging, blob verification, lease anchors, `gc` survival |
-| `xvfs-server` | 120 | catalog and lease state machines, mirroring refspecs, capabilities, authorization, both API surfaces, the exit criteria |
+| `gfs-types` | 52 | OIDs, byte paths, the closed selector grammar, error codes, ADR 0006's lease and timestamp policies |
+| `gfs-proto` | 17 | wire conversions and the schema compatibility goldens |
+| `gfs-git` | 51 | the format gate, tree ordering and paging, blob verification, lease anchors, `gc` survival |
+| `gfs-server` | 120 | catalog and lease state machines, mirroring refspecs, capabilities, authorization, both API surfaces, the exit criteria |
 
 The gate is one script, `scripts/check.sh`, shared with CI: version pinning, format,
 Clippy with `-D warnings`, tests, docs, `cargo-deny`, the ADR 0001 license

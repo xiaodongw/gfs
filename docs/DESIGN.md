@@ -1,4 +1,4 @@
-# XVFS: Agent-Oriented Virtual Git Workspace
+# GFS: Agent-Oriented Virtual Git Workspace
 
 Status: Draft; core implementation choices accepted  
 Audience: engineering, infrastructure, security, and agent-platform teams  
@@ -6,7 +6,7 @@ Target platform: Linux-hosted coding agents
 
 ## 1. Summary
 
-XVFS is a Git-compatible repository service and a Rust FUSE client for short-lived,
+GFS is a Git-compatible repository service and a Rust FUSE client for short-lived,
 hosted coding-agent jobs. A job mounts an immutable Git snapshot, sees a normal
 directory tree, and downloads file data only when a process opens a file. Writes go
 to a local copy-on-write overlay. Code discovery uses a revision-aware server search
@@ -65,10 +65,10 @@ The first production version will not:
 An orchestrator creates one mount per job:
 
 ```text
-xvfs mount \
+gfs mount \
   --repo acme/monorepo \
   --rev refs/heads/main \
-  --state /var/lib/xvfs/jobs/job-123 \
+  --state /var/lib/gfs/jobs/job-123 \
   /work/repo
 ```
 
@@ -79,13 +79,13 @@ The agent uses normal file operations for known files and a dedicated command fo
 discovery:
 
 ```text
-xvfs search 'RequestContext' --glob 'services/**/*.rs'
-xvfs search --regex 'fn\s+authorize_' --json
-xvfs status
-xvfs diff --format git
+gfs search 'RequestContext' --glob 'services/**/*.rs'
+gfs search --regex 'fn\s+authorize_' --json
+gfs status
+gfs diff --format git
 ```
 
-`xvfs search` combines server results for the pinned base commit with a local search
+`gfs search` combines server results for the pinned base commit with a local search
 of modified and newly created overlay files. Deleted or replaced base paths are
 removed from server results. This is necessary for search to remain correct after
 the agent starts editing. A result set that was cut short by a budget, or that could
@@ -96,8 +96,8 @@ carries a synthesized read-only `.git`, and a `git` shim answers `status`, `diff
 `rev-parse`, `ls-files`, `show`, and pinned-commit `log` from the overlay journal and
 the snapshot API. Section 8.6 covers the boundary and what happens outside it.
 
-At job completion the orchestrator runs `xvfs diff` or `xvfs export`. A later phase
-adds `xvfs commit` and compare-and-swap branch updates.
+At job completion the orchestrator runs `gfs diff` or `gfs export`. A later phase
+adds `gfs commit` and compare-and-swap branch updates.
 
 ## 5. System context
 
@@ -105,7 +105,7 @@ adds `xvfs commit` and compare-and-swap branch updates.
 flowchart LR
     G[Standard Git client] -->|smart HTTP v2| GS[Git compatibility gateway]
     A[Agent process] -->|POSIX I/O| F[FUSE workspace daemon]
-    A -->|xvfs search/status/diff| C[XVFS CLI]
+    A -->|gfs search/status/diff| C[GFS CLI]
     F --> MC[Metadata cache]
     F --> BC[Host blob cache]
     F --> O[Per-job writable overlay]
@@ -132,7 +132,7 @@ The prototype will use the following implementation:
 - stock `git upload-pack` is executed as a sandboxed child process behind the Rust
   smart-HTTP gateway for clone/fetch compatibility;
 - the Linux filesystem uses `cberner/fuser`;
-- the FUSE client reads individual files through the XVFS snapshot/blob API, not
+- the FUSE client reads individual files through the GFS snapshot/blob API, not
   through `upload-pack`;
 - the mount presents a synthesized read-only `.git` plus a `git` shim, with a real
   partial-clone `.git` as a measured alternative (section 8.6).
@@ -142,7 +142,7 @@ but application control flow, APIs, authorization, search, orchestration, and
 filesystem behavior remain implemented in Rust. A native Rust Git wire-protocol
 engine is not in the planned scope.
 
-This choice constrains the repositories XVFS can host. libgit2 cannot read the
+This choice constrains the repositories GFS can host. libgit2 cannot read the
 `reftable` ref backend that stock Git 2.45 and later can create, and its SHA-256
 support is experimental and requires a non-default build. Server-side bare
 repositories are therefore created and maintained with the `files` ref backend, and
@@ -153,7 +153,7 @@ serving a partial view of it. Section 12 records the consequence for SHA-256.
 
 ### 6.1 Git is the source of truth
 
-XVFS does not invent a new commit, tree, or blob format. Repository data remains
+GFS does not invent a new commit, tree, or blob format. Repository data remains
 valid Git data, addressed by the repository's object hash algorithm. Internal IDs
 must carry the algorithm as well as the digest; code must not assume a 20-byte
 SHA-1 object ID because Git pack formats also support SHA-256 repositories.
@@ -176,7 +176,7 @@ commit OID, and all later tree, blob, and search requests name that OID. Respons
 repeat the resolved commit. This prevents a file from one branch generation being
 combined with search results or metadata from another generation.
 
-An explicit `xvfs refresh` may move a clean workspace to a new commit, but it does
+An explicit `gfs refresh` may move a clean workspace to a new commit, but it does
 so by creating a new mount generation and replacing the old bind mount rather than
 mutating a live FUSE namespace in place. This preserves the immutable-base
 assumption, avoids stale kernel dentries under long TTLs, and gives open handles
@@ -274,7 +274,7 @@ never returned before its anchor is durable. There is no client-visible gap betw
 revision resolution and lease activation.
 
 The anchor is a ref under a reserved namespace such as
-`refs/xvfs/mounts/{mount_id}`. The namespace is hidden from upload-pack and ordinary
+`refs/gfs/mounts/{mount_id}`. The namespace is hidden from upload-pack and ordinary
 ref enumeration, excluded from upstream mirror and prune refspecs, and rejected as a
 user-supplied revision. It is an implementation reachability root, not a published
 repository ref or an authorization mechanism. Maintenance and garbage collection
@@ -341,7 +341,7 @@ For smart HTTP, the gateway maps the two request phases as follows:
 For protocol v2, the gateway validates the `Git-Protocol` header and passes the
 negotiated value in `GIT_PROTOCOL`. The subprocess implements pkt-line framing,
 `ls-refs`, want/have negotiation, shallow behavior, partial-clone filters, pack
-deltas, and sideband output. XVFS still owns authentication, repository selection,
+deltas, and sideband output. GFS still owns authentication, repository selection,
 HTTP validation, deadlines, cancellation, concurrency limits, and auditing.
 
 Partial-clone support is controlled configuration, not merely a property of the Git
@@ -349,13 +349,13 @@ binary. The gateway enables `uploadpack.allowFilter` only when repository policy
 allows it, disables unselected filter families with
 `uploadpackfilter.<filter>.allow`, and validates the exact requested filter before
 starting the subprocess. That gateway validation matters because Git's per-filter
-configuration can allow a family more broadly than XVFS intends. The initial target
+configuration can allow a family more broadly than GFS intends. The initial target
 is exactly `blob:none`; `blob:limit` and bounded `tree:<depth>` are enabled only if
 M0 measurements require them. Broad or future filter forms are denied by default.
 Unadvertised-object features such as `allowAnySHA1InWant` remain disabled. The same
-protected configuration hides `refs/xvfs/` from advertisement and fetch.
+protected configuration hides `refs/gfs/` from advertisement and fetch.
 
-libgit2's pack builder is useful for XVFS-created objects and later commit/export
+libgit2's pack builder is useful for GFS-created objects and later commit/export
 features, but libgit2 does not provide a drop-in server-side upload-pack state
 machine. Reimplementing capability advertisement, negotiation, filtering,
 reachability security, and sideband streaming on libgit2 would add substantial
@@ -488,7 +488,7 @@ blobs are deduplicated by OID. Binary files and blobs over a configurable limit
 (suggested default: 8 MiB) are excluded from content search but remain available
 through file APIs. Index state records the exclusion reason. Generated and vendored
 tracked text is classified for observability and optional policy, but is not
-excluded by default because `xvfs-rg` would otherwise silently diverge from ordinary
+excluded by default because `gfs rg` would otherwise silently diverge from ordinary
 `rg`.
 
 Search responses carry the exact commit OID and index generation. Time, result,
@@ -565,14 +565,14 @@ dependency update and compatibility testing.
 
 ### 8.1 Processes and deployment
 
-`xvfs` is the user CLI. `xvfsd` owns the FUSE session, caches, network clients, and
+`gfs` is the user CLI. `gfs-fuse` owns the FUSE session, caches, network clients, and
 overlay.
 
 FUSE inside a container generally requires `/dev/fuse` and additional privilege.
-The preferred hosted deployment runs `xvfsd` as a trusted host service or Kubernetes
+The preferred hosted deployment runs `gfs-fuse` as a trusted host service or Kubernetes
 CSI node component, then bind-mounts a per-job workspace into the unprivileged agent
 container. Direct in-container mounting is supported only on platforms that safely
-expose FUSE. A selective `xvfs materialize` mode is a fallback for environments
+expose FUSE. A selective `gfs materialize` mode is a fallback for environments
 where mounting is impossible, but is not the primary architecture.
 
 Credentials belong to the host daemon where possible. A job receives only a mount
@@ -580,7 +580,7 @@ handle and scoped CLI socket, reducing token exposure inside the workload.
 
 ### 8.2 FUSE operation mapping
 
-`xvfsd` implements the `fuser::Filesystem` trait from `cberner/fuser`. Network and
+`gfs-fuse` implements the `fuser::Filesystem` trait from `cberner/fuser`. Network and
 other blocking storage work never runs on a FUSE callback thread without a bound;
 callbacks submit work to bounded executors and preserve cancellation and request
 deadlines.
@@ -641,7 +641,7 @@ boundary because a workload that requires the opposite needs a different design.
 
 Git modes supported initially are regular non-executable, regular executable,
 symlink, directory, and gitlink. A gitlink appears as an empty, read-only directory
-with inspectable XVFS metadata; recursive submodule mounting is explicit and later.
+with inspectable GFS metadata; recursive submodule mounting is explicit and later.
 
 ### 8.3 Local state
 
@@ -686,8 +686,8 @@ telemetry. A hard limit returns `EDQUOT` for new remote hydration while preservi
 overlay and cached access. Hard limits are opt-in because a build may legitimately
 need many files.
 
-An `xvfs-rg` compatibility wrapper translates a deliberately small, documented
-subset of common `rg` flags into `xvfs search`; unsupported options fail with a
+An `gfs rg` compatibility wrapper translates a deliberately small, documented
+subset of common `rg` flags into `gfs search`; unsupported options fail with a
 message unless `--hydrate` is explicitly requested. Hosted agent images place this
 wrapper early in `PATH` and include an `AGENTS.md` instruction. An MCP or native
 agent tool should expose the same search API. This is defense in depth, not a
@@ -729,7 +729,7 @@ nothing answers, tools fail in confusing ways and an agent's most likely repair 
 
 The MVP therefore presents a synthesized, read-only `.git` directory at the mount
 root containing `HEAD`, a `packed-refs` entry for the pinned revision, a minimal
-`config`, and an `xvfs.json` describing the repository, the pinned commit, and the
+`config`, and an `gfs.json` describing the repository, the pinned commit, and the
 API endpoint. It contains no object database and no index. This is deliberate about
 what it does and does not do:
 
@@ -739,9 +739,9 @@ what it does and does not do:
   returning a wrong answer, because a synthesized `.git` with an empty index would
   otherwise report every tracked file as deleted;
 - the directory is outside the overlay's change tracking. It is not searchable, does
-  not appear in `xvfs status`, and cannot be committed or exported.
+  not appear in `gfs status`, and cannot be committed or exported.
 
-Alongside it, a `git` front-end shim — the same pattern as `xvfs-rg`, installed
+Alongside it, a `git` front-end shim — the same pattern as `gfs rg`, installed
 early in `PATH` in hosted agent images — serves the high-frequency read-only
 subcommands from the overlay journal and the snapshot API: `status`, `diff`,
 `rev-parse`, `ls-files`, `show HEAD:<path>`, and `log -1` for the pinned commit. The
@@ -751,21 +751,21 @@ claim compatibility for an entire subcommand name. `GetCommit` supplies the one
 commit of metadata needed by the bounded `log -1` implementation.
 
 For the supported grammar, the shim is both cheaper and more accurate than real Git
-would be, because `xvfs status` is derived from the journal and touches no base
+would be, because `gfs status` is derived from the journal and touches no base
 metadata. Every other form fails with an actionable message. Under the synthesized
 `.git` option there is no generic `--hydrate` escape hatch: no real object database
 or index exists to delegate to. If M0 selects the real partial-clone option, an
 explicit hydration flag may delegate to stock Git under the mount's hydration
-budget. As with `xvfs-rg`, the shim is a usability and hydration-control measure,
+budget. As with `gfs rg`, the shim is a usability and hydration-control measure,
 not a security boundary; tools that bypass `PATH` are expected to see the
 documented limitations of the synthesized `.git`.
 
 The full-fidelity alternative is a real Git repository: a shallow, blobless clone
-whose promisor remote is the XVFS smart-HTTP gateway, with the mount serving as its
+whose promisor remote is the GFS smart-HTTP gateway, with the mount serving as its
 working tree. It would make substantially more of Git work, but integration is not
 assumed to be a small step: index population, checkout suppression, promisor fetch,
 working-tree configuration, and reconciliation with the overlay journal all need
-testing. Its costs also land exactly where XVFS is trying to save: `git status`
+testing. Its costs also land exactly where GFS is trying to save: `git status`
 stats every index entry, so each invocation sweeps the metadata of the entire
 monorepo; the index for a million-file repository is itself on the order of a
 hundred megabytes per job; the required current-tree metadata can exceed the
@@ -784,11 +784,11 @@ must be excluded from search, diff, export, and hydration accounting.
 
 ### 8.7 Bounding local overlay search
 
-`xvfs search` merges server results for the pinned base with a local search of the
+`gfs search` merges server results for the pinned base with a local search of the
 overlay. The server side is bounded by index policy, but the local side is not
 bounded by anything unless it is designed to be. A job that has run a build may hold
 gigabytes of `target/`, `node_modules/`, or generated output in its overlay, and a
-naive scan of every overlay file would make `xvfs search` slower than the `rg`
+naive scan of every overlay file would make `gfs search` slower than the `rg`
 invocation it replaces — the opposite of the product's purpose.
 
 Local search therefore applies the same class of policy the server index applies:
@@ -857,7 +857,7 @@ monorepos, not guaranteed SLOs:
 | Uncached source file first byte | p95 under 250 ms in-region |
 | Warm literal search on an indexed branch | p95 under 2 seconds |
 | Search-induced client blob hydration | zero bytes |
-| `xvfs status` and shim `git status` after edits | p95 under 200 ms, no base metadata sweep |
+| `gfs status` and shim `git status` after edits | p95 under 200 ms, no base metadata sweep |
 | Client disk for a job | overlay + bounded shared cache, independent of repository history size |
 | Crash recovery | no lost acknowledged overlay mutation in fault-injection tests |
 
@@ -929,7 +929,7 @@ cross-platform clients require separate designs.
 
 | Risk | Consequence | Mitigation |
 | --- | --- | --- |
-| Agent runs raw `rg`/scanner | Entire snapshot hydrates | Agent tool, `xvfs-rg`, hydration telemetry and optional hard quota |
+| Agent runs raw `rg`/scanner | Entire snapshot hydrates | Agent tool, `gfs rg`, hydration telemetry and optional hard quota |
 | FUSE unavailable in hosted container | Client cannot mount | Host daemon/CSI; validate in first spike; materialize fallback |
 | Build expects uncommon POSIX semantics | Incorrect build | Declare boundary, run filesystem suites, add operations from measured failures |
 | Search index not ready for arbitrary commit | Slow first search | Eager branch indexing, incremental manifests, on-demand operation with progress |
@@ -944,10 +944,10 @@ cross-platform clients require separate designs.
 | Overlay crash corrupts job | Lost work | WAL, atomic rename, fsync policy, model/fault tests |
 | Pinned commit pruned by GC during a job | Mount breaks irrecoverably mid-task | Durable retention lease anchored as a ref; maintenance treats live mounts as roots |
 | Lease expires while a job is alive | Mount loses its reachability root | Atomic mount creation, authenticated heartbeat renewal, grace interval, renewal alert |
-| Internal lease ref is advertised or pruned | Old commits leak or live mounts break | Hide `refs/xvfs/`, reserve it from user revisions, exclude it from mirror/prune refspecs |
+| Internal lease ref is advertised or pruned | Old commits leak or live mounts break | Hide `refs/gfs/`, reserve it from user revisions, exclude it from mirror/prune refspecs |
 | Agent or build tool requires a working `.git` | Task fails or agent runs `git init` | Synthesized read-only `.git`, `git` shim, M0 measurement of the partial-clone option |
 | Truncated search read as "not found" | Agent deletes or rewrites live code | Separate execution status and scoped coverage, missing-terminal failure, distinct truncation exit |
-| Overlay search scans build outputs | `xvfs search` slower than plain `rg` | Ignore rules, binary/size classification, local time and byte budgets |
+| Overlay search scans build outputs | `gfs search` slower than plain `rg` | Ignore rules, binary/size classification, local time and byte budgets |
 | libgit2 cannot open a target repository format | Repository unsupportable late in the project | Format validated at mirror creation; `reftable`/SHA-256 audited in M0 |
 | Writable `MAP_SHARED` unsupported by the FUSE setup | Some linkers and tools fail | Measure in M0, document the boundary, enable writeback cache only if it is safe |
 | Future-dated commit or skewed host clock | Build system treats edits as older | Sanitized snapshot time plus monotonic overlay logical clock |

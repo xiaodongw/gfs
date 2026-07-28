@@ -1,0 +1,50 @@
+[package]
+name = "gfs-mount"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+description = "FUSE filesystem adapter, mount daemon, and the control protocol"
+
+[dependencies]
+gfs-types = { workspace = true }
+gfs-proto = { workspace = true }
+gfs-overlay = { workspace = true }
+gfs-search = { workspace = true }
+
+fuser = { workspace = true }
+libc = { workspace = true }
+sha1 = { workspace = true }
+
+tokio = { workspace = true }
+tonic = { workspace = true }
+
+# The blob endpoint is HTTP, not gRPC, because a blob wants ranges and ETag
+# revalidation (DESIGN.md section 6.3). `hyper-util`'s pooled client rather than a
+# fresh connection per read: a build opens thousands of files, and a TCP handshake
+# per file would dominate the measured first-byte latency.
+bytes = { workspace = true }
+http = { workspace = true }
+http-body-util = { workspace = true }
+hyper = { workspace = true, features = ["client", "http1"] }
+hyper-util = { workspace = true }
+
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+# `gfs-test` carries the mount harness, and the harness needs a real server to
+# mount against. Both are `crates/` siblings: the cycle back through `gfs-test`
+# is a dev-dependency, which Cargo permits and which keeps this crate's own
+# build graph free of them.
+gfs-test = { workspace = true }
+gfs-service = { workspace = true }
+axum = { workspace = true }
+tempfile = { workspace = true }
+tokio-stream = { workspace = true }
+
+[lints]
+workspace = true

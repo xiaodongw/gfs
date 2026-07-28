@@ -1,0 +1,52 @@
+[package]
+name = "gfs-fuse"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+description = "The gfs-fuse mount daemon and the `git` shim"
+
+# Entry points, not a library. The filesystem itself is `gfs-mount`; this crate
+# turns a command line into a running daemon, which is what keeps `crates/` free
+# of any dependency on the workspace root.
+[[bin]]
+name = "gfs-fuse"
+path = "src/bin/gfs-fuse.rs"
+
+# The `git` shim. It lives here rather than in `gfs-cli` because it answers
+# entirely from the mount and the synthesized `.git` surface -- no server client,
+# no credential -- so it belongs with the filesystem, not with the API client.
+[[bin]]
+name = "gfs-git-shim"
+path = "src/bin/gfs-git-shim.rs"
+
+[dependencies]
+gfs-mount = { workspace = true }
+gfs-types = { workspace = true }
+# The daemon builds an `OverlayConfig`, and the shim renders the journal's
+# change kinds; both name overlay types directly rather than having `gfs-mount`
+# re-export them.
+gfs-overlay = { workspace = true }
+anyhow = { workspace = true }
+clap = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+
+[dev-dependencies]
+# `compat` and `export` drive the `gfs-git-shim` binary through
+# `CARGO_BIN_EXE_gfs-git-shim`, which only resolves inside the crate that
+# declares it. That is why those two tests stayed here when the rest followed
+# the library into `crates/gfs-mount`.
+gfs-test = { workspace = true }
+libc = { workspace = true }
+gfs-mount = { workspace = true }
+gfs-service = { workspace = true }
+axum = { workspace = true }
+tempfile = { workspace = true }
+tokio-stream = { workspace = true }
+
+[lints]
+workspace = true

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# POSIX conformance: pjdfstest against an XVFS mount, with an ext4 control.
+# POSIX conformance: pjdfstest against a GFS mount, with an ext4 control.
 #
 # PLAN.md M2.4 asks for a relevant subset of pjdfstest and xfstests. M2 and M3
 # both recorded it as not run. This runs it.
@@ -17,7 +17,7 @@
 # ADR 0003 treats as a privileged host action.
 #
 # Running as an ordinary user instead makes 76 of 238 test files fail on **ext4**,
-# for reasons that have nothing to do with XVFS. So the suite is run twice, as
+# for reasons that have nothing to do with GFS. So the suite is run twice, as
 # the same user, against ext4 and against the mount, and only the difference is
 # reported. ext4 is the oracle, the same way the raw tree is M2's oracle for the
 # mount and ripgrep is M4's for search: a suite that cannot be its own baseline
@@ -42,11 +42,11 @@ here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 WORKSPACE="${1:-}"
 if [ -z "$WORKSPACE" ] || [ ! -d "$WORKSPACE" ]; then
-  echo "usage: $0 <mounted-xvfs-workspace>" >&2
+  echo "usage: $0 <mounted-gfs-workspace>" >&2
   exit 2
 fi
 
-WORK="${XVFS_CONFORMANCE_DIR:-$HOME/xvfs-conformance}"
+WORK="${GFS_CONFORMANCE_DIR:-$HOME/gfs-conformance}"
 SUITE="$WORK/pjdfstest"
 mkdir -p "$WORK"
 
@@ -110,28 +110,28 @@ rm -rf "$CONTROL" "$SCRATCH"; mkdir -p "$CONTROL" "$SCRATCH"
 echo "== control run on $(df -PT "$CONTROL" | tail -1 | awk '{print $2}')"
 run_suite "$CONTROL" "$WORK/out-ext4"
 echo "== run on $(df -PT "$SCRATCH" | tail -1 | awk '{print $2}')"
-run_suite "$SCRATCH" "$WORK/out-xvfs"
+run_suite "$SCRATCH" "$WORK/out-gfs"
 
 clean_files "$WORK/out-ext4" >"$WORK/ext4.clean"
-clean_files "$WORK/out-xvfs" >"$WORK/xvfs.clean"
+clean_files "$WORK/out-gfs" >"$WORK/gfs.clean"
 
 echo
 printf 'test files:            %s\n' "$(ls "$SUITE"/tests/*/*.t | wc -l)"
 printf 'clean on ext4:         %s\n' "$(wc -l <"$WORK/ext4.clean")"
-printf 'clean on XVFS:         %s\n' "$(wc -l <"$WORK/xvfs.clean")"
-comm -23 "$WORK/ext4.clean" "$WORK/xvfs.clean" >"$WORK/xvfs-only-failures.txt"
-printf 'XVFS-only failures:    %s\n' "$(wc -l <"$WORK/xvfs-only-failures.txt")"
-printf 'XVFS-only passes:      %s  (ext4 fails, XVFS does not)\n' \
-  "$(comm -13 "$WORK/ext4.clean" "$WORK/xvfs.clean" | wc -l)"
+printf 'clean on GFS:         %s\n' "$(wc -l <"$WORK/gfs.clean")"
+comm -23 "$WORK/ext4.clean" "$WORK/gfs.clean" >"$WORK/gfs-only-failures.txt"
+printf 'GFS-only failures:    %s\n' "$(wc -l <"$WORK/gfs-only-failures.txt")"
+printf 'GFS-only passes:      %s  (ext4 fails, GFS does not)\n' \
+  "$(comm -13 "$WORK/ext4.clean" "$WORK/gfs.clean" | wc -l)"
 echo
-echo "== XVFS-only failures, with the suite's own description"
+echo "== GFS-only failures, with the suite's own description"
 while read -r n; do
   src="$SUITE/tests/$(echo "${n%.t}" | sed 's/_/\//').t"
   desc=$(grep -m1 '^desc=' "$src" 2>/dev/null | sed 's/desc=//;s/"//g')
-  f="$WORK/out-xvfs/$n.tap"
+  f="$WORK/out-gfs/$n.tap"
   nf=$(grep -c '^not ok ' "$f")
   tot=$(( $(grep -c '^ok ' "$f") + nf ))
   printf '  %-16s %2s/%-3s  %s\n' "${n%.t}" "$nf" "$tot" "$desc"
-done <"$WORK/xvfs-only-failures.txt"
+done <"$WORK/gfs-only-failures.txt"
 echo
-echo "raw TAP: $WORK/out-xvfs and $WORK/out-ext4"
+echo "raw TAP: $WORK/out-gfs and $WORK/out-ext4"

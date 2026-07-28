@@ -156,9 +156,9 @@ fi
 echo
 echo "== ADR 0001: stock Git is a subprocess, not a link-time dependency =="
 
-# The property: no crate in the graph links Git's internals. Git reaches XVFS
+# The property: no crate in the graph links Git's internals. Git reaches GFS
 # only through Command::new, which is not a derived work and therefore keeps
-# Git's GPL-2.0 off the XVFS binary.
+# Git's GPL-2.0 off the GFS binary.
 if printf '%s' "${metadata:-}" | grep -qE '"(libgit|git)-?(sys|internals)@' &&
   ! printf '%s' "${metadata:-}" | grep -q '"libgit2-sys@'; then
   bad "a crate appears to link Git internals; ADR 0001 requires subprocess invocation only"

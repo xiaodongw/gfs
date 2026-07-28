@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Fetch the M0 benchmark corpus as bare mirrors.
 #
-# Mirrors are the stand-in for the XVFS server's authoritative bare repository,
+# Mirrors are the stand-in for the GFS server's authoritative bare repository,
 # so they are configured the way section 7.2 of DESIGN.md requires: the `files`
 # ref backend, filtering enabled but restricted to the allowed families, and no
 # hooks. Every later spike serves out of these mirrors over file:// or the
@@ -9,7 +9,7 @@
 set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-CORPUS_DIR="${XVFS_CORPUS_DIR:-$HOME/xvfs-corpus}"
+CORPUS_DIR="${GFS_CORPUS_DIR:-$HOME/gfs-corpus}"
 MIRROR_DIR="$CORPUS_DIR/mirrors"
 LOG_DIR="$CORPUS_DIR/logs"
 mkdir -p "$MIRROR_DIR" "$LOG_DIR"
@@ -32,7 +32,7 @@ fetch_one() {
 
     # Server-side policy the gateway will later set explicitly. Set here so
     # local file:// benchmarks exercise the same filter policy as the gateway.
-    # Deny by default, then allow exactly the one filter XVFS policy permits.
+    # Deny by default, then allow exactly the one filter GFS policy permits.
     # Key names are Git's config names per filter family: `blob:none` and
     # `blob:limit` keep their colons, but the `tree:<depth>` family is `tree`.
     git --git-dir="$dest" config uploadpack.allowFilter true

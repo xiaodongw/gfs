@@ -53,7 +53,7 @@ license-files = []
 multiple-versions = "warn"
 wildcards = "deny"
 # The server must never link a Git wire-protocol implementation. ADR 0001 keeps
-# stock Git's GPL-2.0 off the XVFS binary specifically by executing it as a
+# stock Git's GPL-2.0 off the GFS binary specifically by executing it as a
 # child process, and that property is worth enforcing mechanically rather than
 # remembering.
 deny = [

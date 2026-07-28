@@ -17,7 +17,7 @@ The constraints that are already decided and must not be re-litigated here:
   unmeasured, and the amendment requires M2 to keep mount *publication* behind one
   replaceable seam and to mount and read as the same UID in its own tests.
 * **ADR 0005** — the `.git` surface is synthesized and has **six** entries, not
-  the four DESIGN.md listed: `HEAD`, `packed-refs`, `config`, `xvfs.json`,
+  the four DESIGN.md listed: `HEAD`, `packed-refs`, `config`, `gfs.json`,
   `objects/`, `refs/`. Without the two directories Git does not recognize the
   directory as a repository at all. The `git` shim is a correctness requirement,
   because `ls-files` and `diff` against the raw surface exit 0 with empty output.
@@ -27,7 +27,7 @@ The constraints that are already decided and must not be re-litigated here:
   content-verified before publication, and scoped to one repository.
 
 M3 owns the writable overlay, so everything in M2 is read-only: `EROFS` on every
-mutation, an empty `xvfs status`, and an empty `git diff` — all of which are the
+mutation, an empty `gfs status`, and an empty `git diff` — all of which are the
 *correct* answers for a read-only mount, and all of which M3 rewires to the
 journal.
 
@@ -35,7 +35,7 @@ journal.
 
 Four commits, each one green under `scripts/check.sh` before the next starts.
 
-### 1. Filesystem core (`xvfs-fuse`)
+### 1. Filesystem core (`gfs-fuse`)
 
 * `client.rs` — the snapshot API client: gRPC for metadata, HTTP for blob bytes,
   carrying the bearer token and the mount capability on every call.
@@ -54,9 +54,9 @@ Four commits, each one green under `scripts/check.sh` before the next starts.
 * `fs.rs` — the `fuser::Filesystem` implementation. Every callback that can touch
   the network hands its reply to a tokio task and returns immediately.
 
-### 2. Mount lifecycle (`xvfsd`, `xvfs`)
+### 2. Mount lifecycle (`gfs-fuse`, `gfs`)
 
-* `xvfsd` — the client daemon. `CreateMount` first, then `mount.json`, then the
+* `gfs-fuse` — the client daemon. `CreateMount` first, then `mount.json`, then the
   FUSE session, then publication. Heartbeat renewal on the server-supplied
   interval, with the ADR 0006 alert threshold; signal handling and forced
   teardown; a 0600 control socket carrying `inspect`, `health`, `refresh`, and
@@ -64,16 +64,16 @@ Four commits, each one green under `scripts/check.sh` before the next starts.
 * `publish.rs` — the seam ADR 0003's amendment demands. One trait, one local
   implementation (an atomically replaced symlink), and the bind-mount/CSI
   implementations left for M6.1/M7.4 to add without touching the filesystem code.
-* `xvfs mount|unmount|inspect|health|refresh` in the CLI, talking to the daemon.
+* `gfs mount|unmount|inspect|health|refresh` in the CLI, talking to the daemon.
 
 Landed as planned, with these additions discovered during the work: `state.rs`
 (`mount.json`), `control.rs` (the socket protocol), `lease.rs` (heartbeat health),
-`xvfs install-shim`, a `future` fixture carrying a 2050-dated commit, and a
+`gfs install-shim`, a `future` fixture carrying a 2050-dated commit, and a
 separate `tests/exit_criteria.rs` holding the six measured criteria. The shim
-binary lives in `xvfs-fuse` rather than in `xvfs-cli`, because it reads only the
+binary lives in `gfs-fuse` rather than in `gfs-cli`, because it reads only the
 mount and the synthesized surface.
 
-### 3. Compatibility (`xvfs-test`, `xvfs-git-shim`)
+### 3. Compatibility (`gfs-test`, `gfs-git-shim`)
 
 * A raw-tree materializer oracle built from `git ls-tree` and `git cat-file`, and
   a full-tree comparison against the mount.
@@ -157,7 +157,7 @@ ADR 0003's amendment asks only that publication stay behind one replaceable
 step. The local implementation is a symlink replaced by `rename(2)` because
 `mount --bind` needs `CAP_SYS_ADMIN`, and the ADR's entire argument is that the
 daemon needs no capability where it runs. The symlink gives exactly the property
-`xvfs refresh` needs: the swap is atomic, a path resolved after it reaches the
+`gfs refresh` needs: the swap is atomic, a path resolved after it reaches the
 new generation, and a descriptor opened before it keeps the old one.
 
 `MountPublisher` has one implementation today. The bind-mount and CSI forms
@@ -181,8 +181,8 @@ the same event.
 
 ### The `lease` subcommand, split out of `mount`
 
-M1's `xvfs mount` created a lease and nothing else. M2's `xvfs mount` mounts, so
-the lease-only path moved to `xvfs lease create|renew|release` rather than being
+M1's `gfs mount` created a lease and nothing else. M2's `gfs mount` mounts, so
+the lease-only path moved to `gfs lease create|renew|release` rather than being
 deleted: `scripts/dev-stack.sh` uses it to demonstrate M1's lease machine
 without a filesystem, and an orchestrator debugging a lease should not have to
 mount to do it.
@@ -191,22 +191,22 @@ mount to do it.
 
 `log -1` needs one commit's metadata, and DESIGN.md section 8.6 says `GetCommit`
 supplies it. The daemon calls `GetCommit` once at mount time and embeds the
-result in `.git/xvfs.json`, so the shim needs no network and — more importantly
+result in `.git/gfs.json`, so the shim needs no network and — more importantly
 — no credential. A shim that called the server would have to carry the mount
 capability, and putting a credential in a `PATH`-installed wrapper that any
 process in the job can invoke is a worse trade than one JSON read.
 
-That also decides where the binary lives: `xvfs-fuse`, not `xvfs-cli`, because
+That also decides where the binary lives: `gfs-fuse`, not `gfs-cli`, because
 it touches only the mount and the synthesized surface.
 
-### The shim refuses outside an XVFS workspace
+### The shim refuses outside a GFS workspace
 
 Installed early in `PATH`, it is invoked everywhere. Answering for an ordinary
 Git repository would replace a working `git` with a crippled one, so it walks up
-looking for `.git/xvfs.json` specifically and fails with "not an XVFS workspace"
+looking for `.git/gfs.json` specifically and fails with "not a GFS workspace"
 when it finds none.
 
-### XVFS does not enable `FUSE_WRITEBACK_CACHE`
+### GFS does not enable `FUSE_WRITEBACK_CACHE`
 
 Added after the milestone, closing PLAN.md M2.3's open mmap bullet. Measured in
 `tests/mmap.rs`: writable `MAP_SHARED` works on FUSE **without** the writeback
@@ -215,7 +215,7 @@ and `mtime` to the kernel, which ADR 0006's overlay logical clock cannot allow,
 because the daemon has to assign `mtime` for an edit to be provably newer than
 the base under host clock skew.
 
-The write side needed its own one-file probe filesystem: XVFS refuses a
+The write side needed its own one-file probe filesystem: GFS refuses a
 read-write `open`, so a writable mapping fails before `mmap` is reached and
 measuring against the real mount would only re-measure that it is read-only.
 
@@ -239,9 +239,9 @@ exited 1 would be read by a script as a successful non-empty diff.
   is the test that found it.
 - **The `content` fixture's `large-blob.bin` is 12 MiB**, which is what makes
   the single-flight test meaningful: eight concurrent openers reliably overlap.
-- **A backgrounded daemon must not inherit stderr.** `xvfs mount` redirects the
-  daemon's stderr to `<state-dir>/xvfsd.log`. Without it a daemon holds the
-  write end of the caller's pipe open, so `xvfs mount | tee` never sees EOF and
+- **A backgrounded daemon must not inherit stderr.** `gfs mount` redirects the
+  daemon's stderr to `<state-dir>/gfs-fuse.log`. Without it a daemon holds the
+  write end of the caller's pipe open, so `gfs mount | tee` never sees EOF and
   appears to hang long after the command finished. This was found by the dev
   stack hanging for ten minutes with no output.
 - **Paths are made absolute inside `Daemon::start`.** A symlink target resolves
@@ -252,7 +252,7 @@ exited 1 would be read by a script as a successful non-empty diff.
   workspace sees `<state-dir>/generations/N`. Correct, and worth knowing: a bind
   mount would report the workspace path instead, so the two publishers differ
   observably here. M6.1 owns whether that matters to the pilot's tooling.
-- **A second bug the oracle caught, in the oracle.** `xvfs_test::git_raw`
+- **A second bug the oracle caught, in the oracle.** `gfs_test::git_raw`
   returns `String::from_utf8_lossy` of stdout, so reading `git ls-tree -z`
   through it mangled the two non-UTF-8 fixture names into U+FFFD — and the
   *mount*, which had the bytes right, looked wrong. `git_bytes` is the

@@ -7,7 +7,7 @@
 
 ## Context
 
-DESIGN.md section 8.1 proposes running `xvfsd` as a trusted host service or
+DESIGN.md section 8.1 proposes running `gfs-fuse` as a trusted host service or
 Kubernetes CSI node component and bind-mounting a per-job workspace into the
 unprivileged agent container, with direct in-container mounting "supported only
 on platforms that safely expose FUSE". M0.2 was to decide between direct mount,
@@ -116,7 +116,7 @@ The measurements here transfer to it (a CSI node plugin is a privileged host
 component that publishes a mount into an unprivileged pod), but "transfer" is
 an argument, not a measurement.
 
-**`xvfs materialize` as the primary path.** Not needed. Every environment tested
+**`gfs materialize` as the primary path.** Not needed. Every environment tested
 can mount somewhere. PLAN.md M6.1 says to remove `materialize` from the design
 if every target environment can mount; that decision cannot be finalized until
 the real hosted runner is tested.
@@ -203,12 +203,12 @@ M2 is complete: the prototype mounts and serves a workspace locally
 ([M2 report](../reports/m2-completion.md)). The deferral's condition is therefore
 met and re-running `spikes/fuse-probe/deployment-matrix.sh` on the real hosted
 runner and on Kubernetes is unblocked. What M2 owed in exchange was delivered:
-mount publication is behind one replaceable step (`xvfs-fuse/src/publish.rs`),
+mount publication is behind one replaceable step (`crates/gfs-mount/src/publish.rs`),
 and M2's own tests mount and read as the same UID.
 
 ### When this stops being deferrable
 
 Before M6.1. The pilot's orchestrator bind-mounts a workspace into an unprivileged
 container, which is exactly the path that is `BLOCKED` locally and unmeasured on
-Kubernetes. `xvfs materialize` also cannot be resolved until then, for the reason
+Kubernetes. `gfs materialize` also cannot be resolved until then, for the reason
 already given under Alternatives.

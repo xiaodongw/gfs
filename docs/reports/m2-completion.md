@@ -19,10 +19,10 @@ the claim can be checked rather than taken.
 
 | # | Criterion | Verified by | Result |
 | --- | --- | --- | --- |
-| 1 | Cold mount meets the startup/download target | `xvfs-fuse/tests/exit_criteria.rs::criterion_1_cold_mount_meets_the_startup_and_download_target` | **Met, measured** |
+| 1 | Cold mount meets the startup/download target | `gfs-fuse/tests/exit_criteria.rs::criterion_1_cold_mount_meets_the_startup_and_download_target` | **Met, measured** |
 | 2 | Reading selected files transfers only required metadata and blobs | `exit_criteria.rs::criterion_2_...`, `mount.rs::reading_one_file_does_not_hydrate_its_siblings` | **Met, measured** |
 | 3 | Representative read-only build/analysis tasks succeed, with repository-root probing working against the `.git` surface | `exit_criteria.rs::criterion_3_...`, `compat.rs::stock_git_finds_the_repository_root_through_the_synthesized_surface` | Met **within a bounded definition of "representative"** — see below |
-| 4 | Base timestamps stable across remounts and hosts, including future-dated commits and clock skew | `exit_criteria.rs::criterion_4_a_future_dated_commit_reports_a_sane_base_timestamp`, `::criterion_4_base_timestamps_are_identical_across_remounts`, `xvfs-types::time` unit tests | Met |
+| 4 | Base timestamps stable across remounts and hosts, including future-dated commits and clock skew | `exit_criteria.rs::criterion_4_a_future_dated_commit_reports_a_sane_base_timestamp`, `::criterion_4_base_timestamps_are_identical_across_remounts`, `gfs-types::time` unit tests | Met |
 | 5 | Refresh exposes only the old or new generation; open old-generation handles stay valid | `lifecycle.rs::refresh_swaps_generations_and_keeps_open_handles_on_the_old_one`, `publish.rs` unit tests | Met |
 | 6 | Daemon or server failure does not corrupt the shared cache | `exit_criteria.rs::criterion_6_daemon_failure_does_not_corrupt_the_shared_cache`, `::criterion_6_server_failure_leaves_cached_content_readable` | Met |
 
@@ -82,10 +82,10 @@ Read-only `mmap` works against the mount today, both `MAP_PRIVATE` and
 `MAP_SHARED` — which is what a language server or a compiler that maps its inputs
 needs. A writable mapping is refused at `open(2)` with `EROFS`, before `mmap` is
 reached, so the FUSE-level question needed a separate one-file probe filesystem
-to answer: XVFS refuses a read-write open, and measuring against it would only
+to answer: GFS refuses a read-write open, and measuring against it would only
 re-measure that.
 
-**Writable `MAP_SHARED` works without `FUSE_WRITEBACK_CACHE`, so XVFS does not
+**Writable `MAP_SHARED` works without `FUSE_WRITEBACK_CACHE`, so GFS does not
 enable it.** That is the useful half of the result, because enabling writeback
 would have been actively harmful: it transfers ownership of `size` and `mtime` to
 the kernel, and ADR 0006's overlay logical clock requires the *daemon* to assign
@@ -114,7 +114,7 @@ is now the reason criterion 6 can assert **0 bytes re-fetched**.
 
 ### 2. The test oracle corrupted the very paths it was checking
 
-`xvfs_test::git_raw` returns `String::from_utf8_lossy` of stdout. Reading
+`gfs_test::git_raw` returns `String::from_utf8_lossy` of stdout. Reading
 `git ls-tree -z` through it mangled the two non-UTF-8 fixture names into U+FFFD
 — and the *mount*, which had the bytes exactly right, was reported as the thing
 that was wrong. `git_bytes` is now the byte-exact form and the oracle uses it;
@@ -126,11 +126,11 @@ insurance that is never exercised is not insurance.
 
 ### 3. A backgrounded daemon must not inherit stderr
 
-`xvfs mount` starts `xvfsd` and returns. A daemon holding the caller's inherited
-stderr keeps the write end of that pipe open, so `xvfs mount | tee` never sees
+`gfs mount` starts `gfs-fuse` and returns. A daemon holding the caller's inherited
+stderr keeps the write end of that pipe open, so `gfs mount | tee` never sees
 EOF and appears to hang long after the command finished — which is exactly what
 the development stack did, for ten minutes, with no output at all. The daemon's
-stderr now goes to `<state-dir>/xvfsd.log`.
+stderr now goes to `<state-dir>/gfs-fuse.log`.
 
 ### 4. Publication needs absolute paths
 
@@ -168,7 +168,7 @@ after it reaches the new generation, and a descriptor opened before it keeps the
 old one.
 
 **The `git` shim needs no credential.** The daemon calls `GetCommit` once at
-mount time and embeds the result in `.git/xvfs.json`, so the shim's bounded
+mount time and embeds the result in `.git/gfs.json`, so the shim's bounded
 `log -1` reads a local file. A shim that called the server would have to carry
 the mount capability, and putting a credential in a `PATH`-installed wrapper any
 process can invoke is a worse trade than one JSON read.
@@ -179,7 +179,7 @@ process can invoke is a worse trade than one JSON read.
 
 PLAN.md M2.4's first bullet asks for a relevant subset of these suites.
 **Neither was run.** Neither is installed in this environment and neither is
-packaged as a Rust dependency. `xvfs-fuse/tests/compat.rs` covers a hand-written
+packaged as a Rust dependency. `gfs-fuse/tests/compat.rs` covers a hand-written
 subset of the same ground — `ENOTDIR` and `EISDIR` for the wrong object kind,
 `ENAMETOOLONG`, reads past EOF, kernel-enforced permissions, the read-only
 boundary — and says in its own module documentation that it is a subset rather
@@ -233,7 +233,7 @@ reason: there is nothing yet to write.
 
 | Suite | Cases | Covers |
 | --- | ---: | --- |
-| `xvfs-fuse` unit tests | 33 | inode lifetimes, cache eviction and pinning, attribute mapping, the `.git` surface, publication, lease health, the shim's pathspec matcher |
+| `gfs-fuse` unit tests | 33 | inode lifetimes, cache eviction and pinning, attribute mapping, the `.git` surface, publication, lease health, the shim's pathspec matcher |
 | `tests/mount.rs` | 25 | metadata and inode model, blob cache, modes and symlinks, non-UTF-8 paths, 5002-entry pagination, 40-level nesting, `EROFS`, `statfs`, server loss |
 | `tests/lifecycle.rs` | 8 | ordering, `mount.json`, control socket, lease renewal and failure, refresh generations, double-start refusal |
 | `tests/compat.rs` | 20 | raw-tree oracle over 7 fixtures, filtered-checkout divergence, POSIX subset, stock Git against the surface, the shim's frozen grammar |

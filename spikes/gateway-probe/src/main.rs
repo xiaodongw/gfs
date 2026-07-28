@@ -19,7 +19,7 @@ use std::process::Command;
 use upload_pack::{FilterPolicy, GitProtocol, UploadPack, UploadPackPolicy};
 
 #[derive(Parser)]
-#[command(about = "XVFS M0.3 smart-HTTP gateway probe")]
+#[command(about = "GFS M0.3 smart-HTTP gateway probe")]
 struct Cli {
   #[command(subcommand)]
   cmd: Cmd,
@@ -127,10 +127,10 @@ fn git(dir: &Path, args: &[&str]) -> Result<std::process::Output> {
       // Object-writing commands such as `commit-tree` need an identity, and
       // the hermetic config above removes the developer's. Without these the
       // probe's own setup fails in a way that looks like a gateway result.
-      .env("GIT_AUTHOR_NAME", "XVFS Probe")
-      .env("GIT_AUTHOR_EMAIL", "probe@xvfs.invalid")
-      .env("GIT_COMMITTER_NAME", "XVFS Probe")
-      .env("GIT_COMMITTER_EMAIL", "probe@xvfs.invalid")
+      .env("GIT_AUTHOR_NAME", "GFS Probe")
+      .env("GIT_AUTHOR_EMAIL", "probe@gfs.invalid")
+      .env("GIT_COMMITTER_NAME", "GFS Probe")
+      .env("GIT_COMMITTER_EMAIL", "probe@gfs.invalid")
       .output()?,
   )
 }
@@ -329,7 +329,7 @@ fn check_http_headers(gw: &RunningGateway, repo: &str) -> Result<CheckResult> {
 fn check_hidden_refs(bare: &Path, url: &str, work: &Path) -> Result<Vec<CheckResult>> {
   let mut out = Vec::new();
   let head = git_ok(bare, &["rev-parse", "HEAD"])?.trim().to_string();
-  let lease = "refs/xvfs/mounts/gateway-probe";
+  let lease = "refs/gfs/mounts/gateway-probe";
   git_ok(bare, &["update-ref", lease, &head])?;
 
   // A lease ref must be invisible in both protocol versions; a client picks
@@ -342,7 +342,7 @@ fn check_hidden_refs(bare: &Path, url: &str, work: &Path) -> Result<Vec<CheckRes
       .env("GIT_CONFIG_GLOBAL", "/dev/null")
       .env("GIT_CONFIG_SYSTEM", "/dev/null")
       .output()?;
-    if String::from_utf8_lossy(&ls.stdout).contains("refs/xvfs/") {
+    if String::from_utf8_lossy(&ls.stdout).contains("refs/gfs/") {
       leaked = Some(label);
       break;
     }
@@ -362,7 +362,7 @@ fn check_hidden_refs(bare: &Path, url: &str, work: &Path) -> Result<Vec<CheckRes
 
   let mut per_version: Vec<(&str, bool)> = Vec::new();
   if let Ok(oid) = &orphan {
-    git_ok(bare, &["update-ref", "refs/xvfs/mounts/orphan-probe", oid])?;
+    git_ok(bare, &["update-ref", "refs/gfs/mounts/orphan-probe", oid])?;
     for (label, proto) in [("v0", "protocol.version=0"), ("v2", "protocol.version=2")] {
       let dst = work.join(format!("want-unadvertised-{label}"));
       let _ = std::fs::remove_dir_all(&dst);
@@ -382,18 +382,18 @@ fn check_hidden_refs(bare: &Path, url: &str, work: &Path) -> Result<Vec<CheckRes
           .unwrap_or(false);
       per_version.push((label, landed));
     }
-    let _ = git(bare, &["update-ref", "-d", "refs/xvfs/mounts/orphan-probe"]);
+    let _ = git(bare, &["update-ref", "-d", "refs/gfs/mounts/orphan-probe"]);
   }
   let _ = git(bare, &["update-ref", "-d", lease]);
 
   match leaked {
     Some(label) => out.push(fail(
       "hidden_refs",
-      format!("refs/xvfs/ advertised over {label}"),
+      format!("refs/gfs/ advertised over {label}"),
     )),
     None => out.push(pass(
       "hidden_refs",
-      "refs/xvfs/ absent from v0 and v2 advertisements",
+      "refs/gfs/ absent from v0 and v2 advertisements",
     )),
   }
 
@@ -410,7 +410,7 @@ fn check_hidden_refs(bare: &Path, url: &str, work: &Path) -> Result<Vec<CheckRes
   } else if leaked_versions.is_empty() {
     out.push(pass(
       "unadvertised_want",
-      "a commit reachable only from refs/xvfs/ is not fetchable by OID in v0 or v2",
+      "a commit reachable only from refs/gfs/ is not fetchable by OID in v0 or v2",
     ));
   } else if leaked_versions == ["v2"] {
     // Confirmed and understood: see docs/adr/0002. `allowAnySHA1InWant` is
@@ -533,7 +533,7 @@ fn check_clone_matrix(bare: &Path, url: &str, work: &Path) -> Result<Vec<CheckRe
 fn check_filter_policy(url: &str, work: &Path) -> Result<Vec<CheckResult>> {
   let mut out = Vec::new();
   // Each of these sits in a family that Git's own configuration permits at a
-  // coarser granularity than XVFS policy does, so each must be stopped by the
+  // coarser granularity than GFS policy does, so each must be stopped by the
   // gateway's request validation rather than by Git.
   for spec in [
     "tree:0",
@@ -654,7 +654,7 @@ fn check_repo_selection(root: &Path) -> Result<CheckResult> {
 
 fn tempdir() -> Result<TempDir> {
   let base = std::env::temp_dir().join(format!(
-    "xvfs-gateway-probe-{}-{}",
+    "gfs-gateway-probe-{}-{}",
     std::process::id(),
     std::time::SystemTime::now()
       .duration_since(std::time::UNIX_EPOCH)?

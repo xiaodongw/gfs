@@ -16,9 +16,9 @@ Decision: [ADR 0003](../../docs/adr/0003-fuse-deployment-model.md).
 cd spikes
 cargo build -p fuse-probe
 ./target/debug/fuse-probe capabilities
-./target/debug/fuse-probe measure --dir /tmp/xvfs-probe --files 64 \
+./target/debug/fuse-probe measure --dir /tmp/gfs-probe --files 64 \
     --file-size 65536 --latency-ms 20 --parallel 16
-docker build -t xvfs-fuse-probe:latest fuse-probe/
+docker build -t gfs-fuse-probe:latest fuse-probe/
 ./fuse-probe/deployment-matrix.sh
 ```
 

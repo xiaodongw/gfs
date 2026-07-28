@@ -3,7 +3,7 @@
 //! DESIGN.md section 6.1 is explicit that internal IDs must carry the hash
 //! algorithm alongside the digest and that no code may assume a 20-byte SHA-1.
 //! These types are the M0 proof that the rule is implementable against libgit2;
-//! M1.1 re-homes them in `xvfs-types`.
+//! M1.1 re-homes them in `gfs-types`.
 
 use std::fmt;
 
@@ -269,7 +269,7 @@ pub fn b64url(bytes: &[u8]) -> String {
   out
 }
 
-/// The Git file modes XVFS commits to supporting (DESIGN.md section 8.2).
+/// The Git file modes GFS commits to supporting (DESIGN.md section 8.2).
 #[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EntryKind {

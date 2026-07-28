@@ -33,7 +33,7 @@ export SOURCE_DATE_EPOCH
 
 # Remap the workspace root and the Cargo registry to fixed names so the paths
 # baked into the binary do not depend on where it was built.
-remap="--remap-path-prefix=$PWD=/xvfs"
+remap="--remap-path-prefix=$PWD=/gfs"
 remap="$remap --remap-path-prefix=${CARGO_HOME:-$HOME/.cargo}/registry=/cargo-registry"
 
 export CARGO_INCREMENTAL=0

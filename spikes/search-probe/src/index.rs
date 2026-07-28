@@ -35,7 +35,7 @@ pub const MAX_INDEXED_BYTES: usize = 8 * 1024 * 1024;
 
 /// Classify a blob the way the server index must, before it is indexed.
 ///
-/// Deliberately close to what ripgrep does, because `xvfs-rg` has to agree with
+/// Deliberately close to what ripgrep does, because `gfs rg` has to agree with
 /// `rg` or the substitution is a lie: a NUL byte in the first block means
 /// binary.
 pub fn classify(content: &[u8]) -> Option<Exclusion> {

@@ -17,7 +17,7 @@ Decision: [ADR 0004](../../docs/adr/0004-search-representation.md).
 cd spikes
 cargo build -p search-probe --release
 S=./target/release/search-probe
-M="$XVFS_CORPUS_DIR/mirrors"
+M="$GFS_CORPUS_DIR/mirrors"
 $S build     --repo $M/linux.git
 $S manifests --repo $M/linux.git --commits 25 --retained 200
 $S verify    --repo $M/vscode.git --patterns TODO RequestContext '```' 日本語
@@ -83,9 +83,9 @@ naive builder has obvious headroom.
 
 Compared over a raw materialized tree (`ls-tree` + `cat-file` bytes, not
 `git checkout`, so `.gitattributes` conversion cannot make the oracle disagree
-with what XVFS serves):
+with what GFS serves):
 
-| Pattern | XVFS | ripgrep | Agree |
+| Pattern | GFS | ripgrep | Agree |
 | --- | ---: | ---: | :---: |
 | `TODO` | 1587 | 1587 | yes |
 | `RequestContext` | 284 | 284 | yes |

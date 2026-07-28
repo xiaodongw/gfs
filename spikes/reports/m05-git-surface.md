@@ -46,9 +46,9 @@ does and does not absorb: 1000 repeated `stat(2)` calls on one path produced
 the *first* stat of each distinct path. Every one is an upcall.
 
 So `git status` under the partial-clone option is a full metadata sweep of the
-monorepo — the specific cost XVFS exists to eliminate — run by agents out of
+monorepo — the specific cost GFS exists to eliminate — run by agents out of
 habit, repeatedly, in a job whose premise is not sweeping the tree. Against
-that, `xvfs status` is derived from the overlay journal and touches no base
+that, `gfs status` is derived from the overlay journal and touches no base
 metadata at all.
 
 The 9.7 MiB per-job index is a separate objection: it is written at mount time,
@@ -58,7 +58,7 @@ it scales with the repository rather than the job, and it is a second view of
 ## Behaviour of the synthesized surface
 
 > **The specified contents are not sufficient.** DESIGN.md section 8.6 lists
-> `HEAD`, `packed-refs`, `config`, and `xvfs.json`. With exactly those four
+> `HEAD`, `packed-refs`, `config`, and `gfs.json`. With exactly those four
 > files Git does not recognize the directory as a repository at all and every
 > command below fails with `not a git repository`. Empty `objects/` and `refs/`
 > directories are also required. The MVP surface is six entries, not four.

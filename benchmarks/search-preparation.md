@@ -26,11 +26,11 @@ have to be replaced by a policy that rations it.
 
 ```sh
 ./spikes/corpus/fetch-corpus.sh    # once; ~12.5 GiB of bare mirrors
-cargo build --release -p xvfs-server --example prepare-bench
+cargo build --release -p gfs-server --example prepare-bench
 
-./target/release/examples/prepare-bench ~/xvfs-corpus/mirrors/vscode.git main 100
-./target/release/examples/prepare-bench ~/xvfs-corpus/mirrors/rust.git   main 100
-./target/release/examples/prepare-bench ~/xvfs-corpus/mirrors/linux.git  master 100
+./target/release/examples/prepare-bench ~/gfs-corpus/mirrors/vscode.git main 100
+./target/release/examples/prepare-bench ~/gfs-corpus/mirrors/rust.git   main 100
+./target/release/examples/prepare-bench ~/gfs-corpus/mirrors/linux.git  master 100
 ```
 
 The third argument is how far back the arbitrary commit is. `0` resolves to the
@@ -156,7 +156,7 @@ retention policy in M7.2 should be written knowing it.
 - Cold preparation on linux spans 53–78 s across six runs. The spread is I/O,
   not compute; it has not been measured on a warm page cache or on the hosted
   runner's disk, and M6.1 will need the latter.
-- The p95 is measured server-side, on loopback, with no client. `xvfs search`
+- The p95 is measured server-side, on loopback, with no client. `gfs search`
   through the daemon adds the overlay scan and the gRPC round trip; M4.5's own
   criterion is the comparison against `rg`, which is a separate measurement.
 - The 1.4× base-storage gap against the projection is stated, not decomposed. If

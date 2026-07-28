@@ -5,15 +5,15 @@ Milestone: M5 (PLAN.md section 8)
 Status: **Complete**, with one recorded gap (the client-version matrix) and one
 deliberate omission (a process memory limit) carried forward.
 
-M1–M4 built the XVFS-native path: a pinned snapshot API, a lazy mount, a
+M1–M4 built the GFS-native path: a pinned snapshot API, a lazy mount, a
 crash-safe overlay, and revision-aware search. None of it speaks Git's wire
-protocol, so a repository XVFS serves was reachable only by XVFS. M5 adds
+protocol, so a repository GFS serves was reachable only by GFS. M5 adds
 `git clone` and `git fetch` over smart HTTP without weakening any boundary the
 earlier milestones established.
 
 The implementation is the one ADR 0001 accepted and DESIGN.md section 7.2
 describes: a Rust gateway that authenticates, authorizes, limits, and streams to
-a sandboxed stock `git upload-pack` child. Git owns the protocol. XVFS owns
+a sandboxed stock `git upload-pack` child. Git owns the protocol. GFS owns
 everything around it.
 
 ## The exit gate
@@ -22,8 +22,8 @@ PLAN.md section 8 states two criteria.
 
 | # | Criterion | Verified by | Result |
 | --- | --- | --- | --- |
-| 1 | Stock Git clone/fetch and partial-clone tests pass the declared version/feature matrix | `xvfs-server/tests/gateway.rs`, corpus measurement below | **Met for the feature matrix; the *version* row is not covered** — see gaps |
-| 2 | Git traffic cannot bypass the same repository authorization used by XVFS APIs | `xvfs-server/tests/gateway.rs` | **Met** — the gateway calls `Authorizer::authorize_repository`, the same function every other surface calls |
+| 1 | Stock Git clone/fetch and partial-clone tests pass the declared version/feature matrix | `gfs-server/tests/gateway.rs`, corpus measurement below | **Met for the feature matrix; the *version* row is not covered** — see gaps |
+| 2 | Git traffic cannot bypass the same repository authorization used by GFS APIs | `gfs-server/tests/gateway.rs` | **Met** — the gateway calls `Authorizer::authorize_repository`, the same function every other surface calls |
 
 ### Criterion 1: measured on the worst case
 
@@ -49,7 +49,7 @@ The full clone was verified independently rather than by exit status:
 `git fsck --connectivity-only` is clean, `HEAD` equals the bare repository's
 `3dab139d`, and the clone holds 939 tags plus one branch — exactly the
 heads-and-tags set `git clone --bare` fetches, with none of the mirror's 1 930
-`refs/pull/*` and **zero** `refs/xvfs/*`.
+`refs/pull/*` and **zero** `refs/gfs/*`.
 
 ### Criterion 2: the same function, and the boundary that is not claimed
 
@@ -71,7 +71,7 @@ acceptance test expecting the Git path to deny it, and none was written.
 
 What *is* enforced is discovery: a live lease anchor is absent from the v0
 advertisement and from v2 `ls-refs`, and stays absent when the repository's own
-configuration appends `!refs/xvfs/` to `transfer.hideRefs`.
+configuration appends `!refs/gfs/` to `transfer.hideRefs`.
 
 ## Findings
 
@@ -100,7 +100,7 @@ hand-crafted request carrying `filter blob:none` against a filter-disabled
 server is refused `403` even though nothing advertised it. Both halves are
 tested; neither is redundant.
 
-### 3. `RLIMIT_AS` would break the repositories XVFS exists to serve
+### 3. `RLIMIT_AS` would break the repositories GFS exists to serve
 
 PLAN.md M5.3 lists a memory limit. There is none, and the reason is measured:
 `upload-pack` mmaps the repository's packfiles and mapped pack bytes count
@@ -135,7 +135,7 @@ bytes and aborts the response if a reserved ref appears.
 
 It runs on `GET /info/refs` and on nothing else. A `POST /git-upload-pack`
 response carries a **packfile**, whose bytes are arbitrary repository content: a
-blob containing the ASCII `refs/xvfs/` is ordinary — the gateway's own source
+blob containing the ASCII `refs/gfs/` is ordinary — the gateway's own source
 files contain it — and a scanner over pack bytes would abort legitimate clones.
 The advertisement is pkt-lines of ref names and capabilities and never carries
 object content, which is what makes the check safe there and unsafe elsewhere.
@@ -168,8 +168,8 @@ untrusted repositories — and the suite asserts it rather than trusting it.
 
 ## Test inventory
 
-35 tests are M5's: 15 unit tests in `xvfs-server/src/gateway/` and 20 protocol
-tests in `xvfs-server/tests/gateway.rs`. Every test that transfers objects
+35 tests are M5's: 15 unit tests in `crates/gfs-service/src/gateway/` and 20 protocol
+tests in `gfs-server/tests/gateway.rs`. Every test that transfers objects
 verifies the result against a **direct filesystem clone** of the same bare
 repository and runs `git fsck` on it, because the gateway's protocol engine is
 stock `upload-pack` and cannot be its own oracle.
@@ -186,7 +186,7 @@ stock `upload-pack` and cannot be its own oracle.
 | Repository shapes | 4 | packed, 16 MiB content, 5 000-entry directory, non-UTF-8 paths, 40-deep paths, empty/unborn HEAD, alternates-based, corrupt object |
 | Isolation | 3 | reserved namespace under v0 and v2 with a live lease, hostile repository config, formats ADR 0001 refuses at ingest |
 | Limits and abuse | 4 | gzip round-trip and bomb, a fixed malformed-input corpus over bodies/names/headers, admission refusal, disconnect mid-transfer |
-| Version matrix | 1 | every binary named by `XVFS_GIT_CLIENTS`; **skips loudly when unset** |
+| Version matrix | 1 | every binary named by `GFS_GIT_CLIENTS`; **skips loudly when unset** |
 
 The malformed-input sweep is a fixed corpus rather than a random one: a
 randomized sweep that fails is not reproducible, and every shape in it — bad
@@ -200,7 +200,7 @@ the server survived.
 **The client-version matrix is not covered.** PLAN.md M5.2 asks for multiple
 maintained Git client versions on Linux and at least one other OS. Only the
 pinned 2.53.0 is installed here. `every_configured_git_client_version_clones`
-runs whatever `XVFS_GIT_CLIENTS` names and prints a skip notice otherwise, so
+runs whatever `GFS_GIT_CLIENTS` names and prints a skip notice otherwise, so
 the absence is visible in test output rather than implied by a passing run. This
 matters more than it looks: ADR 0002's v0/v2 split is version-sensitive and the
 ADR already says it must be re-measured per client and server version. **Close

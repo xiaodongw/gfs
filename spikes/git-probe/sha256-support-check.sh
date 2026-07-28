@@ -3,11 +3,11 @@
 #
 # DESIGN.md section 5.1 says libgit2's SHA-256 support "is experimental and
 # requires a non-default build". That is true of libgit2 itself but understates
-# the situation for XVFS, because XVFS reaches libgit2 through `git2-rs`. This
+# the situation for GFS, because GFS reaches libgit2 through `git2-rs`. This
 # script establishes the two facts separately:
 #
 #   1. libgit2-sys DOES build with GIT_EXPERIMENTAL_SHA256 enabled.
-#   2. git2 (the safe wrapper XVFS actually uses) does NOT compile against it.
+#   2. git2 (the safe wrapper GFS actually uses) does NOT compile against it.
 #
 # Re-run this whenever git2/libgit2-sys are bumped. The day it passes is the day
 # the SHA-256 pre-production commitment becomes achievable without raw FFI.

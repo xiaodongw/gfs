@@ -9,7 +9,7 @@
 
 DESIGN.md section 8.6 offers two options for what occupies `.git` in a mounted
 workspace: a synthesized read-only directory plus a `git` shim, or a real
-shallow blobless partial clone whose promisor remote is the XVFS gateway. It
+shallow blobless partial clone whose promisor remote is the GFS gateway. It
 states the choice is "a measurement, not a preference", and PLAN.md warns the
 answer changes the milestone graph — if partial clone wins, the minimum M5
 upload-pack/promisor scope becomes a predecessor of M2, and the parallel
@@ -41,7 +41,7 @@ M0.2 measured what that costs. The kernel absorbs *repeated* stats completely �
 1000 `stat(2)` calls on one path produced 0 upcalls at a 60-second TTL — but
 that caching does nothing for the first stat of each of 94 850 distinct paths.
 Every one is an upcall. **`git status` becomes a full metadata sweep of the
-monorepo, which is precisely the cost XVFS exists to avoid**, and an agent runs
+monorepo, which is precisely the cost GFS exists to avoid**, and an agent runs
 it out of habit, repeatedly, in a job whose whole premise is not sweeping the
 tree.
 
@@ -49,19 +49,19 @@ The 9.7 MiB index is a second, independent objection: it is per job, written at
 mount time, and it is a second view of "what changed" that can disagree with the
 overlay journal.
 
-Against that, `xvfs status` is derived from the overlay journal and touches no
+Against that, `gfs status` is derived from the overlay journal and touches no
 base metadata at all. The asymmetry is not marginal.
 
 ### The synthesized surface must include `objects/` and `refs/`
 
 DESIGN.md section 8.6 specifies `HEAD`, a `packed-refs` entry, a minimal
-`config`, and `xvfs.json`. **That set is not sufficient.** With exactly those
+`config`, and `gfs.json`. **That set is not sufficient.** With exactly those
 four files, Git does not recognize the directory as a repository at all and
 every command fails with `not a git repository`, so the surface satisfies
 nothing.
 
 Adding empty `objects/` and `refs/` directories makes repository detection work.
-The MVP surface is therefore: `HEAD`, `packed-refs`, `config`, `xvfs.json`,
+The MVP surface is therefore: `HEAD`, `packed-refs`, `config`, `gfs.json`,
 `objects/`, `refs/`.
 
 ### The shim is load-bearing for correctness, not only for hydration control
@@ -129,12 +129,12 @@ was no way to produce a second commit. `ls-files` was answerable but only by
 listing one directory at a time through the snapshot API, which on django's
 7 077 files took 28.9–53.7 s. Both are questions the **server** can answer
 directly, and it now does, through two new `SnapshotService` RPCs and two tools
-that sit beside `xvfs-rg`:
+that sit beside `gfs rg`:
 
 | Question | Tool | RPC |
 | --- | --- | --- |
-| recent history | `xvfs-log` | `Log` — a libgit2 revwalk, paged by `skip` |
-| filenames | `xvfs-find` | `FindPaths` — a server-side tree walk with globs |
+| recent history | `gfs log` | `Log` — a libgit2 revwalk, paged by `skip` |
+| filenames | `gfs find` | `FindPaths` — a server-side tree walk with globs |
 
 This does not reopen the decision. Nothing is hydrated, no object database
 appears in the workspace, and the tools refuse what would require one — `-p`,
@@ -159,7 +159,7 @@ crippling ordinary Git, but which makes a `PATH`-wide install unsafe.
 
 **Shallow blobless partial clone.** Rejected on the measurement above: a 9.7 MiB
 per-job index and a 94 850-entry metadata sweep on every `git status`, landing
-exactly where XVFS is trying to save. It would make substantially more of Git
+exactly where GFS is trying to save. It would make substantially more of Git
 work, which is a real loss.
 
 **Synthesized by default with partial clone behind a mount option.** Deferred,
@@ -198,7 +198,7 @@ instead of a wrong answer". A shim that did not exist could not be exercised, an
 the alternative — testing the raw surface alone — would have signed off a
 milestone knowing that `ls-files` and `diff` return confidently wrong answers.
 
-`xvfs-fuse/src/bin/xvfs-git-shim.rs` implements the frozen grammar in full.
+`gfs-fuse/src/bin/gfs-git-shim.rs` implements the frozen grammar in full.
 `status`, `diff`, and `ls-files` currently answer from the mount and from the
 fact that a read-only mount has no local changes, which is correct rather than
 approximate: there is no overlay yet to differ from the base. **M3.3's work is
@@ -208,13 +208,13 @@ journal, and add the cases that only exist once something can be edited.
 Two details settled by building it:
 
 - **The shim needs no credential.** The daemon calls `GetCommit` once at mount
-  time and embeds the result in `.git/xvfs.json`, so bounded `log -1` reads a
+  time and embeds the result in `.git/gfs.json`, so bounded `log -1` reads a
   local file. A shim that called the server would carry the mount capability,
   and a `PATH`-installed wrapper any process can invoke is the wrong place for
   one.
-- **It refuses outside an XVFS workspace.** Installed early in `PATH` it is
+- **It refuses outside a GFS workspace.** Installed early in `PATH` it is
   invoked everywhere; answering for an ordinary Git repository would replace a
-  working `git` with a crippled one. It searches upward for `.git/xvfs.json`
+  working `git` with a crippled one. It searches upward for `.git/gfs.json`
   specifically.
 
 The measured behaviour this ADR recorded was re-verified against the current

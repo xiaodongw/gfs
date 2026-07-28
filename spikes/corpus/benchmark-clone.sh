@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # M0.1 clone baselines.
 #
-# Establishes what the workflows XVFS competes with actually cost today, so
+# Establishes what the workflows GFS competes with actually cost today, so
 # "materially lower startup time, network transfer, and local disk" has a
 # denominator. Without these numbers the M0 go/no-go gate cannot be evaluated.
 #
@@ -14,9 +14,9 @@
 # clone rather than the sum of all variants.
 set -uo pipefail
 
-CORPUS_DIR="${XVFS_CORPUS_DIR:-$HOME/xvfs-corpus}"
+CORPUS_DIR="${GFS_CORPUS_DIR:-$HOME/gfs-corpus}"
 MIRROR_DIR="$CORPUS_DIR/mirrors"
-WORK="${XVFS_BENCH_DIR:-$CORPUS_DIR/bench}"
+WORK="${GFS_BENCH_DIR:-$CORPUS_DIR/bench}"
 export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null GIT_TERMINAL_PROMPT=0
 
 mkdir -p "$WORK"
@@ -27,14 +27,14 @@ mkdir -p "$WORK"
 # one), and a function is invisible to a script. An unresolved `rg` silently
 # produced 0 hits in 0.05 s for every variant here, which reads as a plausible
 # measurement rather than as a missing tool. Resolve it or refuse to guess.
-RG="${XVFS_RG:-$(command -v rg || echo "$HOME/.cargo/bin/rg")}"
+RG="${GFS_RG:-$(command -v rg || echo "$HOME/.cargo/bin/rg")}"
 if [ ! -x "$RG" ]; then
-    echo "no ripgrep binary found; set XVFS_RG or run: cargo install ripgrep" >&2
+    echo "no ripgrep binary found; set GFS_RG or run: cargo install ripgrep" >&2
     exit 1
 fi
 echo "<!-- ripgrep: $("$RG" --version | head -1) -->"
 
-# The corpus mirrors carry XVFS's own narrow filter policy. These baselines
+# The corpus mirrors carry GFS's own narrow filter policy. These baselines
 # measure what *Git* can do, so filtering is opened up for the duration and the
 # policy is restored afterwards.
 relax_filters() {
@@ -70,7 +70,7 @@ measure() {
     start=$(date +%s.%N)
     # Filters must be permitted by the source for the partial-clone variants.
     # These baselines measure what Git can do, deliberately unconstrained by
-    # XVFS's own narrower filter policy.
+    # GFS's own narrower filter policy.
     git -c uploadpack.allowFilter=true \
         -c uploadpackfilter.allow=true \
         clone -q "$@" "$src" "$dst" >"$WORK/$repo-$variant.log" 2>&1

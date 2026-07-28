@@ -18,10 +18,10 @@ PLAN.md section 7 states four criteria.
 
 | # | Criterion | Verified by | Result |
 | --- | --- | --- | --- |
-| 1 | Supported literal/regex results match the documented `rg` semantics | `xvfs-server/tests/search_oracle.rs` | **Met** — real `rg 15.2.0` over the raw materialization, generated query corpus, 5 fixtures |
-| 2 | Search after edits returns the merged logical workspace | `xvfs-fuse/tests/search.rs` | **Met** — 15 cases over create, edit, delete, rename, mode change, type change, ignore rules |
-| 3 | Warm search meets the performance target and causes zero base hydration | `benchmarks/search-preparation.md`, `xvfs-fuse/tests/search.rs` | **Met** — p95 **787 ms** on linux against a 2 s target; 0 bytes hydrated |
-| 4 | No tested failure or limit produces a result indistinguishable from "no matches" | `xvfs-fuse/tests/search_faults.rs`, `xvfs-search` unit tests | **Met** — every injected fault carries an exit code that is not 1 |
+| 1 | Supported literal/regex results match the documented `rg` semantics | `gfs-server/tests/search_oracle.rs` | **Met** — real `rg 15.2.0` over the raw materialization, generated query corpus, 5 fixtures |
+| 2 | Search after edits returns the merged logical workspace | `gfs-fuse/tests/search.rs` | **Met** — 15 cases over create, edit, delete, rename, mode change, type change, ignore rules |
+| 3 | Warm search meets the performance target and causes zero base hydration | `benchmarks/search-preparation.md`, `gfs-fuse/tests/search.rs` | **Met** — p95 **787 ms** on linux against a 2 s target; 0 bytes hydrated |
+| 4 | No tested failure or limit produces a result indistinguishable from "no matches" | `gfs-fuse/tests/search_faults.rs`, `gfs-search` unit tests | **Met** — every injected fault carries an exit code that is not 1 |
 
 ### Criterion 1: what "matches `rg`" was allowed to mean
 
@@ -36,7 +36,7 @@ choosing gentle fixtures:
 
 - **a NUL past the first 8 KiB.** ADR 0004 fixed the binary probe at ripgrep's
   8 KiB window; `rg` keeps scanning and calls a file binary on a NUL anywhere.
-- **files over 8 MiB.** XVFS excludes them and *reports* the exclusion; `rg` has
+- **files over 8 MiB.** GFS excludes them and *reports* the exclusion; `rg` has
   no size limit by default.
 
 The corpus is generated from each fixture's own content rather than invented, so
@@ -78,7 +78,7 @@ rests on, and it holds.
 
 An agent that receives no results concludes the symbol does not exist and acts
 on it. Every way a search can come back short therefore carries a distinct exit
-code, and `xvfs-fuse/tests/search_faults.rs` asserts the whole matrix in one
+code, and `gfs-fuse/tests/search_faults.rs` asserts the whole matrix in one
 test — separate tests would let two codes collapse into each other without
 anything failing.
 
@@ -114,7 +114,7 @@ inside identifiers (`authorize_re` finding `authorize_request`) is a trigram
 strength that a source tokenizer would have to choose to fail; ranking is real,
 but an agent consuming `--json` sorts by path and reads all of it.
 
-`xvfs-search` has no tokenizer, no Tantivy dependency, and no token query mode.
+`gfs-search` has no tokenizer, no Tantivy dependency, and no token query mode.
 
 ## What changed under M4 that was not planned
 
@@ -156,13 +156,13 @@ query stops reading warnings.
 
 | Suite | Cases | Covers |
 | --- | ---: | --- |
-| `xvfs-search` unit tests | 113 | blob registry and key allocation, content classification, line boundaries, manifests and scoping, trigram extraction and required-literal analysis, posting merge and intersection, globs, snapshot lifecycle, the query engine and its budgets, the local half |
-| `xvfs-server/tests/search_index.rs` | 11 | manifests against stock `git`, non-UTF-8 paths, deep and wide trees, incremental against full, dedup of simultaneous preparation, TTL, classification completeness |
-| `xvfs-server/tests/search_service.rs` | 12 | the gRPC stream, exactly one terminal message, truncation reporting, scoped coverage, regex, context lines, non-UTF-8 over the wire, index generation |
-| `xvfs-server/tests/search_oracle.rs` | 11 | `rg` as oracle over a generated corpus; CRLF, no final newline, Unicode, invalid UTF-8 paths, repeated blobs, symlinks, huge lines, alternation, and the two documented divergences |
-| `xvfs-fuse/tests/search.rs` | 15 | the merged workspace: create, edit, delete, rename, mode and type change, ignore rules, both halves in one path order, zero hydration |
-| `xvfs-fuse/tests/search_faults.rs` | 7 | transport loss before the terminal message, mid-stream error, severed connection, the exit-code matrix, exclusion reasons counted separately |
-| `xvfs-cli` search output | 13 | `path:line:column:text`, non-UTF-8 paths as bytes, truncation marking, the ADR 0004 exit table, `--json`, the `xvfs-rg` flag subset and its refusals |
+| `gfs-search` unit tests | 113 | blob registry and key allocation, content classification, line boundaries, manifests and scoping, trigram extraction and required-literal analysis, posting merge and intersection, globs, snapshot lifecycle, the query engine and its budgets, the local half |
+| `gfs-server/tests/search_index.rs` | 11 | manifests against stock `git`, non-UTF-8 paths, deep and wide trees, incremental against full, dedup of simultaneous preparation, TTL, classification completeness |
+| `gfs-server/tests/search_service.rs` | 12 | the gRPC stream, exactly one terminal message, truncation reporting, scoped coverage, regex, context lines, non-UTF-8 over the wire, index generation |
+| `gfs-server/tests/search_oracle.rs` | 11 | `rg` as oracle over a generated corpus; CRLF, no final newline, Unicode, invalid UTF-8 paths, repeated blobs, symlinks, huge lines, alternation, and the two documented divergences |
+| `gfs-fuse/tests/search.rs` | 15 | the merged workspace: create, edit, delete, rename, mode and type change, ignore rules, both halves in one path order, zero hydration |
+| `gfs-fuse/tests/search_faults.rs` | 7 | transport loss before the terminal message, mid-stream error, severed connection, the exit-code matrix, exclusion reasons counted separately |
+| `gfs-cli` search output | 13 | `path:line:column:text`, non-UTF-8 paths as bytes, truncation marking, the ADR 0004 exit table, `--json`, the `gfs rg` flag subset and its refusals |
 
 ## Recorded gaps
 
@@ -176,8 +176,8 @@ manifest bytes; the measurement is a whole SQLite database including the `blobs`
 registry and page overhead. The *marginal* per-snapshot cost, which is what the
 storage decision rested on, matches. Not decomposed further.
 
-**The p95 is server-side, on loopback.** `xvfs search` through the daemon adds
-the overlay scan and a gRPC round trip. M4.5's own criterion — that `xvfs
+**The p95 is server-side, on loopback.** `gfs search` through the daemon adds
+the overlay scan and a gRPC round trip. M4.5's own criterion — that `gfs
 search` not be slower than the `rg` invocation it replaces, benchmarked against
 an overlay holding a full build tree — is a client-side measurement that has not
 been taken against a real build tree.

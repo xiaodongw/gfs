@@ -4,7 +4,7 @@
 
 M0 is the go/no-go milestone of `docs/PLAN.md`. It is a measurement milestone, not
 a delivery milestone: nothing in it ships, and its only product is enough evidence
-to decide whether XVFS is worth building and what shape it takes. Four decisions
+to decide whether GFS is worth building and what shape it takes. Four decisions
 come out of it and constrain every later milestone:
 
 1. **Can we mount at all** in the target hosted environment, and with what privilege
@@ -37,7 +37,7 @@ Three inputs were settled with the user before starting:
 - **Toolchain**: latest stable Rust (1.97.1), pinned in `rust-toolchain.toml` as
   the MSRV baseline that M1.1 inherits.
 
-Spike code lives in `spikes/`, deliberately outside the `xvfs-*` workspace that
+Spike code lives in `spikes/`, deliberately outside the `gfs-*` workspace that
 M1.1 creates. Spike code is written to be measured and thrown away; production code
 is written to be maintained, and mixing them makes the second one worse.
 
@@ -115,7 +115,7 @@ is written to be maintained, and mixing them makes the second one worse.
   path semantics.
 - Threat-model the host cache and the FUSE privilege boundary.
 - Fix the retention-lease policy (lifetime, orphan expiry, heartbeat, GC interaction,
-  `refs/xvfs/` hiding) and the timestamp policy, since M1 implements both directly.
+  `refs/gfs/` hiding) and the timestamp policy, since M1 implements both directly.
 - Write the go/no-go architecture review against the four gate conditions.
 
 ## Decisions
@@ -141,7 +141,7 @@ Worth listing separately, because these are the milestone's actual yield —
 confirmations cost nothing to be wrong about, contradictions do:
 
 1. SHA-256 is unreachable through `git2-rs`, not merely experimental.
-2. Hiding `refs/xvfs/` prevents discovery but not access; a documented security
+2. Hiding `refs/gfs/` prevents discovery but not access; a documented security
    claim in DESIGN.md 7.1 was false for the Git gateway path.
 3. The synthesized `.git` contents specified in DESIGN.md 8.6 do not form a
    repository at all — `objects/` and `refs/` are also required.
@@ -164,8 +164,8 @@ each produced a plausible-looking wrong number rather than an obvious failure:
 
 ## Details
 
-- Corpus mirrors live outside the repository at `$XVFS_CORPUS_DIR`
-  (default `~/xvfs-corpus`) so tens of gigabytes of benchmark data never enter git.
-- Spike crates are excluded from the future `xvfs-*` production workspace on purpose.
+- Corpus mirrors live outside the repository at `$GFS_CORPUS_DIR`
+  (default `~/gfs-corpus`) so tens of gigabytes of benchmark data never enter git.
+- Spike crates are excluded from the future `gfs-*` production workspace on purpose.
 - The Kubernetes/CSI leg of M0.2 is unmeasured on this machine. Any M0 exit claim
   about hosted deployment is scoped to WSL2 and Docker.

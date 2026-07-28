@@ -1,4 +1,4 @@
-# POSIX conformance: pjdfstest against an XVFS mount
+# POSIX conformance: pjdfstest against a GFS mount
 
 Date: 2026-07-27
 Reproduce: `./spikes/conformance/pjdfstest.sh <mounted-workspace>`
@@ -14,14 +14,14 @@ the last section.
 ## Method
 
 The suite is run **twice by the same unprivileged user** — once against ext4 and
-once against an XVFS mount — and only the difference is reported.
+once against a GFS mount — and only the difference is reported.
 
 That is not tidiness. pjdfstest's README says "You must be root when running
 these testcases", and root is unavailable here: not merely absent, but unhelpful,
 because a root process cannot enter a uid-1000 FUSE mount without
 `user_allow_other` in `/etc/fuse.conf`, which ADR 0003 treats as a privileged
 host action. Run as an ordinary user, **76 of 238 test files fail on ext4**, for
-reasons that have nothing to do with XVFS. Reporting XVFS's raw failure count
+reasons that have nothing to do with GFS. Reporting GFS's raw failure count
 against POSIX would therefore be meaningless.
 
 So ext4 is the oracle, the same way the raw tree is M2's oracle for the mount and
@@ -43,23 +43,23 @@ before they were found:
 | --- | ---: | ---: |
 | test files run | 238 | 238 |
 | clean on ext4 (the baseline) | 162 | 162 |
-| clean on XVFS | 126 | **128** |
-| **XVFS-only failures** | **37** | **35** |
-| XVFS-only passes | 1 | 1 |
+| clean on GFS | 126 | **128** |
+| **GFS-only failures** | **37** | **35** |
+| GFS-only passes | 1 | 1 |
 
 Two defects were found, root-caused and fixed in the same pass; a third was
 root-caused and is a decision rather than a fix. See "What was fixed" below.
 
-The single XVFS-only *pass* is `rename_22`, whose ext4 failure is a root-only
+The single GFS-only *pass* is `rename_22`, whose ext4 failure is a root-only
 `mknod b`. Not root-caused; it is an artifact of the unprivileged control rather
-than a claim that XVFS is more correct.
+than a claim that GFS is more correct.
 
 ## The 37, triaged
 
 This is the triage of the **first** run. Sections 3, 4 and 5 carry the fixes that
 followed; the rest stand as recorded.
 
-### 1. Object types XVFS does not implement — 5 files
+### 1. Object types GFS does not implement — 5 files
 
 `mkfifo_02`, `mkfifo_03`, `open_17`, `rmdir_01` (named pipes), `open_24` (UNIX
 domain socket)
@@ -95,7 +95,7 @@ documents `EPERM` for precisely this condition:
 > not support the creation of hard links."
 
 `EOPNOTSUPP` appears nowhere in either page's ERRORS section. Changing these to
-`EOPNOTSUPP` would make XVFS the only filesystem answering a kernel-documented
+`EOPNOTSUPP` would make GFS the only filesystem answering a kernel-documented
 condition with a different errno, and would move it away from conformance rather
 than toward it. `EPERM` stays.
 
@@ -140,7 +140,7 @@ The bug-shaped part was in 3a.
 
 The straightforward boundaries are **correct** and were checked directly against
 ext4: a 255-byte component succeeds, 256 gives `ENAMETOOLONG`, and paths of
-4 115–4 236 bytes give `ENAMETOOLONG` on XVFS and ext4 alike. `compat.rs`'s
+4 115–4 236 bytes give `ENAMETOOLONG` on GFS and ext4 alike. `compat.rs`'s
 existing `an_over_long_name_is_refused_by_the_kernel_before_it_reaches_the_daemon`
 holds.
 
@@ -148,7 +148,7 @@ What the suite finds is narrower and worse:
 
 - **`EIO` for some long-path shapes.** `open_03` assertion 1 and `link_03`
   assertion 1 build a deep path out of ~30 components of ~126 bytes and expect
-  the create to *succeed*; XVFS returned `EIO`. From a FUSE filesystem `EIO` means
+  the create to *succeed*; GFS returned `EIO`. From a FUSE filesystem `EIO` means
   the daemon returned an error the kernel could not classify — an internal
   failure surfacing as I/O error, not a POSIX answer. **Root-caused and fixed;
   see "What was fixed".** The boundary is now exact: an in-workspace path of
@@ -163,7 +163,7 @@ What the suite finds is narrower and worse:
 
 Both fail on `test_check $time -lt $mtime` and the `ctime` equivalent: **a
 directory's mtime and ctime do not move when a child is created or removed.**
-Confirmed directly — across a create and a delete, XVFS reported the same mtime
+Confirmed directly — across a create and a delete, GFS reported the same mtime
 three times while ext4 incremented on each.
 
 **Assessment: a real divergence, and the one with the widest blast radius.** Build
@@ -186,7 +186,7 @@ precision and post-2038 values do not round-trip.
 five reduce to `atime` not being stored — `attr.rs` reports `atime: mtime` and
 `setattr` ignores its `_atime` argument. The first reading of `utimensat/09`
 ("post-2038 values do not round-trip", 2³¹ read back as 2³²) was wrong: the test
-sets atime to 2³¹ and mtime to 2³², and XVFS returns mtime for both. There is no
+sets atime to 2³¹ and mtime to 2³², and GFS returns mtime for both. There is no
 arithmetic bug. See "What is a decision, not a defect".
 
 ### 6. Mode fidelity — 1 file
@@ -229,8 +229,8 @@ likely explanation and this deserves its own pass.
 
 ### `EIO` for a path longer than the filesystem allows — fixed
 
-Root cause: `crates/xvfs-overlay/src/error.rs`'s blanket
-`From<XvfsError> for OverlayError` mapped **every** service error to
+Root cause: `crates/gfs-overlay/src/error.rs`'s blanket
+`From<GfsError> for OverlayError` mapped **every** service error to
 `Condition::Io`, on the stated premise that "a service error reaching the overlay
 is always a storage or protocol failure". That premise is wrong for exactly one
 code. The overlay calls `BytePath::validate` on its own arguments, so the
@@ -247,9 +247,9 @@ vocabulary spells both `InvalidArgument` and POSIX spells them differently.
 
 **The tests still fail, and now they fail honestly.** pjdfstest builds a path just
 under the `_PC_PATH_MAX` the filesystem advertises and expects the create to
-succeed. XVFS applies its 4 096-byte cap to the path **from the workspace root**,
+succeed. GFS applies its 4 096-byte cap to the path **from the workspace root**,
 while POSIX applies `PATH_MAX` to the pathname handed to the syscall — so a file
-reachable as a short relative path can still be over XVFS's limit. That is a
+reachable as a short relative path can still be over GFS's limit. That is a
 real and deliberate difference in what the limit *means*, and the remaining
 `ENOENT` assertions in those files are cascades from the first one. The bug was
 the errno; the limit is policy, and it is now reported in a form a caller can act
@@ -260,7 +260,7 @@ on.
 Root cause: nothing advanced a directory's timestamps when its contents changed,
 and `getattr` is answered inline from the inode table, so even a committed
 overlay row would not have been reported. Both halves were needed:
-`Overlay::touch_directory` adopts the parent and stamps it, and `Xvfs::touch_parent`
+`Overlay::touch_directory` adopts the parent and stamps it, and `Gfs::touch_parent`
 **republishes** the inode record — without the second, the first looks like it
 did nothing at all.
 
@@ -284,7 +284,7 @@ sets atime to 2³¹ and mtime to 2³², and reads 2³² back from both.
 Fixing it is not a bug fix but a change to what the overlay *models*: a new
 column in `entries`, an `OVERLAY_FORMAT_VERSION` bump with no migration
 machinery behind it (DESIGN.md section 12 lists crash-safe overlay migration as
-pre-production), and a decision about whether XVFS should carry a timestamp Git
+pre-production), and a decision about whether GFS should carry a timestamp Git
 cannot record and no export can reproduce. POSIX atime semantics would also mean
 every read updates state, which is the cost `noatime` exists to avoid and which a
 lazily-hydrating filesystem can least afford.
@@ -328,7 +328,7 @@ previously claimed the opposite.
 This closes half the M2.4 gap and should be recorded as half.
 
 xfstests is oriented at block filesystems: it wants a scratch device and a test
-device, and a large share of its `generic` group exercises behaviour XVFS does
+device, and a large share of its `generic` group exercises behaviour GFS does
 not claim — quotas, fallocate ranges, reflink, block-level fsync semantics, DAX,
 and crash-consistency against a device. Running it needs a decision about which
 subset is meaningful for a FUSE overlay whose base is immutable, and that

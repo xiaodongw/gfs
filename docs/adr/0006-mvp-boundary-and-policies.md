@@ -45,7 +45,7 @@ Unchanged from DESIGN.md section 12 except where measurement forced a change:
   through `git2-rs` at any version currently published (ADR 0001), so the
   pre-production commitment cannot be met by libgit2 maturing alone.
 - The synthesized `.git` has **six** entries, not four: `HEAD`, `packed-refs`,
-  `config`, `xvfs.json`, `objects/`, `refs/` (ADR 0005).
+  `config`, `gfs.json`, `objects/`, `refs/` (ADR 0005).
 - `git ls-files` and `git diff` invoked **outside** the shim return empty output
   with exit 0 rather than failing. Documented limitation (ADR 0005).
 - Repository read access implies read access to every object in that
@@ -71,7 +71,7 @@ Prototype acceptance targets, revised where M0 produced a real number:
 | Uncached source file first byte | p95 < 250 ms | unchanged |
 | Warm literal search | p95 < 2 s | unchanged |
 | Search-induced client hydration | **zero bytes** | unchanged; the server never returns blobs to the client cache |
-| `xvfs status` after edits | p95 < 200 ms, no base metadata sweep | ADR 0005 makes "no sweep" the load-bearing half |
+| `gfs status` after edits | p95 < 200 ms, no base metadata sweep | ADR 0005 makes "no sweep" the load-bearing half |
 | Arbitrary-commit index preparation | < 5 s to READY | ADR 0004 (445 ms measured worst case) |
 | Manifest storage per retained snapshot | < 5 MiB | ADR 0004 (1.99 MiB measured worst case) |
 | Crash recovery | no lost acknowledged mutation | unchanged |
@@ -95,7 +95,7 @@ Prototype acceptance targets, revised where M0 produced a real number:
   layer round-trips a path through `String`.
 - **Object IDs**: always `{algorithm}:{hex}`. A bare hex digest is accepted only
   where a repository context supplies the algorithm.
-- **Reserved namespace**: `refs/xvfs/` is rejected as a user-supplied revision
+- **Reserved namespace**: `refs/gfs/` is rejected as a user-supplied revision
   at the lowest layer, so no caller can forget to.
 
 ## Mount retention-lease policy
@@ -117,7 +117,7 @@ M0.3: create under the repository lock as `PREPARING` → durable ref anchor →
 libgit2 ref transactions were verified to create and remove anchors visibly to
 stock Git, leaving no trace on rollback.
 
-`refs/xvfs/` is hidden from advertisement, rejected as a user revision, and
+`refs/gfs/` is hidden from advertisement, rejected as a user revision, and
 excluded from every upstream fetch and prune refspec. **It is not an
 authorization mechanism** — ADR 0002 measured that hiding prevents discovery,
 not access.
@@ -164,7 +164,7 @@ carries the job's scoped capability, not repository credentials.
 
 - A repository reader can fetch any object in that repository by OID over
   protocol v2, including lease-retained commits (ADR 0002).
-- The shim and `xvfs-rg` are `PATH`-based conveniences, not boundaries. A
+- The shim and `gfs rg` are `PATH`-based conveniences, not boundaries. A
   program that opens every file still hydrates every file unless a hard budget
   stops it.
 - Tools bypassing the shim get silently-empty `ls-files` and `diff` (ADR 0005).
@@ -204,24 +204,24 @@ These two are **not** engineering decisions and are recorded as open:
 PLAN.md M2.3 left one question open: "Determine whether writable `MAP_SHARED` is
 available in the target deployment and whether enabling the writeback cache to
 get it is acceptable; record the answer as a compatibility boundary either way."
-Measured in `crates/xvfs-fuse/tests/mmap.rs` on Linux 6.18.33.2 (WSL2).
+Measured in `gfs-fuse/tests/mmap.rs` on Linux 6.18.33.2 (WSL2).
 
 | Mapping | Against | Result |
 | --- | --- | --- |
-| `MAP_PRIVATE`, `PROT_READ` | the XVFS mount | works |
-| `MAP_SHARED`, `PROT_READ` | the XVFS mount, 4 MiB file | works |
-| `MAP_SHARED`, `PROT_READ\|PROT_WRITE` | the XVFS mount | `EROFS` at `open(2)`, before `mmap` |
+| `MAP_PRIVATE`, `PROT_READ` | the GFS mount | works |
+| `MAP_SHARED`, `PROT_READ` | the GFS mount, 4 MiB file | works |
+| `MAP_SHARED`, `PROT_READ\|PROT_WRITE` | the GFS mount | `EROFS` at `open(2)`, before `mmap` |
 | `MAP_SHARED`, `PROT_READ\|PROT_WRITE`, **no** `FUSE_WRITEBACK_CACHE` | a writable probe filesystem | **works**; one `write` request; dirtied bytes reach the filesystem |
 | `MAP_SHARED`, `PROT_READ\|PROT_WRITE`, **with** `FUSE_WRITEBACK_CACHE` | the same probe | works; capability granted |
 
-The write side needed a second filesystem because XVFS refuses a read-write
+The write side needed a second filesystem because GFS refuses a read-write
 `open`, so a writable mapping never reaches `mmap`. The question is a property of
-FUSE, not of XVFS, and `tests/mmap.rs` mounts a one-file in-memory probe twice to
+FUSE, not of GFS, and `tests/mmap.rs` mounts a one-file in-memory probe twice to
 answer it.
 
 ### Decision
 
-**Writable `MAP_SHARED` is supported, and XVFS does not enable
+**Writable `MAP_SHARED` is supported, and GFS does not enable
 `FUSE_WRITEBACK_CACHE`.**
 
 The capability is not needed for it — the mapping works without it on this

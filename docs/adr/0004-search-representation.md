@@ -148,7 +148,7 @@ not to be needed:
 
 ### Decision
 
-**M4.4 is not implemented.** `xvfs-search` has no tokenizer, no Tantivy
+**M4.4 is not implemented.** `gfs-search` has no tokenizer, no Tantivy
 dependency, and no token query mode.
 
 ### Consequences
@@ -234,7 +234,7 @@ Applied here:
   bytes-plus-commentary cannot be consumed at all.
 - **`column` is unchanged, and still an offset into the whole line.** On a cut
   line it may point past the end of `line_text`. That is the existing rule in
-  `xvfs-search`'s line module — the column is what an agent edits with, the text
+  `gfs-search`'s line module — the column is what an agent edits with, the text
   is what it displays — and `blob_oid` still leads to the untruncated bytes.
 - A cut never splits a UTF-8 sequence, so a terminal is not shown a replacement
   character the file does not contain. On content that is not UTF-8 this gives up
@@ -245,8 +245,8 @@ Applied here:
 - Peak retained line text per query is `max_display_bytes`, independent of the
   corpus, the pattern, and the client's parameters. Under the defaults that is
   64 MiB.
-- `xvfs search --max-columns` and `xvfs-rg -M/--max-columns` expose the per-line
-  cap. `rg` suppresses a line that wide and prints a note in its place; XVFS
+- `gfs search --max-columns` and `gfs rg -M/--max-columns` expose the per-line
+  cap. `rg` suppresses a line that wide and prints a note in its place; GFS
   keeps the first bytes and marks them. The flag is spelled the same because the
   intent is the same.
 - The oracle comparison in M4.6 is unaffected: it compares `(path, line,

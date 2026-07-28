@@ -87,10 +87,10 @@ pub fn git(dir: &Path, args: &[&OsStr]) -> Result<String> {
     .args(args)
     .env("GIT_CONFIG_GLOBAL", "/dev/null")
     .env("GIT_CONFIG_SYSTEM", "/dev/null")
-    .env("GIT_AUTHOR_NAME", "XVFS Fixture")
-    .env("GIT_AUTHOR_EMAIL", "fixture@xvfs.invalid")
-    .env("GIT_COMMITTER_NAME", "XVFS Fixture")
-    .env("GIT_COMMITTER_EMAIL", "fixture@xvfs.invalid")
+    .env("GIT_AUTHOR_NAME", "GFS Fixture")
+    .env("GIT_AUTHOR_EMAIL", "fixture@gfs.invalid")
+    .env("GIT_COMMITTER_NAME", "GFS Fixture")
+    .env("GIT_COMMITTER_EMAIL", "fixture@gfs.invalid")
     // Fixed timestamps keep object IDs stable across runs, which makes a
     // diff of two report files meaningful.
     .env("GIT_AUTHOR_DATE", "2020-01-01T00:00:00Z")
@@ -174,7 +174,7 @@ fn build_modes(dir: &Path) -> Result<()> {
   g(dir, &["add", "-A", "."])?;
 
   // A gitlink without materializing a real submodule. `--cacheinfo` writes the
-  // 160000 entry directly, which is all the tree needs; XVFS never recurses
+  // 160000 entry directly, which is all the tree needs; GFS never recurses
   // into it.
   g(
     dir,

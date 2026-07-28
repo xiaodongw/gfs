@@ -1,0 +1,96 @@
+syntax = "proto3";
+
+package gfs.v1;
+
+// Shared value types.
+//
+// Two representation decisions here are load-bearing and apply to every message
+// in this package.
+//
+// **Paths are `bytes`.** DESIGN.md section 7.3: "Paths are bytes in the
+// protocol, not assumed UTF-8." A `string` field in Protobuf must be valid
+// UTF-8, and both prost and the Go/Java runtimes will reject or corrupt a path
+// that is not -- so a `string` path field would make a Linux kernel filename
+// with a Latin-1 byte in it unrepresentable at the wire level, where no amount
+// of care in the application can recover it. The same applies to commit
+// messages and author names, which Git also does not constrain to UTF-8.
+//
+// **Object IDs are qualified strings, `{algorithm}:{hex}`.** ADR 0006 froze
+// that canonical form. Carrying the algorithm in the value rather than in a
+// separate field means a digest cannot be separated from the algorithm that
+// gives it meaning -- the failure DESIGN.md section 6.1 exists to prevent -- and
+// costs one short prefix per ID.
+
+// A point in time with nanosecond resolution.
+//
+// Not `google.protobuf.Timestamp`: that type's seconds field is documented as
+// spanning 0001-01-01 to 9999-12-31, and GFS must be able to *represent* an
+// out-of-range Git committer timestamp in order to sanitize it (ADR 0006's
+// clamp). A type that rejects the input makes the clamp unimplementable.
+message Timestamp {
+  int64 secs = 1;
+  uint32 nanos = 2;
+}
+
+// The Git file modes GFS represents (DESIGN.md section 8.2).
+enum EntryKind {
+  ENTRY_KIND_UNSPECIFIED = 0;
+  ENTRY_KIND_REGULAR = 1;
+  ENTRY_KIND_EXECUTABLE = 2;
+  ENTRY_KIND_SYMLINK = 3;
+  ENTRY_KIND_DIRECTORY = 4;
+  // A submodule. Presented as an empty read-only directory.
+  ENTRY_KIND_GITLINK = 5;
+  // A mode GFS does not model. The `mode` field carries the actual value; the
+  // kind is not coerced to the nearest supported one, because presenting a file
+  // as something it is not is worse than reporting it as unsupported.
+  ENTRY_KIND_UNSUPPORTED = 6;
+}
+
+// Proof that the caller may reach a specific commit.
+//
+// DESIGN.md section 7.3: this is "either normal proof that the commit is
+// reachable from a currently allowed ref or the mount capability returned by
+// `CreateMount`". An absent capability means the former -- the server checks
+// reachability itself -- so the common case sends nothing.
+//
+// This is what lets one subject keep reading its force-pushed-away pinned commit
+// without making that retained commit readable by every repository reader
+// through the snapshot API. ADR 0002 records that the same claim does *not* hold
+// for the Git gateway, where one bare repository is one authorization domain.
+message SnapshotAuthorization {
+  // The opaque capability from `CreateMount` or `RenewMount`. Binds subject,
+  // repository, commit, mount ID, and expiry.
+  string mount_capability = 1;
+}
+
+// A structured error, mirroring `gfs_types::GfsError`.
+//
+// Used where a per-item failure must travel inside a successful response --
+// `BatchGetEntry` is the case that needs it, since one unreadable path must not
+// fail the other 999. A whole-request failure uses the gRPC status instead.
+message ErrorDetail {
+  // The stable wire name from `gfs_types::ErrorCode`, such as `NOT_FOUND`.
+  string code = 1;
+  string message = 2;
+}
+
+// One tree entry.
+message TreeEntry {
+  // Full path from the snapshot root. Bytes; see the note at the top.
+  bytes path = 1;
+  EntryKind kind = 2;
+  // The raw Git file mode, always populated even when `kind` is UNSUPPORTED.
+  uint32 mode = 3;
+  // Qualified object ID of the blob, tree, or submodule commit.
+  string oid = 4;
+  // Blob size in bytes. Zero for directories and gitlinks.
+  uint64 size = 5;
+  // For a symlink, the target as stored in the blob. Present only for symlinks,
+  // so a caller need not fetch a blob to resolve one.
+  optional bytes symlink_target = 6;
+  // Short-lived authorization for the immutable blob endpoint (DESIGN.md
+  // section 7.3). Present only when the entry has blob content and the caller
+  // asked for a ticket.
+  optional string blob_ticket = 7;
+}

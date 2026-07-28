@@ -143,7 +143,7 @@ fn check_format_gate(fixture: &str, bare: &Path) -> CheckResult {
     .map(|s| s.trim().to_string())
     .unwrap_or_else(|_| "unknown".into());
 
-  // XVFS's view, read from config without libgit2's cooperation.
+  // GFS's view, read from config without libgit2's cooperation.
   let raw = match git2::Repository::open_bare(bare).or_else(|_| git2::Repository::open(bare)) {
     Ok(r) => gitrepo::read_format(&r).ok(),
     Err(_) => None,
@@ -188,7 +188,7 @@ fn check_format_gate(fixture: &str, bare: &Path) -> CheckResult {
   let rejected = matches!(v, gitrepo::FormatVerdict::Rejected { .. });
   let detail = format!(
     "stock: ref-format={stock_ref_format} object-format={stock_object_format}; \
-         xvfs: ref-backend={ref_backend} algorithm={algorithm}; verdict={v:?}"
+         gfs: ref-backend={ref_backend} algorithm={algorithm}; verdict={v:?}"
   );
   if rejected == should_reject {
     if rejected {
@@ -219,7 +219,7 @@ fn check_refs_match_stock(
   let mut expected: Vec<(String, String)> = stock
     .lines()
     .filter_map(|l| l.split_once(' '))
-    .filter(|(n, _)| !n.starts_with("refs/xvfs/"))
+    .filter(|(n, _)| !n.starts_with("refs/gfs/"))
     .map(|(n, o)| (n.to_string(), o.to_string()))
     .collect();
   expected.sort();
@@ -323,14 +323,14 @@ fn check_annotated_tag_peels(
         peeled += 1;
       }
       Err(_) => {
-        // Stock Git refuses; XVFS must refuse too, and for this reason.
+        // Stock Git refuses; GFS must refuse too, and for this reason.
         if let Ok(r) = repo.resolve_revision(tag) {
           return Ok(fail(
             fixture,
             "annotated_tag_peels",
             format!(
               "{tag} does not dereference to a commit for stock Git, \
-                             but XVFS resolved it to {}",
+                             but GFS resolved it to {}",
               r.commit.to_hex()
             ),
           ));
@@ -365,7 +365,7 @@ fn check_reserved_namespace_rejected(
     return Ok(skip(fixture, "reserved_namespace", "no commits"));
   };
   // Plant a lease-shaped ref, then require that it is invisible and unusable.
-  let name = "refs/xvfs/mounts/probe-mount";
+  let name = "refs/gfs/mounts/probe-mount";
   g(bare, &["update-ref", name, head.trim()])?;
 
   let visible = repo.list_refs()?.iter().any(|(n, _)| n == name);
@@ -376,13 +376,13 @@ fn check_reserved_namespace_rejected(
     Ok(fail(
       fixture,
       "reserved_namespace",
-      "refs/xvfs/ appeared in ref enumeration",
+      "refs/gfs/ appeared in ref enumeration",
     ))
   } else if resolvable {
     Ok(fail(
       fixture,
       "reserved_namespace",
-      "refs/xvfs/ was accepted as a user revision selector",
+      "refs/gfs/ was accepted as a user revision selector",
     ))
   } else {
     Ok(ok(
@@ -742,7 +742,7 @@ fn check_gitlink_mode(fixture: &str, bare: &Path, repo: &Libgit2Repository) -> R
       ));
     }
     // A gitlink must not be traversable: listing it must not recurse into
-    // another repository's objects, which XVFS does not have.
+    // another repository's objects, which GFS does not have.
     let (children, _) = repo.list_directory(&commit, &BytePath::new(path.clone()), None, 16)?;
     if !children.is_empty() {
       return Ok(fail(
@@ -954,7 +954,7 @@ fn check_object_creation_round_trips(
   )?;
   let tree_oid = tb.write()?;
 
-  let sig = git2::Signature::new("XVFS Probe", "probe@xvfs.invalid", &git2::Time::new(0, 0))?;
+  let sig = git2::Signature::new("GFS Probe", "probe@gfs.invalid", &git2::Time::new(0, 0))?;
   let tree = repo.find_tree(tree_oid)?;
   let parent = repo.head()?.peel_to_commit()?;
   let commit = repo.commit(None, &sig, &sig, "probe commit", &tree, &[&parent])?;
@@ -1012,9 +1012,9 @@ fn check_ref_transaction(
   };
   let repo = git2::Repository::open_bare(bare)?;
   let oid = git2::Oid::from_str(head.trim())?;
-  let name = "refs/xvfs/mounts/tx-probe";
+  let name = "refs/gfs/mounts/tx-probe";
 
-  let sig = git2::Signature::new("XVFS Probe", "probe@xvfs.invalid", &git2::Time::new(0, 0))?;
+  let sig = git2::Signature::new("GFS Probe", "probe@gfs.invalid", &git2::Time::new(0, 0))?;
   {
     let mut tx = repo.transaction()?;
     tx.lock_ref(name)?;

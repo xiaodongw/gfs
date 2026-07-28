@@ -7,7 +7,7 @@ members = [
     "search-probe",
 ]
 
-# M0 spike code. Deliberately separate from the `xvfs-*` production workspace that
+# M0 spike code. Deliberately separate from the `gfs-*` production workspace that
 # M1.1 creates: these crates exist to produce measurements and are expected to be
 # deleted, not maintained.
 

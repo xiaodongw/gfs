@@ -7,7 +7,7 @@
 # does.
 set -uo pipefail
 
-CORPUS_DIR="${XVFS_CORPUS_DIR:-$HOME/xvfs-corpus}"
+CORPUS_DIR="${GFS_CORPUS_DIR:-$HOME/gfs-corpus}"
 MIRROR_DIR="$CORPUS_DIR/mirrors"
 export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null
 

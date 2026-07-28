@@ -32,14 +32,14 @@ for arg in "$@"; do
   esac
 done
 
-STATE_DIR="${XVFS_DEV_STATE:-target/dev-stack}"
-HTTP_ADDR="${XVFS_HTTP_ADDR:-127.0.0.1:8430}"
-GRPC_ADDR="${XVFS_GRPC_ADDR:-127.0.0.1:8431}"
+STATE_DIR="${GFS_DEV_STATE:-target/dev-stack}"
+HTTP_ADDR="${GFS_HTTP_ADDR:-127.0.0.1:8430}"
+GRPC_ADDR="${GFS_GRPC_ADDR:-127.0.0.1:8431}"
 TOKEN="dev-token"
 # A fixed key so a restart does not invalidate every capability issued before it.
 # Fine for local development, and exactly what a real deployment must not do with a
 # value committed to a repository.
-CAP_KEY="$(printf 'xvfs-local-development-key-do-not-use-in-production' | od -An -tx1 | tr -d ' \n' | cut -c1-64)"
+CAP_KEY="$(printf 'gfs-local-development-key-do-not-use-in-production' | od -An -tx1 | tr -d ' \n' | cut -c1-64)"
 
 say() { printf '\033[1m==\033[0m %s\n' "$*"; }
 
@@ -53,13 +53,13 @@ say "seeding fixture repositories"
 # drift into seeing different repositories. Running the matrix test is what
 # materializes every fixture into the shared cache under `target/`.
 FIXTURES="basic modes bytes content bigdir deep packed attrs"
-FIXTURE_ROOT="target/xvfs-fixtures/v1/bare"
-cargo test -p xvfs-git --test repository --quiet every_fixture >/dev/null
+FIXTURE_ROOT="target/gfs-fixtures/v1/bare"
+cargo test -p gfs-git --test repository --quiet every_fixture >/dev/null
 mkdir -p "$STATE_DIR"
 
 # Copied into the stack's own state directory, never imported in place.
 #
-# This is not tidiness. The server writes `refs/xvfs/mounts/*` lease anchors into
+# This is not tidiness. The server writes `refs/gfs/mounts/*` lease anchors into
 # whatever repository it serves, and the demo below creates a mount. Importing the
 # shared fixture cache directly would leave an anchor in `basic.git`, which then keeps
 # the tip reachable in every later `scratch_clone` -- and silently breaks the test
@@ -81,7 +81,7 @@ done
 
 if [ "$BIG" -eq 1 ]; then
   say "seeding the million-entry snapshot (this takes a few seconds)"
-  cargo test -p xvfs-server --test exit_criteria --quiet -- --ignored --nocapture
+  cargo test -p gfs-server --test exit_criteria --quiet -- --ignored --nocapture
   big="$FIXTURE_ROOT/bigtree-1000x1000.git"
   if [ -d "$big" ]; then
     cp -a "$big" "$REPO_DIR/bigtree.git"
@@ -98,7 +98,7 @@ fi
 # ---------------------------------------------------------------------------
 say "starting the server"
 rm -f "$STATE_DIR/catalog.sqlite"*
-./target/debug/xvfsd-server \
+./target/debug/gfs-server \
   --state-dir "$STATE_DIR" \
   --http-addr "$HTTP_ADDR" \
   --grpc-addr "$GRPC_ADDR" \
@@ -126,40 +126,40 @@ if ! curl -fsS "http://$HTTP_ADDR/readyz" >/dev/null 2>&1; then
   exit 1
 fi
 
-export XVFS_ENDPOINT="http://$GRPC_ADDR"
-export XVFS_HTTP_ENDPOINT="http://$HTTP_ADDR"
-export XVFS_TOKEN="$TOKEN"
-XVFS=./target/debug/xvfs
+export GFS_ENDPOINT="http://$GRPC_ADDR"
+export GFS_HTTP_ENDPOINT="http://$HTTP_ADDR"
+export GFS_TOKEN="$TOKEN"
+GFS=./target/debug/gfs
 
 # ---------------------------------------------------------------------------
 # The demonstration. Each step is one of M1's deliverables, so a failure here is a
 # real regression rather than a scripting problem.
 say "resolve a revision"
-$XVFS resolve --repo basic main
+$GFS resolve --repo basic main
 
 say "list a directory"
-$XVFS ls --repo basic --rev main src
+$GFS ls --repo basic --rev main src
 
 say "read a file without cloning"
-$XVFS cat --repo basic --rev main README.md
+$GFS cat --repo basic --rev main README.md
 
 say "raw bytes, with no .gitattributes conversion (DESIGN.md section 12)"
 # `attrs` declares `*.txt text eol=crlf`, so a real checkout would emit CRLF and
-# XVFS emits the stored LF. Shown because it is a documented divergence an agent
+# GFS emits the stored LF. Shown because it is a documented divergence an agent
 # would otherwise discover by surprise.
-$XVFS cat --repo attrs --rev main converted.txt | od -c | head -2
+$GFS cat --repo attrs --rev main converted.txt | od -c | head -2
 
 say "a non-UTF-8 path is addressable"
-$XVFS ls --repo bytes --rev main | head -8
+$GFS ls --repo bytes --rev main | head -8
 
 say "create, renew, and release a retention lease by hand"
-MOUNT_OUT=$($XVFS lease create --repo basic --rev main)
+MOUNT_OUT=$($GFS lease create --repo basic --rev main)
 printf '%s\n' "$MOUNT_OUT"
 MOUNT_ID=$(printf '%s\n' "$MOUNT_OUT" | awk '$1=="mount"{print $2}')
 CAP=$(printf '%s\n' "$MOUNT_OUT" | awk '$1=="capability"{print $2}')
-$XVFS lease renew --mount-id "$MOUNT_ID" --capability "$CAP" >/dev/null
+$GFS lease renew --mount-id "$MOUNT_ID" --capability "$CAP" >/dev/null
 say "  lease renewed; the anchor is verified under the repository lock"
-$XVFS lease release --mount-id "$MOUNT_ID" --capability "$CAP"
+$GFS lease release --mount-id "$MOUNT_ID" --capability "$CAP"
 
 # ---------------------------------------------------------------------------
 # The M2 half: a real FUSE mount, driven through the daemon.
@@ -175,19 +175,19 @@ if [ -c /dev/fuse ] && command -v fusermount3 >/dev/null 2>&1; then
   # `rm -rf` over a mounted workspace is both wrong and slow: the base is
   # read-only, so every removal fails, and ADR 0003 measured that a mount point
   # outlives its daemon and answers ENOTCONN until something unmounts it.
-  $XVFS unmount --workspace "$WS" >/dev/null 2>&1 || true
-  for gen in "$WS.xvfs"/generations/*; do
+  $GFS unmount --workspace "$WS" >/dev/null 2>&1 || true
+  for gen in "$WS.gfs"/generations/*; do
     [ -d "$gen" ] && fusermount3 -u -z "$gen" >/dev/null 2>&1 || true
   done
   rm -f "$WS"
-  rm -rf "$WS.xvfs"
+  rm -rf "$WS.gfs"
   # Whatever happens below, do not leave a daemon behind.
   # shellcheck disable=SC2317
-  cleanup_mount() { $XVFS unmount --workspace "$WS" >/dev/null 2>&1 || true; }
+  cleanup_mount() { $GFS unmount --workspace "$WS" >/dev/null 2>&1 || true; }
   trap 'cleanup_mount; cleanup' EXIT
 
   say "mount a pinned commit as a workspace"
-  $XVFS mount --repo basic --rev main --workspace "$WS" --cache-dir "$STATE_DIR/cache"
+  $GFS mount --repo basic --rev main --workspace "$WS" --cache-dir "$STATE_DIR/cache"
 
   say "read a file through the mount, with no repository on the client"
   cat "$WS/README.md"
@@ -201,7 +201,7 @@ if [ -c /dev/fuse ] && command -v fusermount3 >/dev/null 2>&1; then
   ( cd "$WS" && git rev-parse --show-toplevel && git rev-parse --abbrev-ref HEAD )
 
   say "the git shim answers what the raw surface gets wrong (ADR 0005)"
-  SHIM_BIN=$($XVFS install-shim --workspace "$WS" 2>/dev/null)
+  SHIM_BIN=$($GFS install-shim --workspace "$WS" 2>/dev/null)
   printf '  stock git ls-files:  %s entries, exit 0 -- silently wrong\n' \
     "$( (cd "$WS" && git ls-files | wc -l) )"
   printf '  shim  git ls-files:  %s entries\n' \
@@ -215,48 +215,48 @@ if [ -c /dev/fuse ] && command -v fusermount3 >/dev/null 2>&1; then
   echo "  unsupported subcommands are refused, not approximated"
 
   say "hydration accounting"
-  $XVFS inspect --workspace "$WS" | grep -E 'hydration|generation|lease|overlay'
+  $GFS inspect --workspace "$WS" | grep -E 'hydration|generation|lease|overlay'
 
   say "the workspace is writable, and the overlay records what changed"
   echo "a new file" >"$WS/added.txt"
   printf '\nan appended line\n' >>"$WS/README.md"
   rm -f "$WS/src/lib/util.rs"
   mv "$WS/src/main.rs" "$WS/src/entry.rs"
-  $XVFS status --workspace "$WS"
+  $GFS status --workspace "$WS"
 
   say "the same change set as a patch, from the journal (no tree scan)"
-  $XVFS diff --workspace "$WS" | head -20
+  $GFS diff --workspace "$WS" | head -20
 
   say "the shim answers status and diff from the overlay too"
   (cd "$WS" && PATH="$SHIM_BIN:$PATH" git status --porcelain)
 
   say "export is atomic and checksummed"
-  $XVFS export --workspace "$WS" --bundle "$STATE_DIR/export"
+  $GFS export --workspace "$WS" --bundle "$STATE_DIR/export"
   ls -A "$STATE_DIR/export"
 
   say "refresh refuses a dirty workspace (three-way refresh is out of scope)"
-  if $XVFS refresh --workspace "$WS" 2>/dev/null; then
+  if $GFS refresh --workspace "$WS" 2>/dev/null; then
     echo "FAILED: refresh accepted a workspace with local changes" >&2
     exit 1
   fi
   echo "  refused, as PLAN.md M2.1 requires"
 
   say "the overlay survives a daemon restart: the job's edits are still there"
-  $XVFS unmount --workspace "$WS" >/dev/null
-  $XVFS mount --repo basic --rev main --workspace "$WS" >/dev/null
-  $XVFS status --workspace "$WS" | tail -n +2
+  $GFS unmount --workspace "$WS" >/dev/null
+  $GFS mount --repo basic --rev main --workspace "$WS" >/dev/null
+  $GFS status --workspace "$WS" | tail -n +2
 
   say "discard the workspace, and refresh publishes a new generation atomically"
-  $XVFS unmount --workspace "$WS" >/dev/null
-  rm -rf "$WS.xvfs"
-  $XVFS mount --repo basic --rev main --workspace "$WS" >/dev/null
-  $XVFS refresh --workspace "$WS"
+  $GFS unmount --workspace "$WS" >/dev/null
+  rm -rf "$WS.gfs"
+  $GFS mount --repo basic --rev main --workspace "$WS" >/dev/null
+  $GFS refresh --workspace "$WS"
 
   say "health"
-  $XVFS health --workspace "$WS"
+  $GFS health --workspace "$WS"
 
   say "unmount"
-  $XVFS unmount --workspace "$WS"
+  $GFS unmount --workspace "$WS"
 else
   say "FUSE is unavailable (need /dev/fuse and fuse3); the mount demo is SKIPPED"
 fi
@@ -279,21 +279,21 @@ fi
 
 say "the internal lease namespace is absent from the advertisement"
 if git -c "http.extraHeader=Authorization: Bearer $TOKEN" \
-  ls-remote "http://$HTTP_ADDR/v1/repos/basic" 2>/dev/null | grep -q 'refs/xvfs/'; then
-  echo "FAILED: refs/xvfs/ was advertised" >&2
+  ls-remote "http://$HTTP_ADDR/v1/repos/basic" 2>/dev/null | grep -q 'refs/gfs/'; then
+  echo "FAILED: refs/gfs/ was advertised" >&2
   exit 1
 fi
-echo "  ok: no refs/xvfs/ in ls-remote"
+echo "  ok: no refs/gfs/ in ls-remote"
 
 say "a revision expression is refused, not interpreted"
-if $XVFS resolve --repo basic 'main^{tree}' 2>/dev/null; then
+if $GFS resolve --repo basic 'main^{tree}' 2>/dev/null; then
   echo "FAILED: a revision expression was accepted" >&2
   exit 1
 fi
 echo "  ok: main^{tree} rejected"
 
 say "metrics"
-curl -fsS "http://$HTTP_ADDR/metrics" | grep -E '^xvfs_requests_total' | head -5
+curl -fsS "http://$HTTP_ADDR/metrics" | grep -E '^gfs_requests_total' | head -5
 
 if [ "$SMOKE" -eq 1 ]; then
   say "smoke run complete"
@@ -304,17 +304,17 @@ cat <<EOF
 
 $(say "stack is up")
 
-  gRPC     $XVFS_ENDPOINT
-  HTTP     $XVFS_HTTP_ENDPOINT
-  git      $XVFS_HTTP_ENDPOINT/v1/repos/<id>
+  gRPC     $GFS_ENDPOINT
+  HTTP     $GFS_HTTP_ENDPOINT
+  git      $GFS_HTTP_ENDPOINT/v1/repos/<id>
   token    $TOKEN
   state    $STATE_DIR
 
 Try:
-  export XVFS_ENDPOINT=$XVFS_ENDPOINT XVFS_HTTP_ENDPOINT=$XVFS_HTTP_ENDPOINT XVFS_TOKEN=$TOKEN
-  ./target/debug/xvfs ls --repo bigdir --rev main many | head
-  ./target/debug/xvfs mount --repo basic --rev main
-  git -c "http.extraHeader=Authorization: Bearer $TOKEN" clone $XVFS_HTTP_ENDPOINT/v1/repos/basic
+  export GFS_ENDPOINT=$GFS_ENDPOINT GFS_HTTP_ENDPOINT=$GFS_HTTP_ENDPOINT GFS_TOKEN=$TOKEN
+  ./target/debug/gfs ls --repo bigdir --rev main many | head
+  ./target/debug/gfs mount --repo basic --rev main
+  git -c "http.extraHeader=Authorization: Bearer $TOKEN" clone $GFS_HTTP_ENDPOINT/v1/repos/basic
 
 Ctrl-C to stop.
 EOF

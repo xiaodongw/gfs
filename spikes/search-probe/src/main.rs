@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 #[derive(Parser)]
-#[command(about = "XVFS M0.4 search representation probe")]
+#[command(about = "GFS M0.4 search representation probe")]
 struct Cli {
   #[command(subcommand)]
   cmd: Cmd,
@@ -398,8 +398,8 @@ fn verify(repo_path: &Path, rev: &str, rg: Option<PathBuf>, patterns: &[String])
 
   // Materialized with ls-tree + cat-file semantics, not `git checkout`, so
   // `.gitattributes` conversion cannot make the oracle disagree with the raw
-  // bytes XVFS serves. This is PLAN.md section 12's stated oracle.
-  let dir = std::env::temp_dir().join(format!("xvfs-verify-{}", std::process::id()));
+  // bytes GFS serves. This is PLAN.md section 12's stated oracle.
+  let dir = std::env::temp_dir().join(format!("gfs-verify-{}", std::process::id()));
   let _ = std::fs::remove_dir_all(&dir);
   std::fs::create_dir_all(&dir)?;
   let materialized = materialize(&repo, oid, &dir)?;
@@ -409,7 +409,7 @@ fn verify(repo_path: &Path, rev: &str, rg: Option<PathBuf>, patterns: &[String])
   let mut idx = TrigramIndex::default();
   let (manifest, _) = index::build_snapshot(&repo, oid, &mut registry, &mut idx, true)?;
 
-  println!("| pattern | xvfs | ripgrep | agree |");
+  println!("| pattern | gfs | ripgrep | agree |");
   println!("| --- | ---: | ---: | :---: |");
   let mut disagreements = 0;
   for pat in patterns {

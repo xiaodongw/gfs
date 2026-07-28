@@ -3,7 +3,7 @@
 #
 # Decides what occupies `.git`: the synthesized read-only directory plus a `git`
 # shim (DESIGN.md section 8.6's default), or a real shallow blobless partial
-# clone whose promisor remote is the XVFS gateway.
+# clone whose promisor remote is the GFS gateway.
 #
 # DESIGN.md is explicit that this is a measurement, not a preference, because
 # the answer changes the milestone graph: if partial clone wins, the minimum
@@ -11,13 +11,13 @@
 #
 # The number that decides it is `git status` on the worst-case repository,
 # because that is the command agents run most and the one whose cost lands
-# exactly where XVFS is trying to save.
+# exactly where GFS is trying to save.
 set -uo pipefail
 
-CORPUS_DIR="${XVFS_CORPUS_DIR:-$HOME/xvfs-corpus}"
+CORPUS_DIR="${GFS_CORPUS_DIR:-$HOME/gfs-corpus}"
 MIRROR_DIR="$CORPUS_DIR/mirrors"
 REPO="${1:-linux}"
-WORK="${XVFS_SURFACE_DIR:-$CORPUS_DIR/surface}"
+WORK="${GFS_SURFACE_DIR:-$CORPUS_DIR/surface}"
 export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null GIT_TERMINAL_PROMPT=0
 
 mkdir -p "$WORK"
@@ -99,7 +99,7 @@ echo "### \`git diff\` with a small edit set"
 echo
 mapfile -t victims < <(git -C "$dst" ls-files | head -5)
 for f in "${victims[@]}"; do
-    printf '\n// xvfs probe edit\n' >> "$dst/$f"
+    printf '\n// gfs probe edit\n' >> "$dst/$f"
 done
 s=$(now); git -C "$dst" diff --stat >/dev/null 2>&1; e=$(now)
 echo "| operation | wall |"
@@ -127,7 +127,7 @@ syn="$WORK/$REPO-synth"
 rm -rf "$syn"; mkdir -p "$syn/.git"
 # Git's repository detection requires `objects/` and `refs/` to exist in
 # addition to HEAD and config. DESIGN.md section 8.6 lists only HEAD,
-# packed-refs, config, and xvfs.json; with just those, every command below
+# packed-refs, config, and gfs.json; with just those, every command below
 # fails with "not a git repository" and the synthesized surface satisfies
 # nothing at all. Measured, not assumed.
 mkdir -p "$syn/.git/objects" "$syn/.git/refs"
@@ -135,7 +135,7 @@ head_oid=$(git --git-dir="$MIRROR_DIR/$REPO.git" rev-parse HEAD)
 branch=$(git --git-dir="$MIRROR_DIR/$REPO.git" symbolic-ref --short HEAD 2>/dev/null || echo main)
 
 # Exactly what DESIGN.md section 8.6 specifies: HEAD, a packed-refs entry for
-# the pinned revision, a minimal config, and xvfs.json. No object database and
+# the pinned revision, a minimal config, and gfs.json. No object database and
 # no index, deliberately.
 printf 'ref: refs/heads/%s\n' "$branch" > "$syn/.git/HEAD"
 printf '# pack-refs with: peeled fully-peeled sorted \n%s refs/heads/%s\n' \
@@ -147,12 +147,12 @@ cat > "$syn/.git/config" <<CFG
 	bare = false
 	logallrefupdates = false
 CFG
-cat > "$syn/.git/xvfs.json" <<JSON
+cat > "$syn/.git/gfs.json" <<JSON
 {
   "repository": "$REPO",
   "commit": "$head_oid",
   "branch": "$branch",
-  "api": "https://xvfs.invalid/v1",
+  "api": "https://gfs.invalid/v1",
   "surface": "synthesized-readonly"
 }
 JSON

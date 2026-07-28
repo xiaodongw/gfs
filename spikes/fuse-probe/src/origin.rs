@@ -1,4 +1,4 @@
-//! A stand-in for the XVFS snapshot/blob API.
+//! A stand-in for the GFS snapshot/blob API.
 //!
 //! The M0.2 question is about the *filesystem*, not the server, so this is
 //! deliberately the smallest thing that makes a read genuinely remote: a local

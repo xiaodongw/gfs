@@ -18,7 +18,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 #[derive(Parser)]
-#[command(about = "XVFS M0.2 FUSE deployment probe")]
+#[command(about = "GFS M0.2 FUSE deployment probe")]
 struct Cli {
   #[command(subcommand)]
   cmd: Cmd,
@@ -132,7 +132,7 @@ fn base_config(n_threads: usize) -> Config {
   // instead of breaking the build, so any that matter must be set explicitly.
   let mut c = Config::default();
   c.mount_options = vec![
-    MountOption::FSName("xvfs-probe".into()),
+    MountOption::FSName("gfs-probe".into()),
     MountOption::RO,
     // The mount holds someone else's source: no setuid, no device nodes.
     MountOption::NoSuid,
@@ -435,7 +435,7 @@ fn capabilities() -> Result<()> {
   println!("{}", serde_json::to_string_pretty(&environment()?)?);
   println!();
 
-  let base = std::env::temp_dir().join(format!("xvfs-cap-{}", std::process::id()));
+  let base = std::env::temp_dir().join(format!("gfs-cap-{}", std::process::id()));
   // `AutoUnmount` requires allow_other (or allow_root) to be permitted, so
   // the two are varied together: whether the host daemon can rely on the
   // kernel cleaning up after a crashed daemon depends on both.

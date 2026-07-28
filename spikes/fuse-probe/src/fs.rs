@@ -1,7 +1,7 @@
 //! A minimal read-only FUSE filesystem with remote-backed files.
 //!
 //! Small on purpose. The M0.2 question is whether a mount is possible in the
-//! target environment and what it costs, not whether XVFS's eventual inode model
+//! target environment and what it costs, not whether GFS's eventual inode model
 //! is right. What this does model faithfully is the one structural decision
 //! M2 cannot walk back: a `read` has to wait on the network, and where that wait
 //! happens decides whether the whole mount serializes.
@@ -354,7 +354,7 @@ pub fn build_tree(n: usize, file_size: usize) -> (Vec<Entry>, HashMap<String, Ve
   for i in 0..n {
     let name = format!("file-{i:04}");
     // Distinct content per file so a wrong-blob bug cannot pass unnoticed.
-    let mut content = format!("xvfs fuse probe blob {i}\n").into_bytes();
+    let mut content = format!("gfs fuse probe blob {i}\n").into_bytes();
     content.resize(file_size, b'.');
     blobs.insert(name.clone(), content);
     entries.push(Entry {

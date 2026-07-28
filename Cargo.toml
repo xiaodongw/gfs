@@ -1,15 +1,22 @@
 [workspace]
 resolver = "2"
+# The three entry points are the workspace root's own directories; every
+# library lives under `crates/`. The dependency edges run one way only --
+# an entry point may use any `crates/` member, and no `crates/` member may
+# name an entry point -- which is what makes the split mean something.
 members = [
-  "crates/xvfs-types",
-  "crates/xvfs-proto",
-  "crates/xvfs-git",
-  "crates/xvfs-server",
-  "crates/xvfs-search",
-  "crates/xvfs-overlay",
-  "crates/xvfs-fuse",
-  "crates/xvfs-cli",
-  "crates/xvfs-test",
+  "gfs-cli",
+  "gfs-fuse",
+  "gfs-server",
+
+  "crates/gfs-types",
+  "crates/gfs-proto",
+  "crates/gfs-git",
+  "crates/gfs-search",
+  "crates/gfs-overlay",
+  "crates/gfs-mount",
+  "crates/gfs-service",
+  "crates/gfs-test",
 ]
 
 # `spikes/` is its own workspace on purpose. Those crates exist to produce M0
@@ -21,7 +28,7 @@ exclude = ["spikes"]
 version = "0.1.0"
 edition = "2021"
 # Matches rust-toolchain.toml. The MSRV is the pinned toolchain rather than an
-# older floor: XVFS ships as a service, not a library, so supporting an older
+# older floor: GFS ships as a service, not a library, so supporting an older
 # compiler buys nothing and costs CI time.
 rust-version = "1.97"
 publish = false
@@ -40,17 +47,18 @@ str_to_string = "warn"
 string_slice = "warn"
 
 [workspace.dependencies]
-xvfs-types = { path = "crates/xvfs-types" }
-xvfs-proto = { path = "crates/xvfs-proto" }
-xvfs-git = { path = "crates/xvfs-git" }
-xvfs-search = { path = "crates/xvfs-search" }
-xvfs-overlay = { path = "crates/xvfs-overlay" }
-xvfs-fuse = { path = "crates/xvfs-fuse" }
-xvfs-test = { path = "crates/xvfs-test" }
+gfs-types = { path = "crates/gfs-types" }
+gfs-proto = { path = "crates/gfs-proto" }
+gfs-git = { path = "crates/gfs-git" }
+gfs-search = { path = "crates/gfs-search" }
+gfs-overlay = { path = "crates/gfs-overlay" }
+gfs-mount = { path = "crates/gfs-mount" }
+gfs-service = { path = "crates/gfs-service" }
+gfs-test = { path = "crates/gfs-test" }
 
 # Git objects. Versions pinned by ADR 0001; `vendored-libgit2` is load-bearing,
 # not a convenience, because the supported-repository-format boundary is a
-# property of the exact libgit2 build XVFS ships.
+# property of the exact libgit2 build GFS ships.
 #
 # `default-features = false` drops git2's `https` and `ssh` features. The server
 # never uses libgit2 as a network client -- fetching is stock Git's job and

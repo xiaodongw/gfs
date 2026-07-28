@@ -1,4 +1,4 @@
-# XVFS Implementation Plan
+# GFS Implementation Plan
 
 Status: Draft; core implementation choices accepted  
 Companion: [DESIGN.md](DESIGN.md)
@@ -90,7 +90,7 @@ Duration: 2–3 weeks, run concurrently across the whole team
 >
 > Four findings **contradicted** the design and changed it: SHA-256 is
 > unreachable through `git2-rs` rather than merely experimental; hiding
-> `refs/xvfs/` prevents discovery but not access; the specified synthesized
+> `refs/gfs/` prevents discovery but not access; the specified synthesized
 > `.git` contents do not form a repository at all; and `git ls-files`/`git diff`
 > against that surface return empty with exit 0 instead of failing visibly,
 > which makes the shim a correctness requirement.
@@ -221,7 +221,7 @@ and a list of tools that the chosen option does not satisfy.
 - Create an initial failure-mode and data-retention policy.
 - Fix the mount retention-lease policy: lease lifetime, orphan expiry, and the
   interaction with repository garbage collection. Include heartbeat frequency,
-  renewal grace, mount-capability authorization, hiding of `refs/xvfs/`, and
+  renewal grace, mount-capability authorization, hiding of `refs/gfs/`, and
   exclusion of that namespace from mirror/prune refspecs.
 - Fix the timestamp policy using a server-cataloged sanitized snapshot time and a
   client-side monotonic overlay clock; include future-dated commits and host clock
@@ -245,11 +245,11 @@ Duration: 3 weeks
 >
 > | Sub-milestone | Status | Deliverable |
 > | --- | --- | --- |
-> | M1.1 workspace and foundation | ✅ | `xvfs-*` workspace, `scripts/check.sh`, `scripts/dev-stack.sh` |
-> | M1.2 catalog and retention leases | ✅ | `xvfs-server/src/catalog/`, `mounts.rs`, `mirror.rs` |
-> | M1.3 Git object service | ✅ | `xvfs-git` |
-> | M1.4 snapshot and blob APIs | ✅ | `xvfs-proto`, `xvfs-server/src/service/` |
-> | M1.5 authentication and authorization | ⚠️ OIDC is a declared seam | `xvfs-server/src/auth/`, `audit.rs` |
+> | M1.1 workspace and foundation | ✅ | `gfs-*` workspace, `scripts/check.sh`, `scripts/dev-stack.sh` |
+> | M1.2 catalog and retention leases | ✅ | `crates/gfs-service/src/catalog/`, `mounts.rs`, `mirror.rs` |
+> | M1.3 Git object service | ✅ | `gfs-git` |
+> | M1.4 snapshot and blob APIs | ✅ | `gfs-proto`, `crates/gfs-service/src/service/` |
+> | M1.5 authentication and authorization | ⚠️ OIDC is a declared seam | `crates/gfs-service/src/auth/`, `audit.rs` |
 >
 > Criterion 1 measured: 1,000,002 entries paged across 1000 directories in 13.2 s,
 > then one file read, with no client-side repository.
@@ -257,8 +257,8 @@ Duration: 3 weeks
 > Four findings changed something rather than confirming it: `rustfmt.toml`'s BOM
 > silently disabled formatting entirely; `revparse` is too powerful for a service
 > boundary, and `main^{tree}` in particular yields a tree where every layer expects
-> a commit; hiding `refs/xvfs/` needs *two* spellings, because Git resolves the
-> short name `xvfs/mounts/<id>` to a live lease anchor; and lease protection has to
+> a commit; hiding `refs/gfs/` needs *two* spellings, because Git resolves the
+> short name `gfs/mounts/<id>` to a live lease anchor; and lease protection has to
 > account for the prune delay, or a mistaken expiry is unrecoverable by definition.
 >
 > One scope reduction carries forward: **M1.5's OIDC integration is a seam.** No
@@ -268,16 +268,24 @@ Duration: 3 weeks
 
 ### M1.1 Workspace and engineering foundation
 
-- Create a Cargo workspace with:
-  - `xvfs-types`: object IDs, byte paths, revisions, errors, limits;
-  - `xvfs-proto`: Protobuf definitions and generated clients;
-  - `xvfs-git`: `GitRepository` abstraction and `git2-rs` implementation;
-  - `xvfs-server`: HTTP/gRPC process;
-  - `xvfs-search`: indexing and query library;
-  - `xvfs-overlay`: overlay state machine;
-  - `xvfs-fuse`: filesystem adapter;
-  - `xvfs-cli`: user/orchestrator commands;
-  - `xvfs-test`: fixtures, fake server, and fault injection.
+- Create a Cargo workspace split into entry points and libraries. The three
+  entry points are the workspace root's own directories and hold nothing but
+  argument parsing, wiring, and startup; every library lives under `crates/`.
+  The dependency edges run one way only — an entry point may use any `crates/`
+  member, and **no `crates/` member may name an entry point**. That rule is what
+  makes the split mean something rather than being a display order, and it is
+  checked by reading the manifests, not by convention alone.
+  - `gfs-cli` → the `gfs` binary: user and orchestrator commands;
+  - `gfs-fuse` → the `gfs-fuse` mount daemon and the `gfs-git-shim` `git` shim;
+  - `gfs-server` → the `gfs-server` gateway daemon;
+  - `crates/gfs-types`: object IDs, byte paths, revisions, errors, limits;
+  - `crates/gfs-proto`: Protobuf definitions and generated clients;
+  - `crates/gfs-git`: `GitRepository` abstraction and `git2-rs` implementation;
+  - `crates/gfs-service`: catalog, snapshot and blob APIs, and the Git gateway;
+  - `crates/gfs-search`: indexing and query library;
+  - `crates/gfs-overlay`: overlay state machine;
+  - `crates/gfs-mount`: filesystem adapter, mount daemon, control protocol;
+  - `crates/gfs-test`: fixtures, mount harness, fake server, fault injection.
 - Pin a stable Rust toolchain and minimum supported Rust version.
 - Add formatting, Clippy, unit/doc tests, dependency audit, license checks, SBOM,
   secret scanning, and reproducible release builds. The license check must assert
@@ -307,7 +315,7 @@ Duration: 3 weeks
   Git maintenance and garbage collection treat live leases as reachability roots.
 - Implement authenticated idempotent renewal, expiry grace, restart recovery, and
   alerts for a live daemon that cannot renew.
-- Hide `refs/xvfs/` from upload-pack and ordinary ref enumeration, reject it as a
+- Hide `refs/gfs/` from upload-pack and ordinary ref enumeration, reject it as a
   user revision, and exclude it from every upstream fetch/prune refspec. Do not use
   unrestricted mirror pruning over internal refs.
 - Test that a force push, branch deletion, upstream rebase, or `git gc` cannot make
@@ -353,7 +361,7 @@ and every uncached read fails permanently mid-task.
   a pinned commit no longer reachable from a currently visible ref. Within those
   APIs, repository access alone must not reach a commit retained for another
   subject's mount.
-  This requirement is **scoped to the XVFS APIs and does not extend to the Git
+  This requirement is **scoped to the GFS APIs and does not extend to the Git
   gateway**. M0.3 measured that stock `upload-pack` serves any object in the
   repository's object database by object ID over protocol v2, regardless of
   `uploadpack.allowAnySHA1InWant`, so a repository reader can always reach a
@@ -383,8 +391,8 @@ Duration: 3–4 weeks
 > **Status: complete, 2026-07-26.** All six exit criteria met; see the
 > [M2 completion report](reports/m2-completion.md).
 >
-> Code is in [`crates/xvfs-fuse/`](../crates/xvfs-fuse/), the daemon is `xvfsd`,
-> the shim is `xvfs-git-shim`, and the workspace commands are `xvfs
+> Code is in [`gfs-fuse/`](../gfs-fuse/), the daemon is `gfs-fuse`,
+> the shim is `gfs-git-shim`, and the workspace commands are `gfs
 > mount|unmount|inspect|health|refresh|install-shim`.
 >
 > | Sub-milestone | Status | Deliverable |
@@ -392,7 +400,7 @@ Duration: 3–4 weeks
 > | M2.1 mount lifecycle | ✅ | `daemon.rs`, `state.rs`, `publish.rs`, `lease.rs`, `control.rs` |
 > | M2.2 metadata and inode model | ✅ | `inode.rs`, `attr.rs`, `fs.rs` |
 > | M2.3 blob cache and reads | ✅ | `cache.rs`, `client.rs`, `tests/mmap.rs` |
-> | M2.4 compatibility tests | ⚠️ `pjdfstest` run 2026-07-27 ([report](reports/posix-conformance.md)); xfstests **not run** | `tests/compat.rs`, `xvfs-test/src/oracle.rs`, `bin/xvfs-git-shim.rs` |
+> | M2.4 compatibility tests | ⚠️ `pjdfstest` run 2026-07-27 ([report](reports/posix-conformance.md)); xfstests **not run** | `gfs-fuse/tests/compat.rs`, `crates/gfs-test/src/oracle.rs`, `gfs-fuse/src/bin/gfs-git-shim.rs` |
 >
 > Measured: cold mount to a usable root in **99 ms** having downloaded **zero**
 > blob bytes; a two-file read from a 16 MiB snapshot transfers 28 bytes; 1000
@@ -404,14 +412,14 @@ Duration: 3–4 weeks
 > restarted daemon would have silently re-downloaded its warm cache; the test
 > oracle's own `from_utf8_lossy` corrupted the non-UTF-8 paths it was checking and
 > blamed the mount; a backgrounded daemon inheriting stderr holds the caller's
-> pipe open so `xvfs mount | tee` never terminates; and a symlink target resolves
+> pipe open so `gfs mount | tee` never terminates; and a symlink target resolves
 > relative to the link's directory, so a relative `--state-dir` published a
 > workspace pointing nowhere.
 >
 > The mmap question M2.3 raised is answered and recorded as a compatibility
 > boundary ([ADR 0006 amendment](adr/0006-mvp-boundary-and-policies.md)):
 > read-only mapping works, writable `MAP_SHARED` works on FUSE **without**
-> `FUSE_WRITEBACK_CACHE`, and XVFS therefore does not enable that capability —
+> `FUSE_WRITEBACK_CACHE`, and GFS therefore does not enable that capability —
 > it would hand `size` and `mtime` to the kernel, which the overlay logical clock
 > cannot allow.
 >
@@ -422,7 +430,7 @@ Duration: 3–4 weeks
 > **Update, 2026-07-27: `pjdfstest` now runs**, built from source and driven by
 > [`spikes/conformance/pjdfstest.sh`](../spikes/conformance/pjdfstest.sh) against
 > an ext4 control, because the suite requires root and 76 of its 238 files fail
-> on ext4 without it. 37 files failed on XVFS and not on ext4. **Two were defects
+> on ext4 without it. 37 files failed on GFS and not on ext4. **Two were defects
 > and are fixed**: a too-long path reported as `EIO` rather than `ENAMETOOLONG`,
 > because the overlay's blanket error conversion treated its own local argument
 > validation as a storage failure; and a directory's mtime and ctime never
@@ -432,7 +440,7 @@ Duration: 3–4 weeks
 > [POSIX conformance report](reports/posix-conformance.md).
 >
 > **xfstests is still not run** and is not a script invocation away: it wants a
-> scratch block device and much of its `generic` group tests behaviour XVFS does
+> scratch block device and much of its `generic` group tests behaviour GFS does
 > not claim. Scoping a meaningful subset — or recording it as deliberately not
 > applicable, with reasons — remains open before M6.1.
 >
@@ -443,7 +451,7 @@ Duration: 3–4 weeks
 
 ### M2.1 Mount lifecycle
 
-- Implement `xvfs mount`, `unmount`, `inspect`, and daemon health commands.
+- Implement `gfs mount`, `unmount`, `inspect`, and daemon health commands.
 - Persist mount identity, repository, pinned commit, snapshot time, lease state, API
   version, and format version.
 - Call atomic `CreateMount` so revision resolution, authorization, lease catalog
@@ -454,10 +462,10 @@ Duration: 3–4 weeks
   surface renewal failure before grace expires, and release it on unmount or cleanup.
 - Implement the chosen host-daemon/CSI integration skeleton.
 - Implement the `.git` surface selected in M0.5. For the default option that means
-  a synthesized read-only `HEAD`, `packed-refs`, `config`, and `xvfs.json`, excluded
+  a synthesized read-only `HEAD`, `packed-refs`, `config`, and `gfs.json`, excluded
   from search, status, diff, export, and hydration accounting; verify mount
   ownership and `safe.directory` behavior under the bind-mount.
-- Implement `xvfs refresh` for a clean workspace only by creating a second mount
+- Implement `gfs refresh` for a clean workspace only by creating a second mount
   generation and atomically replacing the bind mount. Do not mutate the pinned base
   under existing long-lived kernel dentries. Keep the old generation and its lease
   until old file and directory handles close, then tear it down. Refuse with a clear
@@ -530,16 +538,16 @@ Duration: 3–4 weeks
 > **Status: complete, 2026-07-26.** All three exit criteria met; see the
 > [M3 completion report](reports/m3-completion.md).
 >
-> Code is in [`crates/xvfs-overlay/`](../crates/xvfs-overlay/), the mutation
-> surface is `xvfs-fuse/src/fs.rs`, and the commands are
-> `xvfs status|diff|export` plus the rewired `git` shim.
+> Code is in [`crates/gfs-overlay/`](../crates/gfs-overlay/), the mutation
+> surface is `crates/gfs-mount/src/fs.rs`, and the commands are
+> `gfs status|diff|export` plus the rewired `git` shim.
 >
 > | Sub-milestone | Status | Deliverable |
 > | --- | --- | --- |
 > | M3.1 overlay data model | ✅ | `state.rs`, `journal.rs`, `store.rs`, `merge.rs`, `model.rs` |
-> | M3.2 mutation operations | ✅ | `xvfs-fuse/src/fs.rs`, `inode.rs`, `attr.rs` |
-> | M3.3 status and diff | ✅ | `status.rs`, `diff.rs`, `export.rs`, `blobs.rs`, `xvfs-git-shim` |
-> | M3.4 crash and concurrency | ⚠️ `pjdfstest` run 2026-07-27 ([report](reports/posix-conformance.md)); xfstests **not run** | `fault.rs`, `xvfs-overlay-crash`, `tests/faults.rs` |
+> | M3.2 mutation operations | ✅ | `crates/gfs-mount/src/fs.rs`, `inode.rs`, `attr.rs` |
+> | M3.3 status and diff | ✅ | `status.rs`, `diff.rs`, `export.rs`, `blobs.rs`, `gfs-git-shim` |
+> | M3.4 crash and concurrency | ⚠️ `pjdfstest` run 2026-07-27 ([report](reports/posix-conformance.md)); xfstests **not run** | `fault.rs`, `gfs-overlay-crash`, `tests/faults.rs` |
 >
 > Measured: `status` over a 5002-entry directory with two changes costs **zero**
 > metadata requests, **zero** directory pages, and **zero** blob bytes; a
@@ -558,7 +566,7 @@ Duration: 3–4 weeks
 > **One gap carries forward unchanged from M2, and is now half closed.**
 > `pjdfstest` and xfstests were still not run at M3; `tests/compat.rs` covers a
 > hand-written *writable* subset on top of the read-only one. `pjdfstest` was run
-> on 2026-07-27 and found 37 files failing on XVFS that pass on an ext4 control
+> on 2026-07-27 and found 37 files failing on GFS that pass on an ext4 control
 > (35 after two fixes)
 > — including two of the writable paths M3 built, where a directory's mtime and
 > ctime do not move when a child is created or removed. See the
@@ -632,7 +640,7 @@ Duration: 3–4 weeks
 > [`benchmarks/search-preparation.md`](../benchmarks/search-preparation.md).
 >
 > **Correction, 2026-07-27.** The exit criteria were met component by component
-> and the milestone was nonetheless not usable end to end. Running `xvfs-rg` in a
+> and the milestone was nonetheless not usable end to end. Running `gfs rg` in a
 > real workspace failed every time, for two independent reasons that each looked
 > like the other's absence:
 >
@@ -641,14 +649,14 @@ Duration: 3–4 weeks
 >   manifest is missing rather than building one — so the condition was permanent,
 >   not transient. The daemon now warms the index at mount and the search path
 >   prepares on demand and retries.
-> * **`xvfs-rg` could not find its own workspace.** Discovery canonicalized the
+> * **`gfs rg` could not find its own workspace.** Discovery canonicalized the
 >   path first, which resolves the published symlink to
->   `<workspace>.xvfs/generations/<n>` and destroys the `<workspace>` + `.xvfs`
+>   `<workspace>.gfs/generations/<n>` and destroys the `<workspace>` + `.gfs`
 >   naming the upward walk looks for. It failed from inside the mount — its
 >   documented usage — and `--workspace` was routed through the same walk, so the
 >   flag that exists to bypass discovery depended on it.
 >
-> A third defect made both harder to see: `xvfs search` exited **1** on a server
+> A third defect made both harder to see: `gfs search` exited **1** on a server
 > error, which ADR 0004 defines as "complete, and the pattern genuinely does not
 > occur". It exits 2 now. Every one of these is a case of the exact failure the
 > M4 design set out to prevent — an empty answer that is indistinguishable from
@@ -660,17 +668,17 @@ Duration: 3–4 weeks
 > test ran the tools the way an agent runs them. `benchmarks/agent-workflow.md`
 > is now that test.
 >
-> Code is in [`crates/xvfs-search/`](../crates/xvfs-search/), the server half is
-> `xvfs-server/src/search/`, the merged client half is `xvfs-fuse/src/search.rs`,
-> and the commands are `xvfs search` plus the `xvfs-rg` front end.
+> Code is in [`crates/gfs-search/`](../crates/gfs-search/), the server half is
+> `crates/gfs-service/src/search/`, the merged client half is `crates/gfs-mount/src/search.rs`,
+> and the commands are `gfs search` plus the `gfs rg` front end.
 >
 > | Sub-milestone | Status | Deliverable |
 > | --- | --- | --- |
 > | M4.1 blob registry and classification | ✅ | `registry.rs`, `classify.rs`, `lines.rs`, `store.rs` |
-> | M4.2 snapshot manifests | ✅ | `manifest.rs`, `snapshots.rs`, `xvfs-server/src/search/mod.rs` |
+> | M4.2 snapshot manifests | ✅ | `manifest.rs`, `snapshots.rs`, `crates/gfs-service/src/search/mod.rs` |
 > | M4.3 literal and regex index | ✅ | `trigram.rs`, `postings.rs`, `query.rs`, `service/search.rs` |
 > | M4.4 optional token search | ⏭️ **not implemented, deliberately** | [ADR 0004 amendment](adr/0004-search-representation.md) |
-> | M4.5 overlay-aware client search | ⚠️ `rg` comparison **not benchmarked against a real build tree**; end-to-end defects fixed 2026-07-27 | `local.rs`, `glob.rs`, `xvfs-fuse/src/search.rs`, `xvfs-rg`, `docs/agent-search.md` |
+> | M4.5 overlay-aware client search | ⚠️ `rg` comparison **not benchmarked against a real build tree**; end-to-end defects fixed 2026-07-27 | `local.rs`, `glob.rs`, `crates/gfs-mount/src/search.rs`, `gfs rg`, `docs/agent-search.md` |
 > | M4.6 correctness and performance | ✅ | `search_oracle.rs`, `search_faults.rs`, `examples/prepare-bench.rs` |
 >
 > Measured on the worst case (linux, 94 735 eligible paths): warm search **p95
@@ -691,7 +699,7 @@ Duration: 3–4 weeks
 > [ADR 0004 amendment](adr/0004-search-representation.md) — and the same search
 > peaks at 33 MiB.
 >
-> **One gap carries forward.** M4.5's own criterion is that `xvfs search` must
+> **One gap carries forward.** M4.5's own criterion is that `gfs search` must
 > not become slower than the `rg` invocation it replaces, benchmarked against an
 > overlay containing a full build tree. The p95 above is server-side on loopback;
 > the client-side comparison against a real build tree has not been taken. It
@@ -758,7 +766,7 @@ Duration: 3–4 weeks
 - Bound the local half of the search the same way the server bounds its own: honor
   `.gitignore` and `.git/info/exclude` from the merged workspace, apply the server's
   binary and size classification, and enforce a local time and bytes-read budget.
-  Benchmark against an overlay containing a full build tree; `xvfs search` must not
+  Benchmark against an overlay containing a full build tree; `gfs search` must not
   become slower than the `rg` invocation it replaces. Provide an explicit flag to
   search ignored files.
 - Merge context, ordering, limits, and exit codes predictably.
@@ -769,13 +777,13 @@ Duration: 3–4 weeks
   coverage exclusions warn by default; `--require-exhaustive` turns any coverage gap
   into failure. Cover this contract in the agent instructions and MCP tool schema.
 - Add `--json` and ripgrep-like text output.
-- Implement `xvfs-rg` for the selected safe flag subset and fail closed on
+- Implement `gfs rg` for the selected safe flag subset and fail closed on
   unsupported flags unless explicit hydration is requested.
 - Publish agent instructions and an MCP/native tool schema.
 
 ### M4.6 Search correctness and performance
 
-- Materialize the same commit and compare XVFS results to `rg` for a large generated
+- Materialize the same commit and compare GFS results to `rg` for a large generated
   query corpus within the declared supported corpus and matching semantics.
 - Cover CRLF, files without final newline, Unicode, invalid UTF-8 paths, repeated
   blobs, symlinks, binary files, huge lines, regex corner cases, and overlay edits.
@@ -801,14 +809,14 @@ Duration: 2–4 weeks
 > **Status: complete, 2026-07-26.** Both exit criteria met for the feature
 > matrix; see the [M5 completion report](reports/m5-completion.md).
 >
-> Code is in [`crates/xvfs-server/src/gateway/`](../crates/xvfs-server/src/gateway/),
+> Code is in [`crates/gfs-service/src/gateway/`](../crates/gfs-service/src/gateway/),
 > the routes are on the existing HTTP listener, and a clone URL is
 > `http://<http-addr>/v1/repos/<repository-id>`.
 >
 > | Sub-milestone | Status | Deliverable |
 > | --- | --- | --- |
 > | M5.1 smart HTTP gateway | ✅ | `gateway/mod.rs`, `Server::git_router`, `scripts/dev-stack.sh` |
-> | M5.2 protocol feature matrix | ⚠️ client **version** row not covered | `xvfs-server/tests/gateway.rs` |
+> | M5.2 protocol feature matrix | ⚠️ client **version** row not covered | `gfs-server/tests/gateway.rs` |
 > | M5.3 subprocess and repository isolation | ⚠️ memory limit omitted by decision | `gateway/upload_pack.rs`, `gateway/pkt.rs` |
 >
 > Measured on the worst case (linux, 2 870 refs): a **6.4 GiB full bare clone**
@@ -830,23 +838,23 @@ Duration: 2–4 weeks
 > One item in M5.3 is **deliberately not implemented**: a process memory limit.
 > `upload-pack` mmaps packfiles and mapped pack bytes count against `RLIMIT_AS`,
 > and linux.git's pack is 4.5 GiB, so any limit small enough to be a backstop is
-> small enough to break clones of the repositories XVFS exists to serve. Memory
+> small enough to break clones of the repositories GFS exists to serve. Memory
 > is a cgroup concern, which is what ADR 0003's deployment model already assumes.
 > `RLIMIT_CPU` is applied through `prlimit`, because `pre_exec` is unavailable
 > under this workspace's `unsafe_code = "deny"`.
 >
 > **One gap carries forward.** Only the pinned Git 2.53.0 is installed here, so
 > the client-**version** row of the matrix is not covered; the test runs whatever
-> `XVFS_GIT_CLIENTS` names and skips loudly otherwise. ADR 0002's v0/v2 split is
+> `GFS_GIT_CLIENTS` names and skips loudly otherwise. ADR 0002's v0/v2 split is
 > version-sensitive, so this should close before M6.1.
 >
-> **Addition, 2026-07-27: `xvfs-log` and `xvfs-find`.** With the gateway in
+> **Addition, 2026-07-27: `gfs log` and `gfs find`.** With the gateway in
 > place, the two remaining questions an agent asks about a whole repository were
 > still answered badly inside a mount — `git log` was frozen at one commit
 > because the workspace has no object database, and `git ls-files` cost one
 > snapshot-API round trip per directory. Both are now delegated to the server
 > through new `SnapshotService` RPCs (`Log`, a libgit2 revwalk; `FindPaths`, a
-> server-side tree walk with globs) and exposed as tools beside `xvfs-rg`. This
+> server-side tree walk with globs) and exposed as tools beside `gfs rg`. This
 > does not reopen [ADR 0005](adr/0005-git-command-surface.md): nothing is
 > hydrated, and the flags that would need a tree or blob per commit are refused.
 > See the [ADR 0005 amendment](adr/0005-git-command-surface.md) and
@@ -871,10 +879,10 @@ Duration: 2–4 weeks
 - Pass `Git-Protocol` v2 negotiation correctly.
 - Start upload-pack with protected configuration that enables filtering explicitly
   (`uploadpack.allowFilter=true`), disables unselected filter families with
-  `uploadpackfilter.<filter>.allow`, hides `refs/xvfs/*`, and leaves arbitrary
+  `uploadpackfilter.<filter>.allow`, hides `refs/gfs/*`, and leaves arbitrary
   unadvertised object wants disabled. Validate the exact requested filter in the
   gateway, initially allowing only `blob:none`, because Git's configuration can
-  permit a filter family more broadly than XVFS policy.
+  permit a filter family more broadly than GFS policy.
 - Disable hooks and unsafe repository/path/environment behavior.
 - Add authentication, authorization, request-size, CPU, memory, time, and process
   limits.
@@ -908,7 +916,7 @@ Duration: 2–4 weeks
 - Disable hooks and unsafe configuration and make the repository read-only to the
   upload-pack process.
 - Build the protected upload-pack configuration independently of repository and
-  user configuration. Test that `refs/xvfs/*` is absent from v0/v1 advertisements
+  user configuration. Test that `refs/gfs/*` is absent from v0/v1 advertisements
   and v2 `ls-refs`, and that repository configuration cannot re-enable hidden refs,
   hooks, arbitrary unadvertised wants, or disallowed filters.
 - Apply process count, CPU, memory, output, inactivity, and wall-clock limits.
@@ -924,7 +932,7 @@ Exit criteria:
 
 - Stock Git clone/fetch and partial-clone tests pass the declared version/feature
   matrix.
-- Git traffic cannot bypass the same repository authorization used by XVFS APIs.
+- Git traffic cannot bypass the same repository authorization used by GFS APIs.
 
 ## 9. M6 — Hosted-agent pilot
 
@@ -935,7 +943,7 @@ Duration: 3–4 weeks
 - Create/mount before the job and unmount/archive after the job.
 - Pass repository, revision, job identity, limits, and credentials securely.
 - Bind-mount into an unprivileged container with the expected ownership.
-- Install CLI, `xvfs-rg`, `xvfs-find`, `xvfs-log`, the `git` shim, agent
+- Install CLI, `gfs rg`, `gfs find`, `gfs log`, the `git` shim, agent
   instructions, and optional MCP tool, and verify shim precedence in `PATH`
   inside the real agent image.
 - **Decide the tool surface**: same-name shims (`git`, `rg`, `find`, `grep`
@@ -951,11 +959,11 @@ Duration: 3–4 weeks
 - Handle cancellation, timeout, node drain, orphan mounts, and cleanup retries,
   including heartbeat renewal, warning before the renewal grace deadline, and
   retention-lease release on every teardown path.
-- Resolve `xvfs materialize`: if M0.2 found a target environment that cannot mount,
+- Resolve `gfs materialize`: if M0.2 found a target environment that cannot mount,
   implement selective materialization of an explicit path set into a plain directory
   here; if every target environment can mount, remove it from the design rather than
   leaving an unimplemented fallback in the document. Note that this is distinct from
-  the pilot's clone fallback in M6.5, which abandons XVFS for the job entirely.
+  the pilot's clone fallback in M6.5, which abandons GFS for the job entirely.
 
 ### M6.2 Hydration controls
 
@@ -986,7 +994,7 @@ Duration: 3–4 weeks
 
 ### M6.5 Pilot evaluation
 
-- Randomly assign selected tasks to XVFS and current clone workflow.
+- Randomly assign selected tasks to GFS and current clone workflow.
 - Compare correctness first, then wall time, bytes, disk, failure rate, and cost.
 - Categorize every forced hydration and unsupported filesystem behavior.
 - Define rollback and automatically fall back to clone on safe, recognized startup
@@ -994,7 +1002,7 @@ Duration: 3–4 weeks
 
 On the statistics: a 20–50 task corpus can only detect large correctness
 differences. Treat correctness as a per-task gate rather than a statistical test —
-every XVFS failure that the clone workflow did not also produce must be root-caused
+every GFS failure that the clone workflow did not also produce must be root-caused
 and either fixed or accepted explicitly. Compute a confidence interval on the
 difference and report it honestly as wide. Reserve statistical claims for the
 resource metrics, where per-task measurements are paired and the effect sizes are
@@ -1002,7 +1010,7 @@ large.
 
 Pilot gate:
 
-- zero unexplained correctness regressions, each XVFS-only failure root-caused;
+- zero unexplained correctness regressions, each GFS-only failure root-caused;
 - meaningful median and tail improvement on startup bytes/disk;
 - acceptable end-to-end task latency;
 - no unresolved high-severity security findings;
@@ -1109,7 +1117,7 @@ Every milestone adds cases to the same automated matrix:
 | Concurrency | duplicate fetch, parallel readers/writers, rename/unlink while open |
 | Security | unauthorized repo/OID, path traversal, symlink escape, regex abuse, token expiry |
 | Lifecycle | crash, forced unmount, orphan cleanup, upgrade, downgrade, GC race, force push and branch deletion under a live mount, lease renewal, grace, expiry, and hidden-ref pruning |
-| Agent | raw `rg`, XVFS search, edit-then-search, execution-truncated and coverage-excluded search, strict exhaustive search, build, test, diff/export, exact `git` shim grammar and `.git` probing, ignored-file overlay search |
+| Agent | raw `rg`, GFS search, edit-then-search, execution-truncated and coverage-excluded search, strict exhaustive search, build, test, diff/export, exact `git` shim grammar and `.git` probing, ignored-file overlay search |
 
 Correctness oracles:
 
@@ -1140,7 +1148,7 @@ The first executable backlog should be:
 7. Overlay state model, then mutations and export.
 8. Literal search index, snapshot manifest, and the terminal execution/coverage
    contract.
-9. Overlay-aware `xvfs search`, the `git` shim, and agent tool integration.
+9. Overlay-aware `gfs search`, the `git` shim, and agent tool integration.
 10. Smart HTTP compatibility matrix.
 11. Hosted orchestrator integration and controlled pilot.
 12. Production and push milestones only after pilot evidence.

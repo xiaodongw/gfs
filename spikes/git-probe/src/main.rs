@@ -1,11 +1,11 @@
 //! M0.3 Git integration validation probe.
 //!
 //! Answers, with measurements rather than documentation: what does the pinned
-//! libgit2 build actually do with the repository shapes XVFS intends to host,
+//! libgit2 build actually do with the repository shapes GFS intends to host,
 //! and does it agree with stock Git.
 
 // The `GitRepository` trait and the algorithm-generic types are a proof of
-// concept for M1.1's `xvfs-types`/`xvfs-git`, so parts of their surface are
+// concept for M1.1's `gfs-types`/`gfs-git`, so parts of their surface are
 // deliberately built out ahead of a caller in this probe.
 #![allow(dead_code)]
 
@@ -20,7 +20,7 @@ use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
 #[derive(Parser)]
-#[command(about = "XVFS M0.3 libgit2 / stock Git conformance probe")]
+#[command(about = "GFS M0.3 libgit2 / stock Git conformance probe")]
 struct Cli {
   #[command(subcommand)]
   cmd: Cmd,

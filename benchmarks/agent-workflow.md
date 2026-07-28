@@ -1,10 +1,10 @@
-# The agent edit workflow, raw Git against XVFS
+# The agent edit workflow, raw Git against GFS
 
 Date: 2026-07-27
 Reproduce: `./spikes/corpus/benchmark-workflow.sh django`
 
 [`baseline.md`](baseline.md) measures the **clone**, which is the first step of a
-task and the one XVFS wins by the widest margin. This measures the **whole
+task and the one GFS wins by the widest margin. This measures the **whole
 task**, because the ranking changes once search is in it:
 
 ```
@@ -12,7 +12,7 @@ acquire a workspace -> git log -10 -> start a branch ->
 find by name -> grep by content -> edit files -> status -> commit
 ```
 
-The clone is where XVFS wins. Search is where it can give all of it back.
+The clone is where GFS wins. Search is where it can give all of it back.
 
 ## Machine and corpus
 
@@ -34,7 +34,7 @@ add, one delete, one rename — to the **same four paths**, chosen once from
 Every step's *result* is recorded next to its time. A faster search that returns
 a different answer is not a faster search.
 
-| step | raw git full | raw git `--depth 10` | XVFS | raw result | XVFS result |
+| step | raw git full | raw git `--depth 10` | GFS | raw result | GFS result |
 | --- | ---: | ---: | ---: | --- | --- |
 | acquire | 12.367 s | 1.836 s | **0.211 s** | clone | mount |
 | `log -10` | 0.006 s | 0.006 s | 0.554 s | 10 commits | 10 commits |
@@ -45,7 +45,7 @@ a different answer is not a faster search.
 | commit | 0.054 s | 0.054 s | 0.078 s | | export + apply |
 | **total** | **12.572 s** | **2.041 s** | **2.644 s** | | |
 
-| | raw git full | raw git `--depth 10` | XVFS |
+| | raw git full | raw git `--depth 10` | GFS |
 | --- | ---: | ---: | ---: |
 | local disk | 338 MiB | 58 MiB | **266 KiB** state + 9 KiB cache |
 | bytes fetched | ~294 MiB | ~14 MiB | **8 828 bytes, 4 blobs** |
@@ -63,15 +63,15 @@ the *first* job. A second job on the same server pays none of it:
 | | cold (table above) | warm, median of 3 |
 | --- | ---: | ---: |
 | mount | 0.211 s | 0.211 s |
-| `xvfs-log -10` | 0.554 s | **0.069 s** |
-| `xvfs-find '*test*'` | 0.192 s | **0.029 s** |
-| `xvfs-rg -F TODO` | 1.042 s | **0.043 s** |
+| `gfs log -10` | 0.554 s | **0.069 s** |
+| `gfs find '*test*'` | 0.192 s | **0.029 s** |
+| `gfs rg -F TODO` | 1.042 s | **0.043 s** |
 
 Warm hydration is **0 blobs, 0 bytes**: none of the three tools reads the mount.
 
 ## What the numbers say
 
-**XVFS wins the task, not just the clone.** 2.6 s cold and well under 1 s warm,
+**GFS wins the task, not just the clone.** 2.6 s cold and well under 1 s warm,
 against 12.6 s for a full clone and 2.0 s for the cheapest raw-git option that
 can still answer `git log -10`. Disk is the larger margin: 266 KiB against
 338 MiB, because nothing is materialized that the task did not read.
@@ -80,12 +80,12 @@ can still answer `git log -10`. Disk is the larger margin: 266 KiB against
 `git log -10` returns **one** commit. `--depth 10` is the honest comparison and
 costs 2.0 s.
 
-**`status` is the one step XVFS wins outright on a warm clone** — 0.009 s against
+**`status` is the one step GFS wins outright on a warm clone** — 0.009 s against
 0.116 s — because it is derived from the overlay journal and touches no base
 metadata, where Git stats every index entry.
 
 **The searches are slower per call and that is the correct trade.** `rg` over a
-materialized tree is 0.017 s; `xvfs-rg` is 0.043 s warm. The comparison is not
+materialized tree is 0.017 s; `gfs rg` is 0.043 s warm. The comparison is not
 0.017 against 0.043, it is 0.017 **plus 12.4 s of clone and 338 MiB** against
 0.043 plus 0.2 s and 266 KiB.
 
@@ -97,9 +97,9 @@ its size.
 
 ## History
 
-An earlier revision of this workflow, before `xvfs-find` and `xvfs-log` existed
-and while `xvfs-rg` could not find its own workspace, measured **~53 s** for the
-XVFS column: the filename step went through the `git` shim's `ls-files`, which
+An earlier revision of this workflow, before `gfs find` and `gfs log` existed
+and while `gfs rg` could not find its own workspace, measured **~53 s** for the
+GFS column: the filename step went through the `git` shim's `ls-files`, which
 issued one snapshot-API round trip per directory (28.9–53.7 s for 7 077 files),
 and the content step returned nothing at all. The three tools were introduced to
 delegate those questions to the server; see
@@ -111,7 +111,7 @@ delegate those questions to the server; see
   `baseline.md` varied under 1 %; the sub-second steps here vary more.
 - Clone times exclude network transfer. Over a real network the 294 MiB against
   8 828 bytes gap widens well past the wall-clock ratio.
-- The edit step is slower on XVFS (0.559 s cold against 0.005 s) because five
+- The edit step is slower on GFS (0.559 s cold against 0.005 s) because five
   writes go through FUSE. That is a per-file cost this edit set is too small to
   characterize.
 - **The corpus is still the public stand-in set.** Every number moves when

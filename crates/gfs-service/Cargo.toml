@@ -1,0 +1,48 @@
+[package]
+name = "gfs-service"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+description = "Repository catalog, snapshot and blob APIs, and the Git gateway"
+
+[dependencies]
+gfs-types = { workspace = true }
+gfs-git = { workspace = true }
+gfs-proto = { workspace = true }
+gfs-search = { workspace = true }
+rusqlite = { workspace = true }
+hmac = { workspace = true }
+sha2 = { workspace = true }
+subtle = { workspace = true }
+metrics = { workspace = true }
+metrics-exporter-prometheus = { workspace = true }
+# `observability::init` builds the subscriber, so this is the library's, not the
+# binary's: the daemon calls it rather than assembling a subscriber itself.
+tracing-subscriber = { workspace = true }
+axum = { workspace = true }
+flate2 = { workspace = true }
+tower = { workspace = true }
+tower-http = { workspace = true }
+http = { workspace = true }
+tonic = { workspace = true }
+prost = { workspace = true }
+anyhow = { workspace = true }
+tokio-stream = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+# The gateway's protocol matrix sends a real gzipped `git-upload-pack` body.
+flate2 = { workspace = true }
+http-body-util = { workspace = true }
+hyper = { workspace = true, features = ["client", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+gfs-test = { workspace = true }
+tempfile = { workspace = true }
+
+[lints]
+workspace = true

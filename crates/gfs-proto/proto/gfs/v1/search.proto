@@ -1,0 +1,148 @@
+syntax = "proto3";
+
+package gfs.v1;
+
+import "gfs/v1/common.proto";
+
+// Revision-aware search (DESIGN.md section 7.5).
+//
+// The service exists to make one guarantee that ordinary search APIs do not:
+// **an empty answer is never ambiguous**. An agent that receives no results
+// concludes the symbol does not exist and acts on that. If a budget cut the
+// query short, a policy excluded the file, or the transport died before the
+// server finished, the agent must be able to tell.
+//
+// So a successful stream is zero or more `SearchMatch` messages followed by
+// **exactly one** `SearchCompletion`. A stream that ends without one is a failed
+// search, whatever it delivered. That rule is why the terminal message is part
+// of the stream rather than trailing metadata: trailers are easy to drop, easy
+// to forget to read, and invisible in a proxy that truncates a response.
+service SearchService {
+  // Search one pinned commit. Never a branch name: DESIGN.md section 6.2 makes a
+  // branch only a selector, and a search whose corpus could move under it would
+  // return results from two generations of a tree.
+  rpc Search(SearchRequest) returns (stream SearchResponse);
+}
+
+message SearchRequest {
+  string repository_id = 1;
+  // The exact commit, from `ResolveRevision` or `CreateMount`.
+  string commit_oid = 2;
+  SnapshotAuthorization authorization = 3;
+
+  // The pattern. A regex unless `literal` is set.
+  string pattern = 4;
+  // Treat `pattern` as bytes to find rather than as a regex.
+  bool literal = 5;
+  bool case_insensitive = 6;
+
+  // Path prefix, matched at a path boundary. Empty means the whole snapshot.
+  // Bytes, because a path need not be UTF-8.
+  bytes scope = 7;
+  // Ripgrep-style globs. Include narrows the question; exclude removes from it.
+  // Neither produces a coverage exclusion: a path the caller did not ask about
+  // is out of scope, not a gap in the answer.
+  repeated string include_globs = 8;
+  repeated string exclude_globs = 9;
+
+  uint32 context_before = 10;
+  uint32 context_after = 11;
+
+  // Resume after this path. Deterministic because results are ordered by path.
+  bytes start_after_path = 12;
+
+  // Zero means the server default for each.
+  uint32 max_results = 13;
+  uint64 max_time_ms = 14;
+  uint64 max_bytes_read = 15;
+  uint64 max_candidates = 16;
+  // Cap on the bytes of any one line returned for display, and on the total
+  // line text one answer carries. `rg --max-columns`, and a ceiling on the
+  // product of it with `max_results` and the context lines.
+  //
+  // A result carries a copy of its line, so an uncapped line is a per-match cost
+  // rather than a per-file one: a minified bundle on one 4 MiB line with a
+  // thousand matches is 4 GiB of `line_text`.
+  uint32 max_line_bytes = 17;
+  uint64 max_display_bytes = 18;
+}
+
+message SearchResponse {
+  oneof message {
+    SearchMatch match = 1;
+    // The terminal message. Exactly one, always last.
+    SearchCompletion completion = 2;
+  }
+}
+
+message SearchMatch {
+  bytes path = 1;
+  // 1-based.
+  uint64 line = 2;
+  // 1-based, in **bytes** from the start of the line, into the file as stored.
+  // Not normalized: an agent edits with this number, so a decoder that stripped
+  // a `\r` or expanded a tab would send it to the wrong place.
+  uint64 column = 3;
+  bytes matched = 4;
+  // The line. A CRLF's `\r` is removed here, and only here, because this field
+  // is for display and the `\r` would corrupt a terminal. Cut to
+  // `max_line_bytes`; see `line_truncated`.
+  bytes line_text = 5;
+  repeated bytes before = 6;
+  repeated bytes after = 7;
+  // The blob the match is in, so a caller can deduplicate by content.
+  string blob_oid = 8;
+  // Whether `line_text` or a context line was longer than `max_line_bytes` and
+  // holds only its first bytes.
+  //
+  // `column` remains an offset into the **whole** line, so on a truncated line
+  // it may point past the end of `line_text`. The column is what an agent edits
+  // with and the text is what it displays; those are separate jobs, and
+  // `blob_oid` leads to the untruncated bytes.
+  bool line_truncated = 9;
+}
+
+// Did the query finish evaluating the searchable corpus?
+enum ExecutionStatus {
+  EXECUTION_STATUS_UNSPECIFIED = 0;
+  EXECUTION_STATUS_COMPLETE = 1;
+  EXECUTION_STATUS_TRUNCATED = 2;
+}
+
+// What was outside the searchable corpus, **within the requested scope**.
+//
+// Scoped deliberately. ADR 0004 measured a query scoped to `src/vs/editor`
+// reporting 4 excluded paths where the repository had 240; reporting the
+// repository-wide number would make every scoped query look incomplete, and an
+// agent that sees a warning on every query stops reading warnings.
+message Coverage {
+  bytes scope = 1;
+  // Paths in scope that were actually searched.
+  uint64 eligible_paths = 2;
+  // Paths in scope left out, keyed by reason: `binary`, `oversized`,
+  // `invalid_utf8`, `generated`, `vendored`, `index_gap`.
+  map<string, uint64> excluded = 3;
+  // What the corpus policy excludes at all, whether or not this scope contained
+  // any. Present so "the policy excludes binaries and this scope has none" is
+  // distinguishable from "the policy excludes nothing".
+  repeated string declared_exclusions = 4;
+}
+
+message SearchCompletion {
+  ExecutionStatus execution_status = 1;
+  // Present only when truncated: `result_limit`, `time_budget`, `bytes_budget`,
+  // `candidate_budget`, `display_budget`, `no_required_literal`,
+  // `backend_failure`.
+  optional string truncation_reason = 2;
+  // The budget that stopped the query, rendered for a human.
+  optional string stop_budget = 3;
+  Coverage coverage = 4;
+  // The index generation the answer was computed against, so two results from
+  // either side of a reindex are distinguishable.
+  uint64 index_generation = 5;
+  // The pinned commit, repeated so a logged result identifies its own snapshot.
+  string commit_oid = 6;
+  uint64 candidates_considered = 7;
+  uint64 bytes_read = 8;
+  uint64 elapsed_ms = 9;
+}
