@@ -125,6 +125,10 @@ message CommitChangesRequest {
   string author_email = 6;
   repeated FileChange changes = 7;
   SnapshotAuthorization authorization = 8;
+  // Directories the workspace deleted without a per-file record. The overlay
+  // cannot expand these -- doing so needs the base tree, which a workspace does
+  // not have -- so the server expands them against the base commit.
+  repeated bytes deleted_directories = 9;
 }
 
 message CommitChangesResponse {

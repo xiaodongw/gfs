@@ -61,6 +61,13 @@ pub enum Request {
   Log { skip: u32, limit: u32 },
   /// Filename search over the merged workspace.
   Find(Box<crate::find::FindRequest>),
+  /// Everything the workspace changed, with the bytes, for the CLI to commit.
+  ///
+  /// The daemon collects but does not send: the control socket has no server
+  /// credential, so the CLI is what talks to the gateway. See `CommitPlan`.
+  CommitPlan,
+  /// Adopt a commit that was just made, and re-pin the view to it.
+  AdoptCommit { commit: String },
   /// Release the lease, unmount, and exit.
   Unmount,
 }
@@ -70,6 +77,9 @@ pub struct MountReport {
   pub mount_id: String,
   pub repository_id: String,
   pub revision_selector: String,
+  /// The work branch this view is on, when `gfs switch` put it on one.
+  #[serde(default)]
+  pub work_branch: Option<String>,
   pub commit: String,
   pub tree: String,
   pub ref_name: Option<String>,
@@ -136,10 +146,43 @@ pub struct RefreshReport {
 }
 
 /// A change set plus the commit it is relative to.
+/// What a commit would contain, as the daemon sees it.
+///
+/// Content travels base64url-encoded for the same reason the diff does: this is
+/// a JSON protocol and a Git blob is arbitrary bytes.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct CommitPlan {
+  pub base_commit: String,
+  pub work_branch: Option<String>,
+  pub changes: Vec<PlannedChange>,
+  /// Path prefixes the workspace deleted wholesale, for the server to expand.
+  pub deleted_directories: Vec<String>,
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum PlannedChange {
+  Upsert {
+    path: String,
+    mode: u32,
+    content_b64url: String,
+  },
+  Delete {
+    path: String,
+  },
+}
+
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct StatusReport {
   pub base_commit: String,
   pub ref_name: Option<String>,
+  /// The work branch this view is on, when `gfs switch` put it on one.
+  ///
+  /// Separate from `ref_name`, which is the *base* ref the commit was resolved
+  /// through. After a switch the view is pinned to a bare commit, so `ref_name`
+  /// is `None` and only this says where the work is going.
+  #[serde(default)]
+  pub work_branch: Option<String>,
   #[serde(flatten)]
   pub status: gfs_overlay::Status,
 }
@@ -150,6 +193,7 @@ pub enum Response {
   Inspect(Box<MountReport>),
   Health(LeaseHealth),
   Refresh(RefreshReport),
+  CommitPlan(Box<CommitPlan>),
   Status(Box<StatusReport>),
   /// The patch, base64url-encoded.
   ///

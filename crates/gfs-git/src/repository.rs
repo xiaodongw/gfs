@@ -513,4 +513,33 @@ impl AsyncRepository {
   pub async fn read_ref(&self, name: String) -> Result<Option<ObjectId>, GfsError> {
     self.run(move |r| r.read_ref(&name)).await
   }
+
+  /// Every named path under `root`, collected.
+  ///
+  /// A directory that is absent in the base is *not* an error here, unlike
+  /// [`GitRepository::walk_paths`]: this exists to expand a deletion, and a
+  /// workspace that created a directory and then deleted it has nothing in the
+  /// base to remove. Returning an empty set is the right answer.
+  pub async fn walk_paths_collect(
+    &self,
+    commit: ObjectId,
+    root: BytePath,
+    out: &mut Vec<BytePath>,
+  ) -> Result<(), GfsError> {
+    let collected = self
+      .run(move |r| {
+        let mut paths = Vec::new();
+        match r.walk_paths(&commit, &root, &mut |path, _mode| {
+          paths.push(path);
+          Ok(())
+        }) {
+          Ok(()) => Ok(paths),
+          Err(e) if e.code == ErrorCode::NotFound => Ok(Vec::new()),
+          Err(e) => Err(e),
+        }
+      })
+      .await?;
+    out.extend(collected);
+    Ok(())
+  }
 }

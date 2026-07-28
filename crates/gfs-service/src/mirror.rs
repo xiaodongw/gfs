@@ -185,6 +185,100 @@ pub fn init_bare(repo_path: &Path, git_binary: &Path) -> Result<(), GfsError> {
   Ok(())
 }
 
+/// Push a work ref outward, to a branch on the upstream.
+///
+/// The direction the gateway is allowed to move objects. `git-receive-pack` is
+/// refused *inbound* (see `gateway`) and that stays true: this is the mirror
+/// acting as a Git client against the real server, exactly as [`fetch`] does in
+/// the other direction, not the gateway accepting a push.
+///
+/// The refspec is built here from a validated branch name rather than taken from
+/// the caller, so a caller cannot push into the reserved namespace, delete a
+/// remote ref with a `:branch` spec, or push every branch with a wildcard.
+///
+/// `credential` is the *caller's own*, held only for this call. That is the
+/// difference from a service credential: upstream sees the person who made the
+/// commits, and branch protection there applies to them.
+pub fn push(
+  repo_path: &Path,
+  upstream_url: &str,
+  local_ref: &str,
+  remote_branch: &str,
+  force: bool,
+  credential: Option<&str>,
+  git_binary: &Path,
+) -> Result<PushOutcome, GfsError> {
+  if !gfs_types::revision::is_valid_branch_name(remote_branch) {
+    return Err(GfsError::invalid(format!(
+      "not a usable upstream branch name: {remote_branch:?}"
+    )));
+  }
+  let refspec = format!(
+    "{}{}:refs/heads/{}",
+    if force { "+" } else { "" },
+    local_ref,
+    remote_branch
+  );
+
+  let mut cmd = Command::new(git_binary);
+  cmd
+    .env_clear()
+    .env("GIT_CONFIG_GLOBAL", "/dev/null")
+    .env("GIT_CONFIG_SYSTEM", "/dev/null")
+    .env("GIT_TERMINAL_PROMPT", "0")
+    .env("GIT_ASKPASS", "/bin/true")
+    .env("PATH", "/usr/bin:/bin")
+    .current_dir(repo_path);
+  if let Some(secret) = credential {
+    // Through the environment, never the URL: a URL appears in `ps`, in Git's
+    // own error messages, and in the reflog.
+    cmd.env("GFS_UPSTREAM_CREDENTIAL", secret);
+  }
+
+  cmd.arg("push");
+  if !force {
+    // Refuse a non-fast-forward even if something upstream would have allowed
+    // it. Without `--force` a caller has not asked to discard anything.
+    cmd.arg("--no-force");
+  }
+  cmd
+    .arg("--porcelain")
+    .arg("--")
+    .arg(upstream_url)
+    .arg(&refspec);
+
+  let out = cmd
+    .output()
+    .map_err(|e| GfsError::new(ErrorCode::Unavailable, format!("cannot run git push: {e}")))?;
+
+  if !out.status.success() {
+    // Both streams: `--porcelain` puts the per-ref verdict on stdout and the
+    // reason on stderr, and a rejection with only one of them read is a message
+    // that says a push failed without saying why.
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let joined = format!("{} {}", stdout.trim(), stderr.trim());
+    let bounded: String = joined.chars().take(2000).collect();
+    return Err(GfsError::new(
+      ErrorCode::FailedPrecondition,
+      format!("push rejected: {}", bounded.trim()),
+    ));
+  }
+
+  let summary: String = String::from_utf8_lossy(&out.stdout)
+    .chars()
+    .take(2000)
+    .collect();
+  Ok(PushOutcome { summary })
+}
+
+/// The outcome of one push.
+#[derive(Clone, Debug, Default)]
+pub struct PushOutcome {
+  /// Stock Git's porcelain summary, already bounded and safe to log.
+  pub summary: String,
+}
+
 /// Ask the upstream which branch its `HEAD` points at.
 ///
 /// A bare mirror created by [`init_bare`] has a `HEAD` pointing at whatever this

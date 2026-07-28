@@ -76,6 +76,53 @@ pub struct DaemonConfig {
   pub retire_timeout: Duration,
 }
 
+/// One path's contribution to a commit.
+#[derive(Clone, Debug)]
+pub enum CommitChange {
+  Upsert {
+    path: gfs_types::BytePath,
+    mode: u32,
+    content: Vec<u8>,
+  },
+  Delete {
+    path: gfs_types::BytePath,
+  },
+}
+
+/// Everything a commit needs from the workspace.
+#[derive(Clone, Debug)]
+pub struct PendingCommit {
+  /// What the workspace diverged from. The server refuses if the branch has
+  /// moved past this, rather than committing over someone else's work.
+  pub base_commit: ObjectId,
+  pub changes: Vec<CommitChange>,
+  /// Directories the overlay deleted without per-file rows. Expanded by the
+  /// server, which has the base tree; the workspace does not.
+  pub deleted_directories: Vec<gfs_types::BytePath>,
+}
+
+/// Read one changed path's bytes out of the overlay.
+///
+/// A symlink's target is its content, and it is held in the entry rather than in
+/// the content store -- reading it as a file would fail on the missing local id.
+fn read_overlay_content(
+  overlay: &Overlay,
+  entry: &gfs_overlay::OverlayEntry,
+) -> Result<Vec<u8>, GfsError> {
+  if let Some(target) = &entry.symlink_target {
+    return Ok(target.clone());
+  }
+  use std::io::Read;
+  let mut file = overlay
+    .open_content(entry)
+    .map_err(crate::fs::overlay_as_service_error)?;
+  let mut bytes = Vec::with_capacity(entry.size as usize);
+  file
+    .read_to_end(&mut bytes)
+    .map_err(|e| GfsError::internal(format!("reading workspace content: {e}")))?;
+  Ok(bytes)
+}
+
 /// One mounted generation.
 struct Generation {
   number: u64,
@@ -307,6 +354,7 @@ impl Daemon {
       mount_id: current.monitor.mount_id().as_str().to_owned(),
       repository_id: self.config.repository_id.as_str().to_owned(),
       revision_selector: self.selector.lock().expect("selector").clone(),
+      work_branch: self.work_branch.lock().expect("work branch").clone(),
       commit: current.commit.to_qualified(),
       tree: current.tree.to_qualified(),
       ref_name: current.ref_name.clone(),
@@ -432,7 +480,22 @@ impl Daemon {
          (three-way refresh is out of scope)",
       ));
     }
+    self.republish().await
+  }
 
+  /// Build, publish, and retire -- without asking whether the overlay is clean.
+  ///
+  /// Split out because the three callers disagree about that precondition and
+  /// agree about everything else. `refresh` and `switch` require a clean
+  /// workspace; `commit` requires a *dirty* one and is the reason the check
+  /// cannot live in here.
+  ///
+  /// The new generation gets its own overlay directory, so a committed overlay
+  /// is never reset in place -- it is simply left behind with the generation it
+  /// belonged to, and torn down when the last handle opened through it closes.
+  /// That is what makes commit-then-re-pin safe without a two-phase protocol:
+  /// there is no window in which one overlay is half-cleared.
+  async fn republish(self: &Arc<Self>) -> Result<RefreshReport, GfsError> {
     let (previous_number, previous_commit) = {
       let current = self.current.lock().expect("current generation");
       (current.number, current.commit.clone())
@@ -495,7 +558,161 @@ impl Daemon {
       let mut current = self.work_branch.lock().expect("work branch");
       *current = branch;
     }
-    self.refresh().await
+    self.republish().await
+  }
+
+  /// The work branch this view is on, if any.
+  pub fn work_branch(&self) -> Option<String> {
+    self.work_branch.lock().expect("work branch").clone()
+  }
+
+  /// Everything the workspace changed, with the bytes, ready to commit.
+  ///
+  /// The overlay reports six kinds of change and a tree understands two, so this
+  /// is where the mapping is decided:
+  ///
+  /// * `Added`, `Modified`, `TypeChanged` and `ModeChanged` all become an
+  ///   upsert. A type change is an upsert because writing a path with a new mode
+  ///   and new content *is* the change; a mode change is an upsert whose content
+  ///   happens to be unchanged, and re-sending those bytes is what keeps this a
+  ///   single uniform operation rather than a special case that has to look up
+  ///   the old blob.
+  /// * `Deleted` becomes a delete.
+  /// * `Renamed` becomes **both**: a delete of the old path and an upsert of the
+  ///   new one. The overlay keeps `renamed_from` so export can emit a rename
+  ///   record, but a Git tree has no rename -- it is a content-addressed map, and
+  ///   the pair is exactly what `git` itself stores.
+  ///
+  /// Directory deletions are *not* expanded here. The overlay records them
+  /// without a per-file row, and expanding one needs the base tree, which the
+  /// workspace does not have -- so they travel separately and the server, which
+  /// does have it, expands them.
+  pub async fn changes_for_commit(&self) -> Result<PendingCommit, GfsError> {
+    let (overlay, commit) = {
+      let current = self.current.lock().expect("current generation");
+      (Arc::clone(&current.overlay), current.commit.clone())
+    };
+    let algorithm = commit.algorithm();
+
+    tokio::task::spawn_blocking(move || {
+      let status = overlay
+        .status(algorithm)
+        .map_err(crate::fs::overlay_as_service_error)?;
+      let mut changes = Vec::with_capacity(status.changes.len());
+
+      for change in &status.changes {
+        use gfs_overlay::status::ChangeKind as K;
+        match change.kind {
+          K::Deleted => changes.push(CommitChange::Delete {
+            path: change.path.clone(),
+          }),
+          K::Added | K::Modified | K::TypeChanged | K::ModeChanged | K::Renamed => {
+            if change.kind == K::Renamed {
+              if let Some(from) = &change.from {
+                changes.push(CommitChange::Delete { path: from.clone() });
+              }
+            }
+            let entry = overlay.get(&change.path).ok_or_else(|| {
+              // The journal said this path changed and the state has no row for
+              // it. That is an inconsistency, not an empty file: committing a
+              // zero-byte blob here would silently destroy the content.
+              GfsError::internal(format!(
+                "the overlay reports {} as changed but holds no entry for it",
+                change.path.escaped()
+              ))
+            })?;
+            let mode = change.new_mode.ok_or_else(|| {
+              GfsError::internal(format!(
+                "{} changed with no new mode",
+                change.path.escaped()
+              ))
+            })?;
+            let content = read_overlay_content(&overlay, &entry)?;
+            changes.push(CommitChange::Upsert {
+              path: change.path.clone(),
+              mode,
+              content,
+            });
+          }
+        }
+      }
+
+      Ok(PendingCommit {
+        base_commit: commit,
+        changes,
+        deleted_directories: status.directory_deletions.clone(),
+      })
+    })
+    .await
+    .map_err(|e| GfsError::internal(format!("collecting changes failed: {e}")))?
+  }
+
+  /// The commit this view is pinned to.
+  pub fn pinned_commit(&self) -> ObjectId {
+    self
+      .current
+      .lock()
+      .expect("current generation")
+      .commit
+      .clone()
+  }
+
+  /// The commit the CLI should ask the gateway to make.
+  ///
+  /// The daemon collects and the CLI sends, rather than the daemon talking to
+  /// the gateway itself: the control socket carries no credential, and a commit
+  /// has to be attributed to the caller rather than to whatever token the daemon
+  /// was started with.
+  pub async fn commit_plan(&self) -> Result<crate::control::CommitPlan, GfsError> {
+    use gfs_types::path::b64url_encode;
+    let pending = self.changes_for_commit().await?;
+    if pending.changes.is_empty() && pending.deleted_directories.is_empty() {
+      return Err(GfsError::new(
+        ErrorCode::FailedPrecondition,
+        "nothing to commit; the workspace is clean",
+      ));
+    }
+    Ok(crate::control::CommitPlan {
+      base_commit: pending.base_commit.to_qualified(),
+      work_branch: self.work_branch(),
+      changes: pending
+        .changes
+        .into_iter()
+        .map(|c| match c {
+          CommitChange::Upsert {
+            path,
+            mode,
+            content,
+          } => crate::control::PlannedChange::Upsert {
+            path: b64url_encode(path.as_bytes()),
+            mode,
+            content_b64url: b64url_encode(&content),
+          },
+          CommitChange::Delete { path } => crate::control::PlannedChange::Delete {
+            path: b64url_encode(path.as_bytes()),
+          },
+        })
+        .collect(),
+      deleted_directories: pending
+        .deleted_directories
+        .into_iter()
+        .map(|p| b64url_encode(p.as_bytes()))
+        .collect(),
+    })
+  }
+
+  /// Re-pin to a commit that was just made, keeping the work branch.
+  ///
+  /// Deliberately does **not** check that the overlay is clean: it is not, and
+  /// that is the point. The changes it holds are now in the commit being pinned,
+  /// so the new generation's fresh overlay starts empty and correct while the
+  /// old one is retired with its generation.
+  pub async fn adopt_commit(self: &Arc<Self>, commit: &str) -> Result<RefreshReport, GfsError> {
+    {
+      let mut current = self.selector.lock().expect("selector");
+      *current = commit.to_owned();
+    }
+    self.republish().await
   }
 
   /// The change set, from the journal alone.
@@ -516,6 +733,7 @@ impl Daemon {
     Ok(crate::control::StatusReport {
       base_commit: commit.to_qualified(),
       ref_name,
+      work_branch: self.work_branch(),
       status,
     })
   }
@@ -823,6 +1041,14 @@ impl Daemon {
       Request::Inspect => Response::Inspect(Box::new(self.inspect())),
       Request::Health => Response::Health(self.health()),
       Request::Refresh => match self.refresh().await {
+        Ok(report) => Response::Refresh(report),
+        Err(e) => Response::from_error(&e),
+      },
+      Request::CommitPlan => match self.commit_plan().await {
+        Ok(plan) => Response::CommitPlan(Box::new(plan)),
+        Err(e) => Response::from_error(&e),
+      },
+      Request::AdoptCommit { commit } => match self.adopt_commit(commit.as_str()).await {
         Ok(report) => Response::Refresh(report),
         Err(e) => Response::from_error(&e),
       },

@@ -181,8 +181,8 @@ compiling and running tests after each.
 
 ## Plan
 
-Six phases. **0 through 3 are built, tested, and passing `scripts/check.sh`.
-4 and 5 are not started.**
+Six phases. **All six are built, tested, and passing `scripts/check.sh`**, and
+the whole flow runs end to end against a real upstream Git server.
 
 - **Phase 0 -- cwd discovery. DONE.** `--workspace` is optional on `status`,
   `diff`, `inspect`, `health`, `export`, `refresh`, `unmount` and `search`,
@@ -202,9 +202,13 @@ Six phases. **0 through 3 are built, tested, and passing `scripts/check.sh`.
 - **Phase 3 -- `gfs switch`. DONE.** `RepositoryService.CreateBranch` creates
   `refs/gfs/work/<subject>/<branch>`; `Request::Switch` re-points the view by
   resolving a different selector through the existing generation machinery.
-- **Phase 4 -- `gfs commit`. NOT STARTED.** See "What Phase 4 still needs".
-- **Phase 5 -- `gfs push`. NOT STARTED.** The proto message and a stub handler
-  exist; the `git push` subprocess and the CLI command do not.
+- **Phase 4 -- `gfs commit`. DONE.** The daemon collects the overlay's changes
+  with their bytes (`Request::CommitPlan`), the CLI sends them to
+  `RepositoryService.CommitChanges`, and the view then adopts the new commit
+  (`Request::AdoptCommit`). See "How the atomicity question dissolved".
+- **Phase 5 -- `gfs push`. DONE.** `mirror::push` runs `git push` in the same
+  sandbox `mirror::fetch` uses, mapping `refs/gfs/work/<subject>/<branch>` to
+  `refs/heads/<branch>` upstream, with the caller's credential.
 
 ## Decisions
 
@@ -245,36 +249,46 @@ carving an exception into the selector grammar.
 `flask` would not; the mount directory is `flask`, because that is what
 `git clone` makes.
 
-## What Phase 4 still needs
+## How the atomicity question dissolved
 
-`gfs commit` is the keystone and the riskiest step, and it is untouched. What it
-needs, in the order it has to happen:
+The plan called the overlay-to-commit transition the riskiest step, on the
+grounds that re-pinning the mount and clearing the overlay must not be
+separately observable. Reading the code showed the premise was wrong: **each
+generation already owns its own overlay directory** (`overlay_dir(state_dir,
+generation)`). A commit therefore never clears an overlay in place. The new
+generation is born with an empty one and the old one is retired, with its
+overlay, when its last handle closes -- so there is no window in which one
+overlay is half-cleared, and no two-phase protocol is needed.
 
-1. **The overlay's changes, with content.** `Overlay::status` reports six kinds
-   -- `Added`, `Modified`, `Deleted`, `TypeChanged`, `ModeChanged`, `Renamed` --
-   and `FileChange` in the proto carries three. The extra three each need a
-   decision: a rename is a delete plus an add to a tree, a mode change is an
-   upsert whose content is unchanged, and a type change is a delete plus an add.
-   `Overlay::open_content` supplies the bytes.
-2. **`RepositoryService.CommitChanges`.** Build `Vec<TreeChange>`, then
-   `write_tree` on the base, `create_commit`, and `update_work_ref` with the
-   base as the expected value so a concurrent committer loses rather than
-   clobbers. Content is inline in the request today, which bounds a commit by
-   the gRPC message limit -- acceptable for a prototype, and the server must
-   *say so* rather than truncating.
-3. **`Daemon::commit_to`: the atomic re-pin and clear.** The part that needs
-   care. Re-pinning and emptying the overlay must not be separately observable:
-   a crash between them either re-applies changes that are already committed or
-   discards work that is not. The generation machinery is the right foundation
-   -- publish first, retire as handles drain -- but ordering the overlay reset
-   against the publication is a new question, and it deserves tests alongside
-   the existing `gfs-overlay-crash` harness.
-4. **`gfs commit -m`** in the CLI, reading the work branch the daemon recorded
-   at `switch` time.
+What is left is an ordinary two-step failure, and it is safe in the right
+direction. If `CommitChanges` succeeds and `AdoptCommit` then fails, the commit
+is already durable on the gateway -- that is the model -- and the workspace
+still shows the old base with its changes intact. `gfs switch` to the branch
+recovers. Nothing is lost, which is why the two steps do not need to be one
+transaction.
 
-Phase 5 is much smaller: a `git push` subprocess mirroring `mirror::fetch`'s
-sandbox, mapping `refs/gfs/work/<subject>/<branch>` to `refs/heads/<branch>`,
-plus a `gfs push` command. The proto message and a stub handler already exist.
+`refresh`, `switch` and `commit` now share one private `republish`, differing
+only in their precondition: the first two require a clean workspace and the
+third requires a dirty one. That is exactly why the check could not stay inside
+the shared path.
+
+### The six change kinds, mapped to two
+
+`Overlay::status` reports `Added`, `Modified`, `Deleted`, `TypeChanged`,
+`ModeChanged` and `Renamed`; a Git tree understands upsert and delete. The
+mapping, decided in `Daemon::changes_for_commit`:
+
+* `Added`, `Modified`, `TypeChanged`, `ModeChanged` → one upsert. A mode change
+  re-sends unchanged bytes rather than becoming a special case that has to look
+  up the old blob, which keeps this a single uniform operation.
+* `Deleted` → delete.
+* `Renamed` → **both**: delete the old path, upsert the new one. The overlay
+  keeps `renamed_from` so export can emit a rename record, but a tree is a
+  content-addressed map with no rename, and the pair is what Git itself stores.
+
+Directory deletions are the one thing the workspace cannot resolve: the overlay
+records them without per-file rows, and expanding one needs the base tree. They
+travel as prefixes in `deleted_directories` and the *server* expands them.
 
 ## A consequence worth knowing about `switch`
 

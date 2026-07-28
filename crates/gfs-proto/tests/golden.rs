@@ -399,6 +399,7 @@ const PINNED: &[(&str, &[Field])] = &[
       (6, "author_email", "string"),
       (7, "changes", ".gfs.v1.FileChange"),
       (8, "authorization", ".gfs.v1.SnapshotAuthorization"),
+      (9, "deleted_directories", "bytes"),
     ],
   ),
   (

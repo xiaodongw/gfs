@@ -17,11 +17,12 @@
 use std::sync::Arc;
 use std::time::Instant;
 
+use gfs_git::{CommitSignature, TreeChange, TreeChangeKind};
 use gfs_proto::convert;
 use gfs_proto::v1::{self, repository_service_server::RepositoryService};
 use gfs_types::error::{ErrorCode, GfsError};
 use gfs_types::revision::{self, RevisionSelector};
-use gfs_types::RepositoryId;
+use gfs_types::{BytePath, ObjectId, RepositoryId};
 use tonic::{Request, Response, Status};
 
 use crate::auth::{Authorizer, Identity};
@@ -93,6 +94,69 @@ impl RepositoryApi {
          `gfs clone`.",
       )
     })
+  }
+}
+
+/// The wire's changes as tree changes, refusing what a tree cannot express.
+fn to_tree_changes(changes: &[v1::FileChange]) -> Result<Vec<TreeChange>, GfsError> {
+  let mut out = Vec::with_capacity(changes.len());
+  for change in changes {
+    let path = BytePath::new(change.path.clone());
+    // The same rule the overlay enforces on the way in. Checked again here
+    // because this is a *service* boundary and the client is not the only
+    // possible caller.
+    gfs_overlay_path_condition(&path)?;
+    let kind = v1::ChangeKind::try_from(change.kind)
+      .map_err(|_| GfsError::invalid(format!("unknown change kind {}", change.kind)))?;
+    match kind {
+      v1::ChangeKind::Deleted => out.push(TreeChange {
+        path,
+        kind: TreeChangeKind::Delete,
+      }),
+      v1::ChangeKind::Added | v1::ChangeKind::Modified => out.push(TreeChange {
+        path,
+        kind: TreeChangeKind::Upsert {
+          mode: change.mode,
+          content: change.content.clone(),
+        },
+      }),
+      v1::ChangeKind::Unspecified => {
+        return Err(GfsError::invalid(format!(
+          "{} has no change kind",
+          BytePath::new(change.path.clone()).escaped()
+        )))
+      }
+    }
+  }
+  Ok(out)
+}
+
+/// Reject a path a commit must not carry.
+///
+/// `.git` anywhere in a path would produce a tree that stock Git refuses to
+/// check out, and an absolute or `..`-bearing path would escape the repository.
+fn gfs_overlay_path_condition(path: &BytePath) -> Result<(), GfsError> {
+  if path.is_empty() {
+    return Err(GfsError::invalid("a change with no path"));
+  }
+  for component in path.components() {
+    if component == b".." || component == b"." || component.eq_ignore_ascii_case(b".git") {
+      return Err(GfsError::invalid(format!(
+        "{} is not a path a commit may carry",
+        path.escaped()
+      )));
+    }
+  }
+  Ok(())
+}
+
+/// A non-empty string, or a stated fallback.
+fn nonempty(value: &str, fallback: &str) -> String {
+  let trimmed = value.trim();
+  if trimmed.is_empty() {
+    fallback.to_owned()
+  } else {
+    trimmed.to_owned()
   }
 }
 
@@ -213,17 +277,209 @@ impl RepositoryService for RepositoryApi {
 
   async fn commit_changes(
     &self,
-    _request: Request<v1::CommitChangesRequest>,
+    request: Request<v1::CommitChangesRequest>,
   ) -> Result<Response<v1::CommitChangesResponse>, Status> {
-    Err(Status::unimplemented(
-      "CommitChanges is not implemented yet",
-    ))
+    let ctx = self.begin(&request)?;
+    let req = request.into_inner();
+
+    let result = async {
+      let id = RepositoryId::parse(&req.repository_id)?;
+      self
+        .authz
+        .authorize_repository(&ctx.identity.subject, &id)?;
+      if !revision::is_valid_branch_name(&req.branch) {
+        return Err(GfsError::invalid(format!(
+          "not a usable branch name: {:?}",
+          req.branch
+        )));
+      }
+      if req.message.trim().is_empty() {
+        return Err(GfsError::invalid("a commit needs a message"));
+      }
+
+      let algorithm = self.registry.require_servable(&id)?.algorithm;
+      let base = ObjectId::parse_qualified(&req.base_commit_oid)?;
+      if base.algorithm() != algorithm {
+        return Err(GfsError::invalid("the base commit is the wrong algorithm"));
+      }
+      let repo = self.registry.repository(&id)?;
+      let ref_name = revision::work_ref(ctx.identity.subject.as_str(), &req.branch);
+
+      // The branch must still be where the workspace thinks it is. Read first so
+      // a moved branch is refused *before* any object is written -- writing the
+      // tree and commit anyway would leave unreachable objects behind on every
+      // conflict.
+      let head = repo.read_ref(ref_name.clone()).await?;
+      let expected = match &head {
+        Some(current) if *current == base => Some(base.clone()),
+        Some(current) => {
+          return Err(GfsError::new(
+            ErrorCode::Conflict,
+            format!(
+              "{} has moved to {} since this workspace was pinned to {}; \
+               refresh and commit again",
+              req.branch,
+              current.to_qualified(),
+              base.to_qualified()
+            ),
+          ))
+        }
+        // The branch does not exist yet. Committing creates it, which is what
+        // happens when a view committed before `gfs switch -c` ever ran.
+        None => None,
+      };
+
+      let mut changes = to_tree_changes(&req.changes)?;
+      // Directory deletions arrive as prefixes because the workspace has no base
+      // tree to expand them against. Expanded here, where the tree is.
+      for dir in &req.deleted_directories {
+        let root = BytePath::new(dir.clone());
+        let mut removed = Vec::new();
+        repo
+          .walk_paths_collect(base.clone(), root, &mut removed)
+          .await?;
+        changes.extend(removed.into_iter().map(|path| TreeChange {
+          path,
+          kind: TreeChangeKind::Delete,
+        }));
+      }
+
+      let signature = CommitSignature {
+        name: nonempty(&req.author_name, ctx.identity.subject.as_str()),
+        email: nonempty(&req.author_email, "gfs@localhost"),
+        when_secs: gfs_types::Timestamp::now().secs,
+        offset_minutes: 0,
+      };
+
+      let tree = repo.write_tree(Some(base.clone()), changes).await?;
+      let commit = repo
+        .create_commit(
+          tree.clone(),
+          vec![base.clone()],
+          signature.clone(),
+          signature,
+          req.message.clone(),
+        )
+        .await?;
+      // The compare-and-swap. A concurrent committer that won between the read
+      // above and here loses at this point rather than clobbering.
+      repo
+        .update_work_ref(ref_name.clone(), commit.clone(), expected)
+        .await?;
+
+      Ok::<_, GfsError>(v1::CommitChangesResponse {
+        commit_oid: commit.to_qualified(),
+        tree_oid: tree.to_qualified(),
+        ref_name,
+      })
+    }
+    .await;
+
+    match result {
+      Ok(response) => {
+        tracing::info!(
+          request_id = %ctx.request_id,
+          ref_name = %response.ref_name,
+          commit = %response.commit_oid,
+          "commit created"
+        );
+        Ok(Response::new(response))
+      }
+      Err(e) => Err(convert::to_status(&e)),
+    }
   }
 
   async fn push_branch(
     &self,
-    _request: Request<v1::PushBranchRequest>,
+    request: Request<v1::PushBranchRequest>,
   ) -> Result<Response<v1::PushBranchResponse>, Status> {
-    Err(Status::unimplemented("PushBranch is not implemented yet"))
+    let ctx = self.begin(&request)?;
+    let req = request.into_inner();
+
+    let result = async {
+      let config = self.config()?;
+      let id = RepositoryId::parse(&req.repository_id)?;
+      self
+        .authz
+        .authorize_repository(&ctx.identity.subject, &id)?;
+      if !revision::is_valid_branch_name(&req.branch) {
+        return Err(GfsError::invalid(format!(
+          "not a usable branch name: {:?}",
+          req.branch
+        )));
+      }
+      let remote_branch = if req.remote_branch.trim().is_empty() {
+        req.branch.clone()
+      } else {
+        req.remote_branch.trim().to_owned()
+      };
+      if !revision::is_valid_branch_name(&remote_branch) {
+        return Err(GfsError::invalid(format!(
+          "not a usable upstream branch name: {remote_branch:?}"
+        )));
+      }
+
+      let record = self.registry.require_servable(&id)?;
+      let Some(upstream_url) = record.upstream_url.clone() else {
+        return Err(GfsError::new(
+          ErrorCode::FailedPrecondition,
+          "this repository has no upstream to push to; it was imported from a \
+           local path rather than cloned",
+        ));
+      };
+
+      let local_ref = revision::work_ref(ctx.identity.subject.as_str(), &req.branch);
+      let repo = self.registry.repository(&id)?;
+      // Checked before the subprocess runs, so "there is no such branch" is a
+      // clean `NOT_FOUND` and not a `git push` error mentioning a ref name the
+      // caller never typed.
+      if repo.read_ref(local_ref.clone()).await?.is_none() {
+        return Err(GfsError::not_found(format!(
+          "no work branch {:?} for this caller",
+          req.branch
+        )));
+      }
+
+      let credential = if req.credential.is_empty() {
+        None
+      } else {
+        Some(req.credential.clone())
+      };
+      let repo_path = record.repo_path.clone();
+      let force = req.force;
+      let remote = remote_branch.clone();
+      let local = local_ref.clone();
+      let outcome = tokio::task::spawn_blocking(move || {
+        crate::mirror::push(
+          &repo_path,
+          &upstream_url,
+          &local,
+          &remote,
+          force,
+          credential.as_deref(),
+          &config.git_binary,
+        )
+      })
+      .await
+      .map_err(|e| GfsError::internal(format!("the push task did not finish: {e}")))??;
+
+      Ok::<_, GfsError>(v1::PushBranchResponse {
+        summary: outcome.summary,
+        remote_ref: format!("refs/heads/{remote_branch}"),
+      })
+    }
+    .await;
+
+    match result {
+      Ok(response) => {
+        tracing::info!(
+          request_id = %ctx.request_id,
+          remote_ref = %response.remote_ref,
+          "push completed"
+        );
+        Ok(Response::new(response))
+      }
+      Err(e) => Err(convert::to_status(&e)),
+    }
   }
 }

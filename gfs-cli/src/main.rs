@@ -348,6 +348,46 @@ enum Command {
     state_dir: Option<PathBuf>,
   },
 
+  /// Commit the workspace's changes to the gateway.
+  ///
+  /// The commit is made in the gateway's mirror, which *is* the clone, and this
+  /// view then re-pins to it. There is no local-only commit and no staging area:
+  /// the overlay journal already knows exactly what changed, and the commit is
+  /// durable the moment it is made.
+  Commit {
+    /// The commit message.
+    #[arg(short = 'm', long)]
+    message: String,
+    #[arg(long, env = "GIT_AUTHOR_NAME")]
+    author_name: Option<String>,
+    #[arg(long, env = "GIT_AUTHOR_EMAIL")]
+    author_email: Option<String>,
+    #[arg(long)]
+    workspace: Option<PathBuf>,
+    #[arg(long)]
+    state_dir: Option<PathBuf>,
+  },
+
+  /// Push a work branch to the real Git server.
+  ///
+  /// The gateway pushes outward with **your** credential, the way `git push`
+  /// would, so upstream sees you and not the service.
+  Push {
+    /// The branch to push. Defaults to the one this view is on.
+    branch: Option<String>,
+    /// The upstream branch to create or update. Defaults to the same name.
+    #[arg(long)]
+    remote_branch: Option<String>,
+    #[arg(long, env = "GFS_UPSTREAM_CREDENTIAL", hide_env_values = true)]
+    credential: Option<String>,
+    #[arg(long)]
+    force: bool,
+    #[arg(long)]
+    workspace: Option<PathBuf>,
+    #[arg(long)]
+    state_dir: Option<PathBuf>,
+  },
+
   /// Retention leases, without a mount. Used by the development stack.
   #[command(subcommand)]
   Lease(LeaseCommand),
@@ -451,6 +491,49 @@ fn daemon_binary() -> PathBuf {
 
 fn shim_binary() -> PathBuf {
   sibling_binary("gfs-git-shim", "GFS_GIT_SHIM")
+}
+
+/// The daemon's plan as the wire's changes.
+///
+/// Paths and content travel base64url over the control socket because that is a
+/// JSON protocol and neither a Git path nor a blob is required to be UTF-8.
+fn planned_changes(plan: &gfs_mount::control::CommitPlan) -> Result<Vec<v1::FileChange>> {
+  use gfs_mount::control::PlannedChange;
+  use gfs_types::path::b64url_decode;
+
+  plan
+    .changes
+    .iter()
+    .map(|change| {
+      Ok(match change {
+        PlannedChange::Upsert {
+          path,
+          mode,
+          content_b64url,
+        } => v1::FileChange {
+          path: b64url_decode(path).context("decoding a changed path")?,
+          // `Modified` for both create and replace: a tree upsert is one
+          // operation, and the server does not need to know which it was.
+          kind: v1::ChangeKind::Modified as i32,
+          mode: *mode,
+          content: b64url_decode(content_b64url).context("decoding changed content")?,
+        },
+        PlannedChange::Delete { path } => v1::FileChange {
+          path: b64url_decode(path).context("decoding a deleted path")?,
+          kind: v1::ChangeKind::Deleted as i32,
+          mode: 0,
+          content: Vec::new(),
+        },
+      })
+    })
+    .collect()
+}
+
+fn decode_paths(encoded: &[String]) -> Result<Vec<Vec<u8>>> {
+  encoded
+    .iter()
+    .map(|p| gfs_types::path::b64url_decode(p).context("decoding a deleted directory"))
+    .collect()
 }
 
 /// Run one of the argv-parsing subcommands and leave with its exit code.
@@ -636,9 +719,15 @@ fn print_report(report: &gfs_mount::control::MountReport) {
 /// already learned to parse.
 fn print_status(report: &gfs_mount::control::StatusReport) {
   use std::io::Write;
-  match &report.ref_name {
-    Some(name) => println!("On {} at {}", name, report.base_commit),
-    None => println!("Detached at {}", report.base_commit),
+  // The work branch wins when there is one. After `gfs switch` the view is
+  // pinned to a bare commit -- the reserved namespace cannot be named as a
+  // revision -- so `ref_name` is `None`, and reporting "Detached" there would
+  // tell a caller their branch had been lost when it is exactly where they put
+  // it.
+  match (&report.work_branch, &report.ref_name) {
+    (Some(branch), _) => println!("On {} at {}", branch, report.base_commit),
+    (None, Some(name)) => println!("On {} at {}", name, report.base_commit),
+    (None, None) => println!("Detached at {}", report.base_commit),
   }
   if report.status.is_clean() {
     println!("nothing to commit, working tree clean");
@@ -1155,6 +1244,112 @@ async fn main() -> Result<()> {
       }
       println!("commit     {}", refresh.commit);
       println!("generation {}", refresh.generation);
+    }
+
+    Command::Commit {
+      message,
+      author_name,
+      author_email,
+      workspace,
+      state_dir,
+    } => {
+      let (_workspace, state_dir) = locate(workspace, state_dir)?;
+      let Response::Inspect(report) = call(&state_dir, &Request::Inspect)? else {
+        bail!("the daemon answered an inspect request with something else");
+      };
+      let Response::CommitPlan(plan) = call(&state_dir, &Request::CommitPlan)? else {
+        bail!("the daemon answered a commit-plan request with something else");
+      };
+      let Some(branch) = plan.work_branch.clone() else {
+        bail!(
+          "this workspace is not on a work branch, so there is nowhere to commit. \
+           Run `gfs switch -c <branch>` first."
+        );
+      };
+
+      let mut client = connect_repository(&cli).await?;
+      let response = client
+        .commit_changes(authed(
+          &cli,
+          v1::CommitChangesRequest {
+            repository_id: report.repository_id.clone(),
+            base_commit_oid: plan.base_commit.clone(),
+            branch,
+            message: message.clone(),
+            author_name: author_name.clone().unwrap_or_default(),
+            author_email: author_email.clone().unwrap_or_default(),
+            changes: planned_changes(&plan)?,
+            authorization: None,
+            deleted_directories: decode_paths(&plan.deleted_directories)?,
+          },
+        )?)
+        .await?
+        .into_inner();
+
+      // Only now does the view move. If this call fails the commit still exists
+      // on the gateway -- it is durable the moment it is made -- and `gfs switch`
+      // to the branch recovers, so nothing is lost by the two steps not being
+      // one transaction.
+      let Response::Refresh(refresh) = call(
+        &state_dir,
+        &Request::AdoptCommit {
+          commit: response.commit_oid.clone(),
+        },
+      )?
+      else {
+        bail!("the daemon answered an adopt request with something else");
+      };
+
+      println!("committed  {}", response.commit_oid);
+      println!("tree       {}", response.tree_oid);
+      println!("branch     {}", response.ref_name);
+      println!("generation {}", refresh.generation);
+    }
+
+    Command::Push {
+      branch,
+      remote_branch,
+      credential,
+      force,
+      workspace,
+      state_dir,
+    } => {
+      let (_workspace, state_dir) = locate(workspace, state_dir)?;
+      let Response::Inspect(report) = call(&state_dir, &Request::Inspect)? else {
+        bail!("the daemon answered an inspect request with something else");
+      };
+      // The daemon knows which work branch this view is on; requiring the caller
+      // to repeat it is the one thing `git push` does not do.
+      let branch = match branch.clone() {
+        Some(name) => name,
+        None => report.work_branch.clone().ok_or_else(|| {
+          anyhow::anyhow!(
+            "this workspace is not on a work branch; name the branch to push, \
+             or run `gfs switch -c <branch>` first"
+          )
+        })?,
+      };
+
+      let mut client = connect_repository(&cli).await?;
+      let response = client
+        .push_branch(authed(
+          &cli,
+          v1::PushBranchRequest {
+            repository_id: report.repository_id.clone(),
+            branch: branch.clone(),
+            remote_branch: remote_branch.clone().unwrap_or_default(),
+            credential: credential.clone().unwrap_or_default(),
+            force: *force,
+            authorization: None,
+          },
+        )?)
+        .await?
+        .into_inner();
+
+      println!("pushed {} -> {}", branch, response.remote_ref);
+      if !response.summary.trim().is_empty() {
+        eprintln!("{}", response.summary.trim());
+      }
     }
 
     // These three never come back: their exit code *is* their answer, and the
