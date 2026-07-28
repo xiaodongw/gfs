@@ -53,37 +53,6 @@ last ones it was serving, so a mount you made elsewhere survives.
 The default is short; a lab under a deep scratch directory fails to serve, and
 the failure reads as something else entirely.
 
-## One host, many workspaces
-
-`gfs clone` does not start a daemon per workspace. The first one starts a
-`gfs-fuse` **host** on `$XDG_RUNTIME_DIR/gfs/host.sock`, and every later clone
-asks that host for another mount:
-
-```sh
-gfs clone file:///path/to/one.git
-gfs clone file:///path/to/two.git
-pgrep -a gfs-fuse        # one process
-gfs daemon status        # two mounts
-```
-
-```
-socket     /run/user/1000/gfs/host.sock
-pid        1669729
-mounts     2
-  /tmp/lab/one  tmp_lab_one  sha1:8b0b4b68…  gen 1  Healthy
-  /tmp/lab/two  tmp_lab_two  sha1:5d71e4de…  gen 1  Healthy
-```
-
-Each workspace still has its own control socket beside it, so every command
-below — `gfs status`, `gfs rg`, the `git` shim — works from inside the tree with
-no flags, exactly as it did when each mount had its own process. `gfs unmount`
-drops one workspace and leaves the rest of the host running; `gfs daemon stop`
-unmounts everything and stops the process. See ADR 0008.
-
-Two mounts of the *same* repository share one blob cache, so the second one pays
-nothing for blobs the first already fetched and `--cache-quota` is a per-host
-budget rather than a per-mount one.
-
 ## Prerequisites
 
 - `cargo build` — the script builds for you if `target/debug/gfs-server` is
@@ -93,6 +62,67 @@ budget rather than a per-mount one.
 - Network access to whatever you clone. Any URL `git clone` accepts works; a
   local `file:///path/to/bare.git` works too and is the fastest way to try the
   write path without touching a real forge.
+
+## One host, many workspaces
+
+`gfs clone` does **not** start a daemon per workspace. The first one starts a
+`gfs-fuse` *host* on `$XDG_RUNTIME_DIR/gfs/host.sock`, and every later clone asks
+that host for another mount (ADR 0008). The last two lines of a `gfs clone` say
+which host answered and where its log is:
+
+```sh
+gfs clone file://$HOME/.gfs-lab/alpha.git
+gfs clone file://$HOME/.gfs-lab/beta.git
+pgrep -c gfs-fuse
+gfs daemon status
+```
+
+```
+1
+socket     /run/user/1000/gfs/host.sock
+pid        1733998
+version    0.1.0
+endpoint   http://127.0.0.1:8431
+log        /run/user/1000/gfs/host.log
+mounts     2
+  ~/.gfs-lab/alpha  home_xiaodong_.gfs-lab_alpha  sha1:9768e376…  gen 1  Healthy
+  ~/.gfs-lab/beta   home_xiaodong_.gfs-lab_beta   sha1:2e1a575c…  gen 1  Healthy
+```
+
+Each workspace still has its own control socket beside it, so everything below —
+`gfs status`, `gfs rg`, the `git` shim — works from inside the tree with no
+flags, exactly as it did when a mount had a process to itself. `gfs unmount`
+drops one workspace and leaves the host serving the rest; `gfs daemon stop`
+unmounts everything and stops the process.
+
+**`gfs daemon status` exits non-zero when no host is running**, and does not
+start one to answer — otherwise the answer would always be yes. That makes it
+usable in a script.
+
+### The shared blob cache is worth seeing
+
+Two views of one repository share a cache, so the second pays nothing for blobs
+the first already fetched. `gfs clone` of a URL the gateway holds is a sync, so
+this is two workspaces over one mirror rather than two copies — the repository id
+in `gfs daemon status` is the same for both:
+
+```sh
+gfs clone file://$HOME/.gfs-lab/beta.git beta2
+cat ~/.gfs-lab/beta/pkg/options.py  >/dev/null
+gfs inspect --workspace ~/.gfs-lab/beta  | grep hydration
+cat ~/.gfs-lab/beta2/pkg/options.py >/dev/null
+gfs inspect --workspace ~/.gfs-lab/beta2 | grep hydration
+```
+
+```
+hydration  2 blobs, 54 bytes, 0 cache hits
+hydration  2 blobs, 54 bytes, 1 cache hits
+```
+
+Same byte count after the second read, and a cache hit instead of a fetch. Under
+one daemon per mount each opened its own cache over the same directory, so the
+bytes doubled and `--cache-quota` silently meant "per mount" rather than per
+host.
 
 ## The write path, step by step
 
@@ -271,8 +301,28 @@ touch short                               # still works at the same depth
 
 ## Teardown
 
-Ctrl+C in the terminal running `scripts/dev-server.sh`. That stops the gateway
-and unmounts every workspace under the lab directory.
+Ctrl+C in the terminal running `scripts/dev-server.sh`. That unmounts every
+workspace under the lab directory, then stops the host **if the lab's workspaces
+were the last ones it had**, then stops the gateway. A workspace you mounted
+outside the lab keeps both itself and the host.
+
+The order matters and the script relies on it: the unmount happens while the
+gateway is still up, so each mount releases its lease rather than leaving the
+gateway holding one until expiry. You can see it in the server log:
+
+```
+audit action="release_mount" outcome="ok" mount_id="m-2094a81e77146aae"
+```
+
+By hand, from anywhere:
+
+```sh
+gfs unmount --workspace ~/.gfs-lab/alpha   # one workspace, host keeps running
+gfs daemon stop                            # every workspace, then the host
+```
+
+`gfs daemon stop` removes the workspace symlinks as it goes, so a directory
+listing of the lab afterwards shows only the state directories.
 
 Unmount before deleting anything by hand. `rm -rf` over a live mount is both
 wrong and slow: the base is read-only so every removal fails, and ADR 0003
@@ -290,9 +340,19 @@ Each of these produced a plausible-looking wrong answer during development.
   `GFS_LAB` is not.
 - **Your shell's directory goes stale after `switch`, `commit` and `refresh`.**
   `cd $(pwd)`.
-- **Do not `pkill -f gfs-fuse`.** The pattern can match the shell running it, and
-  `pgrep -c` counts that match too — which reads as a daemon that will not die.
-  Kill by PID.
+- **Killing `gfs-fuse` now kills every workspace, not one.** There is one host for
+  the machine, so what used to end a single job now ends all of them. Use
+  `gfs unmount --workspace <path>` for one and `gfs daemon stop` for all. (The old
+  advice still holds too: `pkill -f gfs-fuse` can match the shell running it, and
+  `pgrep -c` counts that match — which reads as a daemon that will not die.)
+- **`cargo build` does not restart a running host.** The host is long-lived, so
+  after a rebuild it is still the old binary and your change appears to have done
+  nothing. `gfs daemon stop`, then any `gfs clone` starts the new one. A build
+  that changes the *state directory format* is caught and refused by name; every
+  other change is not, and this is the trap.
+- **The host outlives the gateway on purpose.** A workspace should survive a
+  gateway restart. `gfs daemon status` is how you find one left over from an
+  earlier session; it exits non-zero when there is none.
 - **`du` on a live mount walks the FUSE tree** and reports ~45 MiB for Django.
   The real client-side state is around 100 KiB, most of it the installed shim
   binary: `du -sb --exclude=generations <workspace>.gfs`.
