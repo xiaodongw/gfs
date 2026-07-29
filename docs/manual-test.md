@@ -193,10 +193,10 @@ Pushing *to* the gateway with stock `git push` is still refused, deliberately �
 this is the mirror acting as a Git client against the real server, not the
 gateway accepting a push.
 
-## The three server-answered tools
+## The server-answered tools
 
-An agent asks three questions that want to touch every path. All three are
-answered by the gateway; none reads the mount.
+An agent asks a handful of questions that want to touch every path, or every
+commit. All of them are answered by the gateway; none reads the mount.
 
 ```sh
 gfs log -5 --oneline
@@ -208,6 +208,48 @@ gfs inspect | grep hydration     # still 0 blobs, 0 bytes
 `gfs log` prints and then, on stderr, `more history follows; continue with
 --skip 5`. `gfs rg` prints matches plus a coverage note on stderr about binary
 files skipped — that note is deliberate, not a warning of failure.
+
+### Reviewing history
+
+"What did the last three commits change" is a question the workspace cannot
+answer for itself — it has no object database (ADR 0005) — so all of this is
+rendered by the gateway and downloads nothing:
+
+```sh
+gfs log -3 -p                     # each commit with its diff
+gfs show HEAD~2 --stat            # one commit, by file
+gfs diff HEAD~3..HEAD             # the range as one patch
+gfs blame src/flask/cli.py -L 40,80
+gfs inspect | grep hydration      # still 0 blobs, 0 bytes
+```
+
+Three things about this are worth knowing:
+
+- **`HEAD` is this workspace's pin**, not the repository's default branch. After
+  `gfs switch -c` those are different commits, and every command above follows
+  the view. Ancestry expressions work from it: `HEAD~3`, `main^`, `abc1234^2`.
+- **A merge gets a first-parent diff by default**, which is what `git show`
+  refuses to print at all. `--parent 2` gives the side branch and `-m` shows
+  every parent in one run — the two are usually wildly different sizes, and that
+  difference is the thing worth looking at.
+- **`gfs log -- <path>`** shows only commits that touched a path, and limits any
+  patch to it. Rename following (`--follow`) is not implied; that is a
+  similarity search per commit rather than a tree comparison.
+
+`gfs ls` and `gfs cat` need no `--repo` inside a workspace, and default to its
+pin:
+
+```sh
+gfs ls src/flask                  # root-relative paths, always
+gfs cat --rev HEAD~5 src/flask/cli.py
+```
+
+The path column is **root-relative in every position**: listing the root prints
+`src`, listing `src` prints `src/flask`. At the root the two coincide, which
+makes it easy to misread as "basename at the top, full path below" — recursing
+on that reading builds `src/src/…`. Root-relative is what `gfs cat` takes, so
+the output of one is the input of the other. A path that is not a directory in
+that commit is an error with a non-zero exit, never an empty listing.
 
 ### Glob syntax is gitignore's, and this is the part that surprises people
 
@@ -259,8 +301,8 @@ a convenience:
 /usr/bin/git ls-files | wc -l   # 0 files, exit 0 -- reports nothing is tracked
 ```
 
-For history and filenames use `gfs log` and `gfs find`; the shim is not wired to
-them.
+For history, filenames and review use `gfs log`, `gfs find`, `gfs show`,
+`gfs diff` and `gfs blame`; the shim is not wired to them.
 
 ## The smart-HTTP gateway
 

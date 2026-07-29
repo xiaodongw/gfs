@@ -43,6 +43,13 @@ pub const MAX_MOUNT_ID_BYTES: usize = 64;
 pub const MAX_SUBJECT_ID_BYTES: usize = 512;
 pub const MAX_REVISION_SELECTOR_BYTES: usize = 512;
 
+/// Furthest a `~n`/`^n` chain may walk from its base commit.
+///
+/// An ancestry walk is one parent read per hop and cannot be paged, so a
+/// caller asking for `main~9000000` would be asking for a revwalk dressed as a
+/// selector. Well above anything a person types and far below a history.
+pub const MAX_ANCESTRY_DISTANCE: u32 = 4096;
+
 /// Shortest hex prefix accepted as an abbreviated object ID.
 ///
 /// Git's own default is 7 and it grows the printed abbreviation as a repository
@@ -95,6 +102,21 @@ pub const MAX_SEARCHABLE_BLOB_BYTES: u64 = 8 * 1024 * 1024;
 /// Cap on a single non-blob response body, so a pathological tree cannot make
 /// one request consume unbounded server memory.
 pub const MAX_RESPONSE_BYTES: usize = 32 * 1024 * 1024;
+
+/// Rendered bytes in one commit-to-commit diff.
+///
+/// The default is what a person or an agent will actually read: a vendored
+/// dependency bump is megabytes of patch that nobody reviews line by line, and
+/// the truncation flag says so rather than the response quietly stopping. The
+/// ceiling keeps one `gfs show` of a squashed import from becoming a 400 MB
+/// response.
+pub const DEFAULT_DIFF_BYTES: usize = 4 * 1024 * 1024;
+pub const MAX_DIFF_BYTES: usize = 64 * 1024 * 1024;
+
+/// Context lines around a diff hunk. Git's own `-U` has no ceiling; this one
+/// exists because context is emitted per hunk, so a large value multiplies the
+/// response by the number of hunks.
+pub const MAX_DIFF_CONTEXT_LINES: u32 = 1000;
 
 /// Default per-request deadline when the caller supplies none.
 pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);

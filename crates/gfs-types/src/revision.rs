@@ -13,6 +13,19 @@
 //! So the grammar is closed here rather than filtered downstream, on the same
 //! reasoning ADR 0006 gives for rejecting `refs/gfs/` at the lowest layer: a
 //! rule enforced in one place cannot be forgotten in another.
+//!
+//! # Ancestry is an extension of the closed grammar, not a hole in it
+//!
+//! [`RevisionExpression`] accepts `HEAD~1`, `main^`, `main~3`, `abc1234^2` --
+//! and nothing else new. The suffix is parsed *here*, into an explicit list of
+//! [`AncestryStep`]s that the repository layer applies with `commit.parent(n)`,
+//! so no operator ever reaches libgit2's parser. That is the whole difference
+//! between this and reopening `revparse`: `main^{tree}` is still rejected,
+//! because `^` may only be followed by digits or by nothing.
+//!
+//! The reason to have it at all is that reviewing a chain of commits without it
+//! means reading full 40-character IDs out of `gfs log --format=%P` and
+//! threading them by hand, which is what the 2026-07-29 agent report was doing.
 
 use crate::error::{ErrorCode, GfsError};
 use crate::limits;
@@ -131,6 +144,111 @@ impl RevisionSelector {
       | RevisionSelector::ShortName(s) => s,
     }
   }
+}
+
+/// One ancestry hop, as `git rev-parse` spells it.
+///
+/// Two operators, and the difference is the one people get wrong: `^n` picks
+/// *which* parent of one commit, `~n` walks n commits along first parents. On a
+/// non-merge commit they coincide, which is why `HEAD^` and `HEAD~` usually look
+/// interchangeable and stop being so at the first merge.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "op", rename_all = "snake_case")]
+pub enum AncestryStep {
+  /// `^n`. `^` alone means `^1`. `^0` is the commit itself, as Git defines it.
+  Parent(u32),
+  /// `~n`. `~` alone means `~1`. `~0` is the commit itself.
+  Ancestor(u32),
+}
+
+/// A selector plus an ancestry walk: `HEAD~1`, `main^`, `abc1234^2~3`.
+///
+/// This is the type every *read* path parses, and [`RevisionSelector`] is what
+/// it resolves through. Keeping them separate is deliberate: the selector is the
+/// thing that names an object in the repository, and the steps are applied
+/// afterwards by walking parent pointers. Nothing here is handed to `revparse`.
+#[derive(Clone, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize)]
+pub struct RevisionExpression {
+  pub base: RevisionSelector,
+  /// Applied left to right, in the order they were written.
+  pub steps: Vec<AncestryStep>,
+}
+
+impl RevisionExpression {
+  /// Parse `<selector>` optionally followed by a chain of `~n` and `^n`.
+  ///
+  /// The split is unambiguous because Git already forbids `~` and `^` in a ref
+  /// name, so the first one that appears can only be an operator.
+  pub fn parse(input: &str, algorithm: HashAlgorithm) -> Result<Self, GfsError> {
+    if input.len() > limits::MAX_REVISION_SELECTOR_BYTES {
+      return Err(GfsError::invalid(format!(
+        "revision expression exceeds {} bytes",
+        limits::MAX_REVISION_SELECTOR_BYTES
+      )));
+    }
+    let split = input.find(['~', '^']).unwrap_or(input.len());
+    let (base, suffix) = input.split_at(split);
+    if base.is_empty() {
+      return Err(GfsError::invalid(format!(
+        "revision expression {input:?} has no revision before {suffix:?}"
+      )));
+    }
+    Ok(RevisionExpression {
+      base: RevisionSelector::parse(base, algorithm)?,
+      steps: parse_ancestry(input, suffix)?,
+    })
+  }
+
+  /// True when this is a bare selector, so a caller that only understands
+  /// selectors can use it unchanged.
+  pub fn is_bare(&self) -> bool {
+    self.steps.is_empty()
+  }
+}
+
+/// The operator chain. `full` is only used for diagnostics, so an error names
+/// what the caller typed rather than the fragment being parsed.
+fn parse_ancestry(full: &str, mut suffix: &str) -> Result<Vec<AncestryStep>, GfsError> {
+  let mut steps = Vec::new();
+  let mut distance: u64 = 0;
+  while !suffix.is_empty() {
+    let (op, rest) = suffix.split_at(1);
+    // The count is the digits that follow, and an absent one is 1. `^` may be
+    // followed by digits or by nothing -- never by `{`, which is what keeps
+    // `main^{tree}` rejected and a tree OID out of a commit-shaped field.
+    let digit_bytes = rest.bytes().take_while(u8::is_ascii_digit).count();
+    // Safe to split here without an index: ASCII digits are one byte each, so
+    // the boundary is a character boundary by construction.
+    let (digits, rest) = rest.split_at(digit_bytes);
+    if !rest.is_empty() && !rest.starts_with(['~', '^']) {
+      return Err(unsupported_expression(full));
+    }
+    let n: u32 = if digits.is_empty() {
+      1
+    } else {
+      digits
+        .parse()
+        .map_err(|_| GfsError::invalid(format!("{digits:?} is not a usable ancestry count")))?
+    };
+    steps.push(match op {
+      "^" => AncestryStep::Parent(n),
+      "~" => AncestryStep::Ancestor(n),
+      // `find(['~', '^'])` chose the split, so nothing else can be here.
+      _ => unreachable!("ancestry operator"),
+    });
+    distance += u64::from(n);
+    suffix = rest;
+  }
+  if distance > limits::MAX_ANCESTRY_DISTANCE as u64 {
+    return Err(GfsError::new(
+      ErrorCode::ResourceLimit,
+      format!(
+        "an ancestry walk may cover at most {} commits",
+        limits::MAX_ANCESTRY_DISTANCE
+      ),
+    ));
+  }
+  Ok(steps)
 }
 
 fn unsupported_expression(input: &str) -> GfsError {
@@ -348,6 +466,11 @@ mod tests {
     // Every one of these resolves to something under `revparse_single`. The
     // `^{tree}` case is the dangerous one: it yields a tree OID where the whole
     // system expects a commit.
+    //
+    // `HEAD~1` and `main^` are *not* in this list any more -- they are parsed by
+    // `RevisionExpression` and applied as explicit parent hops, never by
+    // `revparse`. A bare selector still rejects them, which is what keeps the
+    // ancestry walk in one place.
     for bad in [
       "HEAD~1",
       "main^",
@@ -368,6 +491,69 @@ mod tests {
         "should reject {bad:?}, got {err}"
       );
     }
+  }
+
+  #[test]
+  fn expressions_accept_ancestry_and_nothing_else() {
+    let cases: [(&str, &[AncestryStep]); 6] = [
+      ("main", &[]),
+      ("HEAD~1", &[AncestryStep::Ancestor(1)]),
+      ("main^", &[AncestryStep::Parent(1)]),
+      ("main~3", &[AncestryStep::Ancestor(3)]),
+      ("main^2", &[AncestryStep::Parent(2)]),
+      (
+        "main^2~3^",
+        &[
+          AncestryStep::Parent(2),
+          AncestryStep::Ancestor(3),
+          AncestryStep::Parent(1),
+        ],
+      ),
+    ];
+    for (input, steps) in cases {
+      let parsed = RevisionExpression::parse(input, SHA1).expect(input);
+      assert_eq!(parsed.steps, steps, "steps for {input:?}");
+      assert_eq!(
+        parsed.base,
+        RevisionSelector::parse(input.split(['~', '^']).next().unwrap(), SHA1).unwrap()
+      );
+    }
+    // A qualified object id keeps working as a base, which is what the daemon
+    // sends once it has substituted its pinned commit for `HEAD`.
+    let hex = format!("sha1:{}~2", "3a".repeat(20));
+    assert_eq!(
+      RevisionExpression::parse(&hex, SHA1).unwrap().steps,
+      vec![AncestryStep::Ancestor(2)]
+    );
+  }
+
+  #[test]
+  fn expressions_still_reject_everything_revparse_adds() {
+    // The point of the whole module. `^` may be followed by digits or by
+    // nothing; `^{tree}` is what would otherwise hand back a tree OID.
+    for bad in [
+      "main^{tree}",
+      "main^{commit}",
+      "HEAD@{2}",
+      "@{-1}",
+      "v1..v2",
+      ":/fix the bug",
+      "main:src/lib.rs",
+      "~1",
+      "^",
+      "main~-1",
+      "main~1x",
+      "main^{}",
+    ] {
+      assert!(
+        RevisionExpression::parse(bad, SHA1).is_err(),
+        "should reject {bad:?}"
+      );
+    }
+    // And an unbounded walk is a resource limit, not an invalid argument: the
+    // expression is well formed and the answer is that it is too expensive.
+    let err = RevisionExpression::parse("main~9000000", SHA1).unwrap_err();
+    assert_eq!(err.code, ErrorCode::ResourceLimit);
   }
 
   #[test]

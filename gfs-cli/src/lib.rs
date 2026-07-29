@@ -11,8 +11,13 @@
 //! ADR 0004's exit-code table is the agent-facing contract — two copies of it
 //! would eventually disagree, so there is one.
 
+pub mod blame;
 pub mod find;
+pub mod gitdate;
+pub mod history;
 pub mod log;
+pub mod revdiff;
 pub mod rg;
 pub mod search_output;
+pub mod show;
 pub mod workspace;

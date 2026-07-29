@@ -43,6 +43,23 @@ service SnapshotService {
   // is deterministic and repeating it is cheaper than carrying a cursor.
   rpc Log(LogRequest) returns (LogResponse);
 
+  // What changed between two commits, rendered.
+  //
+  // The one thing a workspace cannot answer for itself and the reason this RPC
+  // exists: ADR 0005 gave the mount no object database, so a client asking "what
+  // did this commit change" could only walk trees and fetch blobs a piece at a
+  // time -- the unbounded hydration the partial clone was rejected for. The
+  // server *has* the object database and libgit2 renders Git's own patch format,
+  // so one round trip answers it and the mount reads nothing.
+  //
+  // Rendering happens here rather than in the client for the same reason: a
+  // client-side approximation of `git diff` is a second implementation of a
+  // format that has to be byte-exact to be applied.
+  rpc DiffCommits(DiffCommitsRequest) returns (DiffCommitsResponse);
+
+  // Line-by-line attribution for one path at one commit.
+  rpc Blame(BlameRequest) returns (BlameResponse);
+
   // Paths in the pinned commit's tree, filtered by glob.
   //
   // A filename search. The alternative an agent has otherwise is `ListDirectory`
@@ -153,6 +170,17 @@ message LogRequest {
   // it either way, because an unbounded revwalk on a 1.4-million-commit history
   // is a request to serialize the whole repository.
   uint32 limit = 5;
+  // Follow only first parents, as `git log --first-parent` does.
+  bool first_parent = 6;
+  // Show only commits that changed one of these paths. A commit qualifies when
+  // it is not TREESAME to any parent for them, which is Git's own default
+  // simplification: for a merge that means the merge itself touched the path
+  // rather than only inheriting a side branch's change.
+  //
+  // Rename following (`--follow`) is deliberately *not* implied. It is a
+  // similarity search per commit, which is a different and much larger cost than
+  // this tree comparison.
+  repeated bytes paths = 7;
 }
 
 // One commit in a log. Deliberately not `GetCommitResponse`: that carries a
@@ -166,6 +194,10 @@ message LogCommit {
   Signature committer = 4;
   // Bytes, for the same reason as `Signature.name`.
   bytes message = 5;
+  // The commit's tree. Present so `--format=%T` can be answered without a
+  // `GetCommit` per line; unlike `GetCommitResponse.tree_oid` it says nothing
+  // about what is pinned.
+  string tree_oid = 6;
 }
 
 message LogResponse {
@@ -175,6 +207,120 @@ message LogResponse {
   // `has_more` false is the end of history, which is a different fact from a
   // truncated one.
   bool has_more = 2;
+}
+
+// ---------------------------------------------------------------------------
+// Commit-to-commit diff
+// ---------------------------------------------------------------------------
+
+// How a diff is rendered. The structured per-file summary is returned whatever
+// this says; only `patch` bytes change.
+enum DiffFormat {
+  DIFF_FORMAT_UNSPECIFIED = 0;
+  // A unified `diff --git` patch.
+  DIFF_FORMAT_PATCH = 1;
+  // `git diff --stat`'s histogram.
+  DIFF_FORMAT_STAT = 2;
+  DIFF_FORMAT_NAME_STATUS = 3;
+  DIFF_FORMAT_NAME_ONLY = 4;
+}
+
+// What happened to one path. Git's five, deliberately more than the two
+// `TreeDelta` uses internally: a manifest treats "added" and "modified" as the
+// same write, and a reader does not.
+enum ChangeStatus {
+  CHANGE_STATUS_UNSPECIFIED = 0;
+  CHANGE_STATUS_ADDED = 1;
+  CHANGE_STATUS_MODIFIED = 2;
+  CHANGE_STATUS_DELETED = 3;
+  CHANGE_STATUS_RENAMED = 4;
+  CHANGE_STATUS_TYPE_CHANGED = 5;
+}
+
+message DiffCommitsRequest {
+  string repository_id = 1;
+  // The old side. Empty diffs against the empty tree, which is what a root
+  // commit needs and is *not* the same as omitting the field by accident -- a
+  // caller that means "the first parent" resolves it and names it.
+  string base_commit_oid = 2;
+  // The new side.
+  string commit_oid = 3;
+  SnapshotAuthorization authorization = 4;
+  // Limit the diff to these paths. A directory limits to everything under it.
+  repeated bytes paths = 5;
+  DiffFormat format = 6;
+  // Context lines around each hunk. Zero takes the server's default of 3, which
+  // is `git diff`'s; a caller wanting no context sends the explicit sentinel
+  // below rather than zero, for the same reason page sizes work that way.
+  uint32 context_lines = 7;
+  // Ceiling on the rendered bytes. Zero takes the server's default. Reaching it
+  // sets `truncated` rather than failing: an agent reviewing a large commit is
+  // better served by the first megabyte and a flag than by an error.
+  uint64 max_bytes = 8;
+  // Render with no context at all. Distinguishes "I want zero" from "I did not
+  // set `context_lines`", which a bare uint32 cannot.
+  bool zero_context = 9;
+}
+
+message DiffFileChange {
+  bytes path = 1;
+  // Where the content came from. Present only for a rename.
+  bytes old_path = 2;
+  ChangeStatus status = 3;
+  uint32 additions = 4;
+  uint32 deletions = 5;
+  // True when Git treats the content as binary, in which case the counts are
+  // zero and the patch carries a note instead of lines.
+  bool binary = 6;
+  uint32 old_mode = 7;
+  uint32 new_mode = 8;
+}
+
+message DiffCommitsResponse {
+  // The rendered diff, in the requested format. Bytes, because it contains file
+  // content and paths, neither of which Git constrains to UTF-8.
+  bytes rendered = 1;
+  // Always populated, whatever the format, so a caller can act on the change set
+  // without parsing the rendering.
+  repeated DiffFileChange files = 2;
+  bool truncated = 3;
+  string base_commit_oid = 4;
+  string commit_oid = 5;
+}
+
+// ---------------------------------------------------------------------------
+// Blame
+// ---------------------------------------------------------------------------
+
+message BlameRequest {
+  string repository_id = 1;
+  string commit_oid = 2;
+  bytes path = 3;
+  SnapshotAuthorization authorization = 4;
+}
+
+// One contiguous run of lines attributed to one commit.
+message BlameHunk {
+  // 1-based line number in the file as of the blamed commit.
+  uint32 final_start_line = 1;
+  uint32 lines = 2;
+  // The commit the lines are attributed to.
+  string commit_oid = 3;
+  // What the file was called in that commit, which differs from the blamed path
+  // once the file has been renamed.
+  bytes orig_path = 4;
+  uint32 orig_start_line = 5;
+  Signature author = 6;
+  bool boundary = 7;
+}
+
+message BlameResponse {
+  repeated BlameHunk hunks = 1;
+  // The blamed file's bytes, so one round trip answers the whole question. Empty
+  // when `truncated` is set.
+  bytes content = 2;
+  bool truncated = 3;
+  string commit_oid = 4;
 }
 
 message FindPathsRequest {

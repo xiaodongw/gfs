@@ -21,7 +21,8 @@ use gfs_proto::convert;
 use gfs_proto::v1::{self, snapshot_service_server::SnapshotService};
 use gfs_types::error::{ErrorCode, GfsError};
 use gfs_types::{
-  limits, BytePath, EntryKind, HashAlgorithm, MountId, ObjectId, RepositoryId, RevisionSelector,
+  limits, BytePath, EntryKind, HashAlgorithm, MountId, ObjectId, RepositoryId, RevisionExpression,
+  RevisionSelector,
 };
 use tonic::{Request, Response, Status};
 
@@ -226,10 +227,12 @@ impl SnapshotService for SnapshotApi {
 
     let result = async {
       let (id, algorithm) = self.repo_context(&ctx, &req.repository_id).await?;
-      // The closed selector grammar. A `revparse` expression never reaches libgit2.
-      let selector = RevisionSelector::parse(&req.revision_selector, algorithm)?;
+      // The closed selector grammar, plus the ancestry suffix. A `revparse`
+      // expression never reaches libgit2: `~n` and `^n` are parsed here and
+      // applied by walking parent pointers, and everything else is refused.
+      let expression = RevisionExpression::parse(&req.revision_selector, algorithm)?;
       let repo = self.registry.repository(&id)?;
-      let mut resolved = repo.resolve(selector).await?;
+      let mut resolved = repo.resolve_expression(expression).await?;
 
       // The raw committer time from the repository layer is replaced by the
       // cataloged sanitized one. The API never returns an unsanitized timestamp:
@@ -589,8 +592,20 @@ impl SnapshotService for SnapshotApi {
         .await?;
       let repo = self.registry.repository(&access.repository_id)?;
       let limit = page_limit(req.limit, limits::DEFAULT_LOG_LIMIT, limits::MAX_LOG_LIMIT);
+      let mut paths = Vec::with_capacity(req.paths.len());
+      for path in req.paths {
+        paths.push(convert::try_path(path)?);
+      }
       let (commits, has_more) = repo
-        .log(access.commit.clone(), req.skip as usize, limit)
+        .log(
+          access.commit.clone(),
+          gfs_git::repository::LogOptions {
+            skip: req.skip as usize,
+            limit,
+            first_parent: req.first_parent,
+            paths,
+          },
+        )
         .await?;
       Ok((access, commits, has_more))
     }
@@ -621,6 +636,190 @@ impl SnapshotService for SnapshotApi {
         &ctx,
         AuditRecord {
           subject: Some(&ctx.identity.subject),
+          request_id: Some(ctx.request_id.as_str()),
+          ..Default::default()
+        },
+        Err(e),
+      ),
+    }
+  }
+
+  async fn diff_commits(
+    &self,
+    request: Request<v1::DiffCommitsRequest>,
+  ) -> Result<Response<v1::DiffCommitsResponse>, Status> {
+    let ctx = self.begin(&request)?;
+    let req = request.into_inner();
+
+    let result = async {
+      // The *new* side establishes the access, and the old side is authorized
+      // separately below. Both are checked because a diff reveals the content of
+      // both commits, and a caller holding a capability for one of them must not
+      // be able to read the other through this.
+      let (access, algorithm) = self
+        .commit_context(
+          &ctx,
+          &req.repository_id,
+          &req.commit_oid,
+          req.authorization.clone(),
+        )
+        .await?;
+      let base = match req.base_commit_oid.is_empty() {
+        // Empty is the empty tree, which is how a root commit is diffed. It is
+        // not "unspecified": a caller meaning "the first parent" resolves it and
+        // names it, so there is nothing here to guess.
+        true => None,
+        false => {
+          let base = convert::try_oid(&req.base_commit_oid, algorithm, "base_commit_oid")?;
+          self
+            .authz
+            .authorize_commit(
+              &ctx.identity.subject,
+              &access.repository_id,
+              &base,
+              &SnapshotAuthorization {
+                mount_capability: req
+                  .authorization
+                  .map(|a| a.mount_capability)
+                  .filter(|s| !s.is_empty()),
+              },
+            )
+            .await?;
+          Some(base)
+        }
+      };
+
+      let mut paths = Vec::with_capacity(req.paths.len());
+      for path in req.paths {
+        paths.push(convert::try_path(path)?);
+      }
+      let max_bytes = if req.max_bytes == 0 {
+        limits::DEFAULT_DIFF_BYTES
+      } else {
+        (req.max_bytes as usize).min(limits::MAX_DIFF_BYTES)
+      };
+      let context_lines = if req.zero_context {
+        0
+      } else if req.context_lines == 0 {
+        gfs_types::diff::DEFAULT_CONTEXT_LINES
+      } else {
+        req.context_lines.min(limits::MAX_DIFF_CONTEXT_LINES)
+      };
+
+      let repo = self.registry.repository(&access.repository_id)?;
+      let output = repo
+        .diff(gfs_git::repository::DiffRequest {
+          from: base.clone(),
+          to: access.commit.clone(),
+          paths,
+          format: v1::DiffFormat::try_from(req.format)
+            .unwrap_or(v1::DiffFormat::Unspecified)
+            .into(),
+          context_lines,
+          max_bytes,
+        })
+        .await?;
+      Ok((access, base, output))
+    }
+    .await;
+
+    match result {
+      Ok((access, base, output)) => {
+        let response = v1::DiffCommitsResponse {
+          rendered: output.rendered,
+          files: output
+            .files
+            .into_iter()
+            .map(v1::DiffFileChange::from)
+            .collect(),
+          truncated: output.truncated,
+          base_commit_oid: base.map(|b| b.to_qualified()).unwrap_or_default(),
+          commit_oid: access.commit.to_qualified(),
+        };
+        self.finish(
+          Action::DiffCommits,
+          &ctx,
+          AuditRecord {
+            subject: Some(&access.subject),
+            repository_id: Some(&access.repository_id),
+            commit: Some(&access.commit),
+            via_capability: access.via_capability,
+            request_id: Some(ctx.request_id.as_str()),
+            ..Default::default()
+          },
+          Ok(response),
+        )
+      }
+      Err(e) => self.finish(
+        Action::DiffCommits,
+        &ctx,
+        AuditRecord {
+          subject: Some(&ctx.identity.subject),
+          request_id: Some(ctx.request_id.as_str()),
+          ..Default::default()
+        },
+        Err(e),
+      ),
+    }
+  }
+
+  async fn blame(
+    &self,
+    request: Request<v1::BlameRequest>,
+  ) -> Result<Response<v1::BlameResponse>, Status> {
+    let ctx = self.begin(&request)?;
+    let req = request.into_inner();
+    let path = BytePath::new(req.path.clone());
+
+    let result = async {
+      let (access, _) = self
+        .commit_context(&ctx, &req.repository_id, &req.commit_oid, req.authorization)
+        .await?;
+      let path = convert::try_path(req.path)?;
+      let repo = self.registry.repository(&access.repository_id)?;
+      // The searchable-blob ceiling rather than the blob one: a blame is a
+      // read-the-whole-file operation like indexing, and a 512 MB file has no
+      // lines a person is going to attribute.
+      let output = repo
+        .blame(
+          access.commit.clone(),
+          path,
+          limits::MAX_SEARCHABLE_BLOB_BYTES,
+        )
+        .await?;
+      Ok((access, output))
+    }
+    .await;
+
+    match result {
+      Ok((access, output)) => {
+        let response = v1::BlameResponse {
+          hunks: output.hunks.into_iter().map(v1::BlameHunk::from).collect(),
+          content: output.content,
+          truncated: output.truncated,
+          commit_oid: access.commit.to_qualified(),
+        };
+        self.finish(
+          Action::Blame,
+          &ctx,
+          AuditRecord {
+            subject: Some(&access.subject),
+            repository_id: Some(&access.repository_id),
+            commit: Some(&access.commit),
+            path: Some(&path),
+            via_capability: access.via_capability,
+            request_id: Some(ctx.request_id.as_str()),
+            ..Default::default()
+          },
+          Ok(response),
+        )
+      }
+      Err(e) => self.finish(
+        Action::Blame,
+        &ctx,
+        AuditRecord {
+          subject: Some(&ctx.identity.subject),
+          path: Some(&path),
           request_id: Some(ctx.request_id.as_str()),
           ..Default::default()
         },

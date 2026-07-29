@@ -870,6 +870,30 @@ Duration: 2–4 weeks
 > 266 KiB** against 12.6 s and 338 MiB for a full clone, with both flows
 > producing an identical tree. The `git` shim is **not** yet rewired to these
 > tools, so `git log` and `git ls-files` inside a mount still cost what they cost.
+>
+> **Addition, 2026-07-29: history review.** An agent test run found the
+> remaining hole: GFS could read any commit and could not say what one
+> **changed**. `gfs log` refused `-p` and `--stat`, `gfs diff` took no
+> revisions, and there was no `show` — so "review the last three commits" had no
+> first-class answer and the tester hand-rolled a tree-differ out of
+> `gfs ls --rev` and `gfs cat --rev`. Two RPCs close it (`DiffCommits`, which
+> renders with libgit2 server-side, and `Blame`), plus `first_parent` and path
+> limiting on `Log`. The CLI gains `gfs show`, `gfs diff <a> <b>`, `gfs blame`,
+> `gfs log -p/--stat/--first-parent/-- <path>`, the `%b`/`%B` and date format
+> verbs, and ancestry expressions (`HEAD~3`, `main^`) parsed into explicit
+> parent hops rather than handed to `revparse`. `--repo` now defaults from the
+> workspace for `ls`, `cat` and `resolve`, and those two route through the
+> daemon so they reach a commit on an unpushed work branch.
+>
+> This does not reopen ADR 0005 either, and for the same reason as the previous
+> addition — but the reason is worth restating, because the refusals it removes
+> were justified by it. "Needs a tree or blob per commit" was a statement about
+> the **client**: the partial clone was rejected because the *workspace* would
+> hydrate itself a piece at a time. The gateway holds the object database and
+> pays no such cost. Every command added here leaves hydration at 0 blobs and 0
+> bytes, which the tests in `crates/gfs-mount/tests/history.rs` assert directly.
+> See the plan file
+> [`plans/20260729-0630-history-review-tools.md`](../plans/20260729-0630-history-review-tools.md).
 
 ### M5.1 Smart HTTP gateway
 

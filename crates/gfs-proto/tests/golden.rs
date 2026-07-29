@@ -177,6 +177,8 @@ const PINNED: &[(&str, &[Field])] = &[
       (3, "authorization", ".gfs.v1.SnapshotAuthorization"),
       (4, "skip", "uint32"),
       (5, "limit", "uint32"),
+      (6, "first_parent", "bool"),
+      (7, "paths", "bytes"),
     ],
   ),
   (
@@ -187,6 +189,74 @@ const PINNED: &[(&str, &[Field])] = &[
       (3, "author", ".gfs.v1.Signature"),
       (4, "committer", ".gfs.v1.Signature"),
       (5, "message", "bytes"),
+      (6, "tree_oid", "string"),
+    ],
+  ),
+  (
+    "DiffCommitsRequest",
+    &[
+      (1, "repository_id", "string"),
+      (2, "base_commit_oid", "string"),
+      (3, "commit_oid", "string"),
+      (4, "authorization", ".gfs.v1.SnapshotAuthorization"),
+      (5, "paths", "bytes"),
+      (6, "format", ".gfs.v1.DiffFormat"),
+      (7, "context_lines", "uint32"),
+      (8, "max_bytes", "uint64"),
+      (9, "zero_context", "bool"),
+    ],
+  ),
+  (
+    "DiffFileChange",
+    &[
+      (1, "path", "bytes"),
+      (2, "old_path", "bytes"),
+      (3, "status", ".gfs.v1.ChangeStatus"),
+      (4, "additions", "uint32"),
+      (5, "deletions", "uint32"),
+      (6, "binary", "bool"),
+      (7, "old_mode", "uint32"),
+      (8, "new_mode", "uint32"),
+    ],
+  ),
+  (
+    "DiffCommitsResponse",
+    &[
+      (1, "rendered", "bytes"),
+      (2, "files", ".gfs.v1.DiffFileChange"),
+      (3, "truncated", "bool"),
+      (4, "base_commit_oid", "string"),
+      (5, "commit_oid", "string"),
+    ],
+  ),
+  (
+    "BlameRequest",
+    &[
+      (1, "repository_id", "string"),
+      (2, "commit_oid", "string"),
+      (3, "path", "bytes"),
+      (4, "authorization", ".gfs.v1.SnapshotAuthorization"),
+    ],
+  ),
+  (
+    "BlameHunk",
+    &[
+      (1, "final_start_line", "uint32"),
+      (2, "lines", "uint32"),
+      (3, "commit_oid", "string"),
+      (4, "orig_path", "bytes"),
+      (5, "orig_start_line", "uint32"),
+      (6, "author", ".gfs.v1.Signature"),
+      (7, "boundary", "bool"),
+    ],
+  ),
+  (
+    "BlameResponse",
+    &[
+      (1, "hunks", ".gfs.v1.BlameHunk"),
+      (2, "content", "bytes"),
+      (3, "truncated", "bool"),
+      (4, "commit_oid", "string"),
     ],
   ),
   (
@@ -478,6 +548,35 @@ const PINNED_ENUMS: &[(&str, &[(i32, &str)])] = &[
       (3, "CHANGE_KIND_DELETED"),
     ],
   ),
+  (
+    // A *rendering* choice, so unlike `SnapshotState` the unspecified zero has a
+    // safe meaning -- the fullest output -- and must keep it. Renumbering would
+    // turn one client's request for a patch into another's request for a list of
+    // names, which reads as a mysteriously empty diff rather than as an error.
+    "DiffFormat",
+    &[
+      (0, "DIFF_FORMAT_UNSPECIFIED"),
+      (1, "DIFF_FORMAT_PATCH"),
+      (2, "DIFF_FORMAT_STAT"),
+      (3, "DIFF_FORMAT_NAME_STATUS"),
+      (4, "DIFF_FORMAT_NAME_ONLY"),
+    ],
+  ),
+  (
+    // Deliberately *not* `ChangeKind`, and not renumbered to line up with it.
+    // The two answer different questions -- what a workspace changed against its
+    // base, and what one commit did against another -- and this one has Git's
+    // five statuses because a reader needs them.
+    "ChangeStatus",
+    &[
+      (0, "CHANGE_STATUS_UNSPECIFIED"),
+      (1, "CHANGE_STATUS_ADDED"),
+      (2, "CHANGE_STATUS_MODIFIED"),
+      (3, "CHANGE_STATUS_DELETED"),
+      (4, "CHANGE_STATUS_RENAMED"),
+      (5, "CHANGE_STATUS_TYPE_CHANGED"),
+    ],
+  ),
 ];
 
 fn descriptors() -> prost_types::FileDescriptorSet {
@@ -601,7 +700,9 @@ fn service_methods_are_stable() {
     "RepositoryService/PushBranch(.gfs.v1.PushBranchRequest) -> .gfs.v1.PushBranchResponse",
     "SearchService/Search(.gfs.v1.SearchRequest) -> .gfs.v1.SearchResponse",
     "SnapshotService/BatchGetEntry(.gfs.v1.BatchGetEntryRequest) -> .gfs.v1.BatchGetEntryResponse",
+    "SnapshotService/Blame(.gfs.v1.BlameRequest) -> .gfs.v1.BlameResponse",
     "SnapshotService/CreateMount(.gfs.v1.CreateMountRequest) -> .gfs.v1.CreateMountResponse",
+    "SnapshotService/DiffCommits(.gfs.v1.DiffCommitsRequest) -> .gfs.v1.DiffCommitsResponse",
     "SnapshotService/FindPaths(.gfs.v1.FindPathsRequest) -> .gfs.v1.FindPathsResponse",
     "SnapshotService/GetCommit(.gfs.v1.GetCommitRequest) -> .gfs.v1.GetCommitResponse",
     "SnapshotService/GetEntry(.gfs.v1.GetEntryRequest) -> .gfs.v1.GetEntryResponse",

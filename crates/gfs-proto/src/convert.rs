@@ -17,8 +17,9 @@
 
 use gfs_types::error::{ErrorCode, GfsError};
 use gfs_types::{
-  BytePath, CommitMeta, EntryKind, HashAlgorithm, ObjectId, ResolvedRevision, RevisionSelector,
-  Signature, SnapshotState, Timestamp, TreeEntryInfo,
+  BlameHunk, BytePath, CommitMeta, DiffFileChange, DiffFormat, DiffStatus, EntryKind,
+  HashAlgorithm, ObjectId, ResolvedRevision, RevisionSelector, Signature, SnapshotState, Timestamp,
+  TreeEntryInfo,
 };
 
 use crate::v1;
@@ -216,6 +217,7 @@ impl From<CommitMeta> for v1::LogCommit {
   fn from(c: CommitMeta) -> Self {
     v1::LogCommit {
       commit_oid: c.commit.to_qualified(),
+      tree_oid: c.tree.to_qualified(),
       parent_oids: c.parents.iter().map(ObjectId::to_qualified).collect(),
       author: Some(c.author.into()),
       committer: Some(c.committer.into()),
@@ -225,16 +227,23 @@ impl From<CommitMeta> for v1::LogCommit {
 }
 
 impl v1::LogCommit {
-  /// The tree and snapshot time a [`CommitMeta`] carries are not on the wire for
-  /// a log entry, so they are filled from the commit itself: the tree is set to
-  /// the commit's own ID as a placeholder no caller reads, and the time comes
-  /// from the committer signature, which is what `git log` orders and prints by.
+  /// The snapshot time a [`CommitMeta`] carries is not on the wire for a log
+  /// entry, so it comes from the committer signature, which is what `git log`
+  /// orders and prints by.
+  ///
+  /// An empty `tree_oid` falls back to the commit's own ID, because a server one
+  /// minor version older does not send the field and ADR 0006 requires a new
+  /// field to have a safe default rather than to fail the response.
   pub fn try_into_domain(self, algorithm: HashAlgorithm) -> Result<CommitMeta, GfsError> {
     let commit = try_oid(&self.commit_oid, algorithm, "commit_oid")?;
     let committer: Signature =
       required(self.committer, "committer")?.try_into_domain("committer")?;
     Ok(CommitMeta {
-      tree: commit.clone(),
+      tree: if self.tree_oid.is_empty() {
+        commit.clone()
+      } else {
+        try_oid(&self.tree_oid, algorithm, "tree_oid")?
+      },
       commit,
       parents: self
         .parent_oids
@@ -291,6 +300,130 @@ impl v1::ResolveRevisionResponse {
       ref_name: self.ref_name,
       ref_version: self.ref_version,
       snapshot_time: required(self.snapshot_time, "snapshot_time")?.into(),
+    })
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Diff and blame
+// ---------------------------------------------------------------------------
+
+impl From<DiffFormat> for v1::DiffFormat {
+  fn from(f: DiffFormat) -> Self {
+    match f {
+      DiffFormat::Patch => v1::DiffFormat::Patch,
+      DiffFormat::Stat => v1::DiffFormat::Stat,
+      DiffFormat::NameStatus => v1::DiffFormat::NameStatus,
+      DiffFormat::NameOnly => v1::DiffFormat::NameOnly,
+    }
+  }
+}
+
+impl From<v1::DiffFormat> for DiffFormat {
+  /// `UNSPECIFIED` becomes `Patch`.
+  ///
+  /// Unlike `SnapshotState`, guessing is right here: ADR 0006 requires a new
+  /// field to have a safe default, and for a *rendering* choice the safe default
+  /// is the fullest form. A caller that sends nothing gets the whole patch,
+  /// which is never a wrong answer — only a longer one.
+  fn from(f: v1::DiffFormat) -> Self {
+    match f {
+      v1::DiffFormat::Stat => DiffFormat::Stat,
+      v1::DiffFormat::NameStatus => DiffFormat::NameStatus,
+      v1::DiffFormat::NameOnly => DiffFormat::NameOnly,
+      v1::DiffFormat::Patch | v1::DiffFormat::Unspecified => DiffFormat::Patch,
+    }
+  }
+}
+
+impl From<DiffStatus> for v1::ChangeStatus {
+  fn from(s: DiffStatus) -> Self {
+    match s {
+      DiffStatus::Added => v1::ChangeStatus::Added,
+      DiffStatus::Modified => v1::ChangeStatus::Modified,
+      DiffStatus::Deleted => v1::ChangeStatus::Deleted,
+      DiffStatus::Renamed => v1::ChangeStatus::Renamed,
+      DiffStatus::TypeChanged => v1::ChangeStatus::TypeChanged,
+    }
+  }
+}
+
+impl From<v1::ChangeStatus> for DiffStatus {
+  /// `UNSPECIFIED` becomes `Modified`, which is what a peer that does not know
+  /// the status is really saying: this path is different.
+  fn from(s: v1::ChangeStatus) -> Self {
+    match s {
+      v1::ChangeStatus::Added => DiffStatus::Added,
+      v1::ChangeStatus::Deleted => DiffStatus::Deleted,
+      v1::ChangeStatus::Renamed => DiffStatus::Renamed,
+      v1::ChangeStatus::TypeChanged => DiffStatus::TypeChanged,
+      v1::ChangeStatus::Modified | v1::ChangeStatus::Unspecified => DiffStatus::Modified,
+    }
+  }
+}
+
+impl From<DiffFileChange> for v1::DiffFileChange {
+  fn from(c: DiffFileChange) -> Self {
+    v1::DiffFileChange {
+      path: c.path.as_bytes().to_vec(),
+      old_path: c
+        .old_path
+        .map(|p| p.as_bytes().to_vec())
+        .unwrap_or_default(),
+      status: v1::ChangeStatus::from(c.status) as i32,
+      additions: c.additions,
+      deletions: c.deletions,
+      binary: c.binary,
+      old_mode: c.old_mode,
+      new_mode: c.new_mode,
+    }
+  }
+}
+
+impl v1::DiffFileChange {
+  pub fn try_into_domain(self) -> Result<DiffFileChange, GfsError> {
+    Ok(DiffFileChange {
+      path: try_path(self.path)?,
+      old_path: match self.old_path.is_empty() {
+        true => None,
+        false => Some(try_path(self.old_path)?),
+      },
+      status: v1::ChangeStatus::try_from(self.status)
+        .unwrap_or(v1::ChangeStatus::Unspecified)
+        .into(),
+      additions: self.additions,
+      deletions: self.deletions,
+      binary: self.binary,
+      old_mode: self.old_mode,
+      new_mode: self.new_mode,
+    })
+  }
+}
+
+impl From<BlameHunk> for v1::BlameHunk {
+  fn from(h: BlameHunk) -> Self {
+    v1::BlameHunk {
+      final_start_line: h.final_start_line,
+      lines: h.lines,
+      commit_oid: h.commit.to_qualified(),
+      orig_path: h.orig_path.as_bytes().to_vec(),
+      orig_start_line: h.orig_start_line,
+      author: Some(h.author.into()),
+      boundary: h.boundary,
+    }
+  }
+}
+
+impl v1::BlameHunk {
+  pub fn try_into_domain(self, algorithm: HashAlgorithm) -> Result<BlameHunk, GfsError> {
+    Ok(BlameHunk {
+      final_start_line: self.final_start_line,
+      lines: self.lines,
+      commit: try_oid(&self.commit_oid, algorithm, "commit_oid")?,
+      orig_path: try_path(self.orig_path)?,
+      orig_start_line: self.orig_start_line,
+      author: required(self.author, "author")?.try_into_domain("author")?,
+      boundary: self.boundary,
     })
   }
 }

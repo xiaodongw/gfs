@@ -187,9 +187,21 @@ async fn a_revision_expression_is_refused_at_the_api_boundary() {
   // The closed grammar, enforced before libgit2 sees the string. `main^{tree}` is
   // the dangerous one: it resolves, and yields a tree where every layer expects a
   // commit.
+  //
+  // `HEAD~1` and `main^` used to be in this list. They are answered now — parsed
+  // into explicit parent hops and applied with `commit.parent(n)` — so what this
+  // asserts is the part that actually mattered: nothing reaches `revparse`, and
+  // `^` may be followed by digits or by nothing.
   let f = start().await;
   let mut c = client(&f, OWNER_TOKEN).await;
-  for expr in ["HEAD~1", "main^", "main^{tree}", "v1.0..v2.0", "main:src"] {
+  for expr in [
+    "main^{tree}",
+    "main^{commit}",
+    "v1.0..v2.0",
+    "main:src",
+    "HEAD@{2}",
+    "main~1x",
+  ] {
     let status = c
       .resolve_revision(v1::ResolveRevisionRequest {
         repository_id: f.repo_id.to_string(),
@@ -199,6 +211,265 @@ async fn a_revision_expression_is_refused_at_the_api_boundary() {
       .unwrap_err();
     assert_eq!(status.code(), tonic::Code::InvalidArgument, "{expr}");
   }
+}
+
+#[tokio::test]
+async fn an_ancestry_expression_walks_parents_and_drops_the_ref() {
+  // The `basic` fixture is linear, so `main~1` is `main`'s parent and `main^` is
+  // the same commit by the other spelling.
+  let f = start().await;
+  let mut c = client(&f, OWNER_TOKEN).await;
+
+  macro_rules! resolve {
+    ($selector:expr) => {
+      c.resolve_revision(v1::ResolveRevisionRequest {
+        repository_id: f.repo_id.to_string(),
+        revision_selector: $selector.to_owned(),
+      })
+      .await
+      .map(|r| r.into_inner())
+    };
+  }
+
+  let tip = resolve!("main").unwrap();
+  assert_eq!(tip.ref_name.as_deref(), Some("refs/heads/main"));
+
+  let parent = resolve!("main~1").unwrap();
+  assert_ne!(parent.commit_oid, tip.commit_oid);
+  // The ref named the *base*, not what the walk landed on. Reporting
+  // `refs/heads/main` here would say that `main~1` is where main points.
+  assert_eq!(parent.ref_name, None);
+  // The tree comes from the walked commit, not from the base.
+  assert_ne!(parent.tree_oid, tip.tree_oid);
+
+  // `^` and `~` agree on a non-merge commit, and both spellings compose.
+  assert_eq!(resolve!("main^").unwrap().commit_oid, parent.commit_oid);
+  assert_eq!(resolve!("main~0").unwrap().commit_oid, tip.commit_oid);
+
+  // Walking off the end of history is NOT_FOUND, not a silent stop at the root.
+  let status = resolve!("main~500").unwrap_err();
+  assert_eq!(status.code(), tonic::Code::NotFound);
+}
+
+#[tokio::test]
+async fn diff_commits_renders_the_change_between_two_commits() {
+  // The facility the 2026-07-29 agent report was missing entirely. The `basic`
+  // fixture's second commit rewrites `src/main.rs`, adds `src/new.rs` and
+  // deletes `docs/guide.md`, so one call has to report all three.
+  let f = start().await;
+  let mut c = client(&f, OWNER_TOKEN).await;
+
+  let tip = c
+    .resolve_revision(v1::ResolveRevisionRequest {
+      repository_id: f.repo_id.to_string(),
+      revision_selector: "main".to_owned(),
+    })
+    .await
+    .unwrap()
+    .into_inner();
+  let base = c
+    .resolve_revision(v1::ResolveRevisionRequest {
+      repository_id: f.repo_id.to_string(),
+      revision_selector: "main~1".to_owned(),
+    })
+    .await
+    .unwrap()
+    .into_inner();
+
+  let diff = c
+    .diff_commits(v1::DiffCommitsRequest {
+      repository_id: f.repo_id.to_string(),
+      base_commit_oid: base.commit_oid.clone(),
+      commit_oid: tip.commit_oid.clone(),
+      ..Default::default()
+    })
+    .await
+    .unwrap()
+    .into_inner();
+
+  let by_path: std::collections::HashMap<String, &v1::DiffFileChange> = diff
+    .files
+    .iter()
+    .map(|f| (String::from_utf8_lossy(&f.path).into_owned(), f))
+    .collect();
+  assert_eq!(
+    by_path["src/new.rs"].status(),
+    v1::ChangeStatus::Added,
+    "{:?}",
+    by_path.keys()
+  );
+  assert_eq!(by_path["docs/guide.md"].status(), v1::ChangeStatus::Deleted);
+  assert_eq!(by_path["src/main.rs"].status(), v1::ChangeStatus::Modified);
+  assert!(by_path["src/main.rs"].additions >= 1);
+  assert!(by_path["src/main.rs"].deletions >= 1);
+
+  // The rendering is Git's own patch format, not an approximation: it is meant
+  // to be applied.
+  let patch = String::from_utf8(diff.rendered.clone()).unwrap();
+  assert!(
+    patch.contains("diff --git a/src/main.rs b/src/main.rs"),
+    "{patch}"
+  );
+  assert!(
+    patch.contains("+fn main() { println!(\"bye\"); }"),
+    "{patch}"
+  );
+  assert!(patch.contains("new file mode 100644"), "{patch}");
+  assert!(!diff.truncated);
+
+  // A root commit diffs against the empty tree, which is how its whole content
+  // becomes reviewable rather than unreachable.
+  let root = c
+    .diff_commits(v1::DiffCommitsRequest {
+      repository_id: f.repo_id.to_string(),
+      base_commit_oid: String::new(),
+      commit_oid: base.commit_oid.clone(),
+      ..Default::default()
+    })
+    .await
+    .unwrap()
+    .into_inner();
+  assert!(root
+    .files
+    .iter()
+    .all(|f| f.status() == v1::ChangeStatus::Added));
+
+  // Path limiting reduces the change set rather than the rendering alone.
+  let scoped = c
+    .diff_commits(v1::DiffCommitsRequest {
+      repository_id: f.repo_id.to_string(),
+      base_commit_oid: base.commit_oid.clone(),
+      commit_oid: tip.commit_oid.clone(),
+      paths: vec![b"src/new.rs".to_vec()],
+      ..Default::default()
+    })
+    .await
+    .unwrap()
+    .into_inner();
+  assert_eq!(scoped.files.len(), 1);
+  assert_eq!(scoped.files[0].path, b"src/new.rs");
+
+  // `--name-only` renders paths and nothing else, but still carries the same
+  // structured summary -- which is the contract that lets a caller act on the
+  // change set without parsing the rendering.
+  let names = c
+    .diff_commits(v1::DiffCommitsRequest {
+      repository_id: f.repo_id.to_string(),
+      base_commit_oid: base.commit_oid,
+      commit_oid: tip.commit_oid,
+      format: v1::DiffFormat::NameOnly as i32,
+      ..Default::default()
+    })
+    .await
+    .unwrap()
+    .into_inner();
+  let listed = String::from_utf8(names.rendered).unwrap();
+  assert!(listed.contains("src/new.rs"), "{listed}");
+  assert!(!listed.contains("diff --git"), "{listed}");
+  assert_eq!(names.files.len(), diff.files.len());
+}
+
+#[tokio::test]
+async fn blame_attributes_lines_and_returns_the_file() {
+  let f = start().await;
+  let mut c = client(&f, OWNER_TOKEN).await;
+  let tip = c
+    .resolve_revision(v1::ResolveRevisionRequest {
+      repository_id: f.repo_id.to_string(),
+      revision_selector: "main".to_owned(),
+    })
+    .await
+    .unwrap()
+    .into_inner();
+
+  let blame = c
+    .blame(v1::BlameRequest {
+      repository_id: f.repo_id.to_string(),
+      commit_oid: tip.commit_oid.clone(),
+      path: b"src/main.rs".to_vec(),
+      authorization: None,
+    })
+    .await
+    .unwrap()
+    .into_inner();
+
+  assert!(!blame.hunks.is_empty());
+  assert!(!blame.truncated);
+  // The bytes travel with the hunks, because a blame without the lines it
+  // attributes is not an answer.
+  assert!(String::from_utf8_lossy(&blame.content).contains("fn main()"));
+  // `src/main.rs` was rewritten by the second commit, so the tip is what its
+  // lines are attributed to.
+  assert_eq!(blame.hunks[0].commit_oid, tip.commit_oid);
+  assert_eq!(blame.hunks[0].final_start_line, 1);
+
+  // A directory has no lines, and that is a caller error rather than an empty
+  // success -- the same rule `ls` follows for a path that is not a directory.
+  let status = c
+    .blame(v1::BlameRequest {
+      repository_id: f.repo_id.to_string(),
+      commit_oid: tip.commit_oid,
+      path: b"src".to_vec(),
+      authorization: None,
+    })
+    .await
+    .unwrap_err();
+  assert_eq!(status.code(), tonic::Code::InvalidArgument);
+}
+
+#[tokio::test]
+async fn a_path_limited_log_only_shows_commits_that_touched_it() {
+  let f = start().await;
+  let mut c = client(&f, OWNER_TOKEN).await;
+  let tip = c
+    .resolve_revision(v1::ResolveRevisionRequest {
+      repository_id: f.repo_id.to_string(),
+      revision_selector: "main".to_owned(),
+    })
+    .await
+    .unwrap()
+    .into_inner();
+
+  let all = c
+    .log(v1::LogRequest {
+      repository_id: f.repo_id.to_string(),
+      commit_oid: tip.commit_oid.clone(),
+      ..Default::default()
+    })
+    .await
+    .unwrap()
+    .into_inner();
+  assert!(all.commits.len() >= 2);
+  // The tree travels with each commit now, so `--format=%T` costs no extra call.
+  assert!(!all.commits[0].tree_oid.is_empty());
+
+  // `src/new.rs` arrived in the second commit and nowhere else.
+  let scoped = c
+    .log(v1::LogRequest {
+      repository_id: f.repo_id.to_string(),
+      commit_oid: tip.commit_oid.clone(),
+      paths: vec![b"src/new.rs".to_vec()],
+      ..Default::default()
+    })
+    .await
+    .unwrap()
+    .into_inner();
+  assert_eq!(scoped.commits.len(), 1);
+  assert_eq!(scoped.commits[0].commit_oid, tip.commit_oid);
+
+  // A path no commit touched is an empty history, not an error.
+  let none = c
+    .log(v1::LogRequest {
+      repository_id: f.repo_id.to_string(),
+      commit_oid: tip.commit_oid,
+      paths: vec![b"nothing/here".to_vec()],
+      ..Default::default()
+    })
+    .await
+    .unwrap()
+    .into_inner();
+  assert!(none.commits.is_empty());
+  assert!(!none.has_more);
 }
 
 #[tokio::test]

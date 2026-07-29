@@ -11,17 +11,25 @@ use std::sync::Arc;
 use gfs_types::error::{ErrorCode, GfsError};
 use gfs_types::revision::{self, RevisionSelector};
 use gfs_types::{
-  limits, mode, BytePath, CommitMeta, EntryKind, HashAlgorithm, ObjectId, ResolvedRevision,
-  Signature, Timestamp, TreeEntryInfo,
+  limits, mode, AncestryStep, BlameHunk, BytePath, CommitMeta, DiffFileChange, DiffFormat,
+  DiffStatus, EntryKind, HashAlgorithm, ObjectId, ResolvedRevision, Signature, Timestamp,
+  TreeEntryInfo,
 };
 
 use crate::format::{self, RepositoryFormat};
 use crate::pool::{PooledRepo, RepoPool};
 use crate::repository::{
-  CommitSignature, DirectoryPage, EntryLookup, GitRepository, TreeChange, TreeChangeKind,
-  TreeDelta, WalkEntry,
+  BlameOutput, CommitSignature, DiffOutput, DiffRequest, DirectoryPage, EntryLookup, GitRepository,
+  LogOptions, TreeChange, TreeChangeKind, TreeDelta, WalkEntry,
 };
+
 use crate::tree::{DecodedEntry, DecodedTree, TreeCache, TreeCacheStats};
+
+/// Terminal width `--stat` lays its histogram out to.
+///
+/// Git uses the terminal's width; there is no terminal here, so this is the
+/// conventional 80 — the width the output is expected to be pasted at.
+const STAT_WIDTH: usize = 80;
 
 /// The tree containing a path, plus that path's final component.
 ///
@@ -234,6 +242,39 @@ impl Libgit2Repository {
     repo.find_commit(oid).map_err(|e| not_found(&e, "commit"))
   }
 
+  /// Whether a commit changed any of `paths`, relative to its parents.
+  ///
+  /// The rule is Git's own default history simplification, narrowed to the part
+  /// that matters here: a commit is interesting when it is *not* TREESAME to any
+  /// parent. For an ordinary commit that reads as "the path differs from the
+  /// parent"; for a merge it means the merge itself touched the path, rather
+  /// than only inheriting a side branch's change — which is the distinction that
+  /// stops `log -- <path>` on a merge-heavy history from being all merges.
+  ///
+  /// Mode is compared along with the object id, so a `chmod +x` is a change.
+  fn touches(
+    &self,
+    repo: &git2::Repository,
+    oid: git2::Oid,
+    paths: &[BytePath],
+  ) -> Result<bool, GfsError> {
+    let commit = self.find_commit(repo, oid)?;
+    let tree = commit.tree().map_err(|e| not_found(&e, "tree"))?;
+    if commit.parent_count() == 0 {
+      return Ok(paths.iter().any(|p| tree_entry_at(&tree, p).is_some()));
+    }
+    for parent in commit.parents() {
+      let parent_tree = parent.tree().map_err(|e| not_found(&e, "tree"))?;
+      let same = paths
+        .iter()
+        .all(|p| tree_entry_at(&tree, p) == tree_entry_at(&parent_tree, p));
+      if same {
+        return Ok(false);
+      }
+    }
+    Ok(true)
+  }
+
   fn signature_of(sig: &git2::Signature<'_>) -> Signature {
     Signature {
       // Raw bytes: Git does not constrain these to UTF-8, and the M0 spike's
@@ -244,6 +285,39 @@ impl Libgit2Repository {
       time: Timestamp::from_secs(sig.when().seconds()),
       tz_offset_minutes: sig.when().offset_minutes(),
     }
+  }
+}
+
+/// A byte path as the `Path` libgit2's APIs take.
+///
+/// Sound on Unix, where a path *is* bytes; this crate is Linux-only (ADR 0003
+/// builds on FUSE) so the lossless conversion exists and no `String` round trip
+/// is needed.
+fn as_path(path: &BytePath) -> &std::path::Path {
+  use std::os::unix::ffi::OsStrExt;
+  std::path::Path::new(std::ffi::OsStr::from_bytes(path.as_bytes()))
+}
+
+/// One path's `(object id, mode)` in a tree, or `None` when it is absent.
+///
+/// The mode travels with the id because a `chmod +x` changes a tree without
+/// changing a blob, and comparing ids alone would report that commit as having
+/// changed nothing.
+fn tree_entry_at(tree: &git2::Tree<'_>, path: &BytePath) -> Option<(git2::Oid, i32)> {
+  tree
+    .get_path(as_path(path))
+    .ok()
+    .map(|e| (e.id(), e.filemode()))
+}
+
+/// libgit2's delta status as the reporting vocabulary.
+fn diff_status(delta: git2::Delta) -> DiffStatus {
+  match delta {
+    git2::Delta::Added | git2::Delta::Untracked => DiffStatus::Added,
+    git2::Delta::Deleted => DiffStatus::Deleted,
+    git2::Delta::Renamed | git2::Delta::Copied => DiffStatus::Renamed,
+    git2::Delta::Typechange => DiffStatus::TypeChanged,
+    _ => DiffStatus::Modified,
   }
 }
 
@@ -366,6 +440,42 @@ impl GitRepository for Libgit2Repository {
     })
   }
 
+  fn walk_ancestry(&self, commit: &ObjectId, steps: &[AncestryStep]) -> Result<ObjectId, GfsError> {
+    let pooled = self.checkout()?;
+    let walked = {
+      let repo: &git2::Repository = &pooled;
+      let mut current = self.find_commit(repo, self.git_oid(commit)?)?;
+      for (index, step) in steps.iter().enumerate() {
+        // `^0` and `~0` are the commit itself, which is what Git means by them.
+        let (nth, repeats) = match *step {
+          AncestryStep::Parent(0) | AncestryStep::Ancestor(0) => continue,
+          AncestryStep::Parent(n) => (n - 1, 1),
+          // `~n` is n hops along *first* parents, which is not the same as `^n`
+          // and is the difference that matters at a merge.
+          AncestryStep::Ancestor(n) => (0, n),
+        };
+        for hop in 0..repeats {
+          current = current.parent(nth as usize).map_err(|e| match e.code() {
+            git2::ErrorCode::NotFound => GfsError::not_found(format!(
+              "{} has no parent {}; the walk stopped {} step(s) in",
+              current
+                .id()
+                .to_string()
+                .chars()
+                .take(12)
+                .collect::<String>(),
+              nth + 1,
+              index + hop as usize
+            )),
+            _ => GfsError::internal(format!("reading a parent commit: {}", e.message())),
+          })?;
+        }
+      }
+      self.to_oid(current.id())?
+    };
+    Ok(walked)
+  }
+
   fn read_commit(&self, commit: &ObjectId) -> Result<CommitMeta, GfsError> {
     let pooled = self.checkout()?;
     let meta = {
@@ -394,9 +504,9 @@ impl GitRepository for Libgit2Repository {
   fn log(
     &self,
     commit: &ObjectId,
-    skip: usize,
-    limit: usize,
+    options: &LogOptions,
   ) -> Result<(Vec<CommitMeta>, bool), GfsError> {
+    let (skip, limit) = (options.skip, options.limit);
     let pooled = self.checkout()?;
     let repo: &git2::Repository = &pooled;
     let start = self.git_oid(commit)?;
@@ -427,6 +537,13 @@ impl GitRepository for Libgit2Repository {
     walk
       .push(start)
       .map_err(|e| GfsError::internal(format!("seeding a revision walk: {}", e.message())))?;
+    if options.first_parent {
+      // Must come after `push`: libgit2 applies the simplification to the
+      // already-seeded walk, and setting it first is silently a no-op.
+      walk
+        .simplify_first_parent()
+        .map_err(|e| GfsError::internal(format!("simplifying a revision walk: {}", e.message())))?;
+    }
 
     let mut commits = Vec::new();
     let mut seen = 0usize;
@@ -434,6 +551,13 @@ impl GitRepository for Libgit2Repository {
     for step in walk {
       let oid =
         step.map_err(|e| GfsError::internal(format!("walking revisions: {}", e.message())))?;
+      // Path limiting is applied *before* `skip`, so `--skip` pages the filtered
+      // history rather than the raw one -- otherwise page two of
+      // `log -- one/file.rs` would start from an offset into commits the caller
+      // never saw.
+      if !options.paths.is_empty() && !self.touches(repo, oid, &options.paths)? {
+        continue;
+      }
       if seen < skip {
         seen += 1;
         continue;
@@ -725,6 +849,247 @@ impl GitRepository for Libgit2Repository {
       }
     }
     Ok(out)
+  }
+
+  fn diff(&self, request: &DiffRequest) -> Result<DiffOutput, GfsError> {
+    let pooled = self.checkout()?;
+    let repo: &git2::Repository = &pooled;
+
+    let new_tree = self
+      .find_commit(repo, self.git_oid(&request.to)?)?
+      .tree()
+      .map_err(|e| not_found(&e, "tree"))?;
+    // `None` is the empty tree, which is what a root commit is diffed against.
+    // libgit2 spells that as a null old side rather than as a special object.
+    let old_tree = match &request.from {
+      Some(from) => Some(
+        self
+          .find_commit(repo, self.git_oid(from)?)?
+          .tree()
+          .map_err(|e| not_found(&e, "tree"))?,
+      ),
+      None => None,
+    };
+
+    let mut opts = git2::DiffOptions::new();
+    opts.include_typechange(true);
+    opts.context_lines(request.context_lines);
+    for path in &request.paths {
+      opts.pathspec(as_path(path));
+    }
+    let mut diff = repo
+      .diff_tree_to_tree(old_tree.as_ref(), Some(&new_tree), Some(&mut opts))
+      .map_err(|e| not_found(&e, "tree diff"))?;
+    // Rename detection **on**, unlike `diff_commits`. The two differ because
+    // their audiences do: a manifest cannot use a rename and pays similarity
+    // scoring for nothing, while a person reviewing a commit is far better
+    // served by one `R` line than by a delete and an add of the same file.
+    let mut find = git2::DiffFindOptions::new();
+    find.renames(true);
+    diff
+      .find_similar(Some(&mut find))
+      .map_err(|e| GfsError::internal(format!("detecting renames: {}", e.message())))?;
+
+    let mut rendered = Vec::new();
+    let mut truncated = false;
+    // Keyed by the new-side path, which libgit2 sets on every delta including a
+    // deletion, so one key identifies a delta across the two passes.
+    let mut counts: std::collections::HashMap<Vec<u8>, (u32, u32)> =
+      std::collections::HashMap::new();
+
+    let render = matches!(request.format, DiffFormat::Patch);
+    let count = matches!(request.format, DiffFormat::Patch | DiffFormat::Stat);
+    if render || count {
+      let result = diff.print(git2::DiffFormat::Patch, |delta, _hunk, line| {
+        if count {
+          let key = delta
+            .new_file()
+            .path_bytes()
+            .or_else(|| delta.old_file().path_bytes())
+            .unwrap_or_default()
+            .to_vec();
+          let entry = counts.entry(key).or_insert((0, 0));
+          match line.origin() {
+            '+' => entry.0 += 1,
+            '-' => entry.1 += 1,
+            _ => {}
+          }
+        }
+        if render {
+          // libgit2 hands back the line's *content* without its origin marker,
+          // so the `+`, `-` or space has to be written back or the patch does
+          // not apply.
+          if matches!(line.origin(), '+' | '-' | ' ') {
+            rendered.push(line.origin() as u8);
+          }
+          rendered.extend_from_slice(line.content());
+          if rendered.len() >= request.max_bytes {
+            truncated = true;
+            // Aborts the walk. libgit2 reports that as a user-cancelled error,
+            // which is handled below rather than propagated: a truncated diff is
+            // an answer, and an error here would discard what was already
+            // rendered.
+            return false;
+          }
+        }
+        true
+      });
+      if let Err(e) = result {
+        if !truncated {
+          return Err(GfsError::internal(format!(
+            "rendering a diff: {}",
+            e.message()
+          )));
+        }
+      }
+    }
+
+    match request.format {
+      DiffFormat::Patch => {}
+      DiffFormat::Stat => {
+        let stats = diff
+          .stats()
+          .map_err(|e| GfsError::internal(format!("summarizing a diff: {}", e.message())))?;
+        let buf = stats
+          .to_buf(git2::DiffStatsFormat::FULL, STAT_WIDTH)
+          .map_err(|e| GfsError::internal(format!("formatting a diff stat: {}", e.message())))?;
+        rendered = buf.to_vec();
+      }
+      DiffFormat::NameStatus | DiffFormat::NameOnly => {
+        let format = if matches!(request.format, DiffFormat::NameStatus) {
+          git2::DiffFormat::NameStatus
+        } else {
+          git2::DiffFormat::NameOnly
+        };
+        let result = diff.print(format, |_delta, _hunk, line| {
+          rendered.extend_from_slice(line.content());
+          if rendered.len() >= request.max_bytes {
+            truncated = true;
+            return false;
+          }
+          true
+        });
+        if let Err(e) = result {
+          if !truncated {
+            return Err(GfsError::internal(format!(
+              "listing changed paths: {}",
+              e.message()
+            )));
+          }
+        }
+      }
+    }
+    if rendered.len() > request.max_bytes {
+      rendered.truncate(request.max_bytes);
+      truncated = true;
+    }
+
+    // Built after the print pass, because libgit2 only knows whether a file is
+    // binary once it has loaded its content — before that the flag reads false
+    // for everything.
+    let mut files = Vec::new();
+    for delta in diff.deltas() {
+      let new_file = delta.new_file();
+      let old_file = delta.old_file();
+      let path = match new_file.path_bytes().or_else(|| old_file.path_bytes()) {
+        Some(p) => BytePath::new(p.to_vec()),
+        None => continue,
+      };
+      let status = diff_status(delta.status());
+      let (additions, deletions) = counts.get(path.as_bytes()).copied().unwrap_or((0, 0));
+      files.push(DiffFileChange {
+        old_path: match status {
+          DiffStatus::Renamed => old_file.path_bytes().map(|p| BytePath::new(p.to_vec())),
+          _ => None,
+        },
+        path,
+        status,
+        additions,
+        deletions,
+        binary: delta.flags().is_binary(),
+        old_mode: git_mode(old_file.mode()),
+        new_mode: git_mode(new_file.mode()),
+      });
+    }
+
+    Ok(DiffOutput {
+      rendered,
+      files,
+      truncated,
+    })
+  }
+
+  fn blame(
+    &self,
+    commit: &ObjectId,
+    path: &BytePath,
+    max_content_bytes: u64,
+  ) -> Result<BlameOutput, GfsError> {
+    let pooled = self.checkout()?;
+    let repo: &git2::Repository = &pooled;
+    let oid = self.git_oid(commit)?;
+    let tree = self
+      .find_commit(repo, oid)?
+      .tree()
+      .map_err(|e| not_found(&e, "tree"))?;
+
+    let entry = tree
+      .get_path(as_path(path))
+      .map_err(|_| GfsError::not_found("no such path in this commit"))?;
+    // `filemode()` is the raw Git mode already, so it is compared directly
+    // rather than through `git_mode`, which maps libgit2's *enum*.
+    if !matches!(entry.filemode() as u32, mode::REGULAR | mode::EXECUTABLE) {
+      return Err(GfsError::invalid(
+        "only a regular file can be blamed; this path is a directory, symlink, or submodule",
+      ));
+    }
+    let blob = repo
+      .find_blob(entry.id())
+      .map_err(|e| not_found(&e, "blob"))?;
+    if blob.is_binary() {
+      return Err(GfsError::invalid(
+        "this file is binary, so it has no lines to attribute",
+      ));
+    }
+    let (content, truncated) = if blob.size() as u64 > max_content_bytes {
+      (Vec::new(), true)
+    } else {
+      (blob.content().to_vec(), false)
+    };
+
+    let mut opts = git2::BlameOptions::new();
+    // Without this the blame starts from HEAD, which in a bare mirror is the
+    // default branch and not the commit the caller named.
+    opts.newest_commit(oid);
+    let blame = repo
+      .blame_file(as_path(path), Some(&mut opts))
+      .map_err(|e| not_found(&e, "blame"))?;
+
+    let mut hunks = Vec::with_capacity(blame.len());
+    for hunk in blame.iter() {
+      let signature = hunk.final_signature();
+      hunks.push(BlameHunk {
+        final_start_line: hunk.final_start_line() as u32,
+        lines: hunk.lines_in_hunk() as u32,
+        commit: self.to_oid(hunk.final_commit_id())?,
+        orig_path: hunk
+          .path()
+          .map(|p| {
+            use std::os::unix::ffi::OsStrExt;
+            BytePath::new(p.as_os_str().as_bytes().to_vec())
+          })
+          .unwrap_or_else(|| path.clone()),
+        orig_start_line: hunk.orig_start_line() as u32,
+        author: Self::signature_of(&signature),
+        boundary: hunk.is_boundary(),
+      });
+    }
+
+    Ok(BlameOutput {
+      hunks,
+      content,
+      truncated,
+    })
   }
 
   fn read_blob(&self, blob: &ObjectId) -> Result<Vec<u8>, GfsError> {

@@ -19,6 +19,7 @@
 //!   the qualified and short-name spellings, so no caller can forget to
 //!   ([`revision::RESERVED_REF_PREFIX`]).
 
+pub mod diff;
 pub mod entry;
 pub mod error;
 pub mod ids;
@@ -30,13 +31,14 @@ pub mod revision;
 pub mod snapshot;
 pub mod time;
 
+pub use diff::{BlameHunk, DiffFileChange, DiffFormat, DiffStatus};
 pub use entry::{mode, EntryKind};
 pub use error::{ErrorCode, GfsError};
 pub use ids::{DisplayName, MountId, RepositoryId, SubjectId};
 pub use limits::LeasePolicy;
 pub use oid::{HashAlgorithm, ObjectId, OidError};
 pub use path::BytePath;
-pub use revision::{RevisionSelector, RESERVED_REF_PREFIX};
+pub use revision::{AncestryStep, RevisionExpression, RevisionSelector, RESERVED_REF_PREFIX};
 pub use snapshot::{
   CommitMeta, LeaseState, MountGrant, ResolvedRevision, Signature, SnapshotState, TreeEntryInfo,
 };

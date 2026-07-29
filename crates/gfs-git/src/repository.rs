@@ -13,7 +13,8 @@ use std::sync::Arc;
 
 use gfs_types::error::{ErrorCode, GfsError};
 use gfs_types::{
-  BytePath, CommitMeta, HashAlgorithm, ObjectId, ResolvedRevision, RevisionSelector,
+  BlameHunk, BytePath, CommitMeta, DiffFileChange, DiffFormat, HashAlgorithm, ObjectId,
+  ResolvedRevision, RevisionSelector,
 };
 
 use crate::format::RepositoryFormat;
@@ -83,6 +84,65 @@ impl TreeDelta {
   }
 }
 
+/// What to diff, and how much of it to render.
+///
+/// Rendering happens **on the server**, not in the client, and that is the point
+/// of the whole facility: the object database is here, so one round trip returns
+/// Git's own byte format instead of a client walking trees and fetching blobs to
+/// approximate it. See [`GitRepository::diff`].
+#[derive(Clone, Debug)]
+pub struct DiffRequest {
+  /// `None` diffs against the empty tree, which is what a root commit needs.
+  pub from: Option<ObjectId>,
+  pub to: ObjectId,
+  /// Path prefixes to limit the diff to. Empty means the whole tree.
+  pub paths: Vec<BytePath>,
+  pub format: DiffFormat,
+  pub context_lines: u32,
+  /// Ceiling on the rendered bytes. Reaching it sets `truncated` rather than
+  /// failing: a caller reviewing a large commit is better served by the first
+  /// megabyte and a flag than by an error.
+  pub max_bytes: usize,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct DiffOutput {
+  pub rendered: Vec<u8>,
+  /// Always populated, whatever the format, so a caller can act on the change
+  /// set without parsing the rendering.
+  pub files: Vec<DiffFileChange>,
+  pub truncated: bool,
+}
+
+/// What a revwalk should cover.
+#[derive(Clone, Debug, Default)]
+pub struct LogOptions {
+  pub skip: usize,
+  pub limit: usize,
+  /// Follow only first parents, so a merge's side branch is not walked. What
+  /// `git log --first-parent` does, and the only way to read a history whose
+  /// merges outnumber its commits.
+  pub first_parent: bool,
+  /// Show only commits that changed one of these paths, comparing each commit
+  /// against its first parent. `git log -- <path>` without the rename
+  /// following, which is a separate and much more expensive question.
+  pub paths: Vec<BytePath>,
+}
+
+/// Blame hunks together with the bytes they describe.
+///
+/// The content travels with the hunks because a blame is useless without it and
+/// the alternative — hunks now, blob over the ticketed HTTP path afterwards —
+/// costs a second round trip and a ticket for one bounded file.
+#[derive(Clone, Debug)]
+pub struct BlameOutput {
+  pub hunks: Vec<BlameHunk>,
+  pub content: Vec<u8>,
+  /// True when the file was too large to return, in which case `content` is
+  /// empty and only the hunks are present.
+  pub truncated: bool,
+}
+
 /// Read access to one bare repository.
 ///
 /// Implementations must be `Send + Sync`. Every method is allowed to block.
@@ -100,6 +160,19 @@ pub trait GitRepository: Send + Sync + std::fmt::Debug {
   /// catalog fact -- and is left zero for the catalog to fill in.
   fn resolve(&self, selector: &RevisionSelector) -> Result<ResolvedRevision, GfsError>;
 
+  /// Apply a parsed `~n`/`^n` chain by walking parent pointers.
+  ///
+  /// Separate from [`GitRepository::resolve`] and deliberately *not* implemented
+  /// with `revparse`: the steps arrive already parsed
+  /// ([`gfs_types::AncestryStep`]), so the only thing that happens here is
+  /// `commit.parent(n)`, and there is no path by which `main^{tree}` becomes a
+  /// tree OID in a commit-shaped field.
+  fn walk_ancestry(
+    &self,
+    commit: &ObjectId,
+    steps: &[gfs_types::AncestryStep],
+  ) -> Result<ObjectId, GfsError>;
+
   fn read_commit(&self, commit: &ObjectId) -> Result<CommitMeta, GfsError>;
 
   /// Walk `commit`'s ancestry, newest first, in Git's own topological-and-date
@@ -116,8 +189,7 @@ pub trait GitRepository: Send + Sync + std::fmt::Debug {
   fn log(
     &self,
     commit: &ObjectId,
-    skip: usize,
-    limit: usize,
+    options: &LogOptions,
   ) -> Result<(Vec<CommitMeta>, bool), GfsError>;
 
   /// Look up one path in a commit's tree. `Ok(None)` means the path is absent,
@@ -181,6 +253,23 @@ pub trait GitRepository: Send + Sync + std::fmt::Debug {
   /// Used for first-parent incremental manifest construction, which is what makes
   /// preparing the next commit on a branch cost its diff rather than its tree.
   fn diff_commits(&self, from: &ObjectId, to: &ObjectId) -> Result<Vec<TreeDelta>, GfsError>;
+
+  /// The same two trees, rendered for a reader rather than for a manifest.
+  ///
+  /// Distinct from [`GitRepository::diff_commits`] in what it is *for*, which is
+  /// why the two exist side by side: that one answers "what must the search
+  /// index write", so it has two cases and no rename detection; this one answers
+  /// "what did this commit change", so it has Git's five statuses, finds
+  /// renames, and produces bytes.
+  fn diff(&self, request: &DiffRequest) -> Result<DiffOutput, GfsError>;
+
+  /// Line-by-line attribution for one path at one commit, with the bytes.
+  fn blame(
+    &self,
+    commit: &ObjectId,
+    path: &BytePath,
+    max_content_bytes: u64,
+  ) -> Result<BlameOutput, GfsError>;
 
   /// Read a whole blob, verifying its object ID against its contents.
   fn read_blob(&self, blob: &ObjectId) -> Result<Vec<u8>, GfsError>;
@@ -375,13 +464,57 @@ impl AsyncRepository {
     self.run(move |r| r.read_commit(&commit)).await
   }
 
+  /// Resolve a selector and then walk its ancestry, in one blocking operation.
+  ///
+  /// One operation rather than two so a `~50` walk does not take fifty trips
+  /// through the semaphore and the blocking pool, and so the base commit and its
+  /// ancestors are read through the same handle.
+  pub async fn resolve_expression(
+    &self,
+    expression: gfs_types::RevisionExpression,
+  ) -> Result<ResolvedRevision, GfsError> {
+    self
+      .run(move |r| {
+        let mut resolved = r.resolve(&expression.base)?;
+        if expression.steps.is_empty() {
+          return Ok(resolved);
+        }
+        let walked = r.walk_ancestry(&resolved.commit, &expression.steps)?;
+        let meta = r.read_commit(&walked)?;
+        resolved.commit = meta.commit;
+        resolved.tree = meta.tree;
+        // The ref named the *base*, not the ancestor this walked to, and
+        // reporting it here would tell a caller that `main~3` is where `main`
+        // points. Dropped rather than kept, for the same reason `%d` is not a
+        // supported log verb.
+        resolved.ref_name = None;
+        resolved.snapshot_time = meta.snapshot_time;
+        Ok(resolved)
+      })
+      .await
+  }
+
   pub async fn log(
     &self,
     commit: ObjectId,
-    skip: usize,
-    limit: usize,
+    options: LogOptions,
   ) -> Result<(Vec<CommitMeta>, bool), GfsError> {
-    self.run(move |r| r.log(&commit, skip, limit)).await
+    self.run(move |r| r.log(&commit, &options)).await
+  }
+
+  pub async fn diff(&self, request: DiffRequest) -> Result<DiffOutput, GfsError> {
+    self.run(move |r| r.diff(&request)).await
+  }
+
+  pub async fn blame(
+    &self,
+    commit: ObjectId,
+    path: BytePath,
+    max_content_bytes: u64,
+  ) -> Result<BlameOutput, GfsError> {
+    self
+      .run(move |r| r.blame(&commit, &path, max_content_bytes))
+      .await
   }
 
   /// Every named entry under `root`, as `(path, mode)`.

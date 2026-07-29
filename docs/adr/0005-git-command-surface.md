@@ -148,6 +148,55 @@ The shim itself is not yet rewired to these tools, so `git log` and
 cost what they cost. See [`docs/agent-search.md`](../agent-search.md) and
 [`benchmarks/agent-workflow.md`](../../benchmarks/agent-workflow.md).
 
+### Amendment, 2026-07-29: "needs a tree per commit" was about the client
+
+The amendment above refused `-p`, `-S`, `--follow`, `--stat` and `--graph` on
+the grounds that each "needs a tree or blob per commit, which is exactly the
+unbounded download this ADR rejected the partial clone for". Half of that
+sentence was wrong, and an agent test run on 2026-07-29 found the consequence:
+GFS could read any commit and could not say what one **changed**. Reviewing
+three commits had no first-class answer, and the tester wrote a tree-differ in
+Python on top of `gfs ls --rev` and `gfs cat --rev` — a second implementation of
+`git diff`, driven from the client, over dozens of round trips.
+
+The premise this ADR actually established is that a **workspace** must not
+hydrate itself a piece at a time. The partial clone was rejected because the
+fetching happened on the client. A tree comparison on the **gateway**, which
+holds the object database, costs a local object read and returns one rendered
+patch. Those are not the same operation and only one of them was ever the
+problem.
+
+So the following are now answered, all server-side:
+
+| Question | Tool | RPC |
+| --- | --- | --- |
+| what did this commit change? | `gfs show` | `DiffCommits` — libgit2 `diff_tree_to_tree`, rendered |
+| what changed between two? | `gfs diff <a> <b>` | the same |
+| what did each of these commits change? | `gfs log -p` / `--stat` | one `DiffCommits` per printed commit |
+| which commits touched this path? | `gfs log -- <path>` | `Log`, with a per-commit tree comparison |
+| who last changed this line? | `gfs blame` | `Blame` — libgit2 `blame_file` |
+
+The bounds that replace the refusal are real ones rather than a prohibition: a
+diff is capped in rendered bytes and reports truncation, `log -p` issues one
+diff per commit *printed* and the page size is already bounded, and a blame is
+capped at the searchable-blob limit. `crates/gfs-mount/tests/history.rs` asserts
+that each leaves the mount's hydration counters at zero, which is the property
+this ADR exists to protect.
+
+`-S` and `--follow` stay refused, and now for their own reason rather than a
+borrowed one: both search *across* commits — a pickaxe over every blob, a
+similarity score per commit — so neither is bounded by the page size the way a
+comparison against one parent is. `--graph` and `--topo-order` stay refused
+because they need the reachable graph buffered before anything can be printed.
+
+Revision *expressions* were relaxed in the same pass and by the same kind of
+reasoning. ADR 0006's closed grammar exists because `revparse` accepts object-type
+and reachability semantics GFS does not expose, `main^{tree}` being the specific
+hazard. Ancestry is neither: `~n` and `^n` are parsed in `gfs-types` into an
+explicit list of hops and applied with `commit.parent(n)`, so nothing new reaches
+libgit2's parser and `main^{tree}` is still refused. Without them, reviewing a
+chain of commits meant copying 40-character IDs out of `--format=%P`.
+
 Whether those tools should *also* occupy the standard names on `PATH` — and
 whether `find` and `grep` should be intercepted the way `git` is — is
 [ADR 0007](0007-tool-surface-in-the-agent-image.md), open and owned by M6.1. It

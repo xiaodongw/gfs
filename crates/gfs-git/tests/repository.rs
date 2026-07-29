@@ -9,6 +9,7 @@
 
 use std::sync::Arc;
 
+use gfs_git::repository::LogOptions;
 use gfs_git::{GitRepository, Libgit2Repository};
 use gfs_types::error::ErrorCode;
 use gfs_types::{limits, mode, BytePath, EntryKind, HashAlgorithm, ObjectId, RevisionSelector};
@@ -952,12 +953,22 @@ async fn the_async_wrapper_bounds_concurrency_and_returns_correct_results() {
 // Ancestry, for `gfs log`
 // ---------------------------------------------------------------------------
 
+/// A plain page: no first-parent simplification and no path limiting, which is
+/// what most of these assert about.
+fn page(skip: usize, limit: usize) -> LogOptions {
+  LogOptions {
+    skip,
+    limit,
+    ..Default::default()
+  }
+}
+
 #[test]
 fn a_log_walks_ancestry_newest_first_and_pages_without_gaps() {
   let repo = open("basic");
   let head = head(&repo);
 
-  let (all, has_more) = repo.log(&head, 0, 100).unwrap();
+  let (all, has_more) = repo.log(&head, &page(0, 100)).unwrap();
   assert!(!has_more, "the whole history fits in one page of 100");
   assert!(all.len() >= 2, "the basic fixture has at least two commits");
   assert_eq!(
@@ -980,10 +991,10 @@ fn a_log_walks_ancestry_newest_first_and_pages_without_gaps() {
 
   // A page short of the history reports that more remains, and `skip` resumes
   // exactly where it stopped — no gap, no repeat.
-  let (first, more) = repo.log(&head, 0, 1).unwrap();
+  let (first, more) = repo.log(&head, &page(0, 1)).unwrap();
   assert_eq!(first.len(), 1);
   assert!(more, "one commit of a multi-commit history leaves more");
-  let (second, _) = repo.log(&head, 1, 1).unwrap();
+  let (second, _) = repo.log(&head, &page(1, 1)).unwrap();
   assert_eq!(second[0].commit, all[1].commit);
 }
 
@@ -994,9 +1005,9 @@ fn a_log_limit_equal_to_the_history_does_not_claim_more() {
   // otherwise sends a caller into a page that is always empty.
   let repo = open("basic");
   let head = head(&repo);
-  let (all, _) = repo.log(&head, 0, 100).unwrap();
+  let (all, _) = repo.log(&head, &page(0, 100)).unwrap();
 
-  let (exact, has_more) = repo.log(&head, 0, all.len()).unwrap();
+  let (exact, has_more) = repo.log(&head, &page(0, all.len())).unwrap();
   assert_eq!(exact.len(), all.len());
   assert!(
     !has_more,

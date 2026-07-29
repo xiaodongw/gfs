@@ -898,7 +898,11 @@ impl Mount {
   /// No overlay half. The overlay holds file changes, not commits — a workspace
   /// with local edits still has exactly the history its pin has — so there is
   /// nothing to merge and pretending otherwise would invent commits.
-  pub async fn log(&self, skip: u32, limit: u32) -> Result<crate::control::LogReport, GfsError> {
+  pub async fn log(
+    &self,
+    from: Option<&str>,
+    query: crate::client::LogQuery,
+  ) -> Result<crate::control::LogReport, GfsError> {
     let (client, commit, ref_name) = {
       let current = self.current.lock().expect("current pin");
       (
@@ -907,26 +911,247 @@ impl Mount {
         current.ref_name.clone(),
       )
     };
-    let (commits, has_more) = client.log(skip, limit).await?;
+    // A named start point is its own base, and it is not on the pinned ref.
+    let (start, ref_name) = match from {
+      Some(selector) => (self.resolve_here(&client, &commit, selector).await?, None),
+      None => (commit, ref_name),
+    };
+    let (commits, has_more) = client.log(Some(&start), &query).await?;
     Ok(crate::control::LogReport {
-      base_commit: commit.to_qualified(),
+      base_commit: start.to_qualified(),
       ref_name,
-      commits: commits
+      commits: commits.into_iter().map(log_entry).collect(),
+      has_more,
+    })
+  }
+
+  /// Resolve a revision expression the way a caller standing in this workspace
+  /// means it.
+  ///
+  /// `HEAD` is the **pin**, not the repository's default branch. After
+  /// `gfs switch -c` those are different commits, and sending `HEAD` to the
+  /// gateway would silently answer about a branch the caller is not on. The pin
+  /// is substituted here and any `~n`/`^n` suffix travels with it, so the server
+  /// walks the ancestry of the right commit.
+  async fn resolve_here(
+    &self,
+    client: &crate::client::SnapshotClient,
+    pin: &ObjectId,
+    selector: &str,
+  ) -> Result<ObjectId, GfsError> {
+    let suffix_at = selector.find(['~', '^']).unwrap_or(selector.len());
+    let (base, suffix) = selector.split_at(suffix_at);
+    if base != "HEAD" {
+      return client.resolve(selector).await;
+    }
+    if suffix.is_empty() {
+      return Ok(pin.clone());
+    }
+    client
+      .resolve(&format!("{}{suffix}", pin.to_qualified()))
+      .await
+  }
+
+  /// What changed between two revisions, answered by the gateway.
+  pub async fn diff_revs(
+    &self,
+    request: &crate::control::Request,
+  ) -> Result<crate::control::RevDiffReport, GfsError> {
+    let crate::control::Request::DiffRevs {
+      from,
+      to,
+      parent,
+      format,
+      context_lines,
+      paths_b64url,
+    } = request
+    else {
+      return Err(GfsError::internal("not a diff request"));
+    };
+
+    let (client, pin) = {
+      let current = self.current.lock().expect("current pin");
+      (Arc::clone(&current.client), current.commit.clone())
+    };
+    let to_commit = self.resolve_here(&client, &pin, to).await?;
+
+    // An absent `from` means "the parent this commit is being reviewed against",
+    // which is what `git show` diffs. Resolved here rather than on the server
+    // because it is a *presentation* choice -- which parent of a merge -- and the
+    // server should be told the two commits, not asked to guess.
+    let base = match from {
+      Some(selector) => Some(self.resolve_here(&client, &pin, selector).await?),
+      None => {
+        let meta = client.get_commit_at(&to_commit).await?;
+        let index = parent.unwrap_or(1).max(1) as usize - 1;
+        match meta.parents.get(index) {
+          Some(p) => Some(p.clone()),
+          // A root commit has no parent and is diffed against the empty tree,
+          // which is what `git show` does for the first commit in a history.
+          None if index == 0 => None,
+          None => {
+            return Err(GfsError::invalid(format!(
+              "that commit has {} parent(s), so there is no parent {}",
+              meta.parents.len(),
+              index + 1
+            )))
+          }
+        }
+      }
+    };
+
+    let mut paths = Vec::with_capacity(paths_b64url.len());
+    for encoded in paths_b64url {
+      paths.push(gfs_types::BytePath::new(gfs_types::path::b64url_decode(
+        encoded,
+      )?));
+    }
+    let diff = client
+      .diff_commits(
+        base.as_ref(),
+        &to_commit,
+        &crate::client::DiffQuery {
+          paths,
+          format: *format,
+          context_lines: *context_lines,
+          max_bytes: 0,
+        },
+      )
+      .await?;
+
+    Ok(crate::control::RevDiffReport {
+      base_commit: base.map(|b| b.to_qualified()),
+      commit: to_commit.to_qualified(),
+      rendered_b64url: gfs_types::path::b64url_encode(&diff.rendered),
+      files: diff
+        .files
         .into_iter()
-        .map(|c| crate::control::LogEntry {
-          commit: c.commit.to_qualified(),
-          parents: c.parents.iter().map(|p| p.to_qualified()).collect(),
-          author_name: c.author.name,
-          author_email: c.author.email,
-          author_time: c.author.time.secs,
-          author_tz_offset_minutes: c.author.tz_offset_minutes,
-          committer_name: c.committer.name,
-          committer_email: c.committer.email,
-          committer_time: c.committer.time.secs,
-          message: c.message,
+        .map(|f| crate::control::DiffFileEntry {
+          path_b64url: gfs_types::path::b64url_encode(f.path.as_bytes()),
+          old_path_b64url: f
+            .old_path
+            .map(|p| gfs_types::path::b64url_encode(p.as_bytes())),
+          status: f.status,
+          additions: f.additions,
+          deletions: f.deletions,
+          binary: f.binary,
+          old_mode: f.old_mode,
+          new_mode: f.new_mode,
         })
         .collect(),
-      has_more,
+      truncated: diff.truncated,
+    })
+  }
+
+  /// One directory of a snapshot, answered by the gateway.
+  pub async fn ls(
+    &self,
+    rev: Option<&str>,
+    path: &gfs_types::BytePath,
+    page_size: u32,
+  ) -> Result<crate::control::LsReport, GfsError> {
+    let (client, pin) = {
+      let current = self.current.lock().expect("current pin");
+      (Arc::clone(&current.client), current.commit.clone())
+    };
+    let commit = match rev {
+      Some(selector) => self.resolve_here(&client, &pin, selector).await?,
+      None => pin,
+    };
+
+    // Paged to the end here rather than by the caller. A directory listing is
+    // one question, and a CLI that had to thread a page token would be
+    // reimplementing what the daemon already does for the filesystem.
+    let mut entries = Vec::new();
+    let mut token = Vec::new();
+    loop {
+      let page = client
+        .list_directory_at(&commit, path, token, page_size, false)
+        .await?;
+      for entry in page.entries {
+        entries.push(crate::control::LsEntry {
+          path_b64url: gfs_types::path::b64url_encode(entry.path.as_bytes()),
+          mode: entry.mode,
+          size: entry.size,
+          oid: entry.oid.to_qualified(),
+        });
+      }
+      if page.next_page_token.is_empty() {
+        break;
+      }
+      token = page.next_page_token;
+    }
+    Ok(crate::control::LsReport {
+      commit: commit.to_qualified(),
+      entries,
+    })
+  }
+
+  /// One file's raw bytes at a revision, answered by the gateway.
+  pub async fn cat(
+    &self,
+    rev: Option<&str>,
+    path: &gfs_types::BytePath,
+  ) -> Result<(String, Vec<u8>), GfsError> {
+    let (client, pin) = {
+      let current = self.current.lock().expect("current pin");
+      (Arc::clone(&current.client), current.commit.clone())
+    };
+    let commit = match rev {
+      Some(selector) => self.resolve_here(&client, &pin, selector).await?,
+      None => pin,
+    };
+    let entry = client
+      .get_entry_at(&commit, path, true)
+      .await?
+      .ok_or_else(|| GfsError::not_found("no such path in this commit"))?;
+    let ticket = entry
+      .blob_ticket
+      .clone()
+      .ok_or_else(|| GfsError::invalid("that path has no file content to print"))?;
+    // Read through the blob cache the mount already has, so catting a file at
+    // the pinned commit costs nothing the second time and shares with the
+    // filesystem's own reads.
+    let content = client.read_blob(&entry.oid, &ticket).await?;
+    Ok((commit.to_qualified(), content))
+  }
+
+  /// Line attribution for one path, answered by the gateway.
+  pub async fn blame(
+    &self,
+    rev: Option<&str>,
+    path: &gfs_types::BytePath,
+  ) -> Result<crate::control::BlameReport, GfsError> {
+    let (client, pin) = {
+      let current = self.current.lock().expect("current pin");
+      (Arc::clone(&current.client), current.commit.clone())
+    };
+    let commit = match rev {
+      Some(selector) => self.resolve_here(&client, &pin, selector).await?,
+      None => pin,
+    };
+    let blame = client.blame(&commit, path).await?;
+    Ok(crate::control::BlameReport {
+      commit: commit.to_qualified(),
+      path_b64url: gfs_types::path::b64url_encode(path.as_bytes()),
+      hunks: blame
+        .hunks
+        .into_iter()
+        .map(|h| crate::control::BlameHunkEntry {
+          final_start_line: h.final_start_line,
+          lines: h.lines,
+          commit: h.commit.to_qualified(),
+          orig_path_b64url: gfs_types::path::b64url_encode(h.orig_path.as_bytes()),
+          orig_start_line: h.orig_start_line,
+          author_name: h.author.name,
+          author_email: h.author.email,
+          author_time: h.author.time.secs,
+          author_tz_offset_minutes: h.author.tz_offset_minutes,
+          boundary: h.boundary,
+        })
+        .collect(),
+      content_b64url: gfs_types::path::b64url_encode(&blame.content),
+      truncated: blame.truncated,
     })
   }
 
@@ -1173,8 +1398,84 @@ impl Mount {
         Ok(report) => Response::Search(Box::new(report)),
         Err(e) => Response::from_error(&e),
       },
-      Request::Log { skip, limit } => match self.log(skip, limit).await {
-        Ok(report) => Response::Log(Box::new(report)),
+      Request::Log {
+        skip,
+        limit,
+        ref from,
+        first_parent,
+        ref paths_b64url,
+      } => {
+        let decoded: Result<Vec<gfs_types::BytePath>, GfsError> = paths_b64url
+          .iter()
+          .map(|p| Ok(gfs_types::BytePath::new(gfs_types::path::b64url_decode(p)?)))
+          .collect();
+        match decoded {
+          Ok(paths) => {
+            let query = crate::client::LogQuery {
+              skip,
+              limit,
+              first_parent,
+              paths,
+            };
+            match self.log(from.as_deref(), query).await {
+              Ok(report) => Response::Log(Box::new(report)),
+              Err(e) => Response::from_error(&e),
+            }
+          }
+          Err(e) => Response::from_error(&e),
+        }
+      }
+      Request::DiffRevs { .. } => match self.diff_revs(&request).await {
+        Ok(report) => Response::RevDiff(Box::new(report)),
+        Err(e) => Response::from_error(&e),
+      },
+      Request::Ls {
+        ref rev,
+        ref path_b64url,
+        page_size,
+      } => match gfs_types::path::b64url_decode(path_b64url) {
+        Ok(path) => {
+          match self
+            .ls(rev.as_deref(), &gfs_types::BytePath::new(path), page_size)
+            .await
+          {
+            Ok(report) => Response::Ls(Box::new(report)),
+            Err(e) => Response::from_error(&e),
+          }
+        }
+        Err(e) => Response::from_error(&e),
+      },
+      Request::Cat {
+        ref rev,
+        ref path_b64url,
+      } => match gfs_types::path::b64url_decode(path_b64url) {
+        Ok(path) => {
+          match self
+            .cat(rev.as_deref(), &gfs_types::BytePath::new(path))
+            .await
+          {
+            Ok((commit, content)) => Response::Cat {
+              commit,
+              content_b64url: gfs_types::path::b64url_encode(&content),
+            },
+            Err(e) => Response::from_error(&e),
+          }
+        }
+        Err(e) => Response::from_error(&e),
+      },
+      Request::Blame {
+        ref rev,
+        ref path_b64url,
+      } => match gfs_types::path::b64url_decode(path_b64url) {
+        Ok(path) => {
+          match self
+            .blame(rev.as_deref(), &gfs_types::BytePath::new(path))
+            .await
+          {
+            Ok(report) => Response::Blame(Box::new(report)),
+            Err(e) => Response::from_error(&e),
+          }
+        }
         Err(e) => Response::from_error(&e),
       },
       Request::Find(request) => match self.find(&request).await {
@@ -1186,6 +1487,24 @@ impl Mount {
         Response::Unmounted
       }
     }
+  }
+}
+
+/// One commit, as the control socket carries it.
+fn log_entry(c: gfs_types::CommitMeta) -> crate::control::LogEntry {
+  crate::control::LogEntry {
+    commit: c.commit.to_qualified(),
+    tree: c.tree.to_qualified(),
+    parents: c.parents.iter().map(|p| p.to_qualified()).collect(),
+    author_name: c.author.name,
+    author_email: c.author.email,
+    author_time: c.author.time.secs,
+    author_tz_offset_minutes: c.author.tz_offset_minutes,
+    committer_name: c.committer.name,
+    committer_email: c.committer.email,
+    committer_time: c.committer.time.secs,
+    committer_tz_offset_minutes: c.committer.tz_offset_minutes,
+    message: c.message,
   }
 }
 

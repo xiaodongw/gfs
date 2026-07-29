@@ -69,24 +69,39 @@ enum Command {
 
   /// Resolve a revision selector to a pinned commit.
   Resolve {
+    /// Defaults to the repository of the workspace you are standing in.
     #[arg(long)]
-    repo: String,
-    /// A branch, tag, full object ID, or an abbreviation of at least 7 characters.
-    /// Revision expressions such as `HEAD~1` are not accepted.
+    repo: Option<String>,
+    /// A branch, tag, object ID or abbreviation of at least 7 characters,
+    /// optionally followed by an ancestry walk: `HEAD~3`, `main^`, `abc1234^2`.
     rev: String,
+    #[arg(long)]
+    workspace: Option<PathBuf>,
   },
 
   /// List one directory of a snapshot.
+  ///
+  /// The path column is **root-relative**, in every position: listing the root
+  /// prints `src`, listing `src` prints `src/flask`. At the root the two happen
+  /// to coincide, which is what makes the rule easy to misread as "basename at
+  /// the top, full path below" — recursing on that reading builds `src/src/…`.
+  /// Root-relative is what `gfs cat` takes, so the output of one is the input of
+  /// the other.
   Ls {
+    /// Defaults to the repository of the workspace you are standing in.
     #[arg(long)]
-    repo: String,
-    #[arg(long, default_value = "HEAD")]
-    rev: String,
-    /// Path from the snapshot root. Empty lists the root.
+    repo: Option<String>,
+    /// Defaults to that workspace's pinned commit.
+    #[arg(long)]
+    rev: Option<String>,
+    /// Path from the snapshot root. Empty lists the root. A path that is not a
+    /// directory in this commit is an error, not an empty listing.
     #[arg(default_value = "")]
     path: String,
     #[arg(long, default_value_t = 1000)]
     page_size: u32,
+    #[arg(long)]
+    workspace: Option<PathBuf>,
   },
 
   /// Print one file's raw bytes.
@@ -95,11 +110,15 @@ enum Command {
   /// conversion, so these are the bytes the object database holds and not
   /// necessarily the bytes `git checkout` would write.
   Cat {
+    /// Defaults to the repository of the workspace you are standing in.
     #[arg(long)]
-    repo: String,
-    #[arg(long, default_value = "HEAD")]
-    rev: String,
+    repo: Option<String>,
+    /// Defaults to that workspace's pinned commit.
+    #[arg(long)]
+    rev: Option<String>,
     path: String,
+    #[arg(long)]
+    workspace: Option<PathBuf>,
   },
 
   /// Cache a repository on the gateway and mount it, the way `git clone` does.
@@ -278,12 +297,25 @@ enum Command {
     require_exhaustive: bool,
   },
 
-  /// The same change set as a Git-compatible patch on stdout.
+  /// The workspace's change set as a patch, or the diff between two revisions.
+  #[command(disable_help_flag = true)]
   Diff {
-    #[arg(long)]
-    workspace: Option<PathBuf>,
-    #[arg(long)]
-    state_dir: Option<PathBuf>,
+    #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+    args: Vec<String>,
+  },
+
+  /// One commit and what it changed, answered by the server.
+  #[command(disable_help_flag = true)]
+  Show {
+    #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+    args: Vec<String>,
+  },
+
+  /// Who last changed each line of a file, answered by the server.
+  #[command(disable_help_flag = true)]
+  Blame {
+    #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+    args: Vec<String>,
   },
 
   /// Write an atomic, checksummed export bundle.
@@ -496,6 +528,66 @@ async fn resolve(cli: &Cli, client: &mut Client, repo: &str, rev: &str) -> Resul
       .into_inner()
       .commit_oid,
   )
+}
+
+/// What repository and revision a snapshot command should read.
+///
+/// `ls`, `cat` and `resolve` talk to the server directly and used to *require*
+/// `--repo`, which meant an agent standing inside a mount had to find and retype
+/// the repository id that `gfs inspect` was printing two lines away — while
+/// `status`, `diff` and `log` all inferred it. The rule is now the same
+/// everywhere: an explicit flag wins, and its absence means "the workspace I am
+/// standing in".
+///
+/// The revision half matters as much, and is the subtler half. On the server
+/// `HEAD` is the repository's **default branch**; in a workspace it means the
+/// **pinned commit**, and after `gfs switch -c` those are different commits. So
+/// when the repository was inferred from a workspace, a bare `HEAD` — or the
+/// base of an expression like `HEAD~3` — is replaced by the pin before the
+/// request goes out. With an explicit `--repo` nothing is substituted: the
+/// caller named a repository that may not be this one, and quietly answering
+/// about a different commit than the one they wrote is the failure mode this
+/// exists to prevent.
+fn snapshot_target(
+  repo: &Option<String>,
+  rev: &Option<String>,
+  workspace: &Option<PathBuf>,
+) -> Result<(String, String)> {
+  if let (Some(repo), Some(rev)) = (repo, rev) {
+    return Ok((repo.clone(), rev.clone()));
+  }
+  let report = inspect_here(workspace)?;
+  let rev = match rev {
+    None => report.commit.clone(),
+    Some(rev) if repo.is_none() => substitute_pin(rev, &report.commit),
+    Some(rev) => rev.clone(),
+  };
+  Ok((repo.clone().unwrap_or(report.repository_id), rev))
+}
+
+/// Rewrite a leading `HEAD` to the pinned commit, keeping any `~n`/`^n` suffix.
+///
+/// The same rule the daemon applies for `gfs log` and `gfs show`, applied here
+/// so the direct-to-server commands agree with them.
+fn substitute_pin(rev: &str, pin: &str) -> String {
+  let split = rev.find(['~', '^']).unwrap_or(rev.len());
+  let (base, suffix) = rev.split_at(split);
+  if base == "HEAD" {
+    format!("{pin}{suffix}")
+  } else {
+    rev.to_owned()
+  }
+}
+
+fn inspect_here(workspace: &Option<PathBuf>) -> Result<gfs_mount::control::MountReport> {
+  let (_workspace, state_dir) = locate(workspace, &None).context(
+    "no --repo was given and this is not a GFS workspace, so there is nothing to \
+     infer it from",
+  )?;
+  match call(&state_dir, &Request::Inspect)? {
+    Response::Inspect(report) => Ok(*report),
+    _ => bail!("the daemon answered an inspect request with something else"),
+  }
 }
 
 /// `<workspace>.gfs` unless told otherwise.
@@ -811,6 +903,24 @@ fn print_report(report: &gfs_mount::control::MountReport) {
   );
 }
 
+/// One `gfs ls` line. The path column is **root-relative** in every position,
+/// and escaped, because a Git path is bytes and need not be UTF-8.
+fn print_ls_entry(mode: u32, size: u64, oid: &str, path: &[u8]) {
+  println!(
+    "{:06o} {:>10} {}  {}",
+    mode,
+    size,
+    oid,
+    gfs_types::BytePath::new(path.to_vec()).escaped()
+  );
+}
+
+/// Decode a base64url field the control socket carried.
+fn decode(encoded: &str) -> Result<Vec<u8>> {
+  gfs_types::path::b64url_decode(encoded)
+    .map_err(|e| anyhow::anyhow!("the daemon returned an undecodable value: {}", e.message))
+}
+
 /// `git status --short`'s shape, because that is what an agent reading this has
 /// already learned to parse.
 fn print_status(report: &gfs_mount::control::StatusReport) {
@@ -860,7 +970,12 @@ async fn main() -> Result<()> {
       println!("state-format-version {}", gfs_types::STATE_FORMAT_VERSION);
     }
 
-    Command::Resolve { repo, rev } => {
+    Command::Resolve {
+      repo,
+      rev,
+      workspace,
+    } => {
+      let (repo, rev) = snapshot_target(repo, &Some(rev.clone()), workspace)?;
       let mut client = connect(&cli).await?;
       let resp = client
         .resolve_revision(authed(
@@ -886,9 +1001,39 @@ async fn main() -> Result<()> {
       rev,
       path,
       page_size,
+      workspace,
     } => {
+      // Through the daemon when the repository was inferred, because only the
+      // mount's capability opens a commit on an unpushed work branch. With an
+      // explicit `--repo` this stays the direct-to-server call it is documented
+      // to be.
+      if repo.is_none() {
+        let (_workspace, state_dir) = locate(workspace, &None)?;
+        let Response::Ls(report) = call(
+          &state_dir,
+          &Request::Ls {
+            rev: rev.clone(),
+            path_b64url: gfs_types::path::b64url_encode(path.as_bytes()),
+            page_size: *page_size,
+          },
+        )?
+        else {
+          bail!("the daemon answered a list request with something else");
+        };
+        for entry in &report.entries {
+          print_ls_entry(
+            entry.mode,
+            entry.size,
+            &entry.oid,
+            &decode(&entry.path_b64url)?,
+          );
+        }
+        return Ok(());
+      }
+
+      let (repo, rev) = snapshot_target(repo, rev, workspace)?;
       let mut client = connect(&cli).await?;
-      let commit = resolve(&cli, &mut client, repo, rev).await?;
+      let commit = resolve(&cli, &mut client, &repo, &rev).await?;
 
       let mut token = Vec::new();
       loop {
@@ -896,7 +1041,7 @@ async fn main() -> Result<()> {
           .list_directory(authed(
             &cli,
             v1::ListDirectoryRequest {
-              repository_id: repo.clone(),
+              repository_id: repo.to_owned(),
               commit_oid: commit.clone(),
               path: path.as_bytes().to_vec(),
               page_token: token.clone(),
@@ -908,15 +1053,7 @@ async fn main() -> Result<()> {
           .await?
           .into_inner();
         for e in &page.entries {
-          // The escaped form, because a Git path is bytes and need not be UTF-8.
-          let display = gfs_types::BytePath::new(e.path.clone());
-          println!(
-            "{:06o} {:>10} {}  {}",
-            e.mode,
-            e.size,
-            e.oid,
-            display.escaped()
-          );
+          print_ls_entry(e.mode, e.size, &e.oid, &e.path);
         }
         if page.next_page_token.is_empty() {
           break;
@@ -925,9 +1062,34 @@ async fn main() -> Result<()> {
       }
     }
 
-    Command::Cat { repo, rev, path } => {
+    Command::Cat {
+      repo,
+      rev,
+      path,
+      workspace,
+    } => {
+      // Through the daemon when the repository was inferred; see `Ls`.
+      if repo.is_none() {
+        let (_workspace, state_dir) = locate(workspace, &None)?;
+        let Response::Cat { content_b64url, .. } = call(
+          &state_dir,
+          &Request::Cat {
+            rev: rev.clone(),
+            path_b64url: gfs_types::path::b64url_encode(path.as_bytes()),
+          },
+        )?
+        else {
+          bail!("the daemon answered a cat request with something else");
+        };
+        // Written as bytes: file content is not guaranteed UTF-8, and a lossy
+        // conversion would corrupt a binary file.
+        std::io::Write::write_all(&mut std::io::stdout(), &decode(&content_b64url)?)?;
+        return Ok(());
+      }
+
+      let (repo, rev) = snapshot_target(repo, rev, workspace)?;
       let mut client = connect(&cli).await?;
-      let commit = resolve(&cli, &mut client, repo, rev).await?;
+      let commit = resolve(&cli, &mut client, &repo, &rev).await?;
       let entry = client
         .get_entry(authed(
           &cli,
@@ -1274,19 +1436,6 @@ async fn main() -> Result<()> {
       std::process::exit(search_output::exit_code(&report, *require_exhaustive));
     }
 
-    Command::Diff {
-      workspace,
-      state_dir,
-    } => {
-      let (_workspace, state_dir) = locate(workspace, state_dir)?;
-      let Response::Diff { patch_b64url } = call(&state_dir, &Request::Diff)? else {
-        bail!("the daemon answered a diff request with something else");
-      };
-      let patch = gfs_types::path::b64url_decode(&patch_b64url)
-        .map_err(|e| anyhow::anyhow!("the daemon returned an undecodable patch: {}", e.message))?;
-      std::io::Write::write_all(&mut std::io::stdout(), &patch)?;
-    }
-
     Command::Export {
       workspace,
       state_dir,
@@ -1534,11 +1683,14 @@ async fn main() -> Result<()> {
       }
     }
 
-    // These three never come back: their exit code *is* their answer, and the
+    // These six never come back: their exit code *is* their answer, and the
     // `Result` path cannot carry it. See `run_tool`.
     Command::Rg { args } => run_tool("rg", gfs_cli::rg::run(args)),
     Command::Find { args } => run_tool("find", gfs_cli::find::run(args)),
     Command::Log { args } => run_tool("log", gfs_cli::log::run(args)),
+    Command::Show { args } => run_tool("show", gfs_cli::show::run(args)),
+    Command::Diff { args } => run_tool("diff", gfs_cli::revdiff::run(args)),
+    Command::Blame { args } => run_tool("blame", gfs_cli::blame::run(args)),
 
     Command::Lease(LeaseCommand::Create { repo, rev }) => {
       let mut client = connect(&cli).await?;
@@ -1647,5 +1799,20 @@ mod tests {
   fn the_cli_accepts_the_workspace_command_grammar() {
     use clap::CommandFactory;
     Cli::command().debug_assert();
+  }
+
+  #[test]
+  fn head_becomes_the_pin_and_nothing_else_does() {
+    // The silent-wrong-answer case: on the server `HEAD` is the default branch,
+    // and after `gfs switch -c` that is not where the caller is standing.
+    let pin = "sha1:abc";
+    assert_eq!(substitute_pin("HEAD", pin), "sha1:abc");
+    assert_eq!(substitute_pin("HEAD~3", pin), "sha1:abc~3");
+    assert_eq!(substitute_pin("HEAD^2", pin), "sha1:abc^2");
+    // A branch or tag is left alone, including one whose name merely starts with
+    // the same letters.
+    assert_eq!(substitute_pin("main", pin), "main");
+    assert_eq!(substitute_pin("HEADER~1", pin), "HEADER~1");
+    assert_eq!(substitute_pin("sha1:def", pin), "sha1:def");
   }
 }

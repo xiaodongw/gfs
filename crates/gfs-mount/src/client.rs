@@ -46,6 +46,43 @@ pub struct MountBinding {
   pub snapshot_time: Timestamp,
 }
 
+/// What a revwalk should cover. The wire's `LogRequest` in domain terms.
+#[derive(Clone, Debug, Default)]
+pub struct LogQuery {
+  pub skip: u32,
+  pub limit: u32,
+  pub first_parent: bool,
+  pub paths: Vec<BytePath>,
+}
+
+/// What to diff and how to render it.
+#[derive(Clone, Debug, Default)]
+pub struct DiffQuery {
+  pub paths: Vec<BytePath>,
+  pub format: gfs_types::DiffFormat,
+  /// `None` takes the server's default of 3. `Some(0)` genuinely means no
+  /// context, which is why this is an `Option` rather than a bare count.
+  pub context_lines: Option<u32>,
+  /// Zero takes the server's default.
+  pub max_bytes: u64,
+}
+
+/// A rendered commit-to-commit diff.
+#[derive(Clone, Debug)]
+pub struct RevDiff {
+  pub rendered: Vec<u8>,
+  pub files: Vec<gfs_types::DiffFileChange>,
+  pub truncated: bool,
+}
+
+/// Blame hunks and the bytes they describe.
+#[derive(Clone, Debug)]
+pub struct Blame {
+  pub hunks: Vec<gfs_types::BlameHunk>,
+  pub content: Vec<u8>,
+  pub truncated: bool,
+}
+
 /// One page of a directory listing.
 #[derive(Clone, Debug)]
 pub struct DirectoryPage {
@@ -169,9 +206,27 @@ impl SnapshotClient {
     path: &BytePath,
     want_blob_ticket: bool,
   ) -> Result<Option<TreeEntryInfo>, GfsError> {
+    self
+      .get_entry_at(&self.binding.commit, path, want_blob_ticket)
+      .await
+  }
+
+  /// The same, in any commit this mount's capability reaches.
+  ///
+  /// The capability is why this exists rather than the caller talking to the
+  /// server itself: after `gfs switch -c` the workspace is pinned to a commit on
+  /// a branch in the reserved namespace, which is reachable from no visible ref.
+  /// A direct request for it is refused — correctly — and only the mount's own
+  /// capability opens it.
+  pub async fn get_entry_at(
+    &self,
+    commit: &ObjectId,
+    path: &BytePath,
+    want_blob_ticket: bool,
+  ) -> Result<Option<TreeEntryInfo>, GfsError> {
     let request = self.authed(v1::GetEntryRequest {
       repository_id: self.binding.repository_id.as_str().to_owned(),
-      commit_oid: self.binding.commit.to_qualified(),
+      commit_oid: commit.to_qualified(),
       path: path.as_bytes().to_vec(),
       authorization: self.authorization(),
       want_blob_ticket,
@@ -202,9 +257,30 @@ impl SnapshotClient {
     page_size: u32,
     want_blob_tickets: bool,
   ) -> Result<DirectoryPage, GfsError> {
+    self
+      .list_directory_at(
+        &self.binding.commit,
+        path,
+        page_token,
+        page_size,
+        want_blob_tickets,
+      )
+      .await
+  }
+
+  /// The same, in any commit this mount's capability reaches. See
+  /// [`SnapshotClient::get_entry_at`] for why the capability is the point.
+  pub async fn list_directory_at(
+    &self,
+    commit: &ObjectId,
+    path: &BytePath,
+    page_token: Vec<u8>,
+    page_size: u32,
+    want_blob_tickets: bool,
+  ) -> Result<DirectoryPage, GfsError> {
     let request = self.authed(v1::ListDirectoryRequest {
       repository_id: self.binding.repository_id.as_str().to_owned(),
-      commit_oid: self.binding.commit.to_qualified(),
+      commit_oid: commit.to_qualified(),
       path: path.as_bytes().to_vec(),
       page_token,
       page_size,
@@ -309,9 +385,18 @@ impl SnapshotClient {
   }
 
   pub async fn get_commit(&self) -> Result<CommitMeta, GfsError> {
+    self.get_commit_at(&self.binding.commit).await
+  }
+
+  /// Metadata for any commit the caller may read, not only the pin.
+  ///
+  /// Needed because `gfs show <rev>` has to learn which parent to diff against
+  /// before it can ask for the diff, and that commit is by definition not the
+  /// one the mount is pinned to.
+  pub async fn get_commit_at(&self, commit: &ObjectId) -> Result<CommitMeta, GfsError> {
     let request = self.authed(v1::GetCommitRequest {
       repository_id: self.binding.repository_id.as_str().to_owned(),
-      commit_oid: self.binding.commit.to_qualified(),
+      commit_oid: commit.to_qualified(),
       authorization: self.authorization(),
     })?;
     self
@@ -324,16 +409,26 @@ impl SnapshotClient {
       .try_into_domain(self.binding.algorithm)
   }
 
-  /// The pinned commit's ancestry, newest first.
+  /// The ancestry of `from`, newest first. `None` walks the pinned commit.
   ///
   /// Returns the page and whether ancestry remains beyond it.
-  pub async fn log(&self, skip: u32, limit: u32) -> Result<(Vec<CommitMeta>, bool), GfsError> {
+  pub async fn log(
+    &self,
+    from: Option<&ObjectId>,
+    options: &LogQuery,
+  ) -> Result<(Vec<CommitMeta>, bool), GfsError> {
     let request = self.authed(v1::LogRequest {
       repository_id: self.binding.repository_id.as_str().to_owned(),
-      commit_oid: self.binding.commit.to_qualified(),
+      commit_oid: from.unwrap_or(&self.binding.commit).to_qualified(),
       authorization: self.authorization(),
-      skip,
-      limit,
+      skip: options.skip,
+      limit: options.limit,
+      first_parent: options.first_parent,
+      paths: options
+        .paths
+        .iter()
+        .map(|p| p.as_bytes().to_vec())
+        .collect(),
     })?;
     let response = self
       .grpc
@@ -347,6 +442,92 @@ impl SnapshotClient {
       commits.push(commit.try_into_domain(self.binding.algorithm)?);
     }
     Ok((commits, response.has_more))
+  }
+
+  /// Resolve a revision expression against the gateway.
+  ///
+  /// The one method that takes a *selector*, and the module docstring's rule
+  /// still holds: this does not re-pin anything. It answers "what commit does
+  /// `HEAD~1` mean" for `gfs show` and `gfs diff`, which read history rather than
+  /// the mounted tree, and the filesystem never calls it.
+  pub async fn resolve(&self, selector: &str) -> Result<ObjectId, GfsError> {
+    let request = self.authed(v1::ResolveRevisionRequest {
+      repository_id: self.binding.repository_id.as_str().to_owned(),
+      revision_selector: selector.to_owned(),
+    })?;
+    let response = self
+      .grpc
+      .clone()
+      .resolve_revision(request)
+      .await
+      .map_err(|s| convert::from_status(&s))?
+      .into_inner();
+    convert::try_oid(&response.commit_oid, self.binding.algorithm, "commit_oid")
+  }
+
+  /// What changed between two commits, rendered by the server.
+  ///
+  /// `from` is `None` for a root commit, which is diffed against the empty tree.
+  /// Nothing is hydrated: the patch is built where the object database is.
+  pub async fn diff_commits(
+    &self,
+    from: Option<&ObjectId>,
+    to: &ObjectId,
+    query: &DiffQuery,
+  ) -> Result<RevDiff, GfsError> {
+    let request = self.authed(v1::DiffCommitsRequest {
+      repository_id: self.binding.repository_id.as_str().to_owned(),
+      base_commit_oid: from.map(ObjectId::to_qualified).unwrap_or_default(),
+      commit_oid: to.to_qualified(),
+      authorization: self.authorization(),
+      paths: query.paths.iter().map(|p| p.as_bytes().to_vec()).collect(),
+      format: v1::DiffFormat::from(query.format) as i32,
+      context_lines: query.context_lines.unwrap_or(0),
+      max_bytes: query.max_bytes,
+      zero_context: query.context_lines == Some(0),
+    })?;
+    let response = self
+      .grpc
+      .clone()
+      .diff_commits(request)
+      .await
+      .map_err(|s| convert::from_status(&s))?
+      .into_inner();
+    let mut files = Vec::with_capacity(response.files.len());
+    for file in response.files {
+      files.push(file.try_into_domain()?);
+    }
+    Ok(RevDiff {
+      rendered: response.rendered,
+      files,
+      truncated: response.truncated,
+    })
+  }
+
+  /// Line attribution for one path at one commit, with the file's bytes.
+  pub async fn blame(&self, commit: &ObjectId, path: &BytePath) -> Result<Blame, GfsError> {
+    let request = self.authed(v1::BlameRequest {
+      repository_id: self.binding.repository_id.as_str().to_owned(),
+      commit_oid: commit.to_qualified(),
+      path: path.as_bytes().to_vec(),
+      authorization: self.authorization(),
+    })?;
+    let response = self
+      .grpc
+      .clone()
+      .blame(request)
+      .await
+      .map_err(|s| convert::from_status(&s))?
+      .into_inner();
+    let mut hunks = Vec::with_capacity(response.hunks.len());
+    for hunk in response.hunks {
+      hunks.push(hunk.try_into_domain(self.binding.algorithm)?);
+    }
+    Ok(Blame {
+      hunks,
+      content: response.content,
+      truncated: response.truncated,
+    })
   }
 
   /// Paths in the pinned commit's tree matching the globs.

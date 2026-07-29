@@ -73,7 +73,69 @@ pub enum Request {
   Search(Box<crate::search::SearchRequest>),
   /// The pinned commit's ancestry, newest first. Answered by the server's
   /// revwalk: the workspace has no object database to walk.
-  Log { skip: u32, limit: u32 },
+  ///
+  /// `from` is a revision expression -- `HEAD~3`, a branch, a commit id -- and
+  /// `None` means the pin. `HEAD` inside it means the **pinned commit**, not the
+  /// repository's default branch, because after `gfs switch -c` those are not
+  /// the same place and the caller is standing on the former.
+  Log {
+    skip: u32,
+    limit: u32,
+    #[serde(default)]
+    from: Option<String>,
+    #[serde(default)]
+    first_parent: bool,
+    /// Root-relative paths, base64url-encoded. A Git path is bytes and this is
+    /// a JSON protocol.
+    #[serde(default)]
+    paths_b64url: Vec<String>,
+  },
+  /// What changed between two revisions, rendered by the server.
+  ///
+  /// The thing a workspace cannot answer for itself: ADR 0005 left the mount
+  /// with no object database, so without this a caller reviewing a commit had to
+  /// walk trees and fetch blobs -- exactly the hydration the partial clone was
+  /// rejected for. The gateway renders it and the mount reads nothing.
+  DiffRevs {
+    /// The old side. `None` means "the first parent of `to`", which the daemon
+    /// resolves; a root commit then diffs against the empty tree.
+    from: Option<String>,
+    to: String,
+    /// Which parent to use when `from` is `None` and `to` is a merge. 1-based,
+    /// as `git show -m` numbers them.
+    #[serde(default)]
+    parent: Option<u32>,
+    format: gfs_types::DiffFormat,
+    #[serde(default)]
+    context_lines: Option<u32>,
+    #[serde(default)]
+    paths_b64url: Vec<String>,
+  },
+  /// One directory of any revision the workspace can reach.
+  ///
+  /// Routed through the daemon rather than read from the server directly, and
+  /// that is the whole reason it exists: after `gfs switch -c` the pin is a
+  /// commit on a branch in the reserved namespace, reachable from no visible
+  /// ref, and only this mount's capability opens it.
+  Ls {
+    #[serde(default)]
+    rev: Option<String>,
+    path_b64url: String,
+    page_size: u32,
+  },
+  /// One file's raw bytes from any revision the workspace can reach.
+  Cat {
+    #[serde(default)]
+    rev: Option<String>,
+    path_b64url: String,
+  },
+  /// Line-by-line attribution for one path at one revision.
+  Blame {
+    #[serde(default)]
+    rev: Option<String>,
+    /// base64url, for the reason the diff's paths are.
+    path_b64url: String,
+  },
   /// Filename search over the merged workspace.
   Find(Box<crate::find::FindRequest>),
   /// Everything the workspace changed, with the bytes, for the CLI to commit.
@@ -129,6 +191,9 @@ pub struct MountReport {
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct LogEntry {
   pub commit: String,
+  /// The commit's tree, so `--format=%T` needs no second round trip.
+  #[serde(default)]
+  pub tree: String,
   pub parents: Vec<String>,
   pub author_name: Vec<u8>,
   pub author_email: Vec<u8>,
@@ -137,17 +202,96 @@ pub struct LogEntry {
   pub committer_name: Vec<u8>,
   pub committer_email: Vec<u8>,
   pub committer_time: i64,
+  /// Carried alongside the committer time because `%cd` has to print the offset
+  /// the commit was made at, not the reader's.
+  #[serde(default)]
+  pub committer_tz_offset_minutes: i32,
   pub message: Vec<u8>,
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct LogReport {
-  /// The commit the walk started from: the workspace's pin.
+  /// The commit the walk started from: the workspace's pin, or whatever `from`
+  /// resolved to.
   pub base_commit: String,
   pub ref_name: Option<String>,
   pub commits: Vec<LogEntry>,
   /// True when ancestry remains past this page.
   pub has_more: bool,
+}
+
+/// One file's line in a diff summary, as the control socket carries it.
+///
+/// Paths are base64url rather than `BytePath`, for the reason [`LogEntry`]'s
+/// fields are bytes: this is JSON and a Git path is not required to be UTF-8.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct DiffFileEntry {
+  pub path_b64url: String,
+  pub old_path_b64url: Option<String>,
+  pub status: gfs_types::DiffStatus,
+  pub additions: u32,
+  pub deletions: u32,
+  pub binary: bool,
+  pub old_mode: u32,
+  pub new_mode: u32,
+}
+
+/// A rendered diff between two revisions.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct RevDiffReport {
+  /// The old side, or `None` when the new side is a root commit.
+  pub base_commit: Option<String>,
+  pub commit: String,
+  /// The rendered diff, base64url-encoded. It carries file content and paths,
+  /// neither of which is required to be UTF-8, and it has to stay byte-exact to
+  /// be applied.
+  pub rendered_b64url: String,
+  pub files: Vec<DiffFileEntry>,
+  /// True when the rendering hit the server's byte ceiling. An answer, not a
+  /// failure -- but one a caller must not mistake for the whole diff.
+  pub truncated: bool,
+}
+
+/// One blame hunk, as the control socket carries it.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct BlameHunkEntry {
+  pub final_start_line: u32,
+  pub lines: u32,
+  pub commit: String,
+  pub orig_path_b64url: String,
+  pub orig_start_line: u32,
+  pub author_name: Vec<u8>,
+  pub author_email: Vec<u8>,
+  pub author_time: i64,
+  pub author_tz_offset_minutes: i32,
+  pub boundary: bool,
+}
+
+/// One entry of a snapshot directory listing.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct LsEntry {
+  /// Root-relative, always — including when a subdirectory was listed. That is
+  /// what `Cat` takes, so the output of one is the input of the other.
+  pub path_b64url: String,
+  pub mode: u32,
+  pub size: u64,
+  pub oid: String,
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct LsReport {
+  pub commit: String,
+  pub entries: Vec<LsEntry>,
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct BlameReport {
+  pub commit: String,
+  pub path_b64url: String,
+  pub hunks: Vec<BlameHunkEntry>,
+  /// The file's bytes, base64url-encoded. Empty when `truncated`.
+  pub content_b64url: String,
+  pub truncated: bool,
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -222,6 +366,15 @@ pub enum Response {
   Export(gfs_overlay::ExportReport),
   Search(Box<crate::search::SearchReport>),
   Log(Box<LogReport>),
+  RevDiff(Box<RevDiffReport>),
+  Blame(Box<BlameReport>),
+  Ls(Box<LsReport>),
+  /// One file's bytes, base64url-encoded. Bytes for the reason the patch is:
+  /// file content is not required to be UTF-8, and this is a JSON protocol.
+  Cat {
+    commit: String,
+    content_b64url: String,
+  },
   Find(Box<crate::find::FindReport>),
   Unmounted,
   Error {

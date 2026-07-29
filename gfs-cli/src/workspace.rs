@@ -165,6 +165,58 @@ pub fn locate(
   }
 }
 
+/// Turn a path as a caller typed it into one relative to the snapshot root.
+///
+/// An agent stands in a subdirectory and names a file the way `git blame` takes
+/// one — relative to *there*. The snapshot only knows root-relative paths, so
+/// the translation happens here rather than by requiring the caller to know
+/// where the workspace root is.
+///
+/// Resolved **lexically** after canonicalizing the current directory, not with
+/// `canonicalize` on the whole path: the named file need not exist in the
+/// workspace at all. `gfs blame old.rs --rev HEAD~5` is about a file that was
+/// deleted, and demanding it exist now would refuse the most useful case.
+pub fn repo_relative(workspace_root: &Path, path: &str) -> Result<Vec<u8>> {
+  use std::os::unix::ffi::OsStrExt;
+
+  let root = workspace_root
+    .canonicalize()
+    .unwrap_or_else(|_| workspace_root.to_path_buf());
+  let candidate = Path::new(path);
+  let absolute = if candidate.is_absolute() {
+    candidate.to_path_buf()
+  } else {
+    let cwd = std::env::current_dir().context("reading the current directory")?;
+    cwd.canonicalize().unwrap_or(cwd).join(candidate)
+  };
+
+  let mut parts: Vec<&std::ffi::OsStr> = Vec::new();
+  for component in absolute.components() {
+    match component {
+      std::path::Component::CurDir => {}
+      std::path::Component::ParentDir => {
+        parts.pop();
+      }
+      std::path::Component::Normal(name) => parts.push(name),
+      // A root or prefix component resets the accumulation, so an absolute path
+      // does not inherit anything from the current directory.
+      _ => parts.clear(),
+    }
+  }
+  let normalized: PathBuf = std::iter::once(std::path::Component::RootDir.as_os_str())
+    .chain(parts)
+    .collect();
+
+  let relative = normalized.strip_prefix(&root).map_err(|_| {
+    anyhow::anyhow!(
+      "{} is outside the workspace at {}",
+      normalized.display(),
+      root.display()
+    )
+  })?;
+  Ok(relative.as_os_str().as_bytes().to_vec())
+}
+
 /// `/jobs/42/ws.gfs` -> `/jobs/42/ws`, and `None` when the suffix is absent.
 ///
 /// Operates on the whole path rather than the file name because the result has
