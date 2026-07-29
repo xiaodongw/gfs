@@ -53,21 +53,22 @@ const STATE_SUFFIX: &str = ".gfs";
 /// is none is the point: `rg`'s behaviour outside a repository is to search the
 /// current directory, and silently doing that here would hydrate the mount.
 ///
-/// # Two shapes, because the workspace is a symlink
+/// # Two shapes
 ///
-/// A mount publishes `<workspace>` as a symlink to
-/// `<workspace>.gfs/generations/<n>`, so an agent that has merely `cd`-ed into
-/// its own workspace has a current directory whose *resolved* form contains the
-/// state directory rather than sitting beside it. Searching only for a sibling
-/// `<current>.gfs` therefore walks straight past the state directory it is
-/// standing inside and reports "not inside a GFS workspace" from within the
-/// mount — the one place the tool is documented to work.
+/// The workspace is the mount point itself, so `canonicalize` on a directory
+/// inside it yields a path under the workspace and the sibling `<current>.gfs`
+/// is found on the way up. That is the ordinary case.
 ///
-/// Both shapes are accepted at every level:
+/// The second shape is kept because it costs one `exists` call and covers the
+/// caller standing in the state directory rather than the workspace — which is
+/// also where a mount published by a *symlink* used to leave a resolved current
+/// directory, so this keeps working against a daemon from before ADR 0003's
+/// second amendment.
 ///
-/// * `<current>.gfs/control.sock` — `current` is the workspace, unresolved;
-/// * `<current>/control.sock` — `current` *is* the state directory, which is
-///   what an ancestor of the resolved publication path looks like.
+/// Both are accepted at every level:
+///
+/// * `<current>.gfs/control.sock` — `current` is the workspace;
+/// * `<current>/control.sock` — `current` *is* the state directory.
 pub fn discover(start: &Path) -> Option<(PathBuf, PathBuf)> {
   let mut current = start.canonicalize().ok()?;
   loop {
@@ -198,27 +199,36 @@ mod tests {
   }
 
   #[test]
-  fn a_workspace_is_found_through_its_published_symlink() {
-    // The shape a real mount publishes, and the one that made `gfs rg` report
-    // "not inside a GFS workspace" from inside the mount: canonicalizing the
-    // workspace yields a path *under* the state directory, so the sibling
-    // `<current>.gfs` the walk looks for never appears.
+  fn a_workspace_is_found_from_a_subdirectory_of_the_mount() {
+    // Where an agent actually stands. The workspace is the mount point itself,
+    // so canonicalizing a path inside it stays inside it and the sibling
+    // `<current>.gfs` is reached on the way up.
     let tmp = tempfile::tempdir().unwrap();
     let state = tmp.path().join("ws.gfs");
-    let generation = state.join("generations/1");
-    std::fs::create_dir_all(generation.join("django/utils")).unwrap();
+    let ws = tmp.path().join("ws");
+    std::fs::create_dir_all(ws.join("django/utils")).unwrap();
     fake_state_dir(&state);
-    std::os::unix::fs::symlink(&generation, tmp.path().join("ws")).unwrap();
 
     let (workspace, state_dir) =
-      discover(&tmp.path().join("ws")).expect("the workspace was not found through the symlink");
+      discover(&ws.join("django/utils")).expect("the workspace was not found from a subdirectory");
+    assert_eq!(state_dir, state);
+    assert_eq!(workspace, ws.canonicalize().unwrap());
+  }
+
+  #[test]
+  fn a_caller_standing_in_the_state_directory_is_still_located() {
+    // The second shape. Cheap to keep, and it is what a resolved current
+    // directory looked like under the symlink publication ADR 0003's second
+    // amendment replaced -- so a new CLI keeps working against an old daemon.
+    let tmp = tempfile::tempdir().unwrap();
+    let state = tmp.path().join("ws.gfs");
+    std::fs::create_dir_all(state.join("generations/1")).unwrap();
+    fake_state_dir(&state);
+
+    let (workspace, state_dir) =
+      discover(&state.join("generations/1")).expect("the state directory was not recognized");
     assert_eq!(state_dir, state);
     assert_eq!(workspace, tmp.path().join("ws"));
-
-    // And from a subdirectory, which is where an agent actually stands.
-    let (_, from_below) = discover(&tmp.path().join("ws/django/utils"))
-      .expect("the workspace was not found from a subdirectory");
-    assert_eq!(from_below, state);
   }
 
   #[test]

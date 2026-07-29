@@ -43,7 +43,7 @@ fn request(pattern: &str) -> SearchRequest {
 }
 
 async fn run(mount: &Mount, request: &SearchRequest) -> (SearchOutcome, usize) {
-  search(mount.fs.client(), &mount.overlay, request)
+  search(&mount.fs.client(), &mount.overlay, request)
     .await
     .unwrap()
 }
@@ -354,7 +354,7 @@ async fn an_unprepared_snapshot_is_prepared_on_demand_rather_than_answered_empty
   // called `PrepareSnapshot`, so every search in a fresh workspace failed for as
   // long as the workspace existed. The search path now asks.
 
-  let (outcome, _) = search(mount.fs.client(), &mount.overlay, &request("println"))
+  let (outcome, _) = search(&mount.fs.client(), &mount.overlay, &request("println"))
     .await
     .expect("an unprepared snapshot must be prepared on demand, not refused");
 

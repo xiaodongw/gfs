@@ -3,8 +3,8 @@
 //! Run with `--nocapture` to see the numbers; the M2 report quotes them.
 //!
 //! Two of the six are covered elsewhere and referenced here rather than
-//! duplicated: refresh generation isolation is
-//! `lifecycle.rs::refresh_swaps_generations_and_keeps_open_handles_on_the_old_one`,
+//! duplicated: the refresh criterion is
+//! `lifecycle.rs::refresh_repins_in_place_and_keeps_the_workspace_path_and_open_handles`,
 //! and selective transfer is measured both here and in
 //! `mount.rs::reading_one_file_does_not_hydrate_its_siblings`.
 
@@ -341,12 +341,20 @@ async fn criterion_6_server_failure_leaves_cached_content_readable() {
 /// Referenced from the report: the refresh criterion lives in `lifecycle.rs`,
 /// and this asserts the two files stay in step rather than one silently losing
 /// the case.
+///
+/// ADR 0003's second amendment restated the criterion rather than dropping it —
+/// a re-pin keeps the workspace path and open descriptors, instead of isolating
+/// two live generations — so both halves are named here.
 #[test]
 fn criterion_5_is_covered_in_the_lifecycle_suite() {
   let source = include_str!("lifecycle.rs");
   assert!(
-    source.contains("fn refresh_swaps_generations_and_keeps_open_handles_on_the_old_one"),
-    "the refresh generation-isolation criterion must stay covered"
+    source.contains("fn refresh_repins_in_place_and_keeps_the_workspace_path_and_open_handles"),
+    "the in-place re-pin criterion must stay covered"
+  );
+  assert!(
+    source.contains("fn a_working_directory_inside_the_workspace_survives_a_repin"),
+    "the working-directory criterion the re-pin model exists for must stay covered"
   );
   // Silence the unused-import warning that would otherwise appear if this file
   // ever loses its async tests.

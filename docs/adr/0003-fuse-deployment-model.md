@@ -212,3 +212,123 @@ Before M6.1. The pilot's orchestrator bind-mounts a workspace into an unprivileg
 container, which is exactly the path that is `BLOCKED` locally and unmeasured on
 Kubernetes. `gfs materialize` also cannot be resolved until then, for the reason
 already given under Alternatives.
+
+## Amendment, 2026-07-28: the workspace is the mount point, and a re-pin happens in place
+
+Decided after using the prototype with an agent CLI. This replaces M2's
+generation model. It does not touch decisions 1–5 above, and it *keeps* the one
+thing the deferral was bought with: publication is still a single replaceable
+step.
+
+### What the generation model cost
+
+M2 published a workspace as a symlink to `<workspace>.gfs/generations/<n>`, and
+made `gfs refresh` create a whole new generation — a new `CreateMount`, a new
+FUSE session at a new mount point — rather than mutate a live one. The guarantee
+it bought is that no reader ever observes a mixture of two commits.
+
+The cost is `getcwd(2)`. The kernel resolves a working directory from its
+dentries, so it returns the *physical* path; only a shell keeps a logical `$PWD`
+of its own. Every other tool — anything calling `getcwd`, `realpath`, or
+`canonicalize` at startup, which is essentially every non-shell process —
+therefore captures `.../generations/1` and holds it. The next switch retires that
+generation underneath the tool, and every subsequent operation fails with
+`ENOENT`.
+
+That breaks the workflow the project exists to serve:
+
+```
+start an agent in a workspace  ->  ask it to switch branch  ->  keep working
+```
+
+which is ordinary in Git and was impossible here.
+
+### The guarantee was stronger than Git's
+
+`git switch` rewrites a working tree in place, file by file. Mid-checkout the
+tree genuinely is a mixture; a process holding a descriptor gets whatever the
+kernel gives it; a process whose working directory the new branch does not have
+gets `ENOENT`. Git offers no coherence guarantee at all, and no tooling expects
+one.
+
+So M2's guarantee was not merely expensive, it was *unwanted*: it made the
+workspace behave unlike the thing it is meant to be a drop-in for.
+
+### Decision
+
+**1. `DirectMountPublisher` mounts the FUSE session at the workspace path
+itself.** `gfs clone <url> <dir>` produces a mount at `<dir>`, and `getcwd`
+inside it returns `<dir>`. A workspace that exists and is non-empty is refused at
+construction, because mounting over it would hide its contents for the life of
+the job rather than fail.
+
+**2. `gfs switch`, `gfs refresh`, and the re-pin after `gfs commit` swap the
+filesystem's pinned commit in place.** No second session, no second mount point,
+no second lease held open. `Gfs::repin` replaces the client, `.git` surface,
+overlay, and snapshot time as one value, and the mount point never moves.
+
+**3. The kernel is told, not left to time out.** After the swap, every dentry the
+mount handed out is invalidated with `FUSE_NOTIFY_INVAL_ENTRY`, off the session
+threads — issuing it from inside a callback deadlocks the mount against itself.
+The set is bounded by the paths the job actually touched, which is what the inode
+table's `by_path` already records.
+
+### What is kept, and what is given up
+
+Kept, because it turned out not to need the generation model at all:
+
+- **An open descriptor keeps reading what it opened.** A `FileState` holds an
+  open handle on a materialized cache file or overlay content file and never
+  re-reads through the client, so this costs nothing and depends on no lease.
+  That is also why the superseded lease is released immediately rather than kept
+  warm — the reason M2 kept it alive does not exist.
+- **Inode numbers.** DESIGN.md section 8.2 promises a path keeps its number for
+  the life of the mount, and a re-pin does not end the mount. `by_path` is not
+  touched, so the stale-`(device, inode)`-hit hazard that section is about does
+  not reappear.
+
+Given up, in both cases matching `git switch`:
+
+- A job whose working directory exists on the old commit and not on the new one
+  gets `ENOENT` afterwards.
+- A path the new commit *adds* may read as absent for up to `FsConfig::negative_ttl`
+  (1 second). A negative dentry is not enumerable, so unlike a positive one it
+  cannot be invalidated, only waited out. This is the one window with no Git
+  equivalent, because Git rewrites the tree through the kernel rather than
+  underneath it.
+
+Both are asserted in `crates/gfs-mount/tests/lifecycle.rs` rather than left to
+the reader — including the negative-TTL window, which is tested as a bounded
+property instead of being hidden.
+
+### The seam survives
+
+`MountPublisher` keeps its purpose and gains `mountpoint()`: the publisher now
+says *where the daemon should mount* as well as how that becomes visible. The
+local implementation answers "the workspace" and makes `publish` a no-op; the
+bind-mount and CSI publishers M6.1 and M7.4 need will answer with a private path
+and `move_mount(2)` it onto the workspace. That is a better-shaped seam than the
+symlink version, because it is the shape the privileged implementations actually
+have.
+
+The exchange this ADR's first amendment asked M2 for is therefore still honoured.
+
+### Consequences
+
+- PLAN.md M2.1's exit criterion is restated, not dropped: a re-pin keeps the
+  workspace path and open descriptors, rather than isolating two live
+  generations.
+- `retire_timeout`, `retiring_generations`, and the `generations/` directory are
+  gone. `--retire-timeout-seconds` is removed from `gfs-fuse`.
+- `MountState.generation` survives as a re-pin counter. It is reported and it
+  names the overlay directory; nothing is kept alive alongside it.
+- Startup unmounts a stale mount at the workspace, and still sweeps a legacy
+  `generations/` tree, so upgrading over a lab directory needs no manual cleanup.
+- `gfs unmount` leaves the workspace as an empty directory rather than removing
+  it. `umount` leaving its mount point behind is the Unix norm, and removing a
+  directory a process may be standing in is worse than leaving an empty one.
+  `mount.json` is the evidence of release.
+- The invalidation sweep is the new cost of a switch, and it is proportional to
+  what the job touched. A job that walked a monorepo pays for that walk again at
+  the next switch. If that ever matters, the fix is to invalidate only the
+  subtree the diff touched — the manifest diff already knows it.

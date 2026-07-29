@@ -347,8 +347,6 @@ pub fn host_config(backend: &Backend, socket_dir: &Path) -> gfs_mount::HostConfi
     http_endpoint: backend.http.clone(),
     token: TOKEN.to_owned(),
     lease_policy: gfs_types::LeasePolicy::adr_0006(),
-    // Short, so the retirement case does not take five minutes to fail.
-    retire_timeout: std::time::Duration::from_secs(5),
     fs: FsConfig::default(),
   }
 }
@@ -377,7 +375,6 @@ pub fn mount_spec(
     overlay,
     mount: MountConfig::default(),
     lease_policy: gfs_types::LeasePolicy::adr_0006(),
-    retire_timeout: std::time::Duration::from_secs(5),
   }
 }
 

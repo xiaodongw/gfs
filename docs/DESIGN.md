@@ -176,12 +176,17 @@ commit OID, and all later tree, blob, and search requests name that OID. Respons
 repeat the resolved commit. This prevents a file from one branch generation being
 combined with search results or metadata from another generation.
 
-An explicit `gfs refresh` may move a clean workspace to a new commit, but it does
-so by creating a new mount generation and replacing the old bind mount rather than
-mutating a live FUSE namespace in place. This preserves the immutable-base
-assumption, avoids stale kernel dentries under long TTLs, and gives open handles
-well-defined old-generation behavior. Refresh with local changes requires a
-three-way rebase operation and is not part of the MVP.
+An explicit `gfs refresh` may move a clean workspace to a new commit. It does so by
+re-pinning the live filesystem in place and invalidating the kernel's cached
+dentries, so the workspace path never moves and a job standing in it keeps working
+— which is what `git switch` does, and what any tool that resolved its own working
+directory requires. Open handles keep reading what they opened, because a handle
+holds a materialized file rather than a reference to the pinned commit. Refresh with
+local changes requires a three-way rebase operation and is not part of the MVP.
+
+> The original design created a new mount generation and replaced a symlink or bind
+> mount instead. See ADR 0003's second amendment for why that was withdrawn: it made
+> `getcwd(2)` report a generation directory that the next refresh retired.
 
 ### 6.3 Keep extensions outside the Git wire protocol initially
 
@@ -806,8 +811,9 @@ files, and pays for it.
 
 ## 9. Consistency and failure behavior
 
-- A mount generation's base never changes. Explicit refresh replaces it with a new
-  generation rather than modifying it in place.
+- A mount's pinned base changes only through an explicit `gfs refresh`, `gfs switch`,
+  or the re-pin after `gfs commit` — never on its own, and never by re-resolving a
+  branch name. The swap is in place, and the kernel is told what to forget.
 - Immutable tree/blob caches are keyed by repository hash algorithm and OID.
 - Ref resolution has a short TTL; commit/tree/blob data may be cached indefinitely
   subject to space limits.

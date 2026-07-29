@@ -809,9 +809,6 @@ fn print_report(report: &gfs_mount::control::MountReport) {
     report.overlay.local_bytes,
     report.overlay.quota_bytes
   );
-  if !report.retiring_generations.is_empty() {
-    println!("retiring   {:?}", report.retiring_generations);
-  }
 }
 
 /// `git status --short`'s shape, because that is what an agent reading this has
@@ -1353,6 +1350,32 @@ async fn main() -> Result<()> {
       let Response::Inspect(report) = call(&state_dir, &Request::Inspect)? else {
         bail!("the daemon answered an inspect request with something else");
       };
+
+      // Ask about the workspace *before* creating anything on the gateway.
+      //
+      // `CreateBranch` is durable and the daemon's own clean-workspace check
+      // comes after it, so a `switch -c` over a dirty workspace used to create
+      // the branch and then refuse the switch. The caller was left on the old
+      // commit with a branch that existed, and every retry after cleaning up
+      // failed with "already exists" — a state neither `switch` nor `switch -c`
+      // could get out of.
+      //
+      // The daemon still makes the same check, and it is the authority: this one
+      // races nothing important, because losing the race only means creating a
+      // branch the switch then declines, which is where we started. What it buys
+      // is that the *ordinary* dirty-workspace path no longer leaves a ref
+      // behind.
+      if *create {
+        let Response::Status(status) = call(&state_dir, &Request::Status)? else {
+          bail!("the daemon answered a status request with something else");
+        };
+        if !status.status.is_clean() {
+          bail!(
+            "the workspace has local changes; commit or discard them before switching \
+             (no branch was created)"
+          );
+        }
+      }
 
       let mut client = connect_repository(&cli).await?;
       let created = if *create {

@@ -1,10 +1,10 @@
-//! One mounted workspace: its lease, its generations, and its control socket.
+//! One mounted workspace: its lease, its pinned commit, and its control socket.
 //!
 //! A [`Mount`] is everything that belongs to one workspace and nothing that
 //! belongs to the process. [`crate::host`] owns however many of these a
 //! `gfs-fuse` process is serving, which is why none of the state here is global:
-//! every lock, cache handle, and generation list is per-instance, so a mount that
-//! fails does so alone.
+//! every lock and cache handle is per-instance, so a mount that fails does so
+//! alone.
 //!
 //! # Ordering is the whole design
 //!
@@ -20,18 +20,38 @@
 //! the lease while a mount can still read through it is the same window with the
 //! sign flipped.
 //!
-//! # Generations
+//! # Re-pinning, and why it happens in place
 //!
-//! `gfs refresh` does not mutate a live mount. It creates a whole new generation
-//! — a new `CreateMount`, a new FUSE session at a new mount point — and swaps the
-//! publication over atomically. The old generation and *its lease* stay alive
-//! until every handle opened through it closes.
+//! `gfs switch`, `gfs refresh`, and the re-pin after `gfs commit` all do the same
+//! thing: resolve a selector, take out a lease on what it resolved to, and point
+//! this filesystem at it. The mount does not move, the workspace path does not
+//! change, and no second FUSE session is created.
 //!
-//! PLAN.md M2.1 is explicit that a refresh must never mutate the pinned base
-//! under existing kernel dentries. This is why: a kernel that has cached
-//! `src/main.rs` at inode 42 for the old commit must keep resolving it there
-//! until the last reader lets go, and the only way to guarantee that is to leave
-//! the old filesystem mounted.
+//! M2 did the opposite — a whole new generation at a new mount point, published
+//! by swapping a symlink — for a guarantee that no reader ever observes a mixture
+//! of two commits. ADR 0003's second amendment withdraws it. The guarantee was
+//! strictly stronger than the one Git gives (`git switch` rewrites a working tree
+//! in place and offers open descriptors nothing at all), and it was paid for with
+//! the property this project exists to provide: a workspace that behaves like a
+//! Git checkout. A symlinked workspace means `getcwd(2)` reports the generation
+//! directory, so every tool that resolves its own working directory — which is
+//! every tool that is not a shell — ends up pinned to a generation that the next
+//! switch retires underneath it.
+//!
+//! What survives from the old model is the part that was load-bearing:
+//!
+//! * an **open descriptor keeps reading what it opened**, because a `FileState`
+//!   holds a materialized cache file or overlay content file and never re-reads
+//!   through the client. This costs nothing and needs no lease, which is why the
+//!   old generation's lease can be released as soon as the swap is done.
+//! * the kernel is **told** what changed, rather than left to time out. Every
+//!   dentry the mount handed out is invalidated after the swap, so the next
+//!   access re-resolves against the new commit.
+//!
+//! What is genuinely given up: a job whose working directory exists on the old
+//! commit and not on the new one gets `ENOENT` afterwards, and for up to
+//! `negative_ttl` a path that the new commit adds may still read as absent. Both
+//! are what `git switch` does.
 //!
 //! # Failure surfaces, it does not accumulate
 //!
@@ -57,7 +77,7 @@ use crate::control::{MountReport, RefreshReport, Request, Response};
 use crate::fs::{FsConfig, Gfs, GfsFilesystem};
 use crate::gitdir::{GitDir, GitDirFacts};
 use crate::lease::{LeaseHealth, LeaseMonitor};
-use crate::publish::{MountPublisher, SymlinkPublisher};
+use crate::publish::{DirectMountPublisher, MountPublisher};
 use crate::session::MountConfig;
 use crate::state::{prepare_state_dir, LeaseRecord, MountState};
 
@@ -76,10 +96,6 @@ pub struct MountSpec {
   pub overlay: OverlayConfig,
   pub mount: MountConfig,
   pub lease_policy: LeasePolicy,
-  /// How long a retiring generation may keep handles open before it is torn down
-  /// anyway. Bounded because a process that leaks a descriptor must not leak a
-  /// lease and a mount with it for the life of the job.
-  pub retire_timeout: Duration,
 }
 
 /// One path's contribution to a commit.
@@ -129,26 +145,30 @@ fn read_overlay_content(
   Ok(bytes)
 }
 
-/// One mounted generation.
-struct Generation {
-  number: u64,
-  mountpoint: PathBuf,
+/// What the mount is currently looking at.
+///
+/// The filesystem, the FUSE session, and the mount point are deliberately *not*
+/// in here: they outlive every pin, which is the whole point of re-pinning in
+/// place. This is only what a `gfs switch` replaces.
+struct Pin {
+  /// Counts re-pins. Not a generation — nothing is kept alive alongside it — but
+  /// the `.git` surface reports it and an operator watching `gfs inspect` can
+  /// tell one switch from the next.
+  epoch: u64,
   overlay_dir: PathBuf,
-  fs: Arc<Gfs>,
   overlay: Arc<Overlay>,
   client: Arc<SnapshotClient>,
   monitor: Arc<LeaseMonitor>,
-  session: Option<fuser::BackgroundSession>,
   commit: ObjectId,
   tree: ObjectId,
   ref_name: Option<String>,
   snapshot_time: Timestamp,
 }
 
-impl std::fmt::Debug for Generation {
+impl std::fmt::Debug for Pin {
   fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-    f.debug_struct("Generation")
-      .field("number", &self.number)
+    f.debug_struct("Pin")
+      .field("epoch", &self.epoch)
       .field("commit", &self.commit)
       .finish_non_exhaustive()
   }
@@ -170,7 +190,7 @@ const UNMOUNT_TIMEOUT: Duration = Duration::from_secs(5);
 /// release it once the last descriptor closes, which is exactly the semantics a
 /// teardown wants: the workspace stops being reachable now, and the process that
 /// is still reading finishes reading.
-async fn unmount_session(session: fuser::BackgroundSession, mountpoint: PathBuf, generation: u64) {
+async fn unmount_session(session: fuser::BackgroundSession, mountpoint: PathBuf) {
   let mut joined = Box::pin(tokio::task::spawn_blocking(move || {
     session.umount_and_join()
   }));
@@ -181,7 +201,6 @@ async fn unmount_session(session: fuser::BackgroundSession, mountpoint: PathBuf,
     return;
   }
   tracing::warn!(
-    generation,
     mountpoint = %mountpoint.display(),
     "the mount is still busy after the unmount timeout; forcing a lazy unmount"
   );
@@ -192,42 +211,50 @@ async fn unmount_session(session: fuser::BackgroundSession, mountpoint: PathBuf,
     .stderr(std::process::Stdio::null())
     .status();
   if tokio::time::timeout(UNMOUNT_TIMEOUT, joined).await.is_err() {
-    tracing::error!(
-      generation,
-      "the FUSE session thread did not exit even after a lazy unmount"
-    );
+    tracing::error!("the FUSE session thread did not exit even after a lazy unmount");
   }
 }
 
-impl Generation {
-  /// Unmount and release, in that order. See the module docs on ordering.
-  async fn tear_down(mut self) {
-    if let Some(session) = self.session.take() {
-      unmount_session(session, self.mountpoint.clone(), self.number).await;
-    }
+impl Pin {
+  /// Release the lease this pin held, and drop its overlay directory.
+  ///
+  /// Called *after* the filesystem has been re-pointed at the replacement, so
+  /// nothing is reading through it any more. There is no unmount here and no
+  /// waiting for handles to drain: a descriptor opened before the swap reads a
+  /// materialized file, not the pinned commit, so the lease it was created under
+  /// is already unreferenced.
+  async fn release(self) {
     if let Err(e) = self.client.release_mount(self.monitor.mount_id()).await {
       // Not fatal: the lease expires on its own. Logged because a release that
       // keeps failing means orphan leases are accumulating somewhere.
-      tracing::warn!(generation = self.number, error = %e.message, "releasing the lease failed");
+      tracing::warn!(epoch = self.epoch, error = %e.message, "releasing the lease failed");
     }
-    let _ = std::fs::remove_dir(&self.mountpoint);
-    // A retired generation's overlay is empty by construction -- `gfs refresh`
-    // refuses a dirty workspace -- so removing it discards nothing. Leaving it
-    // would accumulate one SQLite database per refresh for the life of the job.
-    if self.overlay.is_empty() {
-      let _ = std::fs::remove_dir_all(&self.overlay_dir);
-    }
+    // Removed unconditionally. The guard used to be `is_empty()`, on the stated
+    // grounds that a superseded overlay is always empty -- true for `switch` and
+    // `refresh`, which refuse a dirty workspace, and false for `commit`, which
+    // does not empty the overlay but gives the new pin a *fresh* one. So the one
+    // path that reliably leaves rows behind was the one path that never cleaned
+    // up, and a job that committed repeatedly accumulated one SQLite database
+    // per commit.
+    //
+    // Nothing is discarded by removing it. This runs only after the re-pin has
+    // succeeded, so the filesystem is already reading the new overlay and no
+    // caller can reach this one again; for `commit` its contents are durable in
+    // the commit that was just made. A descriptor still open on overlay content
+    // keeps working, because it holds the file rather than the name -- the same
+    // property `FileState::Local` relies on when the overlay unlinks content
+    // under a live reader.
+    let _ = std::fs::remove_dir_all(&self.overlay_dir);
   }
 }
 
 pub struct Mount {
   config: MountSpec,
-  /// The selector the next generation resolves.
+  /// The selector the next re-pin resolves.
   ///
   /// Held here rather than in `config` because `switch` changes it: a view is
-  /// re-pointed at another branch by resolving a *different* selector and
-  /// publishing the result, which is the same machinery `refresh` uses. The
-  /// config's value is the starting one.
+  /// re-pointed at another branch by resolving a *different* selector, which is
+  /// the same machinery `refresh` uses. The config's value is the starting one.
   selector: Mutex<String>,
   /// The work branch this view is on, when it is on one.
   ///
@@ -238,9 +265,18 @@ pub struct Mount {
   work_branch: Mutex<Option<String>>,
   cache: Arc<BlobCache>,
   publisher: Box<dyn MountPublisher>,
-  current: Mutex<Generation>,
-  /// Generations kept alive only until their last handle closes.
-  retiring: Mutex<Vec<Arc<Mutex<Option<Generation>>>>>,
+  /// The filesystem, created once and re-pointed by every switch. Outlives every
+  /// [`Pin`], which is what makes the workspace path stable.
+  fs: Arc<Gfs>,
+  /// The one FUSE session. `None` only after shutdown has taken it.
+  session: Mutex<Option<fuser::BackgroundSession>>,
+  current: Mutex<Pin>,
+  /// Serializes re-pins against each other.
+  ///
+  /// A `tokio` lock rather than a `std` one because the critical section awaits:
+  /// two concurrent switches that interleaved their `CreateMount` and their swap
+  /// would leave the filesystem on one commit and `mount.json` naming another.
+  repinning: tokio::sync::Mutex<()>,
   shutting_down: AtomicBool,
 }
 
@@ -261,11 +297,10 @@ impl Mount {
   /// "per mount" rather than "per host". [`crate::host::MountHost`] keeps the
   /// registry that decides which mounts get the same handle.
   pub async fn start(config: MountSpec, cache: Arc<BlobCache>) -> Result<Arc<Self>, GfsError> {
-    // Absolute before anything else. The workspace is published as a symlink,
-    // and a symlink target is resolved relative to the *link's* directory, not
-    // to the daemon's working directory -- so a relative `--state-dir` produces
-    // a link that points at a path that does not exist. It also means the daemon
-    // keeps working if something later changes its working directory.
+    // Absolute before anything else, so the daemon keeps working if something
+    // later changes its working directory, and so `mount.json` names a path an
+    // orchestrator cleaning up after a crash can act on without knowing where
+    // the daemon was started.
     let config = MountSpec {
       state_dir: absolute(&config.state_dir)?,
       workspace: absolute(&config.workspace)?,
@@ -273,20 +308,38 @@ impl Mount {
       ..config
     };
     prepare_state_dir(&config.state_dir)?;
-    adopt_or_refuse_state_dir(&config.state_dir)?;
+    adopt_or_refuse_state_dir(&config.state_dir, &config.workspace)?;
 
     let publisher: Box<dyn MountPublisher> =
-      Box::new(SymlinkPublisher::new(config.workspace.clone())?);
+      Box::new(DirectMountPublisher::new(config.workspace.clone())?);
 
-    let generation =
-      mount_generation(&config, &config.revision_selector.clone(), &cache, 1).await?;
-    publisher.publish(&generation.mountpoint)?;
+    let resolved = resolve_pin(&config, &config.revision_selector.clone(), 1).await?;
+    let fs = Gfs::new(
+      Arc::clone(&resolved.pin.client),
+      Arc::clone(&cache),
+      resolved.gitdir,
+      Arc::clone(&resolved.pin.overlay),
+      resolved.root,
+      config.fs.clone(),
+    );
+
+    let mountpoint = publisher.mountpoint().to_path_buf();
+    std::fs::create_dir_all(&mountpoint)
+      .map_err(|e| GfsError::internal(format!("creating the mount point: {e}")))?;
+    let session = crate::session::spawn_mount(
+      GfsFilesystem::new(Arc::clone(&fs), tokio::runtime::Handle::current()),
+      &mountpoint,
+      &config.mount,
+    )?;
+    publisher.publish()?;
 
     let mount = Arc::new(Mount {
       cache,
       publisher,
-      current: Mutex::new(generation),
-      retiring: Mutex::new(Vec::new()),
+      fs,
+      session: Mutex::new(Some(session)),
+      current: Mutex::new(resolved.pin),
+      repinning: tokio::sync::Mutex::new(()),
       shutting_down: AtomicBool::new(false),
       selector: Mutex::new(config.revision_selector.clone()),
       work_branch: Mutex::new(None),
@@ -302,7 +355,7 @@ impl Mount {
 
   /// A one-line view of this mount, for the host's `ListMounts`.
   pub fn summary(&self) -> crate::control::MountSummary {
-    let current = self.current.lock().expect("current generation");
+    let current = self.current.lock().expect("current pin");
     crate::control::MountSummary {
       workspace: self.config.workspace.clone(),
       state_dir: self.config.state_dir.clone(),
@@ -310,7 +363,7 @@ impl Mount {
       mount_id: current.monitor.mount_id().as_str().to_owned(),
       revision_selector: self.selector.lock().expect("selector").clone(),
       commit: current.commit.to_qualified(),
-      generation: current.number,
+      generation: current.epoch,
       health: current.monitor.health().state,
     }
   }
@@ -320,7 +373,7 @@ impl Mount {
   }
 
   fn persist(&self) -> Result<(), GfsError> {
-    let current = self.current.lock().expect("current generation");
+    let current = self.current.lock().expect("current pin");
     let health = current.monitor.health();
     MountState {
       state_format_version: gfs_types::STATE_FORMAT_VERSION,
@@ -335,7 +388,7 @@ impl Mount {
       grpc_endpoint: self.config.grpc_endpoint.clone(),
       http_endpoint: self.config.http_endpoint.clone(),
       workspace: self.config.workspace.clone(),
-      generation: current.number,
+      generation: current.epoch,
       lease: LeaseRecord {
         state: LeaseState::Active,
         expires_at: health.lease_expiry,
@@ -357,20 +410,7 @@ impl Mount {
   }
 
   pub fn inspect(&self) -> MountReport {
-    let current = self.current.lock().expect("current generation");
-    let retiring = self
-      .retiring
-      .lock()
-      .expect("retiring generations")
-      .iter()
-      .filter_map(|slot| {
-        slot
-          .lock()
-          .expect("retiring slot")
-          .as_ref()
-          .map(|g| g.number)
-      })
-      .collect();
+    let current = self.current.lock().expect("current pin");
     MountReport {
       mount_id: current.monitor.mount_id().as_str().to_owned(),
       repository_id: self.config.repository_id.as_str().to_owned(),
@@ -382,39 +422,31 @@ impl Mount {
       snapshot_time: current.snapshot_time,
       workspace: self.config.workspace.display().to_string(),
       publication: self.publisher.describe(),
-      generation: current.number,
-      retiring_generations: retiring,
+      generation: current.epoch,
       state_dir: self.config.state_dir.display().to_string(),
       daemon_pid: std::process::id(),
       owner_uid: crate::attr::Ownership::current().uid,
       read_only: false,
       overlay: current.overlay.stats(),
       health: current.monitor.health(),
-      stats: current.fs.stats(),
+      stats: self.fs.stats(),
       cache: self.cache.stats(),
-      live_inodes: current.fs.inode_counts().0,
-      assigned_inodes: current.fs.inode_counts().1,
+      live_inodes: self.fs.inode_counts().0,
+      assigned_inodes: self.fs.inode_counts().1,
     }
   }
 
-  /// Renew every live generation's lease.
+  /// Renew the pinned commit's lease.
   ///
-  /// Every generation, not only the published one: a retiring generation still
-  /// has open descriptors reading through its pinned commit, and letting its
-  /// lease lapse would prune the objects those reads depend on.
+  /// One lease, because there is one pin. The generation model had to renew
+  /// superseded generations too — they still had descriptors reading through
+  /// their pinned commits — but a descriptor now reads a materialized file and
+  /// holds nothing on the server, so a superseded lease is released outright
+  /// rather than kept warm.
   pub async fn renew_all(&self) {
     let entries: Vec<(Arc<SnapshotClient>, Arc<LeaseMonitor>)> = {
-      let current = self.current.lock().expect("current generation");
-      let mut entries = vec![(Arc::clone(&current.client), Arc::clone(&current.monitor))];
-      for slot in self.retiring.lock().expect("retiring generations").iter() {
-        if let Some(generation) = slot.lock().expect("retiring slot").as_ref() {
-          entries.push((
-            Arc::clone(&generation.client),
-            Arc::clone(&generation.monitor),
-          ));
-        }
-      }
-      entries
+      let current = self.current.lock().expect("current pin");
+      vec![(Arc::clone(&current.client), Arc::clone(&current.monitor))]
     };
 
     for (client, monitor) in entries {
@@ -459,7 +491,7 @@ impl Mount {
   /// would turn a degraded search into a job that cannot start.
   pub fn spawn_index_warmup(self: &Arc<Self>) {
     let client = {
-      let current = self.current.lock().expect("current generation");
+      let current = self.current.lock().expect("current pin");
       Arc::clone(&current.client)
     };
     tokio::spawn(async move {
@@ -491,81 +523,141 @@ impl Mount {
   /// Replace the published generation with a freshly resolved one.
   pub async fn refresh(self: &Arc<Self>) -> Result<RefreshReport, GfsError> {
     // PLAN.md M2.1: refuse when the overlay is non-empty; three-way refresh is
-    // out of scope. A new generation is a new pinned commit, and an overlay is
-    // bound to the commit it diverged from -- carrying edits across would make
-    // every `status` answer be about a base that is no longer mounted.
-    if !self.overlay_is_empty() {
+    // out of scope. A re-pin is a new pinned commit, and an overlay is bound to
+    // the commit it diverged from -- carrying edits across would make every
+    // `status` answer be about a base the workspace is no longer on. `git pull`
+    // refuses a dirty tree for the same reason.
+    if !self.workspace_is_clean().await? {
       return Err(GfsError::new(
         ErrorCode::FailedPrecondition,
         "the workspace has local changes; export them or discard them before refreshing \
          (three-way refresh is out of scope)",
       ));
     }
-    self.republish().await
+    self.repin().await
   }
 
-  /// Build, publish, and retire -- without asking whether the overlay is clean.
+  /// Resolve the current selector and point the filesystem at what it resolved
+  /// to -- without asking whether the overlay is clean.
   ///
   /// Split out because the three callers disagree about that precondition and
   /// agree about everything else. `refresh` and `switch` require a clean
   /// workspace; `commit` requires a *dirty* one and is the reason the check
   /// cannot live in here.
   ///
-  /// The new generation gets its own overlay directory, so a committed overlay
-  /// is never reset in place -- it is simply left behind with the generation it
-  /// belonged to, and torn down when the last handle opened through it closes.
-  /// That is what makes commit-then-re-pin safe without a two-phase protocol:
-  /// there is no window in which one overlay is half-cleared.
-  async fn republish(self: &Arc<Self>) -> Result<RefreshReport, GfsError> {
-    let (previous_number, previous_commit) = {
-      let current = self.current.lock().expect("current generation");
-      (current.number, current.commit.clone())
+  /// The new pin gets its own overlay directory, so a committed overlay is never
+  /// reset in place -- it is left behind with the pin it belonged to and removed
+  /// once nothing points at it. That is what makes commit-then-re-pin safe
+  /// without a two-phase protocol: there is no window in which one overlay is
+  /// half-cleared.
+  ///
+  /// # Order, and the window it leaves
+  ///
+  /// `CreateMount` runs before anything is swapped, so a failure to resolve the
+  /// new selector leaves the mount exactly as it was — a `gfs switch` at a
+  /// typo'd branch name changes nothing. Then, in order: swap the filesystem's
+  /// pin, invalidate the kernel's dentries, persist, release the old lease.
+  ///
+  /// Between the swap and the end of invalidation the kernel may still answer
+  /// from a dentry it cached under the old commit. This is a real window and it
+  /// is the one Git also has — `git switch` writes a working tree file by file —
+  /// so it is bounded and reported rather than designed away. Invalidation is
+  /// bounded by the paths the job actually touched, not by the size of the tree.
+  async fn repin(self: &Arc<Self>) -> Result<RefreshReport, GfsError> {
+    // Held across the whole operation, so two switches cannot interleave and
+    // leave the filesystem on one commit with `mount.json` naming another.
+    let _serialized = self.repinning.lock().await;
+
+    let (previous_epoch, previous_commit) = {
+      let current = self.current.lock().expect("current pin");
+      (current.epoch, current.commit.clone())
     };
-    let next_number = previous_number + 1;
+    let next_epoch = previous_epoch + 1;
     let selector = self.selector.lock().expect("selector").clone();
-    let fresh = mount_generation(&self.config, &selector, &self.cache, next_number).await?;
-    let commit = fresh.commit.clone();
+    let resolved = resolve_pin(&self.config, &selector, next_epoch).await?;
+    let commit = resolved.pin.commit.clone();
 
-    // Published before the old generation is retired, so there is never a moment
-    // with no workspace at all.
-    self.publisher.publish(&fresh.mountpoint)?;
-
-    let retired = {
-      let mut current = self.current.lock().expect("current generation");
-      std::mem::replace(&mut *current, fresh)
+    let stale = self.fs.repin(
+      crate::fs::Pinned {
+        client: Arc::clone(&resolved.pin.client),
+        gitdir: resolved.gitdir,
+        overlay: Arc::clone(&resolved.pin.overlay),
+        snapshot_time: resolved.pin.snapshot_time,
+      },
+      resolved.root,
+    );
+    let superseded = {
+      let mut current = self.current.lock().expect("current pin");
+      std::mem::replace(&mut *current, resolved.pin)
     };
+
+    self.invalidate(stale).await;
     self.persist()?;
-    self.retire(retired);
+    superseded.release().await;
 
     Ok(RefreshReport {
-      previous_generation: previous_number,
-      generation: next_number,
+      previous_generation: previous_epoch,
+      generation: next_epoch,
       previous_commit: previous_commit.to_qualified(),
       commit: commit.to_qualified(),
       unchanged: previous_commit == commit,
     })
   }
 
+  /// Tell the kernel to forget every name the old commit answered for.
+  ///
+  /// Runs on a blocking worker and never on a FUSE session thread.
+  /// `FUSE_NOTIFY_INVAL_ENTRY` blocks until the kernel has finished with the
+  /// dentry, and the kernel may need this filesystem to answer a request first —
+  /// so issuing it from inside a callback is how a mount deadlocks against
+  /// itself.
+  ///
+  /// Individual failures are dropped rather than propagated. `ENOENT` is the
+  /// common one and means the kernel had already forgotten the entry, which is
+  /// the outcome being asked for; the rest would each, at worst, leave one name
+  /// to expire on its TTL, and none is a reason to fail a switch that has
+  /// already happened.
+  async fn invalidate(&self, entries: Vec<(u64, Vec<u8>)>) {
+    if entries.is_empty() {
+      return;
+    }
+    let notifier = {
+      let session = self.session.lock().expect("fuse session");
+      session.as_ref().map(|s| s.notifier())
+    };
+    let Some(notifier) = notifier else {
+      return;
+    };
+    let count = entries.len();
+    let _ = tokio::task::spawn_blocking(move || {
+      use std::os::unix::ffi::OsStrExt;
+      for (parent, name) in entries {
+        let _ = notifier.inval_entry(fuser::INodeNo(parent), std::ffi::OsStr::from_bytes(&name));
+      }
+    })
+    .await;
+    tracing::debug!(entries = count, "invalidated cached names after a re-pin");
+  }
+
   /// Re-point this view at another revision, and remember it.
   ///
   /// `refresh` re-resolves the *same* selector; this changes which one is
   /// resolved and is what `gfs switch` and the re-pin after `gfs commit` both
-  /// use. The generation machinery underneath is identical -- publish the new
-  /// generation, then retire the old one as its handles drain -- because a view
-  /// changing branch and a view following a moved branch are the same operation
-  /// with a different selector.
+  /// use. The machinery underneath is identical, because a view changing branch
+  /// and a view following a moved branch are the same operation with a different
+  /// selector.
   ///
-  /// Refuses a dirty workspace for the reason `refresh` does: an overlay is
-  /// bound to the commit it diverged from, and carrying edits to a different
-  /// base would make every later `status` describe a base that is not mounted.
-  /// A future `gfs commit` will not hit this: committing empties the overlay
-  /// before re-pinning, so by the time it switches there is nothing to carry.
+  /// Refuses a dirty workspace for the reason `refresh` does, and for the reason
+  /// `git switch` does: an overlay is bound to the commit it diverged from, and
+  /// carrying edits to a different base would make every later `status` describe
+  /// a base the workspace is not on. `gfs commit` does not hit this, because
+  /// committing empties the overlay before re-pinning.
   pub async fn switch_to(
     self: &Arc<Self>,
     selector: &str,
     branch: Option<String>,
   ) -> Result<RefreshReport, GfsError> {
-    if !self.overlay_is_empty() {
+    if !self.workspace_is_clean().await? {
       return Err(GfsError::new(
         ErrorCode::FailedPrecondition,
         "the workspace has local changes; commit or discard them before switching",
@@ -579,7 +671,7 @@ impl Mount {
       let mut current = self.work_branch.lock().expect("work branch");
       *current = branch;
     }
-    self.republish().await
+    self.repin().await
   }
 
   /// The work branch this view is on, if any.
@@ -610,7 +702,7 @@ impl Mount {
   /// does have it, expands them.
   pub async fn changes_for_commit(&self) -> Result<PendingCommit, GfsError> {
     let (overlay, commit) = {
-      let current = self.current.lock().expect("current generation");
+      let current = self.current.lock().expect("current pin");
       (Arc::clone(&current.overlay), current.commit.clone())
     };
     let algorithm = commit.algorithm();
@@ -726,20 +818,20 @@ impl Mount {
   ///
   /// Deliberately does **not** check that the overlay is clean: it is not, and
   /// that is the point. The changes it holds are now in the commit being pinned,
-  /// so the new generation's fresh overlay starts empty and correct while the
-  /// old one is retired with its generation.
+  /// so the new pin's fresh overlay starts empty and correct while the old one
+  /// is released with the pin it belonged to.
   pub async fn adopt_commit(self: &Arc<Self>, commit: &str) -> Result<RefreshReport, GfsError> {
     {
       let mut current = self.selector.lock().expect("selector");
       *current = commit.to_owned();
     }
-    self.republish().await
+    self.repin().await
   }
 
   /// The change set, from the journal alone.
   pub async fn status(&self) -> Result<crate::control::StatusReport, GfsError> {
     let (overlay, commit, ref_name) = {
-      let current = self.current.lock().expect("current generation");
+      let current = self.current.lock().expect("current pin");
       (
         Arc::clone(&current.overlay),
         current.commit.clone(),
@@ -784,7 +876,7 @@ impl Mount {
     request: &crate::search::SearchRequest,
   ) -> Result<crate::search::SearchReport, GfsError> {
     let (client, overlay, commit, ref_name) = {
-      let current = self.current.lock().expect("current generation");
+      let current = self.current.lock().expect("current pin");
       (
         Arc::clone(&current.client),
         Arc::clone(&current.overlay),
@@ -808,7 +900,7 @@ impl Mount {
   /// nothing to merge and pretending otherwise would invent commits.
   pub async fn log(&self, skip: u32, limit: u32) -> Result<crate::control::LogReport, GfsError> {
     let (client, commit, ref_name) = {
-      let current = self.current.lock().expect("current generation");
+      let current = self.current.lock().expect("current pin");
       (
         Arc::clone(&current.client),
         current.commit.clone(),
@@ -848,7 +940,7 @@ impl Mount {
     request: &crate::find::FindRequest,
   ) -> Result<crate::find::FindReport, GfsError> {
     let (client, overlay, commit, ref_name) = {
-      let current = self.current.lock().expect("current generation");
+      let current = self.current.lock().expect("current pin");
       (
         Arc::clone(&current.client),
         Arc::clone(&current.overlay),
@@ -899,7 +991,7 @@ impl Mount {
   > {
     let report = self.status().await?;
     let (overlay, client, commit) = {
-      let current = self.current.lock().expect("current generation");
+      let current = self.current.lock().expect("current pin");
       (
         Arc::clone(&current.overlay),
         Arc::clone(&current.client),
@@ -911,105 +1003,63 @@ impl Mount {
     Ok((report.status, base, overlay, commit))
   }
 
-  /// Whether the published generation's overlay holds anything.
-  fn overlay_is_empty(&self) -> bool {
-    self
-      .current
-      .lock()
-      .expect("current generation")
-      .overlay
-      .is_empty()
+  /// Whether the workspace has changes, by the same definition `gfs status`
+  /// reports.
+  ///
+  /// **Not `Overlay::is_empty`.** That answers "does the journal have rows",
+  /// which is a different question: opening a base file for writing copies it up
+  /// and leaves a row whether or not the bytes end up different. A caller who
+  /// edited a file and undid the edit is told `nothing to commit, working tree
+  /// clean` by `status` — and was then refused by `switch` with "the workspace
+  /// has local changes", naming a change the tool it had just run said did not
+  /// exist and offering nothing to discard.
+  ///
+  /// `Status::is_clean` is the definition a user can act on, so it is the one the
+  /// gate uses. `status` hashes local content rather than reading rows, which is
+  /// why the cheap version was reached for; the cost is bounded by the number of
+  /// *modified* paths, not by the tree, and this runs only on a re-pin.
+  async fn workspace_is_clean(&self) -> Result<bool, GfsError> {
+    let (overlay, algorithm) = {
+      let current = self.current.lock().expect("current pin");
+      (Arc::clone(&current.overlay), current.commit.algorithm())
+    };
+    let status = tokio::task::spawn_blocking(move || overlay.status(algorithm))
+      .await
+      .map_err(|e| GfsError::internal(format!("the status task failed: {e}")))?
+      .map_err(crate::fs::overlay_as_service_error)?;
+    Ok(status.is_clean())
   }
 
-  /// Keep a generation alive until its last handle closes, then tear it down.
-  fn retire(self: &Arc<Self>, generation: Generation) {
-    let slot = Arc::new(Mutex::new(Some(generation)));
-    self
-      .retiring
-      .lock()
-      .expect("retiring generations")
-      .push(Arc::clone(&slot));
-
-    let daemon = Arc::clone(self);
-    tokio::spawn(async move {
-      let deadline = tokio::time::Instant::now() + daemon.config.retire_timeout;
-      loop {
-        let idle = {
-          let guard = slot.lock().expect("retiring slot");
-          match guard.as_ref() {
-            Some(generation) => generation.fs.open_handles() == 0,
-            None => return,
-          }
-        };
-        if idle || tokio::time::Instant::now() >= deadline {
-          if !idle {
-            tracing::warn!(
-              "a retiring mount generation still had open handles after the retire timeout; \
-               tearing it down anyway"
-            );
-          }
-          break;
-        }
-        tokio::time::sleep(Duration::from_millis(200)).await;
-      }
-      let generation = slot.lock().expect("retiring slot").take();
-      if let Some(generation) = generation {
-        generation.tear_down().await;
-      }
-      daemon
-        .retiring
-        .lock()
-        .expect("retiring generations")
-        .retain(|other| other.lock().expect("retiring slot").is_some());
-    });
-  }
-
-  /// Unpublish, unmount every generation, release every lease, and remove the
-  /// state that says a mount is live here.
+  /// Unpublish, unmount, release the lease, and remove the state that says a
+  /// mount is live here.
   pub async fn shutdown(self: &Arc<Self>) {
     if self.shutting_down.swap(true, Ordering::SeqCst) {
       return;
     }
     // Unpublish first: the job must stop being able to reach the mount before
     // the mount stops being able to serve it, or a read in flight sees ENOTCONN
-    // rather than a missing workspace.
+    // rather than a missing workspace. With a direct mount the unmount below is
+    // what actually does it, and this stays because a privileged publisher's
+    // unpublish is a real step that must keep happening in this order.
     let _ = self.publisher.unpublish();
 
-    let retiring: Vec<_> =
-      std::mem::take(&mut *self.retiring.lock().expect("retiring generations"));
-    for slot in retiring {
-      let generation = slot.lock().expect("retiring slot").take();
-      if let Some(generation) = generation {
-        generation.tear_down().await;
-      }
+    // Taken out under the lock and unmounted outside it: `unmount_session`
+    // awaits, and holding a `std::sync::Mutex` across an await is how a daemon
+    // deadlocks on its own shutdown.
+    let session = self.session.lock().expect("fuse session").take();
+    let mountpoint = self.publisher.mountpoint().to_path_buf();
+    if let Some(session) = session {
+      unmount_session(session, mountpoint.clone()).await;
     }
-
-    // Swapped out under the lock and torn down outside it: `tear_down` awaits,
-    // and holding a `std::sync::Mutex` across an await is how a daemon deadlocks
-    // on its own shutdown.
-    let (placeholder, generation, point) = {
-      let mut current = self.current.lock().expect("current generation");
-      (
-        current.session.take(),
-        current.number,
-        current.mountpoint.clone(),
-      )
-    };
-    if let Some(session) = placeholder {
-      unmount_session(session, point, generation).await;
-    }
-    let (client, monitor, mountpoint) = {
-      let current = self.current.lock().expect("current generation");
-      (
-        Arc::clone(&current.client),
-        Arc::clone(&current.monitor),
-        current.mountpoint.clone(),
-      )
+    let (client, monitor) = {
+      let current = self.current.lock().expect("current pin");
+      (Arc::clone(&current.client), Arc::clone(&current.monitor))
     };
     if let Err(e) = client.release_mount(monitor.mount_id()).await {
       tracing::warn!(error = %e.message, "releasing the lease failed during shutdown");
     }
-    let _ = std::fs::remove_dir(&mountpoint);
+    // The workspace directory is the mount point now, so removing it is removing
+    // what the job was told to use. Only the daemon's own state goes.
     let _ = std::fs::remove_file(MountState::path(&self.config.state_dir));
     let _ = std::fs::remove_file(self.control_socket());
   }
@@ -1139,28 +1189,40 @@ impl Mount {
   }
 }
 
-/// Where one generation's overlay lives.
-fn overlay_dir(state_dir: &Path, generation: u64) -> PathBuf {
-  state_dir.join("overlay").join(generation.to_string())
+/// Where one pin's overlay lives.
+fn overlay_dir(state_dir: &Path, epoch: u64) -> PathBuf {
+  state_dir.join("overlay").join(epoch.to_string())
 }
 
 /// Make a path absolute without requiring it to exist.
 ///
 /// `canonicalize` would be stronger but demands that every component already
 /// exists, which the workspace path deliberately does not: it is about to be
-/// created as a symlink.
+/// created as a directory to mount on.
 fn absolute(path: &Path) -> Result<PathBuf, GfsError> {
   std::path::absolute(path)
     .map_err(|e| GfsError::invalid(format!("{} cannot be made absolute: {e}", path.display())))
 }
 
-/// Create a lease and mount it, in that order.
-async fn mount_generation(
-  config: &MountSpec,
-  selector: &str,
-  cache: &Arc<BlobCache>,
-  number: u64,
-) -> Result<Generation, GfsError> {
+/// A pin, plus the two things the filesystem needs that the pin does not hold.
+///
+/// `gitdir` and `root` belong to the *filesystem's* view of a commit rather than
+/// to the mount's bookkeeping, so they are handed straight to [`Gfs::new`] or
+/// [`Gfs::repin`] and not stored twice.
+struct Resolved {
+  pin: Pin,
+  gitdir: Arc<GitDir>,
+  root: gfs_types::TreeEntryInfo,
+}
+
+/// Take out a lease on what a selector resolves to, and build everything that
+/// reads through it.
+///
+/// Creates no FUSE session and touches no live filesystem: the caller decides
+/// whether this is the first pin (mount it) or a replacement (swap it in). That
+/// split is what makes a failed `gfs switch` a no-op — the mount is only
+/// disturbed once this has already succeeded.
+async fn resolve_pin(config: &MountSpec, selector: &str, epoch: u64) -> Result<Resolved, GfsError> {
   let grant = create_mount(config, selector).await?;
 
   let commit = ObjectId::parse_qualified(&grant.commit_oid)
@@ -1217,14 +1279,14 @@ async fn mount_generation(
     snapshot_time,
     grpc_endpoint: config.grpc_endpoint.clone(),
     http_endpoint: config.http_endpoint.clone(),
-    generation: number,
+    generation: epoch,
     commit_meta,
   }));
 
-  // One overlay per generation, in its own directory. The binding check inside
+  // One overlay per pin, in its own directory. The binding check inside
   // `Overlay::open` then does real work: a daemon restarted against a moved
-  // branch cannot silently adopt the previous generation's edits.
-  let overlay_dir = overlay_dir(&config.state_dir, number);
+  // branch cannot silently adopt the previous pin's edits.
+  let overlay_dir = overlay_dir(&config.state_dir, epoch);
   let overlay = Arc::new(
     Overlay::open(
       &overlay_dir,
@@ -1257,38 +1319,22 @@ async fn mount_generation(
     );
   }
 
-  let fs = Gfs::new(
-    Arc::clone(&client),
-    Arc::clone(cache),
+  let root = crate::fs::root_entry(tree.clone());
+
+  Ok(Resolved {
     gitdir,
-    Arc::clone(&overlay),
-    crate::fs::root_entry(tree.clone()),
-    config.fs.clone(),
-  );
-
-  let mountpoint = MountState::generation_dir(&config.state_dir, number);
-  std::fs::create_dir_all(&mountpoint)
-    .map_err(|e| GfsError::internal(format!("creating the mount point: {e}")))?;
-
-  let session = crate::session::spawn_mount(
-    GfsFilesystem::new(Arc::clone(&fs), tokio::runtime::Handle::current()),
-    &mountpoint,
-    &config.mount,
-  )?;
-
-  Ok(Generation {
-    number,
-    mountpoint,
-    overlay_dir,
-    fs,
-    overlay,
-    client,
-    monitor: LeaseMonitor::new(mount_id, expiry, interval, config.lease_policy),
-    session: Some(session),
-    commit,
-    tree,
-    ref_name: grant.ref_name,
-    snapshot_time,
+    root,
+    pin: Pin {
+      epoch,
+      overlay_dir,
+      overlay,
+      client,
+      monitor: LeaseMonitor::new(mount_id, expiry, interval, config.lease_policy),
+      commit,
+      tree,
+      ref_name: grant.ref_name,
+      snapshot_time,
+    },
   })
 }
 
@@ -1334,7 +1380,7 @@ async fn create_mount(
 /// explicit responsibility rather than something the kernel does. This is the
 /// daemon's half of it: whatever the previous occupant of this state directory
 /// left behind is removed before a new mount is created in it.
-fn adopt_or_refuse_state_dir(state_dir: &Path) -> Result<(), GfsError> {
+fn adopt_or_refuse_state_dir(state_dir: &Path, workspace: &Path) -> Result<(), GfsError> {
   let socket = MountState::control_socket(state_dir);
   if socket.exists() {
     if crate::control::is_live(&socket) {
@@ -1350,20 +1396,29 @@ fn adopt_or_refuse_state_dir(state_dir: &Path) -> Result<(), GfsError> {
   }
 
   // Unmount anything a killed daemon left behind. Every operation on such a
-  // mount point returns ENOTCONN, so a new mount over it would be unreachable.
-  let generations = state_dir.join(crate::state::GENERATIONS_DIR);
-  if let Ok(entries) = std::fs::read_dir(&generations) {
-    for entry in entries.flatten() {
-      let path = entry.path();
-      let _ = std::process::Command::new("fusermount3")
-        .args(["-u", "-z"])
-        .arg(&path)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status();
-      let _ = std::fs::remove_dir(&path);
-    }
+  // mount point returns ENOTCONN, so a new mount over it would be unreachable --
+  // and, now that the workspace *is* the mount point, so would the check
+  // `DirectMountPublisher` makes for a non-empty directory: `read_dir` on a dead
+  // FUSE mount fails, and the publisher would refuse a path that holds nothing.
+  //
+  // The workspace is swept rather than the old `generations/` tree. A daemon
+  // killed before this change left its mounts there instead, so both are
+  // cleaned: an upgrade must not require the operator to know that the layout
+  // moved.
+  let mut orphans = vec![workspace.to_path_buf()];
+  let legacy = state_dir.join("generations");
+  if let Ok(entries) = std::fs::read_dir(&legacy) {
+    orphans.extend(entries.flatten().map(|entry| entry.path()));
   }
+  for path in orphans {
+    let _ = std::process::Command::new("fusermount3")
+      .args(["-u", "-z"])
+      .arg(&path)
+      .stdout(std::process::Stdio::null())
+      .stderr(std::process::Stdio::null())
+      .status();
+  }
+  let _ = std::fs::remove_dir_all(&legacy);
   let _ = std::fs::remove_file(MountState::path(state_dir));
   Ok(())
 }
@@ -1380,13 +1435,13 @@ mod tests {
 
     // A stale socket file with nothing listening: adopted.
     std::fs::write(&socket, b"").unwrap();
-    adopt_or_refuse_state_dir(tmp.path()).unwrap();
+    adopt_or_refuse_state_dir(tmp.path(), &tmp.path().join("ws")).unwrap();
     assert!(!socket.exists());
 
     // A real listener: refused, because two daemons over one state directory
     // would each believe they own the lease.
     let _listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
-    let e = adopt_or_refuse_state_dir(tmp.path()).unwrap_err();
+    let e = adopt_or_refuse_state_dir(tmp.path(), &tmp.path().join("ws")).unwrap_err();
     assert_eq!(e.code, ErrorCode::Conflict);
   }
 }

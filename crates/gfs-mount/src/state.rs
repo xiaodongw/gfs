@@ -30,7 +30,6 @@ use gfs_types::{LeaseState, Timestamp};
 
 pub const MOUNT_STATE_FILE: &str = "mount.json";
 pub const CONTROL_SOCKET_FILE: &str = "control.sock";
-pub const GENERATIONS_DIR: &str = "generations";
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct LeaseRecord {
@@ -58,8 +57,11 @@ pub struct MountState {
   pub snapshot_time: Timestamp,
   pub grpc_endpoint: String,
   pub http_endpoint: String,
+  /// The path the job uses, which is also the FUSE mount point. A crashed
+  /// daemon's mount is unmounted through this, so it is stored absolute.
   pub workspace: PathBuf,
-  /// The generation currently published. Incremented by `gfs refresh`.
+  /// How many times this mount has been re-pinned. Incremented by `gfs refresh`,
+  /// `gfs switch`, and the re-pin after `gfs commit`.
   pub generation: u64,
   pub lease: LeaseRecord,
   pub daemon_pid: u32,
@@ -117,10 +119,6 @@ impl MountState {
     Ok(())
   }
 
-  pub fn generation_dir(state_dir: &Path, generation: u64) -> PathBuf {
-    state_dir.join(GENERATIONS_DIR).join(generation.to_string())
-  }
-
   pub fn control_socket(state_dir: &Path) -> PathBuf {
     state_dir.join(CONTROL_SOCKET_FILE)
   }
@@ -128,7 +126,7 @@ impl MountState {
 
 /// Create the state directory tree with the permissions the daemon owns.
 pub fn prepare_state_dir(state_dir: &Path) -> Result<(), GfsError> {
-  std::fs::create_dir_all(state_dir.join(GENERATIONS_DIR))
+  std::fs::create_dir_all(state_dir)
     .map_err(|e| GfsError::internal(format!("creating the state directory: {e}")))?;
   // 0700: the state directory holds the capability and, from M3, the overlay.
   // Jobs reach content through the mount, never by reading the daemon's state.

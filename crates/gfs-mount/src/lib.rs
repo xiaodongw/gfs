@@ -55,6 +55,6 @@ pub use gitdir::{GitDir, GitDirFacts};
 pub use host::{HostConfig, MountHost};
 pub use lease::{HealthState, LeaseHealth, LeaseMonitor};
 pub use mount::{Mount, MountSpec};
-pub use publish::{MountPublisher, SymlinkPublisher};
+pub use publish::{DirectMountPublisher, MountPublisher};
 pub use session::{spawn_mount, MountConfig};
 pub use state::MountState;

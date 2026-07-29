@@ -166,12 +166,22 @@ re-pins the view to it. There is no staging area and no local-only commit: the
 commit is durable on the gateway the moment it is made, which is what lets
 `gfs log` show it.
 
-**Your shell's directory goes stale here.** The workspace is a symlink into
-`<workspace>.gfs/generations/<n>`, and committing publishes a new generation and
-retires the old one — so a shell standing in the old one gets `ENOENT` on its
-next command. `cd $(pwd)` recovers. The same applies to `gfs switch` and
-`gfs refresh`. This is inherent to the generation model: PLAN.md M2.1 requires
-that a refresh never mutate the pinned base under existing kernel dentries.
+**Your shell keeps working.** The workspace is the mount point itself and the
+re-pin happens in place, so a shell — or an agent CLI, or a build — standing
+anywhere inside it is standing in the same place afterwards. The same applies to
+`gfs switch` and `gfs refresh`.
+
+Two things behave the way `git switch` behaves, and are worth knowing:
+
+- a working directory that exists on the old commit and not on the new one gives
+  `ENOENT` afterwards, exactly as it would after `git switch`;
+- a file the new commit *adds* can read as absent for up to a second if something
+  looked for it just before the switch. Negative dentries are not enumerable, so
+  they expire rather than being invalidated.
+
+Before 2026-07-28 the workspace was a symlink into
+`<workspace>.gfs/generations/<n>` and this section said the opposite. See ADR
+0003's second amendment.
 
 ### `gfs push`
 
@@ -321,8 +331,10 @@ gfs unmount --workspace ~/.gfs-lab/alpha   # one workspace, host keeps running
 gfs daemon stop                            # every workspace, then the host
 ```
 
-`gfs daemon stop` removes the workspace symlinks as it goes, so a directory
-listing of the lab afterwards shows only the state directories.
+`gfs daemon stop` unmounts each workspace as it goes, leaving the directory in
+place and empty. An empty workspace beside a `.gfs` state directory is what a
+released mount looks like; `mount.json` is gone, which is what tells cleanup the
+lease was released.
 
 Unmount before deleting anything by hand. `rm -rf` over a live mount is both
 wrong and slow: the base is read-only so every removal fails, and ADR 0003
@@ -338,8 +350,9 @@ Each of these produced a plausible-looking wrong answer during development.
 - **Long lab paths fail the control socket.** Under 108 bytes for
   `<workspace>.gfs/control.sock`. The default lab directory is short; a deep
   `GFS_LAB` is not.
-- **Your shell's directory goes stale after `switch`, `commit` and `refresh`.**
-  `cd $(pwd)`.
+- **A workspace must be empty to mount on.** It is the mount point now, so
+  `gfs clone` into a non-empty directory is refused rather than hiding what is
+  there — the same rule `git clone` has.
 - **Killing `gfs-fuse` now kills every workspace, not one.** There is one host for
   the machine, so what used to end a single job now ends all of them. Use
   `gfs unmount --workspace <path>` for one and `gfs daemon stop` for all. (The old
@@ -355,7 +368,8 @@ Each of these produced a plausible-looking wrong answer during development.
   earlier session; it exits non-zero when there is none.
 - **`du` on a live mount walks the FUSE tree** and reports ~45 MiB for Django.
   The real client-side state is around 100 KiB, most of it the installed shim
-  binary: `du -sb --exclude=generations <workspace>.gfs`.
+  binary: `du -sb <workspace>.gfs`. The state directory no longer contains the
+  mount, so nothing has to be excluded.
 - **`core.autocrlf=true`** in your global Git config makes anything you clone
   with shell scripts in it arrive with CRLF endings and fail in ways that look
   like the cloned project is broken. It also corrupts `git apply`.

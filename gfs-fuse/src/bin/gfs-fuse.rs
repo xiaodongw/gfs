@@ -11,7 +11,6 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -38,11 +37,6 @@ struct Args {
 
   #[arg(long, env = "GFS_TOKEN", hide_env_values = true, default_value = "")]
   token: String,
-
-  /// How long a retiring generation may keep handles open before it is torn down
-  /// anyway.
-  #[arg(long, default_value_t = 300)]
-  retire_timeout_seconds: u64,
 }
 
 #[tokio::main]
@@ -61,7 +55,6 @@ async fn main() -> Result<()> {
     http_endpoint: args.http_endpoint,
     token: args.token,
     lease_policy: LeasePolicy::adr_0006(),
-    retire_timeout: Duration::from_secs(args.retire_timeout_seconds),
     fs: FsConfig::default(),
   };
 

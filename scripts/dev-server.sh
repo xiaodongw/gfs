@@ -55,7 +55,12 @@ cleanup() {
   done
   # Then force anything that did not go quietly -- a workspace with an open
   # descriptor refuses a clean unmount, and a leftover FUSE mount is what makes
-  # the *next* run fail confusingly.
+  # the *next* run fail confusingly. The workspace is the mount point, so that is
+  # what gets forced; `generations/*` is swept too, for a lab left behind by a
+  # build from before ADR 0003's second amendment.
+  for state in "$LAB"/*.gfs; do
+    fusermount3 -u -z "${state%.gfs}" >/dev/null 2>&1 || true
+  done
   for gen in "$LAB"/*.gfs/generations/*; do
     fusermount3 -u -z "$gen" >/dev/null 2>&1 || true
   done

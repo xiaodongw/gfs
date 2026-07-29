@@ -46,7 +46,6 @@ use std::collections::HashMap;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, Weak};
-use std::time::Duration;
 
 use gfs_types::error::{ErrorCode, GfsError};
 use gfs_types::{HashAlgorithm, LeasePolicy, RepositoryId};
@@ -69,7 +68,6 @@ pub struct HostConfig {
   pub http_endpoint: String,
   pub token: String,
   pub lease_policy: LeasePolicy,
-  pub retire_timeout: Duration,
   pub fs: FsConfig,
 }
 
@@ -244,7 +242,6 @@ impl MountHost {
         auto_unmount: request.allow_other,
       },
       lease_policy: self.config.lease_policy,
-      retire_timeout: self.config.retire_timeout,
     };
     Ok(self.mount(spec).await?.inspect())
   }

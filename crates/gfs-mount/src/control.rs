@@ -101,9 +101,9 @@ pub struct MountReport {
   pub snapshot_time: Timestamp,
   pub workspace: String,
   pub publication: String,
+  /// How many times this mount has been re-pinned. Not a generation: nothing
+  /// is kept alive alongside it, and `gfs switch` replaces the pin in place.
   pub generation: u64,
-  /// Generations still alive because handles opened through them are still open.
-  pub retiring_generations: Vec<u64>,
   pub state_dir: String,
   pub daemon_pid: u32,
   /// The UID the mount reports as owner. An operator comparing this with the

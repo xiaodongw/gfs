@@ -54,7 +54,18 @@ async fn two_workspaces_on_one_host_are_served_independently() {
     on_fs(move || std::fs::read(a.join("README.md")).unwrap()).await
   };
   assert_eq!(still_there, b"# basic\n");
-  assert!(!second_workspace.exists(), "the other workspace is gone");
+  // The other workspace is an empty directory again. The mount point survives
+  // the unmount -- see `lifecycle.rs` -- so "empty" rather than "absent" is what
+  // distinguishes a released mount from a live one.
+  let released = second_workspace.clone();
+  on_fs(move || {
+    assert_eq!(
+      std::fs::read_dir(&released).unwrap().count(),
+      0,
+      "the other workspace stopped serving its commit"
+    );
+  })
+  .await;
 
   // And the host forgot it, rather than keeping a dead entry that `gfs daemon
   // status` would report as live.
@@ -130,7 +141,11 @@ async fn the_host_socket_reports_and_tears_down_its_mounts() {
     call(&socket, destroy).await,
     HostResponse::Destroyed
   ));
-  assert!(!second_workspace.exists());
+  assert_eq!(
+    std::fs::read_dir(&second_workspace).unwrap().count(),
+    0,
+    "the destroyed mount stopped serving its commit"
+  );
 
   let HostResponse::Mounts { mounts } = call(&socket, HostRequest::ListMounts).await else {
     panic!("the host answered a list request with something else");

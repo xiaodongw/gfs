@@ -48,7 +48,7 @@ use std::ffi::OsStr;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::FileExt;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
 use fuser::{
@@ -201,15 +201,31 @@ struct Resolved {
   base: Option<BaseFacts>,
 }
 
+/// Everything about the pinned commit, swapped as one value.
+///
+/// One struct behind one lock rather than four locks, because these four are
+/// only meaningful together: a reader that got the new commit's client and the
+/// old commit's `.git` surface would report a `HEAD` that does not describe the
+/// tree it is reading. The tree a job sees may change under it — that is what
+/// `git switch` does — but it must never be an interleaving of two commits'
+/// plumbing.
+#[derive(Debug)]
+pub struct Pinned {
+  pub client: Arc<SnapshotClient>,
+  pub gitdir: Arc<GitDir>,
+  pub overlay: Arc<Overlay>,
+  pub snapshot_time: Timestamp,
+}
+
 /// The filesystem. Shared behind an `Arc` so a callback can hand it to a worker.
 pub struct Gfs {
-  client: Arc<SnapshotClient>,
+  /// Replaced wholesale by [`Gfs::repin`]. Read through [`Gfs::pinned`], which
+  /// clones the `Arc` and releases the lock — a guard held across an `await`
+  /// would let a re-pin block every reader on the mount.
+  pinned: RwLock<Arc<Pinned>>,
   cache: Arc<BlobCache>,
-  gitdir: Arc<GitDir>,
-  overlay: Arc<Overlay>,
   config: FsConfig,
   owner: Ownership,
-  snapshot_time: Timestamp,
   inodes: Mutex<InodeTable>,
   dirs: Mutex<HashMap<u64, Arc<tokio::sync::Mutex<DirState>>>>,
   files: Mutex<HashMap<u64, Arc<FileState>>>,
@@ -221,7 +237,7 @@ impl std::fmt::Debug for Gfs {
   fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
     f.debug_struct("Gfs")
       .field("config", &self.config)
-      .field("snapshot_time", &self.snapshot_time)
+      .field("snapshot_time", &self.snapshot_time())
       .finish_non_exhaustive()
   }
 }
@@ -240,13 +256,15 @@ impl Gfs {
     // The numbers a previous process handed out, before any new one is issued.
     inodes.seed(&overlay.entries());
     Arc::new(Gfs {
-      client,
+      pinned: RwLock::new(Arc::new(Pinned {
+        client,
+        gitdir,
+        overlay,
+        snapshot_time,
+      })),
       cache,
-      gitdir,
-      overlay,
       config,
       owner: Ownership::current(),
-      snapshot_time,
       inodes: Mutex::new(inodes),
       dirs: Mutex::new(HashMap::new()),
       files: Mutex::new(HashMap::new()),
@@ -255,13 +273,41 @@ impl Gfs {
     })
   }
 
+  /// The commit this mount is currently looking at, as one consistent value.
+  pub fn pinned(&self) -> Arc<Pinned> {
+    Arc::clone(&self.pinned.read().expect("pinned commit"))
+  }
+
+  /// Look at a different commit, without ending the mount.
+  ///
+  /// This is `gfs switch`, and the shape is the one `git switch` has: the
+  /// working tree a job is standing in changes underneath it, and the path it is
+  /// standing in does not. Returns the paths whose kernel dentries the caller
+  /// must now invalidate — see [`InodeTable::repin`] for why the caller does
+  /// that rather than this.
+  ///
+  /// Open descriptors are deliberately untouched. A `FileState` holds an open
+  /// handle on a materialized cache file or an overlay content file, so a
+  /// descriptor obtained before the re-pin goes on reading the bytes it opened,
+  /// owing nothing to the old commit's lease. That is what `git switch` leaves
+  /// behind too: replacing a file does not reach into a reader's descriptor.
+  pub fn repin(&self, pinned: Pinned, root: TreeEntryInfo) -> Vec<(u64, Vec<u8>)> {
+    // The inode table first, and under both locks, so no lookup can resolve
+    // against the new commit and then be recorded against the old root.
+    let mut inodes = self.inodes.lock().expect("inode table");
+    let mut slot = self.pinned.write().expect("pinned commit");
+    inodes.seed(&pinned.overlay.entries());
+    *slot = Arc::new(pinned);
+    inodes.repin(root)
+  }
+
   pub fn stats(&self) -> FsStats {
     *self.stats.lock().expect("fs stats")
   }
 
   /// The stable sanitized time every base entry reports.
   pub fn snapshot_time(&self) -> Timestamp {
-    self.snapshot_time
+    self.pinned().snapshot_time
   }
 
   pub fn cache_stats(&self) -> CacheStats {
@@ -274,12 +320,12 @@ impl Gfs {
   /// capability*, which is refreshed by every heartbeat renewal. A second client
   /// built for search would hold a copy that goes stale, and its first read
   /// after a force push -- the exact moment a mount must not break -- would fail.
-  pub fn client(&self) -> &Arc<SnapshotClient> {
-    &self.client
+  pub fn client(&self) -> Arc<SnapshotClient> {
+    Arc::clone(&self.pinned().client)
   }
 
-  pub fn overlay(&self) -> &Arc<Overlay> {
-    &self.overlay
+  pub fn overlay(&self) -> Arc<Overlay> {
+    Arc::clone(&self.pinned().overlay)
   }
 
   /// Live inodes and distinct paths ever numbered. Reported by `gfs inspect`.
@@ -302,7 +348,7 @@ impl Gfs {
   }
 
   fn attr(&self, record: &Record) -> FileAttr {
-    attr_of(record, self.snapshot_time, self.owner)
+    attr_of(record, self.snapshot_time(), self.owner)
   }
 
   fn record(&self, ino: u64) -> Option<Record> {
@@ -372,14 +418,13 @@ impl Gfs {
   ) -> Result<Option<TreeEntryInfo>, GfsError> {
     path.validate()?;
     self.bump(|s| s.metadata_requests += 1);
-    self
-      .retrying(|| self.client.get_entry(path, want_ticket))
-      .await
+    let client = self.client();
+    self.retrying(|| client.get_entry(path, want_ticket)).await
   }
 
   /// Resolve a path across all three worlds. The single place the order lives.
   async fn resolve_path(&self, path: &BytePath) -> Result<Resolved, GfsError> {
-    match self.overlay.resolve(path) {
+    match self.pinned().overlay.resolve(path) {
       Resolution::Overlay(entry) => {
         let base = entry.base.clone();
         Ok(Resolved {
@@ -393,7 +438,7 @@ impl Gfs {
       // replacement rather than an addition.
       Resolution::Absent => Ok(Resolved {
         node: None,
-        base: self.overlay.get(path).and_then(|entry| entry.base),
+        base: self.pinned().overlay.get(path).and_then(|entry| entry.base),
       }),
       Resolution::Base => {
         let entry = self.base_entry(path, false).await?;
@@ -414,6 +459,7 @@ impl Gfs {
     if parent.ino == ROOT_INO && name == GIT_DIR {
       return Ok(
         self
+          .pinned()
           .gitdir
           .get(&BytePath::new(GIT_DIR.to_vec()))
           .map(Node::Synth),
@@ -421,7 +467,7 @@ impl Gfs {
     }
     if parent.node.is_synth() {
       let path = parent.path.join(name);
-      return Ok(self.gitdir.get(&path).map(Node::Synth));
+      return Ok(self.pinned().gitdir.get(&path).map(Node::Synth));
     }
     Ok(self.resolve_path(&parent.path.join(name)).await?.node)
   }
@@ -441,17 +487,16 @@ impl Gfs {
 
   /// Every name the base has in a directory, paged to the end.
   async fn base_child_names(&self, dir: &BytePath) -> Result<Vec<Vec<u8>>, GfsError> {
-    if self.overlay.masks_base(dir) {
+    if self.pinned().overlay.masks_base(dir) {
       return Ok(Vec::new());
     }
     let mut names = Vec::new();
     let mut token = Vec::new();
+    let client = self.client();
     loop {
       let page = self
         .retrying(|| {
-          self
-            .client
-            .list_directory(dir, token.clone(), self.config.directory_page_size, false)
+          client.list_directory(dir, token.clone(), self.config.directory_page_size, false)
         })
         .await?;
       self.bump(|s| s.directory_pages += 1);
@@ -471,7 +516,7 @@ impl Gfs {
   /// Whether a directory is empty in the merged view.
   async fn merged_dir_is_empty(&self, dir: &BytePath) -> Result<bool, GfsError> {
     let names = self.base_child_names(dir).await?;
-    Ok(self.overlay.merged_dir_is_empty(dir, &names))
+    Ok(self.pinned().overlay.merged_dir_is_empty(dir, &names))
   }
 
   /// Every base descendant of a directory, for a rename that has to materialize
@@ -481,10 +526,10 @@ impl Gfs {
   /// fails before it has fetched a million directory pages rather than after.
   async fn base_descendants(&self, dir: &BytePath) -> Result<Vec<BaseDescendant>, GfsError> {
     let mut out = Vec::new();
-    if self.overlay.masks_base(dir) {
+    if self.pinned().overlay.masks_base(dir) {
       return Ok(out);
     }
-    let limit = self.overlay.config().max_rename_entries;
+    let limit = self.pinned().overlay.config().max_rename_entries;
     let mut queue = vec![BytePath::root()];
     while let Some(relative) = queue.pop() {
       let absolute = if relative.is_empty() {
@@ -493,10 +538,11 @@ impl Gfs {
         BytePath::new(join(dir.as_bytes(), relative.as_bytes()))
       };
       let mut token = Vec::new();
+      let client = self.client();
       loop {
         let page = self
           .retrying(|| {
-            self.client.list_directory(
+            client.list_directory(
               &absolute,
               token.clone(),
               self.config.directory_page_size,
@@ -549,16 +595,21 @@ impl Gfs {
         // The base listing is exhausted, so anything the overlay holds that the
         // base never named is appended now. Always last, so a child's offset
         // cannot move between two `readdir` calls on one handle.
-        for entry in self.overlay.extra_children(&state.path, &state.base_names) {
+        for entry in self
+          .pinned()
+          .overlay
+          .extra_children(&state.path, &state.base_names)
+        {
           state.children.push(Child::Overlay(Box::new(entry)));
         }
         state.complete = true;
         break;
       }
       let token = std::mem::take(&mut state.next_page_token);
+      let client = self.client();
       let page = self
         .retrying(|| {
-          self.client.list_directory(
+          client.list_directory(
             &state.path,
             token.clone(),
             self.config.directory_page_size,
@@ -570,7 +621,7 @@ impl Gfs {
       for entry in page.entries {
         let name = entry.path.file_name().unwrap_or_default().to_vec();
         state.base_names.insert(name.clone());
-        match self.overlay.resolve(&state.path.join(&name)) {
+        match self.pinned().overlay.resolve(&state.path.join(&name)) {
           Resolution::Absent => {}
           Resolution::Overlay(row) => state.children.push(Child::Overlay(row)),
           Resolution::Base => state.children.push(Child::Base(entry)),
@@ -608,10 +659,13 @@ impl Gfs {
         ));
       }
       let ticket = fresh.blob_ticket.unwrap_or_default();
-      let (cached, _) = self.cache.open_blob(&self.client, oid, &ticket).await?;
+      let (cached, _) = self
+        .cache
+        .open_blob(&self.pinned().client, oid, &ticket)
+        .await?;
       return open_cached(&cached);
     }
-    let (cached, _) = self.cache.open_blob(&self.client, oid, "").await?;
+    let (cached, _) = self.cache.open_blob(&self.pinned().client, oid, "").await?;
     open_cached(&cached)
   }
 
@@ -623,7 +677,7 @@ impl Gfs {
   /// away.
   async fn copy_up(&self, record: &Record, truncating: bool) -> Result<OverlayEntry, GfsError> {
     let path = record.path.clone();
-    let overlay = Arc::clone(&self.overlay);
+    let overlay = self.overlay();
     let ino = record.ino;
 
     // Already local: nothing to do, and nothing to fetch to find that out.
@@ -957,7 +1011,7 @@ impl Filesystem for GfsFilesystem {
             let Some(id) = entry.content.local_id() else {
               return reply.error(Errno::EIO);
             };
-            match fs.overlay.content_store().open_write(id) {
+            match fs.overlay().content_store().open_write(id) {
               Ok(file) => {
                 fs.republish(&record.path, entry);
                 FileState::Local {
@@ -975,7 +1029,7 @@ impl Filesystem for GfsFilesystem {
           }
         },
         Node::Overlay(entry) => match entry.content.local_id() {
-          Some(id) => match fs.overlay.content_store().open_read(id) {
+          Some(id) => match fs.overlay().content_store().open_read(id) {
             Ok(file) => FileState::Local {
               content_id: id,
               file: Arc::new(file),
@@ -1052,7 +1106,7 @@ impl Filesystem for GfsFilesystem {
       }
       // Git records exactly one permission bit, so that is the one this reads.
       let executable = mode & !umask & 0o111 != 0;
-      let overlay = Arc::clone(&fs.overlay);
+      let overlay = fs.overlay();
       let parent_base = Gfs::parent_base(&parent);
       let target = path.clone();
       let ino = fs.number_for(&path);
@@ -1070,7 +1124,7 @@ impl Filesystem for GfsFilesystem {
       let Some(id) = entry.content.local_id() else {
         return reply.error(Errno::EIO);
       };
-      let file = match fs.overlay.content_store().open_write(id) {
+      let file = match fs.overlay().content_store().open_write(id) {
         Ok(file) => file,
         Err(e) => return reply.error(errno_of_overlay(&e)),
       };
@@ -1188,7 +1242,7 @@ impl Filesystem for GfsFilesystem {
         // Not `EROFS`: the filesystem is writable, this descriptor is not.
         _ => return reply.error(Errno::EBADF),
       };
-      let overlay = Arc::clone(&fs.overlay);
+      let overlay = fs.overlay();
       let written =
         Gfs::blocking(move || overlay.write_content(content_id, &file, offset, &data)).await;
       match written {
@@ -1203,7 +1257,7 @@ impl Filesystem for GfsFilesystem {
           // file had when its name was removed, and a read through the same
           // descriptor stops short.
           if let Some(record) = fs.record(ino.0) {
-            match fs.overlay.get(&record.path) {
+            match fs.overlay().get(&record.path) {
               Some(entry) => {
                 fs.republish(&record.path, entry);
               }
@@ -1287,7 +1341,7 @@ impl Filesystem for GfsFilesystem {
         Some(FileState::Local { file, .. }) => Some(Arc::clone(file)),
         _ => None,
       };
-      let overlay = Arc::clone(&fs.overlay);
+      let overlay = fs.overlay();
       let result = tokio::task::spawn_blocking(move || {
         if let Some(file) = file {
           file
@@ -1315,7 +1369,7 @@ impl Filesystem for GfsFilesystem {
   ) {
     let fs = Arc::clone(&self.fs);
     self.spawn(async move {
-      let overlay = Arc::clone(&fs.overlay);
+      let overlay = fs.overlay();
       match tokio::task::spawn_blocking(move || overlay.sync()).await {
         Ok(Ok(())) => reply.ok(),
         Ok(Err(e)) => reply.error(errno_of_overlay(&e)),
@@ -1370,6 +1424,7 @@ impl Filesystem for GfsFilesystem {
       Node::Synth(SynthNode::Dir) => {
         state.children = self
           .fs
+          .pinned()
           .gitdir
           .children(&record.path)
           .into_iter()
@@ -1380,7 +1435,7 @@ impl Filesystem for GfsFilesystem {
       Node::Synth(SynthNode::File(_)) => return reply.error(Errno::ENOTDIR),
       Node::Overlay(entry) if entry.kind.is_dir() => {
         // A created directory shadows the base, so there is nothing to page.
-        state.base_done = self.fs.overlay.masks_base(&record.path);
+        state.base_done = self.fs.overlay().masks_base(&record.path);
       }
       Node::Overlay(_) => return reply.error(Errno::ENOTDIR),
       Node::Base(entry) => match entry.kind {
@@ -1393,7 +1448,12 @@ impl Filesystem for GfsFilesystem {
           // pages. Appending it last would require exhausting the listing before
           // the first entry could be emitted.
           if ino.0 == ROOT_INO {
-            if let Some(node) = self.fs.gitdir.get(&BytePath::new(GIT_DIR.to_vec())) {
+            if let Some(node) = self
+              .fs
+              .pinned()
+              .gitdir
+              .get(&BytePath::new(GIT_DIR.to_vec()))
+            {
               state.children.push(Child::Synth {
                 name: GIT_DIR.to_vec(),
                 node,
@@ -1612,7 +1672,7 @@ impl Filesystem for GfsFilesystem {
     // of gigabytes when its real budget is the per-job quota, and the failure
     // would arrive as a surprise `EDQUOT` in the middle of a link step.
     const BLOCK: u64 = 4096;
-    let stats = self.fs.overlay.stats();
+    let stats = self.fs.overlay().stats();
     let blocks = stats.quota_bytes / BLOCK;
     let used = stats.local_bytes.div_ceil(BLOCK).min(blocks);
     let free = blocks - used;
@@ -1689,7 +1749,7 @@ impl Filesystem for GfsFilesystem {
           Ok(_) => {}
           Err(e) => return reply.error(errno_of(&e)),
         }
-        let overlay = Arc::clone(&fs.overlay);
+        let overlay = fs.overlay();
         let path = record.path.clone();
         if let Err(e) = Gfs::blocking(move || overlay.truncate(&path, size)).await {
           return reply.error(errno_of_overlay(&e));
@@ -1697,7 +1757,7 @@ impl Filesystem for GfsFilesystem {
       }
 
       if let Some(mode) = mode {
-        let overlay = Arc::clone(&fs.overlay);
+        let overlay = fs.overlay();
         let path = record.path.clone();
         let base = base.clone();
         let ino = record.ino;
@@ -1714,7 +1774,7 @@ impl Filesystem for GfsFilesystem {
           fuser::TimeOrNow::SpecificTime(t) => Some(Timestamp::from_system_time(t)),
           fuser::TimeOrNow::Now => None,
         };
-        let overlay = Arc::clone(&fs.overlay);
+        let overlay = fs.overlay();
         let path = record.path.clone();
         let base = base.clone();
         let ino = record.ino;
@@ -1726,7 +1786,7 @@ impl Filesystem for GfsFilesystem {
 
       // Nothing asked for: `truncate`-less `utimensat`-less `chmod`-less
       // `setattr` still has to answer with the current attributes.
-      match fs.overlay.get(&record.path) {
+      match fs.overlay().get(&record.path) {
         Some(entry) => {
           let attr = fs.republish(&record.path, entry);
           reply.attr(&fs.config.ttl, &attr);
@@ -1762,7 +1822,7 @@ impl Filesystem for GfsFilesystem {
         Ok(resolved) => resolved,
         Err(e) => return reply.error(errno_of(&e)),
       };
-      let overlay = Arc::clone(&fs.overlay);
+      let overlay = fs.overlay();
       let parent_base = Gfs::parent_base(&parent);
       let target = path.clone();
       let ino = fs.number_for(&path);
@@ -1811,7 +1871,7 @@ impl Filesystem for GfsFilesystem {
         Ok(resolved) => resolved,
         Err(e) => return reply.error(errno_of(&e)),
       };
-      let overlay = Arc::clone(&fs.overlay);
+      let overlay = fs.overlay();
       let parent_base = Gfs::parent_base(&parent);
       let link_path = path.clone();
       let ino = fs.number_for(&path);
@@ -1946,11 +2006,11 @@ impl Filesystem for GfsFilesystem {
         return reply.error(errno_of(&e));
       }
       let wanted = offset.saturating_add(length);
-      let current = fs.overlay.get(&record.path).map(|e| e.size).unwrap_or(0);
+      let current = fs.overlay().get(&record.path).map(|e| e.size).unwrap_or(0);
       if wanted <= current {
         return reply.ok();
       }
-      let overlay = Arc::clone(&fs.overlay);
+      let overlay = fs.overlay();
       let path = record.path.clone();
       match Gfs::blocking(move || overlay.truncate(&path, wanted)).await {
         Ok(entry) => {
@@ -2018,7 +2078,7 @@ impl Gfs {
     } else {
       true
     };
-    let overlay = Arc::clone(&self.overlay);
+    let overlay = self.overlay();
     let target = path.clone();
     Self::blocking(move || overlay.remove(&target, resolved.base, expect_dir, empty))
       .await
@@ -2047,7 +2107,7 @@ impl Gfs {
     if parent.path.is_empty() || parent.node.is_synth() {
       return;
     }
-    let overlay = Arc::clone(&self.overlay);
+    let overlay = self.overlay();
     let path = parent.path.clone();
     let base = Gfs::parent_base(parent);
     let ino = parent.ino;
@@ -2131,7 +2191,7 @@ impl Gfs {
       true
     };
 
-    let overlay = Arc::clone(&self.overlay);
+    let overlay = self.overlay();
     let to_parent_base = Gfs::parent_base(&to_parent);
     let (from_path, to_path) = (from.clone(), to.clone());
     let from_base = source.base.clone();
@@ -2165,7 +2225,7 @@ impl Gfs {
       .expect("inode table")
       .rename_subtree(&from, &to);
     for (ino, path) in moved {
-      if let Some(entry) = self.overlay.get(&path) {
+      if let Some(entry) = self.pinned().overlay.get(&path) {
         self
           .inodes
           .lock()

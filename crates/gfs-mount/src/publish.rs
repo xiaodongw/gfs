@@ -7,97 +7,130 @@
 //! surface — so the later answer must not ripple into the filesystem code.
 //!
 //! This module is that step, and it is deliberately small. Everything above it
-//! knows only "make generation N visible at the workspace path".
+//! knows only two things: where the daemon should create its FUSE session, and
+//! how that session becomes reachable at the workspace path.
 //!
-//! # Why the local implementation is a symlink and not a bind mount
+//! # The workspace is the mount point
 //!
-//! `mount --bind` needs `CAP_SYS_ADMIN`. ADR 0003's whole argument is the
-//! privilege asymmetry: the daemon needs no capability where it runs, and the job
-//! needs none to use what the daemon produced. An unprivileged daemon therefore
-//! cannot bind-mount, and a symlink replaced by `rename(2)` gives the property
-//! `gfs refresh` actually needs:
+//! ADR 0003's second amendment removed the generation model, and with it the
+//! reason this module ever moved anything. A job's workspace is now the FUSE
+//! mount itself, so [`DirectMountPublisher::mountpoint`] *is* the workspace and
+//! [`MountPublisher::publish`] has nothing left to do. `gfs switch` re-points
+//! the filesystem underneath rather than swapping what the workspace resolves
+//! to, which is what makes a workspace behave like a Git working tree: the path
+//! a job is standing in stays the path it was standing in.
 //!
-//! * the swap is atomic, so no reader ever resolves a half-published path;
-//! * a path resolved *after* the swap reaches the new generation;
-//! * a descriptor opened *before* it keeps referring to the old one until closed.
+//! The seam survives the simplification because the reason for it was never the
+//! symlink. A privileged deployment still publishes differently:
 //!
-//! That is precisely PLAN.md M2.1's requirement that refresh expose only the old
-//! or the new generation and never a mixture.
+//! * `DirectMountPublisher` — mount at the workspace. Needs no capability, which
+//!   is ADR 0003's whole argument, and is what the local daemon uses.
+//! * a bind-mount or CSI publisher (M6.1, M7.4) — mount somewhere private, then
+//!   `move_mount(2)` it onto the workspace. Needs `CAP_SYS_ADMIN` where it runs;
+//!   the job still needs none.
 //!
-//! The bind-mount and CSI publishers replace this one implementation when M6.1
-//! and M7.4 need them.
+//! Those differ in exactly the two methods below, which is the seam doing its
+//! job.
 
 use std::path::{Path, PathBuf};
 
 use gfs_types::error::{ErrorCode, GfsError};
 
-/// How a mount generation becomes visible to the job.
+/// How a mount becomes visible to the job.
 pub trait MountPublisher: Send + Sync + std::fmt::Debug {
-  /// Make `generation` the workspace, replacing whatever was there atomically.
-  fn publish(&self, generation: &Path) -> Result<(), GfsError>;
-  /// Remove the workspace. Idempotent.
+  /// Where the daemon should create its FUSE session.
+  ///
+  /// Not necessarily the workspace: a privileged publisher mounts somewhere
+  /// private and moves it. The daemon creates this directory if it is absent.
+  fn mountpoint(&self) -> &Path;
+
+  /// Make the mount reachable at the workspace. Called once, after the session
+  /// is serving.
+  fn publish(&self) -> Result<(), GfsError>;
+
+  /// Make it unreachable again. Idempotent, and called before the unmount so a
+  /// read in flight sees a missing workspace rather than `ENOTCONN`.
   fn unpublish(&self) -> Result<(), GfsError>;
+
   /// The path the job sees.
   fn workspace(&self) -> &Path;
+
   /// A one-line description for `gfs inspect`, so an operator can tell which
   /// publication mechanism a mount is using without reading configuration.
   fn describe(&self) -> String;
 }
 
-/// Publishes by atomically replacing a symlink. The unprivileged local form.
+/// Mounts at the workspace itself. The unprivileged local form.
 #[derive(Clone, Debug)]
-pub struct SymlinkPublisher {
+pub struct DirectMountPublisher {
   workspace: PathBuf,
 }
 
-impl SymlinkPublisher {
-  /// Refuses a workspace path that is a real directory.
+impl DirectMountPublisher {
+  /// Refuses a workspace that exists and is not an empty directory.
   ///
-  /// A `rename(2)` over a directory fails, so publication would break on the
-  /// *second* generation rather than the first — a failure that appears only
-  /// during a refresh, which is the worst possible time to discover it.
+  /// Mounting over a populated directory succeeds and *hides* what was there,
+  /// which is a data-loss shape rather than an error: the files come back when
+  /// the job ends, having been invisible for its whole run. A symlink left by an
+  /// older build is removed rather than refused, so upgrading over an existing
+  /// lab directory does not need manual cleanup.
   pub fn new(workspace: PathBuf) -> Result<Self, GfsError> {
-    if let Ok(meta) = std::fs::symlink_metadata(&workspace) {
-      if !meta.file_type().is_symlink() {
+    match std::fs::symlink_metadata(&workspace) {
+      Ok(meta) if meta.file_type().is_symlink() => {
+        std::fs::remove_file(&workspace).map_err(|e| {
+          GfsError::internal(format!(
+            "removing the workspace symlink left by an older GFS: {}",
+            e.kind()
+          ))
+        })?;
+      }
+      Ok(meta) if meta.is_dir() => {
+        let empty = std::fs::read_dir(&workspace)
+          .map_err(|e| {
+            GfsError::internal(format!("reading the workspace directory: {}", e.kind()))
+          })?
+          .next()
+          .is_none();
+        if !empty {
+          return Err(GfsError::new(
+            ErrorCode::FailedPrecondition,
+            format!(
+              "{} is not empty; mounting over it would hide its contents for the life of \
+               the job",
+              workspace.display()
+            ),
+          ));
+        }
+      }
+      Ok(_) => {
         return Err(GfsError::new(
           ErrorCode::FailedPrecondition,
           format!(
-            "{} already exists and is not a symlink; the local publisher \
-             replaces a symlink atomically and cannot replace a directory",
+            "{} exists and is not a directory; a workspace is a mount point",
             workspace.display()
           ),
         ));
       }
+      Err(_) => {}
     }
-    Ok(SymlinkPublisher { workspace })
+    Ok(DirectMountPublisher { workspace })
   }
 }
 
-impl MountPublisher for SymlinkPublisher {
-  fn publish(&self, generation: &Path) -> Result<(), GfsError> {
-    let temporary = self
-      .workspace
-      .with_extension(format!("gfs-publish-{}", std::process::id()));
-    let _ = std::fs::remove_file(&temporary);
-    std::os::unix::fs::symlink(generation, &temporary)
-      .map_err(|e| GfsError::internal(format!("staging the workspace symlink: {}", e.kind())))?;
-    // The atomic step. A reader either resolves the old target or the new one.
-    std::fs::rename(&temporary, &self.workspace).map_err(|e| {
-      let _ = std::fs::remove_file(&temporary);
-      GfsError::internal(format!("publishing the workspace: {}", e.kind()))
-    })?;
+impl MountPublisher for DirectMountPublisher {
+  fn mountpoint(&self) -> &Path {
+    &self.workspace
+  }
+
+  /// Nothing to do: the session is already serving the workspace path.
+  fn publish(&self) -> Result<(), GfsError> {
     Ok(())
   }
 
+  /// Also nothing. The unmount is what makes the workspace unreachable, and
+  /// removing the directory here would race the session that is still on it.
   fn unpublish(&self) -> Result<(), GfsError> {
-    match std::fs::remove_file(&self.workspace) {
-      Ok(()) => Ok(()),
-      Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-      Err(e) => Err(GfsError::internal(format!(
-        "removing the workspace: {}",
-        e.kind()
-      ))),
-    }
+    Ok(())
   }
 
   fn workspace(&self) -> &Path {
@@ -105,7 +138,7 @@ impl MountPublisher for SymlinkPublisher {
   }
 
   fn describe(&self) -> String {
-    format!("symlink({})", self.workspace.display())
+    format!("direct({})", self.workspace.display())
   }
 }
 
@@ -114,62 +147,57 @@ mod tests {
   use super::*;
 
   #[test]
-  fn publication_is_atomic_and_swaps_generations() {
+  fn the_workspace_is_the_mount_point() {
     let tmp = tempfile::tempdir().unwrap();
-    let one = tmp.path().join("generations/1");
-    let two = tmp.path().join("generations/2");
-    std::fs::create_dir_all(&one).unwrap();
-    std::fs::create_dir_all(&two).unwrap();
-    std::fs::write(one.join("marker"), b"one").unwrap();
-    std::fs::write(two.join("marker"), b"two").unwrap();
-
     let workspace = tmp.path().join("ws");
-    let publisher = SymlinkPublisher::new(workspace.clone()).unwrap();
-
-    publisher.publish(&one).unwrap();
-    assert_eq!(std::fs::read(workspace.join("marker")).unwrap(), b"one");
-
-    // Replacing an existing publication must work, not fail with EEXIST.
-    publisher.publish(&two).unwrap();
-    assert_eq!(std::fs::read(workspace.join("marker")).unwrap(), b"two");
-
+    let publisher = DirectMountPublisher::new(workspace.clone()).unwrap();
+    assert_eq!(publisher.mountpoint(), workspace);
+    assert_eq!(publisher.workspace(), workspace);
+    // Both are no-ops, and both are idempotent, because job cleanup runs more
+    // than once and startup must not depend on ordering that no longer exists.
+    publisher.publish().unwrap();
+    publisher.publish().unwrap();
     publisher.unpublish().unwrap();
-    assert!(!workspace.exists());
-    // Idempotent: job cleanup runs more than once.
     publisher.unpublish().unwrap();
   }
 
   #[test]
-  fn a_descriptor_opened_before_the_swap_still_reads_the_old_generation() {
-    // The property `gfs refresh` depends on: open handles keep their generation.
-    use std::io::Read;
+  fn an_empty_directory_is_accepted_and_a_populated_one_is_refused() {
     let tmp = tempfile::tempdir().unwrap();
-    let one = tmp.path().join("generations/1");
-    let two = tmp.path().join("generations/2");
-    std::fs::create_dir_all(&one).unwrap();
-    std::fs::create_dir_all(&two).unwrap();
-    std::fs::write(one.join("f"), b"old").unwrap();
-    std::fs::write(two.join("f"), b"new").unwrap();
+    let empty = tmp.path().join("empty");
+    std::fs::create_dir(&empty).unwrap();
+    DirectMountPublisher::new(empty).unwrap();
 
-    let workspace = tmp.path().join("ws");
-    let publisher = SymlinkPublisher::new(workspace.clone()).unwrap();
-    publisher.publish(&one).unwrap();
-
-    let mut open = std::fs::File::open(workspace.join("f")).unwrap();
-    publisher.publish(&two).unwrap();
-
-    let mut old = String::new();
-    open.read_to_string(&mut old).unwrap();
-    assert_eq!(old, "old", "an open descriptor keeps its generation");
-    assert_eq!(std::fs::read(workspace.join("f")).unwrap(), b"new");
+    let populated = tmp.path().join("populated");
+    std::fs::create_dir(&populated).unwrap();
+    std::fs::write(populated.join("work.txt"), b"not mine to hide").unwrap();
+    let e = DirectMountPublisher::new(populated).unwrap_err();
+    assert_eq!(e.code, ErrorCode::FailedPrecondition);
   }
 
   #[test]
-  fn a_real_directory_is_refused_at_construction_not_at_the_first_refresh() {
+  fn a_symlink_from_an_older_build_is_cleaned_up_rather_than_refused() {
+    // Upgrading over a lab directory created by the generation-model build must
+    // not require the operator to know that the layout changed.
+    let tmp = tempfile::tempdir().unwrap();
+    let target = tmp.path().join("generations/1");
+    std::fs::create_dir_all(&target).unwrap();
+    let workspace = tmp.path().join("ws");
+    std::os::unix::fs::symlink(&target, &workspace).unwrap();
+
+    DirectMountPublisher::new(workspace.clone()).unwrap();
+    assert!(
+      std::fs::symlink_metadata(&workspace).is_err(),
+      "the stale symlink is gone, leaving the path free to be a mount point"
+    );
+  }
+
+  #[test]
+  fn a_regular_file_at_the_workspace_is_refused() {
     let tmp = tempfile::tempdir().unwrap();
     let workspace = tmp.path().join("ws");
-    std::fs::create_dir(&workspace).unwrap();
-    let e = SymlinkPublisher::new(workspace).unwrap_err();
+    std::fs::write(&workspace, b"").unwrap();
+    let e = DirectMountPublisher::new(workspace).unwrap_err();
     assert_eq!(e.code, ErrorCode::FailedPrecondition);
   }
 }

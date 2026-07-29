@@ -465,11 +465,16 @@ Duration: 3–4 weeks
   a synthesized read-only `HEAD`, `packed-refs`, `config`, and `gfs.json`, excluded
   from search, status, diff, export, and hydration accounting; verify mount
   ownership and `safe.directory` behavior under the bind-mount.
-- Implement `gfs refresh` for a clean workspace only by creating a second mount
-  generation and atomically replacing the bind mount. Do not mutate the pinned base
-  under existing long-lived kernel dentries. Keep the old generation and its lease
-  until old file and directory handles close, then tear it down. Refuse with a clear
-  error when the overlay is non-empty; three-way refresh stays out of scope.
+- Implement `gfs refresh` for a clean workspace only. Refuse with a clear error when
+  the overlay is non-empty; three-way refresh stays out of scope.
+  > **Superseded by ADR 0003's second amendment (2026-07-28).** The original task
+  > said to create a second mount generation and atomically replace the bind mount,
+  > and never to mutate the pinned base under existing kernel dentries. That model
+  > shipped and was withdrawn: a symlinked workspace makes `getcwd(2)` report the
+  > generation directory, so any tool that resolves its own working directory ends
+  > up in a generation the next refresh retires. A refresh now re-pins the live
+  > filesystem in place and invalidates the kernel's dentries, which is what
+  > `git switch` does.
 
 ### M2.2 Metadata and inode model
 
@@ -527,8 +532,10 @@ Exit criteria:
   tooling that probes for a repository root working against the `.git` surface.
 - Base timestamps are stable across remounts and hosts and do not confuse the
   selected build systems, including with future-dated commits and clock skew.
-- Refresh exposes only the old or new mount generation; open old-generation handles
-  remain valid until close and no kernel-cached path mixes generations.
+- A refresh re-pins in place: the workspace path is unchanged, a working directory
+  inside it stays valid, open handles keep reading what they opened, and a path the
+  kernel had cached reads the new commit's bytes. (Restated by ADR 0003's second
+  amendment; the original criterion was generation isolation.)
 - Daemon or server failure does not corrupt the shared cache.
 
 ## 6. M3 — Writable overlay and export ✅ COMPLETE

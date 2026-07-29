@@ -283,6 +283,60 @@ impl InodeTable {
     }
   }
 
+  /// Re-point the table at another commit's root, and report what the kernel
+  /// must be told to forget.
+  ///
+  /// `by_path` is left completely alone. DESIGN.md section 8.2 promises a path
+  /// keeps its inode number for the life of the *mount*, and a re-pin does not
+  /// end the mount — `gfs switch` is the same mount looking at a different
+  /// commit, exactly as `git switch` is. Renumbering here would reintroduce the
+  /// stale-`(device, inode)`-hit hazard that section is about.
+  ///
+  /// Records are also left alone, and that is deliberate rather than lazy. The
+  /// kernel still holds a dentry for each one; dropping the record first would
+  /// make the `getattr` it is entitled to send next answer `ESTALE` for a file
+  /// that exists perfectly well on the new commit. Instead the caller
+  /// invalidates the returned paths, the kernel drops the dentries and sends
+  /// `forget`, and the records leave through the door they normally leave by.
+  /// The next access is a fresh `lookup` resolved against the new commit.
+  ///
+  /// Only the root is rewritten in place, because nothing ever invalidates it:
+  /// inode 1 is never forgotten, so it would otherwise keep describing the tree
+  /// the mount was created with.
+  ///
+  /// The result is `(parent inode, name)` pairs rather than paths because that
+  /// is what `FUSE_NOTIFY_INVAL_ENTRY` takes, and resolving a parent path to its
+  /// number needs `by_path` — which lives here and nowhere else.
+  pub fn repin(&mut self, root: TreeEntryInfo) -> Vec<(u64, Vec<u8>)> {
+    if let Some(record) = self.records.get_mut(&ROOT_INO) {
+      record.node = Node::Base(root);
+    }
+    let paths: Vec<BytePath> = self
+      .records
+      .values()
+      .filter(|record| record.ino != ROOT_INO)
+      .map(|record| record.path.clone())
+      .collect();
+    paths
+      .into_iter()
+      .filter_map(|path| {
+        let bytes = path.as_bytes();
+        let (parent, name) = match bytes.iter().rposition(|b| *b == b'/') {
+          Some(slash) => (&bytes[..slash], &bytes[slash + 1..]),
+          None => (&bytes[..0], bytes),
+        };
+        if name.is_empty() {
+          return None;
+        }
+        // A child is only ever numbered by a lookup through its parent, so the
+        // parent is numbered too. `filter_map` rather than `expect` because a
+        // missing parent is a reason to invalidate less, never to abort a switch.
+        let parent_ino = *self.by_path.get(parent)?;
+        Some((parent_ino, name.to_vec()))
+      })
+      .collect()
+  }
+
   /// Live records. Reported by `gfs inspect`, and the number that would grow
   /// without bound if `forget` were ignored.
   pub fn live(&self) -> usize {
