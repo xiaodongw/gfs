@@ -431,6 +431,7 @@ impl Mount {
       health: current.monitor.health(),
       stats: self.fs.stats(),
       cache: self.cache.stats(),
+      budget: self.fs.budget_report(),
       live_inodes: self.fs.inode_counts().0,
       assigned_inodes: self.fs.inode_counts().1,
     }

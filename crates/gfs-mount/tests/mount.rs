@@ -619,3 +619,79 @@ async fn an_unmounted_path_is_empty_rather_than_stale() {
     "the mount point is a plain empty directory again"
   );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_spent_hydration_budget_refuses_the_open_with_edquot() {
+  // ADR 0009's enforcement property, end to end through real syscalls: the
+  // configuration that keeps a workspace cheap is overridable per invocation, so
+  // the budget at the filesystem is the only limit a sweep cannot bypass. The
+  // refusal must land on `open` -- a refusal per `read` makes `grep -r` print one
+  // error per file and keep walking.
+  let backend = Backend::start("basic").await;
+  let mount = Mount::with_config(
+    &backend,
+    "main",
+    FsConfig {
+      // Fits README.md ("# basic\n", 8 bytes) and nothing after it.
+      hydration_budget_bytes: 10,
+      ..FsConfig::default()
+    },
+  )
+  .await;
+
+  let readme = mount.join("README.md");
+  let main_rs = mount.join("src/main.rs");
+  let (first, denied) = on_fs(move || {
+    let first = std::fs::read(&readme).expect("the first small file fits the budget");
+    let denied = std::fs::File::open(&main_rs).expect_err("the budget is spent");
+    (first, denied)
+  })
+  .await;
+
+  assert_eq!(first, b"# basic\n");
+  assert_eq!(
+    denied.raw_os_error(),
+    Some(libc::EDQUOT),
+    "EDQUOT, chosen for its strerror -- EIO would read as a corrupt filesystem: {denied:?}"
+  );
+
+  let report = mount.fs.budget_report();
+  assert_eq!(report.refusals, 1, "{report:?}");
+  assert_eq!(report.charged_bytes, 8, "{report:?}");
+  assert_eq!(
+    mount.fs.cache_stats().fetches,
+    1,
+    "the refused blob was never downloaded: an EDQUOT issued after the fetch \
+     has already spent what it was meant to protect"
+  );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_budget_charges_a_blob_once_and_cached_reads_stay_free() {
+  // Section 8.4 limits *new remote hydration* while preserving cached access. A
+  // budget that counted every read would refuse a job for the cache's eviction
+  // behaviour rather than its own appetite.
+  let backend = Backend::start("basic").await;
+  let mount = Mount::with_config(
+    &backend,
+    "main",
+    FsConfig {
+      hydration_budget_bytes: 10,
+      ..FsConfig::default()
+    },
+  )
+  .await;
+
+  let path = mount.join("README.md");
+  let p = path.clone();
+  on_fs(move || std::fs::read(&p).unwrap()).await;
+  // Well past the limit if re-reads were charged: 8 bytes x 5.
+  for _ in 0..4 {
+    let p = path.clone();
+    on_fs(move || std::fs::read(&p).expect("a cached read is free")).await;
+  }
+
+  let report = mount.fs.budget_report();
+  assert_eq!(report.charged_bytes, 8, "{report:?}");
+  assert_eq!(report.refusals, 0, "{report:?}");
+}

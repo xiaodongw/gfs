@@ -37,6 +37,13 @@ struct Args {
 
   #[arg(long, env = "GFS_TOKEN", hide_env_values = true, default_value = "")]
   token: String,
+
+  /// Bytes a job may hydrate from the server before reads fail with EDQUOT.
+  /// 0 disables the budget. Mandatory-by-default per ADR 0009: the Git
+  /// configuration that keeps a workspace cheap is overridable per invocation,
+  /// so this is the only enforcement a mount actually has.
+  #[arg(long, env = "GFS_HYDRATION_BUDGET", default_value_t = FsConfig::default().hydration_budget_bytes)]
+  hydration_budget: u64,
 }
 
 #[tokio::main]
@@ -55,7 +62,10 @@ async fn main() -> Result<()> {
     http_endpoint: args.http_endpoint,
     token: args.token,
     lease_policy: LeasePolicy::adr_0006(),
-    fs: FsConfig::default(),
+    fs: FsConfig {
+      hydration_budget_bytes: args.hydration_budget,
+      ..FsConfig::default()
+    },
   };
 
   let (host, listener) =

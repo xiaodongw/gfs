@@ -33,6 +33,7 @@
 
 pub mod attr;
 pub mod blobs;
+pub mod budget;
 pub mod cache;
 pub mod client;
 pub mod control;

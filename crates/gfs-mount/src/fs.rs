@@ -80,6 +80,10 @@ pub struct FsConfig {
   pub directory_page_size: u32,
   /// Attempts for a retryable failure, including the first.
   pub attempts: u32,
+  /// Bytes a job may hydrate from the server before reads are refused with
+  /// `EDQUOT`. Zero is unlimited. See [`crate::budget`] for why this is
+  /// mandatory rather than opt-in.
+  pub hydration_budget_bytes: u64,
 }
 
 impl Default for FsConfig {
@@ -96,6 +100,14 @@ impl Default for FsConfig {
       negative_ttl: Duration::from_secs(1),
       directory_page_size: gfs_types::limits::DEFAULT_DIRECTORY_PAGE_SIZE as u32,
       attempts: 3,
+      // 1 GiB, on by default, which is the point of ADR 0009: a budget that has
+      // to be switched on is not enforcement. The number is chosen from
+      // `spikes/reports/m05b-git-projection.md` to sit between the two behaviours
+      // it has to tell apart -- a full re-hash of the Linux kernel's working tree
+      // is 1 540 MiB and trips it, while every measured well-behaved command is
+      // orders of magnitude below it. Retune from real jobs (PLAN.md M6.2); do not
+      // turn it off to make a workload fit.
+      hydration_budget_bytes: 1 << 30,
     }
   }
 }
@@ -112,6 +124,8 @@ pub struct FsStats {
   pub read_bytes: u64,
   pub writes: u64,
   pub written_bytes: u64,
+  /// Reads refused because the job's hydration budget was spent.
+  pub hydration_refusals: u64,
   pub copy_ups: u64,
   pub copy_up_bytes: u64,
   pub errors: u64,
@@ -231,6 +245,9 @@ pub struct Gfs {
   files: Mutex<HashMap<u64, Arc<FileState>>>,
   next_handle: AtomicU64,
   stats: Mutex<FsStats>,
+  /// Deliberately not inside [`Pinned`]: a re-pin changes which commit the job is
+  /// looking at and does not refund what it has already spent.
+  budget: crate::budget::HydrationBudget,
 }
 
 impl std::fmt::Debug for Gfs {
@@ -252,6 +269,7 @@ impl Gfs {
     config: FsConfig,
   ) -> Arc<Self> {
     let snapshot_time = client.binding().snapshot_time;
+    let budget = crate::budget::HydrationBudget::new(config.hydration_budget_bytes);
     let mut inodes = InodeTable::new(root);
     // The numbers a previous process handed out, before any new one is issued.
     inodes.seed(&overlay.entries());
@@ -270,6 +288,7 @@ impl Gfs {
       files: Mutex::new(HashMap::new()),
       next_handle: AtomicU64::new(1),
       stats: Mutex::new(FsStats::default()),
+      budget,
     })
   }
 
@@ -303,6 +322,11 @@ impl Gfs {
 
   pub fn stats(&self) -> FsStats {
     *self.stats.lock().expect("fs stats")
+  }
+
+  /// What the hydration budget has admitted and refused.
+  pub fn budget_report(&self) -> crate::budget::BudgetReport {
+    self.budget.report()
   }
 
   /// The stable sanitized time every base entry reports.
@@ -657,6 +681,20 @@ impl Gfs {
         return Err(GfsError::internal(
           "the server returned a different blob for a pinned path",
         ));
+      }
+      // The budget is charged here and nowhere else, because this is the only
+      // place bytes cross the network for a base blob -- and it runs inside
+      // `open`, which is where ADR 0009 requires the refusal to land. Admitting
+      // *before* the fetch is the whole point: an `EDQUOT` issued after the
+      // download has already spent what it was meant to protect.
+      if let Err(e) = self.budget.admit(oid, fresh.size) {
+        self.bump(|s| s.hydration_refusals += 1);
+        tracing::warn!(
+          path = ?path,
+          size = fresh.size,
+          "hydration budget refused a read: {e}"
+        );
+        return Err(e);
       }
       let ticket = fresh.blob_ticket.unwrap_or_default();
       let (cached, _) = self

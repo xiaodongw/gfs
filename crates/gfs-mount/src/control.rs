@@ -178,6 +178,10 @@ pub struct MountReport {
   pub health: LeaseHealth,
   pub stats: crate::fs::FsStats,
   pub cache: crate::cache::CacheStats,
+  /// The hydration budget's ledger (ADR 0009). `refusals > 0` is the first thing
+  /// to check when a job reports `EDQUOT`.
+  #[serde(default)]
+  pub budget: crate::budget::BudgetReport,
   pub live_inodes: usize,
   pub assigned_inodes: usize,
 }

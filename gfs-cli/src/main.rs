@@ -892,6 +892,25 @@ fn print_report(report: &gfs_mount::control::MountReport) {
     "hydration  {} blobs, {} bytes, {} cache hits",
     report.cache.fetches, report.cache.bytes_fetched, report.cache.hits
   );
+  // The budget line names the remedy, because the EDQUOT the job saw could not
+  // (a FUSE reply is an errno, with no room for prose -- ADR 0009).
+  if report.budget.limit_bytes > 0 {
+    println!(
+      "budget     {} of {} bytes used ({} unique blobs), {} refusals",
+      report.budget.charged_bytes,
+      report.budget.limit_bytes,
+      report.budget.unique_blobs,
+      report.budget.refusals
+    );
+    if report.budget.refusals > 0 {
+      println!(
+        "           reads failed with EDQUOT: prefer `gfs rg` and `gfs find` over \
+         scanning the tree, or raise the host's --hydration-budget"
+      );
+    }
+  } else {
+    println!("budget     unlimited");
+  }
   // The overlay line answers the two questions an operator actually has about a
   // running job: has it changed anything, and how close is it to its quota.
   println!(
