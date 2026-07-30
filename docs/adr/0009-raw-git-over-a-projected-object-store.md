@@ -285,3 +285,45 @@ semantics (`A  added.txt` for any new file). Stock Git reports `?? added.txt`
 until `git add`, and `git ls-files` keeps listing a deleted-but-unstaged file.
 The rewritten tests assert Git's behaviour, because Git's behaviour is the
 compatibility this ADR buys.
+
+## Amendment, 2026-07-30: the recorded gaps, closed
+
+The 2026-07-29 build left four gaps, recorded in its plan file. All four are
+now built, and two of them changed shape on contact with the code.
+
+**The residency budget is implemented, as SLRU rather than plain LRU.** The
+two-budgets table above stands: opt-in (`--odb-residency-budget`, default off),
+bytes held, evict-and-refetch, never refuse. The scan-resistance requirement —
+a streaming `blame` must not flush a build's working set — is what forced the
+segmented policy: single-touch blocks never leave probation, so protected
+blocks survive a one-pass scan of any size. Eviction clears the presence bit
+and punches a hole in the sparse file, in that order, under the same lock that
+marks presence; blocks of an in-flight read are pinned. The refetch/unique
+ratio this ADR names as the thrash signal is counted and surfaced in
+`gfs status`.
+
+**`grep`/`find` got their degrade rule.** A second shim (`gfs-scan-shim`,
+installed as `grep`, `find`, and `rg`) advises on stderr — naming `gfs rg` and
+`git ls-files` and the budget that will otherwise price the sweep — then execs
+the real tool. Output is never substituted; outside a GFS workspace it is
+silent. `grep` is only nagged when a recursive flag is present.
+
+**`git push` to the gateway exists, confined to the pusher's own namespace.**
+Receive-pack runs as a sandboxed child like upload-pack, with one policy fetch
+does not have: `receive.hideRefs=refs/` followed by `!refs/gfs/work/<subject>`
+(Git checks the list back to front), plus a pre-spawn command check for a
+legible refusal. The mirror's `refs/heads/*` stays upstream's — written by
+fetch, never by push. `receive.autogc` is off, because a post-receive gc could
+repack away files live projections reference. The workspace's seeded `.git`
+carries an `origin` push refspec mapping `refs/heads/*` into the caller's work
+subtree (the root travels in `CreateMountResponse`), and a credential helper
+reading `GFS_TOKEN` at push time — the token is not written to disk.
+`CommitChanges` stays for API callers.
+
+**Per-job odb attribution moved up a layer instead of into the store.** The
+projection is shared, so the store cannot know which job read; a pid lookup at
+read time is racy and was already rejected. Each workspace now mounts its own
+*view* — a second small FUSE mount over the same shared block store — and its
+`objects/info/alternates` names the view, so which-mountpoint-was-read is the
+job identity. Blocks and residency stay shared; only the counting is per view.
+`gfs status` reports both the repository's traffic and this job's share.

@@ -401,6 +401,16 @@ pub fn is_valid_branch_name(name: &str) -> bool {
 /// `/`, a space, or an `@` -- none of which can appear in this position without
 /// changing the ref's shape.
 pub fn work_ref(subject: &str, branch: &str) -> String {
+  format!("{}/{branch}", work_ref_root(subject))
+}
+
+/// The root of one subject's work-branch namespace, without a trailing slash.
+///
+/// This is the boundary `git push` to the gateway is confined to: the
+/// receive-pack surface un-hides exactly this subtree for the authenticated
+/// caller, so the shape here *is* the push authorization boundary and must stay
+/// in lockstep with [`work_ref`].
+pub fn work_ref_root(subject: &str) -> String {
   let mut folded = String::with_capacity(subject.len());
   let mut last_was_sep = false;
   for c in subject.chars() {
@@ -418,7 +428,7 @@ pub fn work_ref(subject: &str, branch: &str) -> String {
   } else {
     folded
   };
-  format!("{RESERVED_REF_PREFIX}work/{owner}/{branch}")
+  format!("{RESERVED_REF_PREFIX}work/{owner}")
 }
 
 /// The lease anchor ref name for a mount (DESIGN.md section 7.1).

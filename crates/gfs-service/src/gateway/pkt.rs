@@ -74,6 +74,31 @@ pub fn decode(mut data: &[u8]) -> Result<Vec<Packet>, GfsError> {
   Ok(out)
 }
 
+/// Decode the pkt-line section that precedes the first flush packet.
+///
+/// A receive-pack request body is pkt-framed only up to the flush: the packfile
+/// follows as raw bytes, so [`decode`] over the whole body would report the
+/// pack's first bytes as broken framing. The command section is what the
+/// gateway validates; the pack is the child's to parse.
+pub fn decode_until_flush(mut data: &[u8]) -> Result<Vec<Packet>, GfsError> {
+  let mut out = Vec::new();
+  while data.len() >= 4 {
+    let Some((packet, consumed)) = decode_one(data)? else {
+      return Err(GfsError::new(
+        ErrorCode::InvalidArgument,
+        "truncated pkt-line",
+      ));
+    };
+    let done = matches!(packet, Packet::Flush);
+    out.push(packet);
+    if done {
+      return Ok(out);
+    }
+    data = &data[consumed..];
+  }
+  Ok(out)
+}
+
 /// Decode the packet at the head of `data`, returning it and the bytes consumed.
 ///
 /// `Ok(None)` means the framing is valid but the buffer ends mid-packet, so more
@@ -111,6 +136,11 @@ fn decode_one(data: &[u8]) -> Result<Option<(Packet, usize)>, GfsError> {
 #[derive(Debug)]
 pub struct AdvertisementScanner {
   hidden: Vec<String>,
+  /// Prefixes inside the hidden namespace that are legitimate in *this*
+  /// advertisement. Receive-pack advertises the authenticated caller's own
+  /// work-branch subtree, which lives under `refs/gfs/`; the scanner still
+  /// aborts on any other appearance of the hidden namespace.
+  allowed: Vec<String>,
   pending: Vec<u8>,
 }
 
@@ -118,8 +148,15 @@ impl AdvertisementScanner {
   pub fn new(hidden_prefixes: &[String]) -> Self {
     AdvertisementScanner {
       hidden: hidden_prefixes.to_vec(),
+      allowed: Vec::new(),
       pending: Vec::new(),
     }
+  }
+
+  /// Permit one subtree of the hidden namespace to appear.
+  pub fn allowing(mut self, prefix: &str) -> Self {
+    self.allowed.push(prefix.to_owned());
+    self
   }
 
   /// Accept a chunk, returning the prefix that has been fully scanned.
@@ -165,7 +202,21 @@ impl AdvertisementScanner {
   /// effectively as a ref line.
   fn check(&self, payload: &[u8]) -> Result<(), GfsError> {
     for prefix in &self.hidden {
-      if contains(payload, prefix.as_bytes()) {
+      // Every occurrence of a hidden prefix must be the start of an allowed
+      // subtree; one that is not is a leak, wherever in the line it appears.
+      let needle = prefix.as_bytes();
+      if needle.is_empty() || payload.len() < needle.len() {
+        continue;
+      }
+      let all_allowed = (0..=payload.len() - needle.len())
+        .filter(|&i| &payload[i..i + needle.len()] == needle)
+        .all(|i| {
+          self
+            .allowed
+            .iter()
+            .any(|a| payload[i..].starts_with(a.as_bytes()))
+        });
+      if !all_allowed {
         return Err(GfsError::new(
           ErrorCode::PermissionDenied,
           "the ref advertisement contained a reserved namespace; refusing to serve it",
@@ -174,17 +225,6 @@ impl AdvertisementScanner {
     }
     Ok(())
   }
-}
-
-/// Substring search over bytes.
-///
-/// Naive on purpose: the needles are ref prefixes of a dozen bytes and the
-/// haystack is one pkt-line, so a specialized searcher would add a dependency to
-/// the trust boundary for an unmeasurable gain.
-fn contains(haystack: &[u8], needle: &[u8]) -> bool {
-  !needle.is_empty()
-    && haystack.len() >= needle.len()
-    && haystack.windows(needle.len()).any(|w| w == needle)
 }
 
 #[cfg(test)]

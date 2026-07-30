@@ -9,8 +9,16 @@ use gfs_mount::odb::{OdbClient, OdbProjection};
 use gfs_test::mount::{Backend, TOKEN};
 
 async fn projected(backend: &Backend, root: &tempfile::TempDir) -> std::sync::Arc<OdbProjection> {
+  projected_with_limit(backend, root, 0).await
+}
+
+async fn projected_with_limit(
+  backend: &Backend,
+  root: &tempfile::TempDir,
+  residency_limit: u64,
+) -> std::sync::Arc<OdbProjection> {
   let client = OdbClient::new(&backend.http, TOKEN, backend.repo_id.clone());
-  OdbProjection::mount(client, root.path())
+  OdbProjection::mount(client, root.path(), residency_limit)
     .await
     .expect("mount the odb projection")
 }
@@ -121,6 +129,55 @@ async fn a_second_read_is_served_from_cached_blocks() {
   assert_eq!(
     second.blocks_fetched, first.blocks_fetched,
     "the same question must not fetch again"
+  );
+  projection.unmount();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_residency_limit_evicts_and_refetches_instead_of_refusing() {
+  let backend = Backend::start("basic").await;
+  let root = tempfile::tempdir().unwrap();
+  // One byte: every block admitted is over the limit, so every unpinned block
+  // is evicted as soon as its read releases it. The most adversarial setting,
+  // and the only one guaranteed to trip on a fixture of any size.
+  let projection = projected_with_limit(&backend, &root, 1).await;
+  let head = head_of(&backend);
+  let gitdir = agent_git(root.path(), &projection.mountpoint, &head);
+
+  let (ok, first_log) = git(&gitdir, &["log", "--oneline"]);
+  assert!(ok, "{first_log}");
+  let first = projection.store.stats();
+  assert!(
+    first.evicted_blocks > 0,
+    "a walk over the limit must evict; stats {first:?}"
+  );
+
+  // The same question again: answered correctly, never refused. (The kernel's
+  // page cache may serve it without reaching the store at all — KEEP_CACHE
+  // holds true bytes, so an eviction underneath it is invisible, which is
+  // exactly why eviction is safe to run while a mount is live.)
+  let (ok, second_log) = git(&gitdir, &["log", "--oneline"]);
+  assert!(ok, "{second_log}");
+  assert_eq!(first_log, second_log, "eviction must not change any answer");
+
+  // Refetch accounting, asserted below the page cache: reading two files
+  // through the store alternately, with a limit of one byte, means the second
+  // read of the first file finds its blocks evicted and fetches them again.
+  let listing = projection.store.listing();
+  let (a, _) = listing.first().expect("the fixture has objects");
+  let (b, _) = listing.last().expect("the fixture has objects");
+  assert_ne!(a, b, "the fixture has at least two files");
+  projection.store.read(a, 0, 64).await.expect("read a");
+  projection
+    .store
+    .read(b, 0, 64)
+    .await
+    .expect("read b evicts a");
+  projection.store.read(a, 0, 64).await.expect("read a again");
+  let second = projection.store.stats();
+  assert!(
+    second.refetched_blocks > 0,
+    "evicted blocks read again must count as refetches; stats {second:?}"
   );
   projection.unmount();
 }

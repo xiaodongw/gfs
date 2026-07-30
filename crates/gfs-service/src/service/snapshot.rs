@@ -926,6 +926,7 @@ impl SnapshotService for SnapshotApi {
           mount_capability: grant.capability.clone(),
           lease_expiry: Some(grant.lease_expiry.into()),
           heartbeat_interval_seconds: grant.heartbeat_interval.as_secs(),
+          work_ref_root: gfs_types::revision::work_ref_root(ctx.identity.subject.as_str()),
         };
         self.finish(
           Action::CreateMount,

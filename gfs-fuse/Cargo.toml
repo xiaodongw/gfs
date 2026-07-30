@@ -21,6 +21,12 @@ path = "src/bin/gfs-fuse.rs"
 name = "gfs-git-shim"
 path = "src/bin/gfs-git-shim.rs"
 
+# The `grep`/`find`/`rg` shim: ADR 0009's degrade rule. Same reasoning as the
+# `git` shim for living here: no server client, no credential.
+[[bin]]
+name = "gfs-scan-shim"
+path = "src/bin/gfs-scan-shim.rs"
+
 [[bin]]
 name = "gfs-fsmonitor"
 path = "src/bin/gfs-fsmonitor.rs"

@@ -189,9 +189,23 @@ The gateway pushes outward to the real Git server with **your** credential
 (`--credential`, or `GFS_UPSTREAM_CREDENTIAL`), so upstream sees you and not the
 service. `refs/gfs/work/<you>/<branch>` is mapped to `refs/heads/<branch>` there.
 
-Pushing *to* the gateway with stock `git push` is still refused, deliberately —
-this is the mirror acting as a Git client against the real server, not the
-gateway accepting a push.
+### `git push` (to the gateway)
+
+Stock `git push` works from inside a workspace: local commits leave as a pack
+through the gateway's receive-pack surface. The seeded `.git` carries an
+`origin` remote whose push refspec maps `refs/heads/*` into your own
+`refs/gfs/work/<you>/*` namespace — the only subtree the gateway accepts
+updates for — and a credential helper that reads `GFS_TOKEN` from your
+environment at push time.
+
+```sh
+git commit -m "local work"
+git push origin main      # lands at refs/gfs/work/<you>/main on the gateway
+```
+
+A push to `refs/heads/*` or any other namespace is refused by name: the branch
+namespace mirrors upstream and is written by fetch. `gfs push` above is still
+how a work branch continues outward to the real Git server.
 
 ## The server-answered tools
 

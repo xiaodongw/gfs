@@ -97,6 +97,11 @@ pub struct GitDirFacts {
   /// had to call the server would need the mount capability, which would put a
   /// credential in a `PATH`-installed convenience wrapper.
   pub commit_meta: Option<CommitMeta>,
+  /// The caller's push namespace (`refs/gfs/work/<subject>`, no trailing
+  /// slash), from `CreateMount`. What the seeded `origin` push refspec maps
+  /// local branches into; `None` on servers that predate the field, which
+  /// seeds no remote and leaves `gfs push` as the only push path.
+  pub work_ref_root: Option<String>,
 }
 
 #[derive(Debug)]
@@ -283,6 +288,7 @@ mod tests {
       http_endpoint: "http://127.0.0.1:8430".to_owned(),
       generation: 1,
       commit_meta: None,
+      work_ref_root: Some("refs/gfs/work/job-owner".to_owned()),
     }
   }
 
@@ -495,6 +501,24 @@ pub fn seed_git_dir(spec: &SeedSpec<'_>) -> Result<(), gfs_types::error::GfsErro
      [maintenance]\n\
      \tauto = false\n",
   );
+  if let Some(work_root) = &facts.work_ref_root {
+    // The push path (ADR 0009's receive-pack surface). Local branches map into
+    // the caller's own work namespace -- the only subtree the gateway accepts
+    // updates for -- so a plain `git push origin <branch>` works without the
+    // agent knowing the namespace exists. The credential helper reads the
+    // job's own GFS_TOKEN at push time; the token itself is never written to
+    // disk here.
+    config.push_str(&format!(
+      "[remote \"origin\"]\n\
+       \turl = {url}/v1/repos/{repository}\n\
+       \tfetch = +refs/heads/*:refs/remotes/origin/*\n\
+       \tpush = refs/heads/*:{work_root}/*\n\
+       [credential]\n\
+       \thelper = \"!f() {{ echo username=x-access-token; echo password=$GFS_TOKEN; }}; f\"\n",
+      url = facts.http_endpoint.trim_end_matches('/'),
+      repository = facts.repository_id.as_str(),
+    ));
+  }
   config.push_str(&format!(
     "[gfs]\n\
      \trepository = {repository}\n\

@@ -184,6 +184,14 @@ pub struct MountReport {
   /// to check when a job reports `EDQUOT`.
   #[serde(default)]
   pub budget: crate::budget::BudgetReport,
+  /// The shared odb projection's counters (ADR 0009). Shared per repository,
+  /// so these are the repository's traffic on this host, not this job's; the
+  /// refetch counters are residency mode's thrash signal.
+  #[serde(default)]
+  pub odb: crate::odb::OdbStats,
+  /// This workspace's own share of the odb traffic, counted at its view mount.
+  #[serde(default)]
+  pub odb_job: crate::odb::OdbViewStats,
   pub live_inodes: usize,
   pub assigned_inodes: usize,
 }

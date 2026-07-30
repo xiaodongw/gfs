@@ -12,13 +12,17 @@
 //! * [`upload_pack`] is everything the gateway decides *about the child*: its
 //!   executable, arguments, working directory, environment, configuration, and
 //!   resource limits. Nothing user-supplied reaches any of them.
+//! * [`receive_pack`] is the same contract for the push direction, plus the one
+//!   policy fetch does not have: ref updates are confined to the caller's own
+//!   work namespace.
 //! * [`pkt`] is the only place the gateway looks at Git's wire bytes, and it
-//!   does so for exactly two reasons that cannot be delegated to the child: the
-//!   exact partial-clone filter, and the reserved `refs/gfs/` namespace.
+//!   does so for exactly three reasons that cannot be delegated to the child:
+//!   the exact partial-clone filter, the reserved `refs/gfs/` namespace, and
+//!   the push command list.
 //! * this file is the HTTP surface: routing, credentials, the version-dependent
 //!   framing, bounded request bodies, and streamed responses.
 //!
-//! # Two routes, and the framing difference between them
+//! # The fetch routes, and the framing difference between them
 //!
 //! `GET .../info/refs?service=git-upload-pack` runs
 //! `upload-pack --http-backend-info-refs`, which emits **only** the
@@ -54,6 +58,7 @@
 //! do not write an acceptance test that expects the Git path to deny it.
 
 pub mod pkt;
+pub mod receive_pack;
 pub mod upload_pack;
 
 use std::sync::Arc;
@@ -74,6 +79,7 @@ use crate::auth::{Authorizer, Identity};
 use crate::observability::{self, RequestId};
 use crate::registry::Registry;
 
+pub use receive_pack::ReceivePack;
 pub use upload_pack::{
   FilterPolicy, GitProtocol, Mode, ResourceLimits, UploadPack, UploadPackPolicy,
 };
@@ -82,12 +88,16 @@ pub use upload_pack::{
 /// back to the dumb protocol when it does not match.
 const ADVERTISEMENT_TYPE: &str = "application/x-git-upload-pack-advertisement";
 const RESULT_TYPE: &str = "application/x-git-upload-pack-result";
+const RECEIVE_ADVERTISEMENT_TYPE: &str = "application/x-git-receive-pack-advertisement";
+const RECEIVE_RESULT_TYPE: &str = "application/x-git-receive-pack-result";
 
 /// Metric action labels. The two routes are separated because their latencies
 /// are unrelated -- an advertisement is milliseconds and a clone is minutes --
 /// and one histogram over both would describe neither.
 const METRIC_ADVERTISE: &str = "git_advertise";
 const METRIC_RPC: &str = "git_upload_pack";
+const METRIC_RECEIVE_ADVERTISE: &str = "git_receive_advertise";
+const METRIC_RECEIVE_RPC: &str = "git_receive_pack";
 
 /// Chunks in flight between the child and the socket.
 ///
@@ -148,6 +158,10 @@ pub fn router(state: GatewayState) -> Router {
     .route(
       "/v1/repos/{repository_id}/git-upload-pack",
       post(upload_pack_rpc),
+    )
+    .route(
+      "/v1/repos/{repository_id}/git-receive-pack",
+      post(receive_pack_rpc),
     )
     // The cap applies to the compressed body; `decompress_body` caps what it may
     // expand to. Both are needed: neither bound implies the other.
@@ -267,25 +281,26 @@ async fn info_refs(
   let rid = request_id(&headers);
   let started = std::time::Instant::now();
 
-  let prepared = async {
-    // Dumb HTTP is not served at all. A missing or unknown `service` is refused
-    // rather than falling through, because the fallback exposes the object
-    // directory as static files and bypasses every check in this module.
-    match query.service.as_str() {
-      "git-upload-pack" => {}
-      "git-receive-pack" => {
-        return Err(GfsError::new(
-          ErrorCode::PermissionDenied,
-          "this repository is read-only over Git; push is not supported",
-        ))
-      }
-      _ => {
-        return Err(GfsError::new(
+  // Dumb HTTP is not served at all. A missing or unknown `service` is refused
+  // rather than falling through, because the fallback exposes the object
+  // directory as static files and bypasses every check in this module.
+  match query.service.as_str() {
+    "git-upload-pack" => {}
+    "git-receive-pack" => return receive_info_refs(state, repository_id, headers, rid).await,
+    _ => {
+      return fail(
+        METRIC_ADVERTISE,
+        &GfsError::new(
           ErrorCode::InvalidArgument,
-          "only service=git-upload-pack is supported",
-        ))
-      }
+          "only service=git-upload-pack and service=git-receive-pack are supported",
+        ),
+        &rid,
+        started,
+      )
     }
+  }
+
+  let prepared = async {
     let (identity, repo_id, repo_path) = resolve(&state, &repository_id, &headers).await?;
     let pack = UploadPack::new(&repo_path, (*state.policy).clone())?;
     Ok((identity, repo_id, pack))
@@ -319,7 +334,9 @@ async fn info_refs(
     preamble,
     // Scanned: an advertisement is pkt-lines of ref names and never carries
     // object content, so a reserved-namespace check here cannot false-positive.
-    true,
+    Some(pkt::AdvertisementScanner::new(
+      &state.policy.hidden_ref_prefixes,
+    )),
     &rid,
   )
   .await
@@ -341,6 +358,69 @@ async fn info_refs(
 
   let mut response = (StatusCode::OK, body).into_response();
   git_response_headers(response.headers_mut(), ADVERTISEMENT_TYPE, &rid);
+  response
+}
+
+/// `GET /info/refs?service=git-receive-pack`: the push advertisement.
+///
+/// Always the v0 preamble — receive-pack has no protocol v2 to omit it for.
+/// The scanner permits exactly the caller's own work subtree, which is the one
+/// part of the reserved namespace this advertisement legitimately shows.
+async fn receive_info_refs(
+  state: GatewayState,
+  repository_id: String,
+  headers: HeaderMap,
+  rid: RequestId,
+) -> Response {
+  let started = std::time::Instant::now();
+
+  let prepared = async {
+    let (identity, repo_id, repo_path) = resolve(&state, &repository_id, &headers).await?;
+    let work_root = gfs_types::revision::work_ref_root(identity.subject.as_str());
+    let pack = ReceivePack::new(&repo_path, (*state.policy).clone(), work_root)?;
+    Ok((identity, repo_id, pack))
+  }
+  .await;
+
+  let (identity, repo_id, pack) = match prepared {
+    Ok(v) => v,
+    Err(e) => return fail(METRIC_RECEIVE_ADVERTISE, &e, &rid, started),
+  };
+
+  let mut preamble = pkt::pkt_line(b"# service=git-receive-pack\n");
+  preamble.extend_from_slice(pkt::FLUSH_PKT);
+
+  let scanner =
+    pkt::AdvertisementScanner::new(&state.policy.hidden_ref_prefixes).allowing(pack.work_root());
+  let body = match stream_child(
+    &state,
+    &pack,
+    GitProtocol::V0,
+    Mode::Advertise,
+    None,
+    preamble,
+    Some(scanner),
+    &rid,
+  )
+  .await
+  {
+    Ok(body) => body,
+    Err(e) => return fail(METRIC_RECEIVE_ADVERTISE, &e, &rid, started),
+  };
+
+  audit::success(
+    Action::GitPush,
+    &AuditRecord {
+      subject: Some(&identity.subject),
+      repository_id: Some(&repo_id),
+      request_id: Some(rid.as_str()),
+      ..Default::default()
+    },
+  );
+  observability::record_request(METRIC_RECEIVE_ADVERTISE, None, started.elapsed());
+
+  let mut response = (StatusCode::OK, body).into_response();
+  git_response_headers(response.headers_mut(), RECEIVE_ADVERTISEMENT_TYPE, &rid);
   response
 }
 
@@ -391,7 +471,7 @@ async fn upload_pack_rpc(
     Vec::new(),
     // Never scanned: this response carries a packfile, whose bytes are
     // arbitrary repository content. See the note in `pkt`.
-    false,
+    None,
     &rid,
   )
   .await
@@ -417,8 +497,137 @@ async fn upload_pack_rpc(
 }
 
 // ---------------------------------------------------------------------------
+// POST /git-receive-pack
+// ---------------------------------------------------------------------------
+
+async fn receive_pack_rpc(
+  State(state): State<GatewayState>,
+  Path(repository_id): Path<String>,
+  headers: HeaderMap,
+  body: Bytes,
+) -> Response {
+  let rid = request_id(&headers);
+  let started = std::time::Instant::now();
+
+  let prepared = async {
+    let (identity, repo_id, repo_path) = resolve(&state, &repository_id, &headers).await?;
+    let work_root = gfs_types::revision::work_ref_root(identity.subject.as_str());
+    let pack = ReceivePack::new(&repo_path, (*state.policy).clone(), work_root)?;
+
+    // Decompress, then confine the ref updates to the caller's work subtree,
+    // then -- and only then -- spawn. The hideRefs configuration enforces the
+    // same boundary inside the child; this check is the one that produces a
+    // legible audit entry.
+    let request = if header_str(&headers, header::CONTENT_ENCODING.as_str())
+      .is_some_and(|v| v.eq_ignore_ascii_case("gzip"))
+    {
+      upload_pack::decompress(&state.policy, &body)?
+    } else {
+      body.to_vec()
+    };
+    pack.validate_commands(&request)?;
+    Ok((identity, repo_id, pack, request))
+  }
+  .await;
+
+  let (identity, repo_id, pack, request) = match prepared {
+    Ok(v) => v,
+    Err(e) => return fail(METRIC_RECEIVE_RPC, &e, &rid, started),
+  };
+
+  let body = match stream_child(
+    &state,
+    &pack,
+    GitProtocol::V0,
+    Mode::StatelessRpc,
+    Some(request),
+    Vec::new(),
+    // Never scanned: the report-status stream quotes client ref names, and the
+    // caller's own work refs are reserved-namespace by construction.
+    None,
+    &rid,
+  )
+  .await
+  {
+    Ok(body) => body,
+    Err(e) => return fail(METRIC_RECEIVE_RPC, &e, &rid, started),
+  };
+
+  audit::success(
+    Action::GitPush,
+    &AuditRecord {
+      subject: Some(&identity.subject),
+      repository_id: Some(&repo_id),
+      request_id: Some(rid.as_str()),
+      ..Default::default()
+    },
+  );
+  observability::record_request(METRIC_RECEIVE_RPC, None, started.elapsed());
+
+  let mut response = (StatusCode::OK, body).into_response();
+  git_response_headers(response.headers_mut(), RECEIVE_RESULT_TYPE, &rid);
+  response
+}
+
+// ---------------------------------------------------------------------------
 // Streaming
 // ---------------------------------------------------------------------------
+
+/// The child-wrapper surface the pump needs, written once for both directions.
+///
+/// `UploadPack` and `ReceivePack` differ in what they validate and configure —
+/// that stays in their own modules — but a child streaming pkt-lines through a
+/// bounded channel is the same machine either way.
+trait GitService: Clone + Send + Sync + 'static {
+  fn spawn_child(
+    &self,
+    protocol: GitProtocol,
+    mode: Mode,
+  ) -> Result<tokio::process::Child, GfsError>;
+  fn policy(&self) -> &UploadPackPolicy;
+  fn redact(&self, stderr: &str) -> String;
+  /// The child's name in log lines.
+  fn name(&self) -> &'static str;
+}
+
+impl GitService for UploadPack {
+  fn spawn_child(
+    &self,
+    protocol: GitProtocol,
+    mode: Mode,
+  ) -> Result<tokio::process::Child, GfsError> {
+    self.spawn(protocol, mode)
+  }
+  fn policy(&self) -> &UploadPackPolicy {
+    self.policy()
+  }
+  fn redact(&self, stderr: &str) -> String {
+    self.redact(stderr)
+  }
+  fn name(&self) -> &'static str {
+    "upload-pack"
+  }
+}
+
+impl GitService for ReceivePack {
+  fn spawn_child(
+    &self,
+    _protocol: GitProtocol,
+    mode: Mode,
+  ) -> Result<tokio::process::Child, GfsError> {
+    // Receive-pack has no protocol v2; the child never sees GIT_PROTOCOL.
+    self.spawn(mode)
+  }
+  fn policy(&self) -> &UploadPackPolicy {
+    self.policy()
+  }
+  fn redact(&self, stderr: &str) -> String {
+    self.redact(stderr)
+  }
+  fn name(&self) -> &'static str {
+    "receive-pack"
+  }
+}
 
 /// Spawn the child and turn its stdout into a response body.
 ///
@@ -430,12 +639,12 @@ async fn upload_pack_rpc(
 #[allow(clippy::too_many_arguments)]
 async fn stream_child(
   state: &GatewayState,
-  pack: &UploadPack,
+  pack: &impl GitService,
   protocol: GitProtocol,
   mode: Mode,
   stdin_bytes: Option<Vec<u8>>,
   preamble: Vec<u8>,
-  scan_advertisement: bool,
+  scanner: Option<pkt::AdvertisementScanner>,
   rid: &RequestId,
 ) -> Result<Body, GfsError> {
   // Admission before spawn. `try_acquire_owned` rather than `acquire`: a client
@@ -450,7 +659,7 @@ async fn stream_child(
       )
     })?;
 
-  let mut child = pack.spawn(protocol, mode)?;
+  let mut child = pack.spawn_child(protocol, mode)?;
   let mut stdout = child
     .stdout
     .take()
@@ -495,7 +704,6 @@ async fn stream_child(
     tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(STREAM_CHANNEL_DEPTH);
 
   let limits = pack.policy().limits.clone();
-  let hidden = pack.policy().hidden_ref_prefixes.clone();
   let pack_for_log = pack.clone();
   let rid_owned = rid.clone();
 
@@ -504,7 +712,7 @@ async fn stream_child(
     // task ends -- including when it ends because the client hung up.
     let _permit = permit;
     let deadline = tokio::time::Instant::now() + limits.wall_clock;
-    let mut scanner = scan_advertisement.then(|| pkt::AdvertisementScanner::new(&hidden));
+    let mut scanner = scanner;
     let mut sent: u64 = 0;
 
     if !preamble.is_empty() && tx.send(Ok(preamble.into())).await.is_err() {
@@ -585,11 +793,11 @@ async fn stream_child(
         request_id = %rid_owned,
         status = ?status,
         stderr = %pack_for_log.redact(stderr.trim()),
-        "upload-pack failed"
+        "{} failed", pack_for_log.name()
       );
       let message = match outcome {
         Err(e) => e.to_string(),
-        Ok(()) => "upload-pack exited non-zero".to_owned(),
+        Ok(()) => format!("{} exited non-zero", pack_for_log.name()),
       };
       // An error item truncates the response body, which every Git client
       // reports as a failed transfer. Silently ending the stream would let a
@@ -603,13 +811,13 @@ async fn stream_child(
   let Some(first) = rx.recv().await else {
     return Err(GfsError::new(
       ErrorCode::Unavailable,
-      "upload-pack produced no output",
+      format!("{} produced no output", pack.name()),
     ));
   };
   let first = first.map_err(|e| {
     GfsError::new(
       ErrorCode::Unavailable,
-      format!("upload-pack failed: {}", e.kind()),
+      format!("{} failed: {}", pack.name(), e.kind()),
     )
   })?;
 

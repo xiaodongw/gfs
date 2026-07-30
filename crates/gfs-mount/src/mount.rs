@@ -264,10 +264,14 @@ pub struct Mount {
   /// to know which ref to advance.
   work_branch: Mutex<Option<String>>,
   cache: Arc<BlobCache>,
-  /// The per-repository object-database projection this workspace borrows
-  /// through `objects/info/alternates`. Held so the projection outlives every
-  /// workspace that references it (ADR 0009).
+  /// The per-repository object-database projection this workspace borrows.
+  /// Held so the projection outlives every workspace that references it
+  /// (ADR 0009).
   odb: Arc<crate::odb::OdbProjection>,
+  /// This workspace's own window onto the shared store. `objects/info/
+  /// alternates` names the view's mountpoint rather than the shared one, so
+  /// odb traffic is attributed to this job by construction.
+  odb_view: Arc<crate::odb::OdbView>,
   publisher: Box<dyn MountPublisher>,
   /// The filesystem, created once and re-pointed by every switch. Outlives every
   /// [`Pin`], which is what makes the workspace path stable.
@@ -328,10 +332,14 @@ impl Mount {
     // file deleted, which is wrong -- so it fails the mount instead.
     let git_dir_path = config.state_dir.join("git");
     let index = odb.client.commit_index(&resolved.pin.commit).await?;
+    // The workspace's own view of the shared store (per-job odb attribution).
+    // In the state directory, so its lifetime and cleanup follow the mount's.
+    let odb_view =
+      crate::odb::OdbView::mount(Arc::clone(&odb.store), &config.state_dir.join("odb"))?;
     crate::gitdir::seed_git_dir(&crate::gitdir::SeedSpec {
       git_dir: &git_dir_path,
       workspace: &config.workspace,
-      odb_mountpoint: &odb.mountpoint,
+      odb_mountpoint: &odb_view.mountpoint,
       facts: &resolved.facts,
       index: Some(&index),
     })?;
@@ -357,6 +365,7 @@ impl Mount {
     let mount = Arc::new(Mount {
       cache,
       odb,
+      odb_view,
       publisher,
       fs,
       session: Mutex::new(Some(session)),
@@ -454,6 +463,8 @@ impl Mount {
       stats: self.fs.stats(),
       cache: self.cache.stats(),
       budget: self.fs.budget_report(),
+      odb: self.odb.store.stats(),
+      odb_job: self.odb_view.stats(),
       live_inodes: self.fs.inode_counts().0,
       assigned_inodes: self.fs.inode_counts().1,
     }
@@ -629,7 +640,7 @@ impl Mount {
     crate::gitdir::seed_git_dir(&crate::gitdir::SeedSpec {
       git_dir: &git_dir_path,
       workspace: &self.config.workspace,
-      odb_mountpoint: &self.odb.mountpoint,
+      odb_mountpoint: &self.odb_view.mountpoint,
       facts: &resolved.facts,
       index: Some(&index),
     })?;
@@ -1357,6 +1368,9 @@ impl Mount {
     if let Some(session) = session {
       unmount_session(session, mountpoint.clone()).await;
     }
+    // The view holds no state of its own; unmounted after the workspace so no
+    // job read can land on a dead alternates path while the mount still serves.
+    self.odb_view.unmount();
     let (client, monitor) = {
       let current = self.current.lock().expect("current pin");
       (Arc::clone(&current.client), Arc::clone(&current.monitor))
@@ -1681,6 +1695,7 @@ async fn resolve_pin(config: &MountSpec, selector: &str, epoch: u64) -> Result<R
     http_endpoint: config.http_endpoint.clone(),
     generation: epoch,
     commit_meta,
+    work_ref_root: (!grant.work_ref_root.is_empty()).then(|| grant.work_ref_root.clone()),
   };
 
   // One overlay per pin, in its own directory. The binding check inside

@@ -69,6 +69,12 @@ pub struct HostConfig {
   pub token: String,
   pub lease_policy: LeasePolicy,
   pub fs: FsConfig,
+  /// Bytes each repository's odb projection may hold on local disk before it
+  /// evicts and re-fetches (ADR 0009's residency budget). Zero — the default —
+  /// is unbounded: the budget exists for small disks and is opt-in, unlike the
+  /// hydration budget, because eviction degrades to slowness rather than
+  /// refusal and a host with disk to spare should not pay re-fetches for it.
+  pub odb_residency_bytes: u64,
 }
 
 /// Where a host listens when nobody says otherwise.
@@ -358,7 +364,8 @@ impl MountHost {
     // second concurrent asker at worst mounts a duplicate that drops on insert.
     let client = crate::odb::OdbClient::new(http_endpoint, token, repository_id.clone());
     let root = cache_dir.join(repository_id.as_str()).join("odb");
-    let projection = crate::odb::OdbProjection::mount(client, &root).await?;
+    let projection =
+      crate::odb::OdbProjection::mount(client, &root, self.config.odb_residency_bytes).await?;
     let mut odbs = self.odbs.lock().expect("odb projections");
     if let Some(existing) = odbs.get(&key).and_then(Weak::upgrade) {
       return Ok(existing);

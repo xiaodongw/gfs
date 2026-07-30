@@ -441,32 +441,7 @@ impl UploadPack {
   /// ratio cap apply, and the reader is `take`-bounded so the cap is enforced
   /// during inflation rather than after it.
   pub fn decompress_body(&self, body: &[u8]) -> Result<Vec<u8>, GfsError> {
-    use std::io::Read;
-    let limit = self.policy.max_decompressed_bytes;
-    let mut out = Vec::new();
-    let mut decoder = flate2::read::GzDecoder::new(body).take(limit as u64 + 1);
-    decoder.read_to_end(&mut out).map_err(|e| {
-      GfsError::new(
-        ErrorCode::InvalidArgument,
-        format!("malformed gzip request body: {e}"),
-      )
-    })?;
-    if out.len() > limit {
-      return Err(GfsError::new(
-        ErrorCode::ResourceLimit,
-        format!("gzip request body exceeded the {limit} byte output limit"),
-      ));
-    }
-    if !body.is_empty() && out.len() / body.len() > self.policy.max_decompression_ratio {
-      return Err(GfsError::new(
-        ErrorCode::ResourceLimit,
-        format!(
-          "gzip request body exceeded the {}:1 expansion ratio",
-          self.policy.max_decompression_ratio
-        ),
-      ));
-    }
-    Ok(out)
+    decompress(&self.policy, body)
   }
 
   /// Redact anything about the server's filesystem out of a child's stderr.
@@ -486,6 +461,40 @@ impl UploadPack {
   }
 }
 
+/// Decompress a `Content-Encoding: gzip` request body under explicit bounds.
+///
+/// A free function because both directions of the gateway need it and the
+/// bounds are the policy's, not the service's. See [`UploadPack::decompress_body`]
+/// for why both caps exist.
+pub fn decompress(policy: &UploadPackPolicy, body: &[u8]) -> Result<Vec<u8>, GfsError> {
+  use std::io::Read;
+  let limit = policy.max_decompressed_bytes;
+  let mut out = Vec::new();
+  let mut decoder = flate2::read::GzDecoder::new(body).take(limit as u64 + 1);
+  decoder.read_to_end(&mut out).map_err(|e| {
+    GfsError::new(
+      ErrorCode::InvalidArgument,
+      format!("malformed gzip request body: {e}"),
+    )
+  })?;
+  if out.len() > limit {
+    return Err(GfsError::new(
+      ErrorCode::ResourceLimit,
+      format!("gzip request body exceeded the {limit} byte output limit"),
+    ));
+  }
+  if !body.is_empty() && out.len() / body.len() > policy.max_decompression_ratio {
+    return Err(GfsError::new(
+      ErrorCode::ResourceLimit,
+      format!(
+        "gzip request body exceeded the {}:1 expansion ratio",
+        policy.max_decompression_ratio
+      ),
+    ));
+  }
+  Ok(out)
+}
+
 /// Which of the two upload-pack invocations to run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
@@ -496,7 +505,7 @@ pub enum Mode {
 }
 
 /// `prlimit`, if util-linux is installed.
-fn prlimit_path() -> Option<&'static str> {
+pub(crate) fn prlimit_path() -> Option<&'static str> {
   use std::sync::OnceLock;
   static FOUND: OnceLock<Option<&'static str>> = OnceLock::new();
   *FOUND.get_or_init(|| {

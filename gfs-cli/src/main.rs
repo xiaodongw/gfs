@@ -598,6 +598,10 @@ fn shim_binary() -> PathBuf {
   sibling_binary("gfs-git-shim", "GFS_GIT_SHIM")
 }
 
+fn scan_shim_binary() -> PathBuf {
+  sibling_binary("gfs-scan-shim", "GFS_SCAN_SHIM")
+}
+
 /// The daemon's plan as the wire's changes.
 ///
 /// Paths and content travel base64url over the control socket because that is a
@@ -898,6 +902,29 @@ fn print_report(report: &gfs_mount::control::MountReport) {
   } else {
     println!("budget     unlimited");
   }
+  // The odb line is per repository on this host, not per job -- the projection
+  // is shared. The refetch figure is residency mode's thrash signal: a large
+  // refetched/fetched ratio means the residency budget is smaller than the
+  // working set and the job is slow for that reason, not stuck.
+  if report.odb.residency_limit_bytes > 0 {
+    println!(
+      "odb        {} bytes fetched, {} of {} bytes resident, {} blocks evicted, {} bytes refetched",
+      report.odb.bytes_fetched,
+      report.odb.resident_bytes,
+      report.odb.residency_limit_bytes,
+      report.odb.evicted_blocks,
+      report.odb.refetched_bytes
+    );
+  } else {
+    println!(
+      "odb        {} bytes fetched, {} bytes resident (no residency limit)",
+      report.odb.bytes_fetched, report.odb.resident_bytes
+    );
+  }
+  println!(
+    "           this job: {} bytes fetched, {} block hits",
+    report.odb_job.bytes_fetched, report.odb_job.block_hits
+  );
   // The overlay line answers the two questions an operator actually has about a
   // running job: has it changed anything, and how close is it to its quota.
   println!(
@@ -1487,6 +1514,26 @@ async fn main() -> Result<()> {
       let _ = std::fs::remove_file(&link);
       std::os::unix::fs::symlink(&shim, &link)
         .with_context(|| format!("linking {}", link.display()))?;
+
+      // The scan shim (ADR 0009's grep/find degrade rule) under each name it
+      // dispatches on. Its absence is not an error: an image built without it
+      // still has a working `git`, and the budget prices sweeps either way.
+      let scan_shim = scan_shim_binary();
+      if scan_shim.is_file() {
+        let scan_shim = std::path::absolute(&scan_shim).unwrap_or(scan_shim);
+        for name in ["grep", "find", "rg"] {
+          let link = bin_dir.join(name);
+          let _ = std::fs::remove_file(&link);
+          std::os::unix::fs::symlink(&scan_shim, &link)
+            .with_context(|| format!("linking {}", link.display()))?;
+        }
+      } else {
+        eprintln!(
+          "gfs: {} not found; `grep`/`find`/`rg` keep their stock behaviour \
+           (set GFS_SCAN_SHIM to its path to install the degrade notes)",
+          scan_shim.display()
+        );
+      }
 
       println!("{}", bin_dir.display());
       eprintln!("prepend that directory to PATH so `git` resolves to the shim first");

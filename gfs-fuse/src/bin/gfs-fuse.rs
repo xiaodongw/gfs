@@ -44,6 +44,14 @@ struct Args {
   /// so this is the only enforcement a mount actually has.
   #[arg(long, env = "GFS_HYDRATION_BUDGET", default_value_t = FsConfig::default().hydration_budget_bytes)]
   hydration_budget: u64,
+
+  /// Bytes each repository's odb projection may hold on local disk before it
+  /// evicts and re-fetches instead of growing (ADR 0009's residency budget).
+  /// 0 — the default — is unbounded; set it on hosts whose disk is smaller
+  /// than the repositories they mount. Eviction degrades to re-fetching, never
+  /// to refusal.
+  #[arg(long, env = "GFS_ODB_RESIDENCY_BUDGET", default_value_t = 0)]
+  odb_residency_budget: u64,
 }
 
 #[tokio::main]
@@ -66,6 +74,7 @@ async fn main() -> Result<()> {
       hydration_budget_bytes: args.hydration_budget,
       ..FsConfig::default()
     },
+    odb_residency_bytes: args.odb_residency_budget,
   };
 
   let (host, listener) =

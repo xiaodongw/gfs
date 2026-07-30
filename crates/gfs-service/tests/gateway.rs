@@ -277,21 +277,19 @@ async fn the_v0_advertisement_carries_the_service_preamble_and_v2_does_not() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn only_the_upload_pack_service_is_served() {
+async fn only_the_two_smart_services_are_served() {
   let fx = start(&[("r-git", "basic")]).await;
-  // Push is refused with a status a client can act on, rather than a 404 that
-  // reads as "no such repository".
+  // Dumb HTTP is not served at all: falling through would expose the object
+  // directory as static files and bypass every check in the gateway. An
+  // unknown service is refused the same way.
+  let (status, _, _) = http_get(&format!("{}/info/refs", fx.url("r-git")), OWNER_TOKEN, None).await;
+  assert_eq!(status, 400);
   let (status, _, _) = http_get(
-    &format!("{}/info/refs?service=git-receive-pack", fx.url("r-git")),
+    &format!("{}/info/refs?service=git-annex", fx.url("r-git")),
     OWNER_TOKEN,
     None,
   )
   .await;
-  assert_eq!(status, 403);
-
-  // Dumb HTTP is not served at all: falling through would expose the object
-  // directory as static files and bypass every check in the gateway.
-  let (status, _, _) = http_get(&format!("{}/info/refs", fx.url("r-git")), OWNER_TOKEN, None).await;
   assert_eq!(status, 400);
 }
 
@@ -1194,6 +1192,188 @@ async fn every_configured_git_client_version_clones() {
       assert_eq!(tree_of(&checkout), tree_of(&direct), "{binary} v{version}");
       eprintln!("ok   {binary} protocol v{version}");
     }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Push: receive-pack confined to the caller's work namespace
+// ---------------------------------------------------------------------------
+
+/// The work-ref root the fixture's owner token folds to.
+const OWNER_WORK_ROOT: &str = "refs/gfs/work/job-owner";
+
+/// A ref's value in the served bare repository, straight off the filesystem.
+fn server_ref(fx: &Fixture, name: &str) -> Option<String> {
+  let out = git_client(
+    &["-C", fx.repo_path.to_str().unwrap(), "rev-parse", name],
+    None,
+  );
+  out.status.success().then(|| stdout(&out).trim().to_owned())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_push_lands_in_the_callers_work_namespace_and_is_fsck_clean() {
+  let fx = start(&[("r-git", "basic")]).await;
+  let tmp = tempfile::tempdir().unwrap();
+  let clone = clone_and_verify(&fx, &[], tmp.path());
+
+  // A local commit, the way a workspace's real `.git` produces one.
+  std::fs::write(clone.join("pushed.txt"), "pushed through the gateway\n").unwrap();
+  let out = git_client(&["-C", clone.to_str().unwrap(), "add", "pushed.txt"], None);
+  assert!(out.status.success(), "{}", stderr(&out));
+  let out = Command::new("git")
+    .env("GIT_CONFIG_GLOBAL", "/dev/null")
+    .env("GIT_CONFIG_SYSTEM", "/dev/null")
+    .env("GIT_AUTHOR_NAME", "a")
+    .env("GIT_AUTHOR_EMAIL", "a@example.com")
+    .env("GIT_COMMITTER_NAME", "a")
+    .env("GIT_COMMITTER_EMAIL", "a@example.com")
+    .args([
+      "-C",
+      clone.to_str().unwrap(),
+      "commit",
+      "-q",
+      "-m",
+      "local work",
+    ])
+    .output()
+    .unwrap();
+  assert!(out.status.success(), "{}", stderr(&out));
+
+  let out = git_client(
+    &[
+      "-C",
+      clone.to_str().unwrap(),
+      "push",
+      "-q",
+      "origin",
+      &format!("HEAD:{OWNER_WORK_ROOT}/feature"),
+    ],
+    Some(OWNER_TOKEN),
+  );
+  assert!(out.status.success(), "push failed: {}", stderr(&out));
+
+  // The ref exists on the server at exactly the pushed commit, and the
+  // repository survives fsck with the pushed objects in it.
+  let local = git_client(&["-C", clone.to_str().unwrap(), "rev-parse", "HEAD"], None);
+  let pushed = server_ref(&fx, &format!("{OWNER_WORK_ROOT}/feature"));
+  assert_eq!(pushed.as_deref(), Some(stdout(&local).trim()));
+  fsck_clean(&fx.repo_path);
+
+  // A second push of the same branch fast-forwards through the CAS the
+  // advertisement provides.
+  std::fs::write(clone.join("pushed.txt"), "amended\n").unwrap();
+  let out = Command::new("git")
+    .env("GIT_CONFIG_GLOBAL", "/dev/null")
+    .env("GIT_CONFIG_SYSTEM", "/dev/null")
+    .env("GIT_AUTHOR_NAME", "a")
+    .env("GIT_AUTHOR_EMAIL", "a@example.com")
+    .env("GIT_COMMITTER_NAME", "a")
+    .env("GIT_COMMITTER_EMAIL", "a@example.com")
+    .args(["-C", clone.to_str().unwrap(), "commit", "-aq", "-m", "more"])
+    .output()
+    .unwrap();
+  assert!(out.status.success(), "{}", stderr(&out));
+  let out = git_client(
+    &[
+      "-C",
+      clone.to_str().unwrap(),
+      "push",
+      "-q",
+      "origin",
+      &format!("HEAD:{OWNER_WORK_ROOT}/feature"),
+    ],
+    Some(OWNER_TOKEN),
+  );
+  assert!(out.status.success(), "second push failed: {}", stderr(&out));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_push_outside_the_work_namespace_is_refused_by_name() {
+  let fx = start(&[("r-git", "basic")]).await;
+  let tmp = tempfile::tempdir().unwrap();
+  let clone = clone_and_verify(&fx, &[], tmp.path());
+  let before = server_ref(&fx, "refs/heads/main");
+
+  for refused in [
+    "HEAD:refs/heads/hijack".to_owned(),
+    "HEAD:refs/tags/v999".to_owned(),
+    "+HEAD:refs/heads/main".to_owned(),
+    "HEAD:refs/gfs/work/job-outsider/steal".to_owned(),
+    "HEAD:refs/gfs/mounts/m-fake".to_owned(),
+  ] {
+    let out = git_client(
+      &["-C", clone.to_str().unwrap(), "push", "origin", &refused],
+      Some(OWNER_TOKEN),
+    );
+    assert!(!out.status.success(), "{refused} must be refused");
+  }
+  // Nothing moved.
+  assert_eq!(server_ref(&fx, "refs/heads/main"), before);
+  assert_eq!(server_ref(&fx, "refs/heads/hijack"), None);
+  assert_eq!(server_ref(&fx, "refs/gfs/work/job-outsider/steal"), None);
+
+  // An outsider cannot push anywhere, including their own would-be namespace:
+  // repository authorization comes first.
+  let out = git_client(
+    &[
+      "-C",
+      clone.to_str().unwrap(),
+      "push",
+      "origin",
+      "HEAD:refs/gfs/work/job-outsider/feature",
+    ],
+    Some(OUTSIDER_TOKEN),
+  );
+  assert!(!out.status.success(), "an outsider push must be refused");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_push_advertisement_shows_only_the_callers_own_subtree() {
+  let fx = start(&[("r-git", "basic")]).await;
+
+  // Plant refs a leak would show: another subject's work branch and a lease
+  // anchor. `main` exists from the fixture.
+  let head = server_ref(&fx, "refs/heads/main").unwrap();
+  for name in [
+    &format!("{OWNER_WORK_ROOT}/mine"),
+    "refs/gfs/work/someone-else/theirs",
+    "refs/gfs/mounts/m-1",
+  ] {
+    let out = git_client(
+      &[
+        "-C",
+        fx.repo_path.to_str().unwrap(),
+        "update-ref",
+        name,
+        &head,
+      ],
+      None,
+    );
+    assert!(out.status.success(), "{}", stderr(&out));
+  }
+
+  let url = format!("{}/info/refs?service=git-receive-pack", fx.url("r-git"));
+  let (status, headers, body) = http_get(&url, OWNER_TOKEN, None).await;
+  assert_eq!(status, 200);
+  assert_eq!(
+    headers.get("content-type").map(String::as_str),
+    Some("application/x-git-receive-pack-advertisement")
+  );
+  let body = String::from_utf8_lossy(&body);
+  assert!(
+    body.starts_with("001f# service=git-receive-pack"),
+    "the service preamble is required: {body:?}"
+  );
+  assert!(
+    body.contains(&format!("{OWNER_WORK_ROOT}/mine")),
+    "the caller's own work refs are the advertisement: {body}"
+  );
+  for hidden in ["someone-else", "refs/gfs/mounts", "refs/heads/main"] {
+    assert!(
+      !body.contains(hidden),
+      "{hidden} must not be advertised to a pusher: {body}"
+    );
   }
 }
 

@@ -525,6 +525,81 @@ async fn the_shim_works_from_a_subdirectory() {
 }
 
 // ---------------------------------------------------------------------------
+// The scan shim: ADR 0009's grep/find degrade rule
+// ---------------------------------------------------------------------------
+
+/// Run the scan shim under a tool's name, the way its symlink install does.
+fn run_scan_shim(directory: &Path, as_tool: &str, args: &[&str]) -> (bool, String, String) {
+  let bin_dir = tempfile::tempdir().unwrap();
+  let link = bin_dir.path().join(as_tool);
+  std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_gfs-scan-shim"), &link).unwrap();
+  let out = Command::new(&link)
+    .current_dir(directory)
+    .args(args)
+    .output()
+    .unwrap_or_else(|e| panic!("running the scan shim as {as_tool}: {e}"));
+  (
+    out.status.success(),
+    String::from_utf8_lossy(&out.stdout).into_owned(),
+    String::from_utf8_lossy(&out.stderr).into_owned(),
+  )
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_scan_shim_advises_and_degrades_rather_than_refusing() {
+  let backend = Backend::start("basic").await;
+  let job = Job::start(&backend, "main").await;
+  let root = job.workspace.clone();
+
+  on_fs(move || {
+    // A recursive grep: the note on stderr, real grep's answer on stdout.
+    let (ok, out, err) = run_scan_shim(&root, "grep", &["-r", "basic", "."]);
+    assert!(ok, "{err}");
+    assert!(out.contains("README.md"), "real grep still answers: {out}");
+    assert!(
+      err.contains("gfs rg"),
+      "the note names the cheap route: {err}"
+    );
+
+    // A non-recursive grep is not a sweep, so it is not nagged.
+    let (ok, out, err) = run_scan_shim(&root, "grep", &["basic", "README.md"]);
+    assert!(ok, "{err}");
+    assert!(out.contains("basic"));
+    assert!(err.is_empty(), "no sweep, no note: {err}");
+
+    // grep's data-bearing exit 1 (no match) passes through untouched.
+    let (ok, _, err) = run_scan_shim(&root, "grep", &["absent-string", "README.md"]);
+    assert!(!ok, "no match is exit 1, and the shim must not eat it");
+    assert!(err.is_empty(), "{err}");
+
+    // find walks by definition; the note names the free listing.
+    let (ok, out, err) = run_scan_shim(&root, "find", &[".", "-name", "*.md"]);
+    assert!(ok, "{err}");
+    assert!(out.contains("README.md"), "{out}");
+    assert!(err.contains("git ls-files"), "{err}");
+  })
+  .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_scan_shim_is_silent_outside_a_gfs_workspace() {
+  // The property that makes a PATH-wide install safe, same as the git shim's.
+  let ordinary = tempfile::tempdir().unwrap();
+  std::fs::write(ordinary.path().join("file.txt"), "needle\n").unwrap();
+  let (ok, out, err) = run_scan_shim(ordinary.path(), "grep", &["-r", "needle", "."]);
+  assert!(ok, "{err}");
+  assert!(out.contains("needle"));
+  assert!(
+    err.is_empty(),
+    "outside a workspace the shim says nothing: {err}"
+  );
+
+  let (ok, _, err) = run_scan_shim(ordinary.path(), "find", &[".", "-name", "*.txt"]);
+  assert!(ok, "{err}");
+  assert!(err.is_empty(), "{err}");
+}
+
+// ---------------------------------------------------------------------------
 // Regressions found by pjdfstest
 //
 // `spikes/conformance/pjdfstest.sh` runs the suite against an ext4 control; these

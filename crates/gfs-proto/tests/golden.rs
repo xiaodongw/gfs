@@ -307,6 +307,7 @@ const PINNED: &[(&str, &[Field])] = &[
       (6, "mount_capability", "string"),
       (7, "lease_expiry", ".gfs.v1.Timestamp"),
       (8, "heartbeat_interval_seconds", "uint64"),
+      (9, "work_ref_root", "string"),
     ],
   ),
   (

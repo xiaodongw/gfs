@@ -32,6 +32,7 @@ pub enum Action {
   ReleaseMount,
   Search,
   GitFetch,
+  GitPush,
 }
 
 impl Action {
@@ -52,6 +53,7 @@ impl Action {
       Action::ReleaseMount => "release_mount",
       Action::Search => "search",
       Action::GitFetch => "git_fetch",
+      Action::GitPush => "git_push",
     }
   }
 }

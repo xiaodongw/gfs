@@ -64,6 +64,79 @@ async fn a_fresh_workspace_reads_clean_through_stock_git() {
   assert!(ok_files, "{files}");
   assert!(files.contains("README.md"), "{files}");
   assert!(files.contains("src/main.rs"), "{files}");
+
+  // The log walk above read pack data through this workspace's own odb view,
+  // so the traffic is attributed to this job — the gap ADR 0009's amendment
+  // recorded ("counted per repository, not per job") is closed.
+  let report = job.daemon.inspect();
+  assert!(
+    report.odb_job.bytes_fetched > 0,
+    "history reads must be attributed to the job: {:?}",
+    report.odb_job
+  );
+  assert!(
+    report.odb.bytes_fetched >= report.odb_job.bytes_fetched,
+    "the shared store counts at least what this job counted"
+  );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_local_commit_pushes_to_the_callers_work_namespace_through_the_seeded_remote() {
+  // The push half of ADR 0009: `git push origin <branch>` out of the box. The
+  // seeded config maps `refs/heads/*` into the caller's work namespace and the
+  // credential helper reads GFS_TOKEN from the job's environment, so stock Git
+  // needs to be told nothing.
+  let backend = Backend::start("basic").await;
+  let job = Job::start(&backend, "main").await;
+  let ws = job.workspace.clone();
+
+  let (pushed_ok, push_out, local_head) = on_fs(move || {
+    std::fs::write(ws.join("pushed.txt"), b"leaving as a pack\n").unwrap();
+    let (ok, out) = git_in(&ws, &["add", "pushed.txt"]);
+    assert!(ok, "{out}");
+    let (ok, out) = git_in(&ws, &["commit", "-q", "-m", "local work"]);
+    assert!(ok, "{out}");
+    let (_, head) = git_in(&ws, &["rev-parse", "HEAD"]);
+
+    let out = std::process::Command::new("git")
+      .env_clear()
+      .env("GIT_CONFIG_GLOBAL", "/dev/null")
+      .env("GIT_CONFIG_SYSTEM", "/dev/null")
+      .env("PATH", "/usr/bin:/bin")
+      .env("GFS_TOKEN", gfs_test::mount::TOKEN)
+      .current_dir(&ws)
+      .args(["push", "-q", "origin", "main"])
+      .output()
+      .unwrap();
+    (
+      out.status.success(),
+      String::from_utf8_lossy(&out.stderr).into_owned(),
+      head.trim().to_owned(),
+    )
+  })
+  .await;
+  assert!(pushed_ok, "push failed: {push_out}");
+
+  // The commit is on the server, in this subject's namespace, at exactly the
+  // local HEAD. `job-mount` is the harness token's subject.
+  let out = std::process::Command::new("git")
+    .env_clear()
+    .env("PATH", "/usr/bin:/bin")
+    .arg("-C")
+    .arg(&backend.repo_path)
+    .args(["rev-parse", "refs/gfs/work/job-mount/main"])
+    .output()
+    .unwrap();
+  assert!(
+    out.status.success(),
+    "{}",
+    String::from_utf8_lossy(&out.stderr)
+  );
+  assert_eq!(
+    String::from_utf8_lossy(&out.stdout).trim(),
+    local_head,
+    "the pushed ref must be the local commit"
+  );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

@@ -450,6 +450,11 @@ message CreateMountResponse {
   // How often the client must renew, so the heartbeat interval comes from the
   // server rather than from a constant compiled into each client.
   uint64 heartbeat_interval_seconds = 8;
+  // The caller's work-ref namespace root (`refs/gfs/work/<subject>`, no
+  // trailing slash): the one subtree `git push` to the gateway may update. Sent
+  // so the workspace can seed a push refspec without knowing how the server
+  // folds subject ids into ref names.
+  string work_ref_root = 9;
 }
 
 message RenewMountRequest {

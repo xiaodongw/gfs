@@ -262,6 +262,7 @@ impl Mount {
       // Fetched the way the daemon fetches it, so the shim's `log -1` is
       // exercised against real metadata rather than a hand-built value.
       commit_meta: client.get_commit().await.ok(),
+      work_ref_root: (!grant.work_ref_root.is_empty()).then(|| grant.work_ref_root.clone()),
     }));
 
     let overlay_dir = tempfile::tempdir().unwrap();
@@ -348,6 +349,7 @@ pub fn host_config(backend: &Backend, socket_dir: &Path) -> gfs_mount::HostConfi
     token: TOKEN.to_owned(),
     lease_policy: gfs_types::LeasePolicy::adr_0006(),
     fs: FsConfig::default(),
+    odb_residency_bytes: 0,
   }
 }
 
