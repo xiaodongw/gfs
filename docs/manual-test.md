@@ -16,7 +16,7 @@ cd ~/.gfs-lab
 gfs clone https://github.com/pallets/flask.git
 cd flask
 gfs status
-gfs log -10 --oneline
+git log --oneline -10
 gfs switch -c my-change
 echo "a change" >> README.md
 gfs commit -m "a change"
@@ -164,7 +164,7 @@ git --git-dir=~/.gfs-lab/repos/*.git for-each-ref refs/gfs/work
 Builds the tree from the overlay journal, makes the commit in the mirror, and
 re-pins the view to it. There is no staging area and no local-only commit: the
 commit is durable on the gateway the moment it is made, which is what lets
-`gfs log` show it.
+`git log` show it.
 
 **Your shell keeps working.** The workspace is the mount point itself and the
 re-pin happens in place, so a shell — or an agent CLI, or a build — standing
@@ -207,30 +207,33 @@ A push to `refs/heads/*` or any other namespace is refused by name: the branch
 namespace mirrors upstream and is written by fetch. `gfs push` above is still
 how a work branch continues outward to the real Git server.
 
-## The server-answered tools
+## Cheap questions: stock Git for names and history, the gateway for content
 
-An agent asks a handful of questions that want to touch every path, or every
-commit. All of them are answered by the gateway; none reads the mount.
+`gfs log` and `gfs find` are gone — ADR 0009 deleted them. The workspace has a
+real `.git` over the projected object store now, so stock Git answers those
+questions itself; what stays server-side is the question that would otherwise
+read file *content* wholesale:
 
 ```sh
-gfs log -5 --oneline
-gfs find '*.py'
-gfs rg -F 'some-symbol' -m 5
+git log --oneline -5             # commits come through the projection -- cheap
+git ls-files | wc -l             # the index is local -- free
+gfs rg -F 'some-symbol' -m 5     # content search, answered by the gateway
 gfs inspect | grep hydration     # still 0 blobs, 0 bytes
 ```
 
-`gfs log` prints and then, on stderr, `more history follows; continue with
---skip 5`. `gfs rg` prints matches plus a coverage note on stderr about binary
-files skipped — that note is deliberate, not a warning of failure.
+`gfs rg` prints matches plus a coverage note on stderr about binary files
+skipped — that note is deliberate, not a warning of failure. The `git`
+invocations move the `odb` counters in `gfs status` rather than the
+`hydration` line: commits and trees are small, and that traffic is the
+projection working as designed.
 
 ### Reviewing history
 
-"What did the last three commits change" is a question the workspace cannot
-answer for itself — it has no object database (ADR 0005) — so all of this is
-rendered by the gateway and downloads nothing:
+"What did the last three commits change" is a question stock `git log -p` can
+now answer — through the projection, at the price of every blob the diffs
+touch. The server-side renderers answer it without downloading anything:
 
 ```sh
-gfs log -3 -p                     # each commit with its diff
 gfs show HEAD~2 --stat            # one commit, by file
 gfs diff HEAD~3..HEAD             # the range as one patch
 gfs blame src/flask/cli.py -L 40,80
@@ -246,9 +249,9 @@ Three things about this are worth knowing:
   refuses to print at all. `--parent 2` gives the side branch and `-m` shows
   every parent in one run — the two are usually wildly different sizes, and that
   difference is the thing worth looking at.
-- **`gfs log -- <path>`** shows only commits that touched a path, and limits any
-  patch to it. Rename following (`--follow`) is not implied; that is a
-  similarity search per commit rather than a tree comparison.
+- **Path-limited history is stock Git's now**: `git log --oneline -- <path>`
+  walks commits and trees through the projection, which is cheap; adding `-p`
+  prices in the blobs of every diff it prints.
 
 `gfs ls` and `gfs cat` need no `--repo` inside a workspace, and default to its
 pin:
@@ -265,7 +268,9 @@ on that reading builds `src/src/…`. Root-relative is what `gfs cat` takes, so
 the output of one is the input of the other. A path that is not a directory in
 that commit is an error with a non-zero exit, never an empty listing.
 
-### Glob syntax is gitignore's, and this is the part that surprises people
+### Two glob dialects, and this is the part that surprises people
+
+`gfs rg -g` uses ripgrep's globs, which are gitignore's:
 
 | Pattern | Matches |
 | --- | --- |
@@ -273,14 +278,18 @@ that commit is an error with a non-zero exit, never an empty listing.
 | `*` | zero or more bytes, **none of them `/`** |
 | `**` | zero or more path components, `/` included |
 
-**A pattern with no `/` in it matches the file name, not the whole path.** On a
-Django checkout, where `admin/options.py` exists:
+`git ls-files` — the replacement for the deleted `gfs find` — defaults to the
+*opposite*: its pathspec `*` crosses `/`, and `:(glob)` is what restores
+gitignore semantics:
 
 ```sh
-gfs find '*options.py'            # 3   -- basename match
-gfs find '*/admin/options.py'     # 0   -- `*` cannot cross `/`
-gfs find '**/admin/options.py'    # 2   -- `**` can
+git ls-files '*options.py'           # deep matches -- `*` crosses `/` here
+git ls-files ':(glob)*options.py'    # top level only
+git ls-files ':(glob)**/options.py'  # gitignore's `**`
 ```
+
+The same pattern silently over- or under-matches depending on which tool reads
+it, which is exactly the shape of wrong answer this document exists to flag.
 
 ### The comparison worth making yourself
 
@@ -296,27 +305,39 @@ seconds and downloads the entire tree — roughly 6 200 blobs and 47 MB. `gfs rg
 answers in tens of milliseconds and downloads nothing. That difference is the
 whole product.
 
-## The `git` shim
+With the shims installed (next section), the first command also prints a
+stderr note naming `gfs rg` before running — that note is the degrade rule
+working, not a failure.
+
+## The shims: a hint layer, not a grammar
+
+ADR 0005's shim was a frozen grammar that refused most of Git; ADR 0009
+retired it. With a real `.git` over the projection, stock Git answers
+truthfully, so the shim now routes *cost*, not correctness — the default is
+pass-through, and the refused list is five commands that each walk or rewrite
+the entire object database:
 
 ```sh
 export PATH="$(gfs install-shim):$PATH"
-git rev-parse HEAD          # works
-git ls-files | wc -l        # the tracked set
-git log -3 --oneline        # REFUSED, exit 2, prints the supported grammar
-git rev-parse --short HEAD  # also refused: the grammar is frozen and narrow
+git rev-parse --short HEAD  # works -- there is no grammar to fall outside of
+git log -3 --oneline        # works
+git gc                      # REFUSED, exit 2 (also: repack, prune, fsck, maintenance)
+git blame src/flask/cli.py  # runs -- after a stderr note naming `gfs blame`
 ```
 
-The refusals are the designed behaviour. Without the shim, stock `git ls-files`
-inside a mount exits **0 with empty output** — it reports that nothing is
-tracked — which is why ADR 0005 calls the shim a correctness measure rather than
-a convenience:
+The refusals exist because each of those five, through a projection, is a
+wholesale download (`repack -a` measured 6.6 GiB on a kernel-sized
+repository). They exit 2, not 1: several Git subcommands use exit 1 as a
+data-bearing answer, and a refusal must not be readable as one.
 
-```sh
-/usr/bin/git ls-files | wc -l   # 0 files, exit 0 -- reports nothing is tracked
-```
-
-For history, filenames and review use `gfs log`, `gfs find`, `gfs show`,
-`gfs diff` and `gfs blame`; the shim is not wired to them.
+`gfs install-shim` also links `grep`, `find`, and `rg` to the scan shim, whose
+rule is weaker still: it never refuses and never substitutes output. Inside a
+workspace it says the cheap route once on stderr — `gfs rg` for a recursive
+`grep` or any `rg`, `git ls-files` for `find` — then execs the real tool, and
+the hydration budget prices whatever the sweep hydrates (`EDQUOT` at open when
+it runs out). Non-recursive `grep` is not nagged. Outside a GFS workspace all
+four names are fully transparent, which is what makes a `PATH`-wide install
+safe.
 
 ## The smart-HTTP gateway
 
