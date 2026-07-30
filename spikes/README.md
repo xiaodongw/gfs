@@ -13,6 +13,7 @@ written to be lived with, and mixing the two makes the second one worse.
 | `gateway-probe` | M0.3 | Can the smart-HTTP subprocess contract with stock `upload-pack` be reproduced exactly, and does the sandbox hold? |
 | `fuse-probe` | M0.2 | Can we mount in the target hosted environment, and at what privilege? |
 | `search-probe` | M0.4 | Does the blob-key + trigram + snapshot-bitmap representation fit on disk at steady state? |
+| `git-projection` | M0.5, re-opened | What does *raw* Git cost against a projected object store, once `core.fsmonitor` and `core.checkStat` are configured? |
 
 ## Corpus
 

@@ -548,6 +548,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "git-projection-probe"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "fuser",
+ "libc",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "git2"
 version = "0.20.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"

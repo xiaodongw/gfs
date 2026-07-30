@@ -5,6 +5,7 @@ members = [
     "gateway-probe",
     "fuse-probe",
     "search-probe",
+    "git-projection",
 ]
 
 # M0 spike code. Deliberately separate from the `gfs-*` production workspace that

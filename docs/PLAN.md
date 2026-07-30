@@ -998,8 +998,20 @@ Duration: 3–4 weeks
 
 ### M6.2 Hydration controls
 
+**Promoted by [ADR 0009](adr/0009-raw-git-over-a-projected-object-store.md): the
+hard budget is now a prerequisite for M9 and ships first.** It is the only
+enforcement a projected object store has, because the Git configuration that keeps
+it cheap can be overridden by any invocation.
+
+- Enforce a mandatory, default-on hard budget: `EDQUOT`, refused at `open` and
+  `opendir`, counted once per unique block, with separate working-tree and
+  object-store counters.
+- Add the mutually exclusive cache residency budget — evict and re-fetch rather
+  than refuse — with a re-fetch/unique ratio reported and a scan-resistant
+  eviction policy.
 - Attribute hydration to job, process, path, and operation where the OS permits.
-- Add per-job soft/hard budgets and user-visible diagnostics.
+  Attribution only, never enforcement: process identity is a name check, not a
+  boundary.
 - Produce reports showing commands that caused bulk hydration.
 - Add prefetch for an explicit path set without scanning the mount.
 - Tune metadata/blob concurrency, read-ahead, and cache sizes from real jobs.
@@ -1133,6 +1145,85 @@ Exit criteria:
 
 - A mounted job can create an ordinary commit and safely advance an allowed branch.
 - Ambiguous failures and concurrent updates cannot lose or overwrite another commit.
+
+## 11b. M9 — Raw Git over a projected object store
+
+Duration: unestimated. Decided in
+[ADR 0009](adr/0009-raw-git-over-a-projected-object-store.md); measured in
+[`spikes/reports/m05b-git-projection.md`](../spikes/reports/m05b-git-projection.md).
+
+Ordered by dependency, not by size. M6.2's hard budget is a **predecessor** of
+everything below.
+
+### M9.1 Pack retention policy
+
+Design only, and first, because its failure mode is a job dying mid-command after
+a gateway repack rather than anything a test would catch later.
+
+- Do not prune packs while a lease predating the repack is live; derive
+  `gc.pruneExpire` from the lease TTL.
+- Return `ESTALE` with "the repository was repacked; remount" when it happens.
+- Key cached blocks by `(pack name, offset)` so staleness is impossible by
+  construction rather than by discipline.
+
+### M9.2 Block cache and lazy fetch
+
+- 64 KiB blocks — measured; 8 MiB costs up to 68× amplification on sparse random
+  access.
+- One cache, two policies: hydration budget (default) or residency budget
+  (opt-in), never both.
+- Scan-resistant eviction: streaming a packfile must not flush the tree blocks a
+  build is using; tree content outranks history traffic.
+
+### M9.3 Gateway artifacts per commit
+
+- Build the index with `snapshot_time` stat data, so one index is valid on every
+  host that mounts the commit.
+- Write `commit-graph` with `--changed-paths`.
+- Serve a per-mount **filtered** ref view; `packed-refs` projected verbatim would
+  disclose every agent's work branches.
+
+### M9.4 The projection and the real `.git`
+
+- `.git` as a file pointing at per-mount local state; `objects/info/alternates`
+  into the mount; `refs/` and `index` local per mount, never shared.
+- Set the required configuration in the projected config.
+- Wire `core.fsmonitor` to the overlay journal. **Correctness-critical**: the
+  spike used a static stand-in, and a wrong token is a silently wrong
+  `git status`.
+- Exclude `.git` from search, diff and export, as section 8.6 requires of whatever
+  occupies it.
+
+### M9.5 Retire the custom surface
+
+- Delete the `git` shim grammar, `gfs find`/`FindPaths`, `gfs log`/`Log`, ADR
+  0006's closed revision grammar, and the overlay export/apply commit path.
+- Keep `gfs rg`, `gfs show`, `gfs diff <a> <b>`, `gfs blame`, and
+  `gfs clone`/`mount`/`switch`.
+- Replace export/apply with `git push` through the M5 gateway.
+
+### M9.6 Hint layer
+
+Last, because the routing list depends on what turns out to be cheap once the
+cache exists.
+
+- `git`: route four, fail six, pass everything else. A fixed list, never a
+  grammar — pressure to grow it is the signal that this is repeating ADR 0005.
+- `grep`/`find`: degrade rather than fail. Bounded pathspec passes; an unbounded
+  recursive sweep is redirected.
+- Deliver the "use `gfs rg`" redirect from the orchestrator reading the control
+  socket after a non-zero exit, since a FUSE reply carries an errno and no prose.
+
+Exit criteria:
+
+- `git status` on the worst-case corpus stays within a small constant of the
+  spike's 170 lookups and 49 ms;
+- a hydration counter assertion, like `crates/gfs-mount/tests/history.rs`, proves
+  the tree is not swept;
+- two agents on one branch can both commit locally and one can rebase onto the
+  other;
+- `git -c core.checkStat=default status` trips the budget rather than downloading
+  the tree.
 
 ## 12. Cross-cutting test matrix
 

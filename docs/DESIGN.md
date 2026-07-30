@@ -691,8 +691,34 @@ The client records, per process where available:
 
 Mount options set soft and hard byte/file budgets. A soft limit emits warnings and
 telemetry. A hard limit returns `EDQUOT` for new remote hydration while preserving
-overlay and cached access. Hard limits are opt-in because a build may legitimately
-need many files.
+overlay and cached access.
+
+**Amended by [ADR 0009](adr/0009-raw-git-over-a-projected-object-store.md): hard
+limits are mandatory and default-on, not opt-in.** Once stock Git runs inside the
+mount, the configuration that keeps it cheap — `core.checkStat`, `core.fsmonitor`,
+`gc.auto` — is not enforceable, because any invocation may override it with
+`git -c`. The budget is the only enforcement that cannot be bypassed by renaming a
+binary or overriding a setting, and it is what discriminates correctly without a
+deny list: a configured `git status` touches no tree bytes, while `grep -r` trips
+the budget immediately. Four properties are load-bearing rather than incidental:
+
+- `EDQUOT` is chosen for its `strerror`. A FUSE reply carries an errno and no
+  prose, so the only text a tool prints is "Disk quota exceeded" plus the path.
+  `EIO` would read as a corrupt filesystem.
+- Refusal happens at `open` and `opendir`, not at `read`, so a sweeping tool
+  aborts instead of emitting one error per file.
+- Bytes are counted **once per unique block**. Counting every fetch would make a
+  job die for re-reading something the cache evicted.
+- The working tree and the object store have separate counters. Object-store
+  traffic is bounded by the command; tree traffic is bounded only by repository
+  size.
+
+The budget has a mutually exclusive alternative for hosts that would rather be
+slow than refuse: a **cache residency budget** that evicts and re-fetches instead
+of failing. Only one is active at a time, because a monotonic limit over an
+evicting cache is a job that dies for behaving. Residency mode reports re-fetched
+over unique bytes, since its risk is an unbounded re-fetch multiplier that presents
+as a slow job rather than an error.
 
 An `gfs rg` compatibility wrapper translates a deliberately small, documented
 subset of common `rg` flags into `gfs search`; unsupported options fail with a
@@ -726,6 +752,27 @@ The server performs a compare-and-swap ref transaction. A mismatch never silentl
 overwrites another writer.
 
 ### 8.6 The `.git` directory and Git commands inside the mount
+
+> **Superseded by [ADR 0009](adr/0009-raw-git-over-a-projected-object-store.md).**
+> This section chose between a synthesized `.git` and a client-side partial clone,
+> and ADR 0005 chose the former. ADR 0009 chooses neither: the gateway's real
+> object database is **projected** into the mount, which is not the same operation
+> as a client fetching it a piece at a time. Read this section for the constraints
+> it identified — all of which still hold — and ADR 0009 for what is built.
+>
+> Two claims here are now measured rather than reasoned. "`git status` stats every
+> index entry, so each invocation sweeps the metadata of the entire monorepo" is
+> true under Git's defaults and false with `core.fsmonitor` and
+> `core.untrackedCache`: 108 445 lookups become 170, and 18.8 s becomes 49 ms on
+> the Linux kernel. And the defaults are *worse* than this section predicted — not
+> a metadata sweep but a full content re-hash of 1 615 MiB, because a shipped
+> index's `dev`/`ino` cannot match another filesystem. `core.checkStat=minimal`
+> plus the deterministic `snapshot_time` of section 8.2 is what fixes it.
+>
+> What survives unchanged: a workspace with no `.git` is not a usable workspace;
+> whatever occupies `.git` must be excluded from search, diff, export and
+> hydration accounting; and `safe.directory` is required whenever the mount is
+> owned by the host daemon rather than the job UID.
 
 A mounted workspace that contains no `.git` directory is not a usable agent
 workspace. Coding agents run `git status`, `git diff`, and `git log` as a matter of
