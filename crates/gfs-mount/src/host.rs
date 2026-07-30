@@ -107,6 +107,10 @@ pub struct MountHost {
   /// `adopt_or_refuse_state_dir` already treats it as the thing at most one
   /// mount may own.
   mounts: Mutex<HashMap<PathBuf, MountEntry>>,
+  /// One odb projection per `(cache directory, repository)`, the same sharing
+  /// rule as the blob cache below and for the same reason (ADR 0009: every file
+  /// in the store is immutable by name, so mounts can only agree).
+  odbs: Mutex<HashMap<(PathBuf, String), Weak<crate::odb::OdbProjection>>>,
   /// One blob cache per `(cache directory, repository)`, shared by every mount
   /// of that repository. Weak so that a repository nobody mounts any more stops
   /// costing an in-memory index.
@@ -157,6 +161,7 @@ impl MountHost {
       config,
       mounts: Mutex::new(HashMap::new()),
       caches: Mutex::new(HashMap::new()),
+      odbs: Mutex::new(HashMap::new()),
       _lock: lock,
     });
     Ok((host, listener))
@@ -277,7 +282,15 @@ impl MountHost {
     }
 
     let cache = self.cache_for(&spec.cache_dir, &spec.repository_id, spec.cache_quota_bytes)?;
-    let mount = Mount::start(spec, cache).await?;
+    let odb = self
+      .odb_for(
+        &spec.cache_dir,
+        &spec.repository_id,
+        &spec.http_endpoint,
+        &spec.token,
+      )
+      .await?;
+    let mount = Mount::start(spec, cache, odb).await?;
     let listener = match mount.bind_control() {
       Ok(listener) => listener,
       Err(e) => {
@@ -319,6 +332,39 @@ impl MountHost {
     caches.insert(key, Arc::downgrade(&cache));
     caches.retain(|_, handle| handle.strong_count() > 0);
     Ok(cache)
+  }
+
+  /// The object-database projection for one repository, mounting it if this is
+  /// the first workspace to ask (ADR 0009).
+  ///
+  /// Weak for the same reason the cache map is: the projection lives exactly as
+  /// long as some mount borrows it, and dropping the last reference unmounts.
+  async fn odb_for(
+    &self,
+    cache_dir: &Path,
+    repository_id: &RepositoryId,
+    http_endpoint: &str,
+    token: &str,
+  ) -> Result<Arc<crate::odb::OdbProjection>, GfsError> {
+    let key = (cache_dir.to_path_buf(), repository_id.as_str().to_owned());
+    {
+      let mut odbs = self.odbs.lock().expect("odb projections");
+      if let Some(existing) = odbs.get(&key).and_then(Weak::upgrade) {
+        return Ok(existing);
+      }
+      odbs.retain(|_, handle| handle.strong_count() > 0);
+    }
+    // Mounted outside the lock: it fetches the manifest over the network, and a
+    // second concurrent asker at worst mounts a duplicate that drops on insert.
+    let client = crate::odb::OdbClient::new(http_endpoint, token, repository_id.clone());
+    let root = cache_dir.join(repository_id.as_str()).join("odb");
+    let projection = crate::odb::OdbProjection::mount(client, &root).await?;
+    let mut odbs = self.odbs.lock().expect("odb projections");
+    if let Some(existing) = odbs.get(&key).and_then(Weak::upgrade) {
+      return Ok(existing);
+    }
+    odbs.insert(key, Arc::downgrade(&projection));
+    Ok(projection)
   }
 
   /// Start a mount's tasks and record it.

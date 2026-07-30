@@ -629,6 +629,7 @@ dependencies = [
  "gfs-types",
  "git2",
  "serde",
+ "sha1",
  "tempfile",
  "tokio",
 ]

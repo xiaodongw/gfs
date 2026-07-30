@@ -25,6 +25,7 @@ pub mod locks;
 pub mod mirror;
 pub mod mounts;
 pub mod observability;
+pub mod odb;
 pub mod registry;
 pub mod search;
 pub mod service;

@@ -361,20 +361,6 @@ enum Command {
     args: Vec<String>,
   },
 
-  /// Find files by name, answered by the server rather than by walking.
-  #[command(disable_help_flag = true)]
-  Find {
-    #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
-    args: Vec<String>,
-  },
-
-  /// Commit history for the pinned revision, answered by the server.
-  #[command(disable_help_flag = true)]
-  Log {
-    #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
-    args: Vec<String>,
-  },
-
   /// Move this view to another branch, creating it with `-c`.
   ///
   /// The branch is created on the **gateway**, not locally: the gateway's mirror
@@ -904,8 +890,9 @@ fn print_report(report: &gfs_mount::control::MountReport) {
     );
     if report.budget.refusals > 0 {
       println!(
-        "           reads failed with EDQUOT: prefer `gfs rg` and `gfs find` over \
-         scanning the tree, or raise the host's --hydration-budget"
+        "           reads failed with EDQUOT: prefer `gfs rg` over scanning the \
+         tree (`git ls-files` and `git log` are free), or raise the host's \
+         --hydration-budget"
       );
     }
   } else {
@@ -1705,8 +1692,6 @@ async fn main() -> Result<()> {
     // These six never come back: their exit code *is* their answer, and the
     // `Result` path cannot carry it. See `run_tool`.
     Command::Rg { args } => run_tool("rg", gfs_cli::rg::run(args)),
-    Command::Find { args } => run_tool("find", gfs_cli::find::run(args)),
-    Command::Log { args } => run_tool("log", gfs_cli::log::run(args)),
     Command::Show { args } => run_tool("show", gfs_cli::show::run(args)),
     Command::Diff { args } => run_tool("diff", gfs_cli::revdiff::run(args)),
     Command::Blame { args } => run_tool("blame", gfs_cli::blame::run(args)),

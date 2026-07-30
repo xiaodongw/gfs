@@ -89,6 +89,51 @@ tens of minutes.
 
 ## Details
 
+### The build (same day, branch `git-projection`)
+
+M9.1–M9.6 were implemented after the spike, in dependency order, each phase
+compiled and tested before the next:
+
+* **M9.1** — retention policy in every mirror's own config: `gc.pruneExpire`
+  derived from ADR 0006's `prune_delay`, `gc.auto=0`, `maintenance.auto=false`,
+  `repack.cruftPacks=true`.
+* **M9.3** — three HTTP routes (`/odb` manifest, `/odb/{path}` range reads under
+  an allowlist grammar that *is* the security boundary, `/index?commit=`), a
+  git-index-v2 writer in `gfs-git` whose entries record `snapshot_time` stat
+  data, and `commit-graph write --split --changed-paths` at ingest. The
+  round-trip test materializes a tree at `snapshot_time` and asserts stock
+  `git status` reads the shipped index clean.
+* **M9.2** — `gfs-mount/src/odb.rs`: 64 KiB block store over sparse local files
+  (presence bitmap in memory only — a bitmap that lied would serve zeros as
+  pack bytes), absent blocks fetched one HTTP range per contiguous run, and a
+  small read-only FUSE fs (`OdbFs`), one per repository per host, shared via
+  the same `Weak` registry as the blob cache.
+* **M9.4** — the workspace `.git` became a synthesized *file* naming
+  `<state>/git`, seeded with HEAD, the pinned branch ref, the required config,
+  `objects/info/alternates` into the projection, and the shipped index. The
+  fsmonitor hook (`gfs-fsmonitor` binary → control socket →
+  `Mount::fsmonitor_changes`) answers cumulatively from the overlay status with
+  a `gfs:<generation>` token; a token from another generation forces one full
+  rescan. Repin refuses over local commits (`gitdir::local_head`).
+* **M9.6** — the shim shrank from 842 lines of frozen grammar to ~130 of
+  route/fail/pass, transparent outside a GFS workspace.
+* **M9.5** — `gfs find`/`gfs log` CLI and the `FindPaths` RPC deleted end to
+  end; `docs/agent-search.md` rewritten.
+
+Two deltas from the ADR, recorded in its 2026-07-29 amendment: the `Log` RPC
+survives as `gfs show`'s one-commit header fetch, and `blame` advises on stderr
+instead of routing, because `gfs blame`'s output format is not `git blame`'s
+and silently substituting it is the `ls-files` lie with a new face.
+
+Known gaps, deliberately left: the residency-budget *eviction* policy is not
+implemented (the block store counts what it needs to decide later; ADR 0009's
+accounting section stands); odb traffic is counted per repository, not per job
+(the projection is shared, so job attribution needs a different layer); the
+direct-`Gfs` test harness still builds ADR 0005's six-entry surface for FUSE
+fundamentals tests, marked legacy. One flake observed once under full-suite
+parallelism (`mutations`, not reproducible alone or on rerun) — likely FUSE
+mount contention across ~20 concurrent mounts.
+
 Two harness bugs are worth remembering, because both produced plausible wrong
 answers rather than errors:
 

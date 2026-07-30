@@ -184,7 +184,7 @@ fn print_help() {
            --name-only      just the paths\n    \
            --name-status    those paths with a status letter\n    \
        -U<n>, --unified=<n> context lines (default 3)\n    \
-           --format=<FMT>   the header's format; see `gfs log --help`\n    \
+           --format=<FMT>   the header's format (%H %h %s %an %ae %ad %P)\n    \
            --no-header      the diff alone, for piping to `git apply`\n    \
            --workspace <P>  the workspace, when not standing in it\n\
      \n\

@@ -21,6 +21,10 @@ path = "src/bin/gfs-fuse.rs"
 name = "gfs-git-shim"
 path = "src/bin/gfs-git-shim.rs"
 
+[[bin]]
+name = "gfs-fsmonitor"
+path = "src/bin/gfs-fsmonitor.rs"
+
 [dependencies]
 gfs-mount = { workspace = true }
 gfs-types = { workspace = true }

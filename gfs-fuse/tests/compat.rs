@@ -29,7 +29,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::Command;
 
-use gfs_test::mount::{on_fs, Backend, Mount};
+use gfs_test::mount::{on_fs, Backend, Job, Mount};
 
 /// The shim binary, built by the same `cargo test` invocation that runs this.
 fn shim() -> &'static str {
@@ -430,10 +430,11 @@ async fn stock_git_finds_the_repository_root_through_the_synthesized_surface() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn stock_git_ls_files_and_diff_are_silently_empty_which_is_why_the_shim_exists() {
-  // ADR 0005's central measurement, asserted rather than trusted. If a future Git
-  // starts failing loudly here instead, the shim's justification changes and a
-  // reviewer should be told by a test rather than by an incident.
+async fn stock_git_ls_files_and_diff_are_silently_empty_against_the_legacy_surface() {
+  // ADR 0005's central measurement, kept against the object-free surface the
+  // direct-mount harness still builds: it is the recorded reason that surface
+  // could never be enough, and the reason ADR 0009 replaced it with a real
+  // `.git` in the production path (`Job`, tested above and in workspace_git.rs).
   let backend = Backend::start("basic").await;
   let mount = Mount::new(&backend, "main").await;
   let root = mount.path.clone();
@@ -458,135 +459,52 @@ async fn stock_git_ls_files_and_diff_are_silently_empty_which_is_why_the_shim_ex
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn the_shim_answers_the_frozen_grammar() {
+async fn the_shim_passes_through_and_agrees_with_stock_git() {
+  // ADR 0009: the shim routes cost, not correctness. Everything below reaches
+  // real Git against the seeded `.git`, so the assertion is agreement with
+  // stock behaviour -- the exact property ADR 0005's grammar could not have.
   let backend = Backend::start("basic").await;
-  let mount = Mount::new(&backend, "main").await;
-  let root = mount.path.clone();
-  let commit = mount.commit.to_hex();
+  let job = Job::start(&backend, "main").await;
+  let root = job.workspace.clone();
+  let commit = {
+    let report = job.daemon.inspect();
+    report.commit.split_once(':').unwrap().1.to_owned()
+  };
 
   on_fs(move || {
     let git = shim();
 
-    // The two commands stock Git answers wrongly.
     let (ok, out, err) = run_in(&root, git, &["ls-files"]);
     assert!(ok, "{err}");
     let listed: Vec<&str> = out.lines().collect();
     assert!(listed.contains(&"README.md"), "{listed:?}");
     assert!(listed.contains(&"src/main.rs"), "{listed:?}");
-    assert!(listed.contains(&"src/lib/util.rs"), "{listed:?}");
     assert!(
       !listed.iter().any(|p| p.starts_with(".git")),
-      "the synthesized surface is not tracked content: {listed:?}"
+      ".git is not tracked content: {listed:?}"
     );
 
-    // `status` and `diff` are covered in `tests/export.rs` instead: from M3 they
-    // read the overlay journal through the daemon's control socket, and this
-    // harness mounts a filesystem without running a daemon.
-
-    // rev-parse and symbolic-ref, which stock Git also answers -- checked so the
-    // shim cannot silently disagree with the thing it shadows.
     let (ok, out, _) = run_in(&root, git, &["rev-parse", "HEAD"]);
     assert!(ok);
     assert_eq!(out.trim(), commit);
     let (ok, out, _) = run_in(&root, git, &["rev-parse", "--show-toplevel"]);
     assert!(ok);
     assert_eq!(out.trim(), root.to_string_lossy());
-    let (ok, out, _) = run_in(&root, git, &["rev-parse", "--is-inside-work-tree"]);
-    assert!(ok);
-    assert_eq!(out.trim(), "true");
     let (ok, out, _) = run_in(&root, git, &["symbolic-ref", "--short", "HEAD"]);
     assert!(ok);
     assert_eq!(out.trim(), "main");
 
-    // show HEAD:<path>
+    // The forms ADR 0005's grammar froze out, now answered by real Git through
+    // the projection: multi-commit log, arbitrary revisions, pathspec magic.
     let (ok, out, err) = run_in(&root, git, &["show", "HEAD:README.md"]);
     assert!(ok, "{err}");
     assert_eq!(out, "# basic\n");
-
-    // log -1
-    let (ok, out, err) = run_in(&root, git, &["log", "-1", "--format=%H"]);
+    let (ok, out, err) = run_in(&root, git, &["log", "--format=%H"]);
     assert!(ok, "{err}");
-    assert_eq!(out.trim(), commit);
-    let (ok, out, _) = run_in(&root, git, &["log", "-1", "--format=%s"]);
-    assert!(ok);
-    assert_eq!(out.trim(), "second");
-    let (ok, out, _) = run_in(&root, git, &["log", "-1"]);
-    assert!(ok);
-    assert!(out.contains(&format!("commit {commit}")), "{out}");
-    assert!(out.contains("GFS Fixture"), "{out}");
-  })
-  .await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn the_shim_scopes_ls_files_by_pathspec() {
-  let backend = Backend::start("basic").await;
-  let mount = Mount::new(&backend, "main").await;
-  let root = mount.path.clone();
-
-  on_fs(move || {
-    let git = shim();
-    let (ok, out, _) = run_in(&root, git, &["ls-files", "--", "src"]);
-    assert!(ok);
-    let listed: Vec<&str> = out.lines().collect();
-    assert!(listed.iter().all(|p| p.starts_with("src/")), "{listed:?}");
-    assert!(listed.contains(&"src/lib/util.rs"));
-
-    let (ok, out, _) = run_in(&root, git, &["ls-files", "--", "*.md"]);
-    assert!(ok);
-    assert_eq!(out.lines().collect::<Vec<_>>(), vec!["README.md"]);
-  })
-  .await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn the_shim_refuses_everything_outside_the_grammar_with_an_actionable_message() {
-  let backend = Backend::start("basic").await;
-  let mount = Mount::new(&backend, "main").await;
-  let root = mount.path.clone();
-
-  on_fs(move || {
-    let git = shim();
-    for args in [
-      vec!["checkout", "main"],
-      vec!["commit", "-m", "x"],
-      vec!["add", "."],
-      vec!["log"],
-      vec!["log", "-5"],
-      vec!["diff", "HEAD~1"],
-      vec!["show", "main:README.md"],
-      vec!["rev-parse", "HEAD~1"],
-      vec!["ls-files", "--", ":(exclude)src"],
-      vec!["-C", "/tmp", "status"],
-      vec!["status", "--long"],
-      vec!["log", "-1", "--format=%zz"],
-    ] {
-      let (ok, out, err) = run_in(&root, git, &args);
-      assert!(!ok, "`git {}` must be refused", args.join(" "));
-      assert!(
-        out.is_empty(),
-        "a refusal must print nothing on stdout, or a caller reads it as an answer: {out:?}"
-      );
-      assert!(
-        err.contains("unsupported") && err.contains("the supported grammar"),
-        "the message must name what is supported: {err}"
-      );
-    }
-  })
-  .await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn the_shim_refuses_to_answer_for_an_ordinary_git_repository() {
-  // Installed early in `PATH`, the shim is invoked everywhere -- including
-  // outside a workspace. Answering for a real repository would replace a working
-  // `git` with a crippled one.
-  let outside = tempfile::tempdir().unwrap();
-  let path = outside.path().to_path_buf();
-  on_fs(move || {
-    let (ok, _, err) = run_in(&path, shim(), &["status"]);
-    assert!(!ok);
-    assert!(err.contains("not a GFS workspace"), "{err}");
+    assert!(out.lines().count() >= 2, "the whole history answers: {out}");
+    let (ok, out, err) = run_in(&root, git, &["ls-files", "--", ":(exclude)src"]);
+    assert!(ok, "magic pathspecs are ordinary git now: {err}");
+    assert!(!out.contains("src/"), "{out}");
   })
   .await;
 }
@@ -594,9 +512,9 @@ async fn the_shim_refuses_to_answer_for_an_ordinary_git_repository() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_shim_works_from_a_subdirectory() {
   let backend = Backend::start("basic").await;
-  let mount = Mount::new(&backend, "main").await;
-  let root = mount.path.clone();
-  let subdirectory = mount.join("src/lib");
+  let job = Job::start(&backend, "main").await;
+  let root = job.workspace.clone();
+  let subdirectory = root.join("src/lib");
 
   on_fs(move || {
     let (ok, out, err) = run_in(&subdirectory, shim(), &["rev-parse", "--show-toplevel"]);

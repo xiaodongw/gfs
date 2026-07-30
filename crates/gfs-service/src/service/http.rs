@@ -52,6 +52,9 @@ pub fn router(state: HttpState) -> Router {
     .route("/metrics", get(metrics_endpoint))
     .route("/v1/repos/{repository_id}/file", get(file_by_revision))
     .route("/v1/repos/{repository_id}/blobs/{oid}", get(immutable_blob))
+    .route("/v1/repos/{repository_id}/odb", get(odb_manifest))
+    .route("/v1/repos/{repository_id}/odb/{*path}", get(odb_file))
+    .route("/v1/repos/{repository_id}/index", get(commit_index))
     .route("/v1/repos/{repository_id}/ref-events", post(ref_webhook))
     .layer(tower_http::limit::RequestBodyLimitLayer::new(
       // Webhook payloads are small; anything larger is a mistake or an attack.
@@ -366,6 +369,225 @@ async fn immutable_blob(
       blob_headers(response.headers_mut(), &etag, &rid);
       response
     }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// The projected object database (ADR 0009)
+// ---------------------------------------------------------------------------
+//
+// Authorization on these three routes is repository-level, deliberately: ADR
+// 0002 measured that repository read access already implies object-database
+// read access through stock `upload-pack`, so this surface promises exactly
+// what the Git gateway already does. No refs are served here — the manifest's
+// grammar cannot name one — because ref *listing* does disclose other
+// subjects' work branches and is filtered per mount instead.
+
+/// The files a workspace's Git may borrow, with sizes: what the mount projects.
+async fn odb_manifest(
+  State(state): State<HttpState>,
+  Path(repository_id): Path<String>,
+  headers: HeaderMap,
+) -> Response {
+  let rid = request_id(&headers);
+  let result = async {
+    let identity = state.authz.authenticate(bearer(&headers))?;
+    let repo_id = RepositoryId::parse(&repository_id)?;
+    state
+      .authz
+      .authorize_repository(&identity.subject, &repo_id)?;
+    let record = state.registry.require_servable(&repo_id)?;
+    // A directory walk is blocking I/O over possibly thousands of loose files.
+    tokio::task::spawn_blocking(move || crate::odb::manifest(&record.repo_path))
+      .await
+      .map_err(|e| GfsError::internal(format!("manifest task: {e}")))?
+  }
+  .await;
+  match result {
+    Ok(files) => {
+      let mut response = axum::Json(files).into_response();
+      // NOT immutable: a fetch or a repack changes the listing under this URL.
+      // The mount refreshes it on repin and must see the new truth.
+      response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        header::HeaderValue::from_static("no-store"),
+      );
+      set(
+        response.headers_mut(),
+        observability::REQUEST_ID_KEY,
+        rid.as_str(),
+      );
+      response
+    }
+    Err(e) => error_response(&e, &rid),
+  }
+}
+
+/// A range of one object-store file.
+///
+/// The mount reads in 64 KiB blocks, so this is the hottest route on the
+/// server and the one that must never buffer a file: linux's pack is 8.1 GiB.
+/// Only the requested range is read, at offset, from an opened file.
+async fn odb_file(
+  State(state): State<HttpState>,
+  Path((repository_id, odb_path)): Path<(String, String)>,
+  headers: HeaderMap,
+) -> Response {
+  let rid = request_id(&headers);
+  let result = async {
+    let identity = state.authz.authenticate(bearer(&headers))?;
+    let repo_id = RepositoryId::parse(&repository_id)?;
+    state
+      .authz
+      .authorize_repository(&identity.subject, &repo_id)?;
+    let record = state.registry.require_servable(&repo_id)?;
+    let full = crate::odb::resolve(&record.repo_path, &odb_path)?;
+
+    let range = headers
+      .get(header::RANGE)
+      .and_then(|v| v.to_str().ok())
+      .map(|v| v.to_owned());
+    tokio::task::spawn_blocking(move || -> Result<_, GfsError> {
+      use std::io::{Read, Seek, SeekFrom};
+      let mut file = std::fs::File::open(&full).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::NotFound {
+          // The retention hazard, surfaced honestly: the store had this file
+          // when the manifest was taken and a repack removed it. The mount
+          // maps this to ESTALE and tells the job to remount.
+          GfsError::new(
+            ErrorCode::FailedPrecondition,
+            "the object store was repacked; refresh the manifest",
+          )
+        } else {
+          GfsError::internal(format!("opening an object-store file: {e}"))
+        }
+      })?;
+      let total = file
+        .metadata()
+        .map_err(|e| GfsError::internal(format!("stat: {e}")))?
+        .len();
+      let (start, end) = match range.as_deref() {
+        Some(value) => parse_range(value, total)?,
+        None if total > limits::MAX_UNRANGED_ODB_READ => {
+          // A whole-file GET of a monorepo pack is always a mistake -- a
+          // misconfigured client about to download 8 GiB. Refuse loudly.
+          return Err(GfsError::new(
+            ErrorCode::InvalidArgument,
+            format!("this file is {total} bytes; request a range"),
+          ));
+        }
+        None => (0, total.saturating_sub(1)),
+      };
+      let len = (end - start + 1) as usize;
+      let mut buf = vec![0u8; len];
+      file
+        .seek(SeekFrom::Start(start))
+        .map_err(|e| GfsError::internal(format!("seek: {e}")))?;
+      file
+        .read_exact(&mut buf)
+        .map_err(|e| GfsError::internal(format!("short read of an immutable file: {e}")))?;
+      Ok((buf, start, end, total))
+    })
+    .await
+    .map_err(|e| GfsError::internal(format!("odb read task: {e}")))?
+  }
+  .await;
+
+  match result {
+    Ok((buf, start, end, total)) => {
+      let partial = !(start == 0 && end + 1 == total);
+      let status = if partial {
+        StatusCode::PARTIAL_CONTENT
+      } else {
+        StatusCode::OK
+      };
+      let mut response = (status, Body::from(buf)).into_response();
+      let h = response.headers_mut();
+      if partial {
+        set(
+          h,
+          header::CONTENT_RANGE.as_str(),
+          &format!("bytes {start}-{end}/{total}"),
+        );
+      }
+      h.insert(
+        header::CONTENT_TYPE,
+        header::HeaderValue::from_static("application/octet-stream"),
+      );
+      h.insert(
+        header::ACCEPT_RANGES,
+        header::HeaderValue::from_static("bytes"),
+      );
+      // Immutable by *name*: a pack file's name is its own checksum and a loose
+      // object's path is its digest, so these bytes can never change under this
+      // URL -- they can only stop existing, which no cache lifetime prevents.
+      h.insert(
+        header::CACHE_CONTROL,
+        header::HeaderValue::from_static("public, max-age=31536000, immutable"),
+      );
+      set(h, observability::REQUEST_ID_KEY, rid.as_str());
+      response
+    }
+    Err(e) => error_response(&e, &rid),
+  }
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct IndexQuery {
+  /// The pinned commit, qualified (`sha1:<hex>`).
+  commit: String,
+}
+
+/// The index file the gateway ships with a mount (ADR 0009).
+///
+/// Built server-side because building it client-side means walking the whole
+/// tree through the snapshot API — the sweep the projection exists to avoid.
+/// Immutable per (commit, snapshot time), and the snapshot time is durable in
+/// the catalog, so the commit alone keys it.
+async fn commit_index(
+  State(state): State<HttpState>,
+  Path(repository_id): Path<String>,
+  Query(query): Query<IndexQuery>,
+  headers: HeaderMap,
+) -> Response {
+  let rid = request_id(&headers);
+  let result = async {
+    let identity = state.authz.authenticate(bearer(&headers))?;
+    let repo_id = RepositoryId::parse(&repository_id)?;
+    state
+      .authz
+      .authorize_repository(&identity.subject, &repo_id)?;
+    let commit = ObjectId::parse_qualified(&query.commit)?;
+    let repo = state.registry.repository(&repo_id)?;
+    // The same sanitized time every projected entry reports, from the catalog:
+    // this is the value that makes the shipped stat data match on every host.
+    let resolved = repo
+      .resolve(RevisionSelector::parse(
+        &commit.to_qualified(),
+        commit.algorithm(),
+      )?)
+      .await?;
+    repo.index_for_commit(commit, resolved.snapshot_time).await
+  }
+  .await;
+
+  match result {
+    Ok(bytes) => {
+      let mut response = (StatusCode::OK, Body::from(bytes)).into_response();
+      let h = response.headers_mut();
+      h.insert(
+        header::CONTENT_TYPE,
+        header::HeaderValue::from_static("application/octet-stream"),
+      );
+      set(h, header::ETAG.as_str(), &format!("\"{}\"", query.commit));
+      h.insert(
+        header::CACHE_CONTROL,
+        header::HeaderValue::from_static("public, max-age=31536000, immutable"),
+      );
+      set(h, observability::REQUEST_ID_KEY, rid.as_str());
+      response
+    }
+    Err(e) => error_response(&e, &rid),
   }
 }
 

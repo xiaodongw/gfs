@@ -169,6 +169,16 @@ pub fn ingest(
   let default_branch = mirror::default_branch(url, credential, &config.git_binary)?;
   mirror::set_head(&mirror_path, &default_branch, &config.git_binary)?;
 
+  // The commit-graph is a gateway artifact the projection serves to every mount
+  // (ADR 0009): without it a history walk reads commit objects out of the pack,
+  // and `--changed-paths` Bloom filters are what let `git log -- <path>` skip
+  // commits without loading their trees. Written per sync so it covers what the
+  // fetch brought; a failure is logged and not fatal, because a mirror without
+  // a commit-graph is slower, not wrong.
+  if let Err(e) = mirror::write_commit_graph(&mirror_path, &config.git_binary) {
+    tracing::warn!(repository = %repository_id, "commit-graph write failed: {e}");
+  }
+
   let created = existing.is_none();
   if created {
     let format = gfs_git::read_format(&mirror_path)?;

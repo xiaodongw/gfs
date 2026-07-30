@@ -60,13 +60,7 @@ service SnapshotService {
   // Line-by-line attribution for one path at one commit.
   rpc Blame(BlameRequest) returns (BlameResponse);
 
-  // Paths in the pinned commit's tree, filtered by glob.
-  //
-  // A filename search. The alternative an agent has otherwise is `ListDirectory`
-  // per directory, which on a 7 000-file repository is thousands of round trips
-  // and was measured at 56 seconds for what this answers in one.
-  rpc FindPaths(FindPathsRequest) returns (FindPathsResponse);
-
+  
   // Many paths in one round trip. Per-path failures travel in the response;
   // one unreadable path does not fail the batch.
   rpc BatchGetEntry(BatchGetEntryRequest) returns (BatchGetEntryResponse);
@@ -323,37 +317,10 @@ message BlameResponse {
   string commit_oid = 4;
 }
 
-message FindPathsRequest {
-  string repository_id = 1;
-  string commit_oid = 2;
-  SnapshotAuthorization authorization = 3;
-  // Directory prefix to walk. Empty walks the whole tree.
-  bytes scope = 4;
-  // Match a path when any include glob matches, and no exclude glob does. No
-  // includes means every path in scope.
-  repeated string include_globs = 5;
-  repeated string exclude_globs = 6;
-  // Zero takes the server's default. Capped by the server.
-  uint32 limit = 7;
-  // Resume after this path, for paging a tree larger than one page.
-  bytes start_after_path = 8;
-}
-
 message FoundPath {
   bytes path = 1;
   EntryKind kind = 2;
   uint32 mode = 3;
-}
-
-message FindPathsResponse {
-  repeated FoundPath paths = 1;
-  // Set when the limit stopped the walk. Distinct from an empty result for the
-  // same reason as search's truncation flag: "no matches" and "I stopped early"
-  // are different answers and an agent acts differently on each.
-  bool truncated = 2;
-  // The last path emitted, to pass back as `start_after_path`. Empty when the
-  // walk finished.
-  bytes next_start_after_path = 3;
 }
 
 message GetEntryRequest {

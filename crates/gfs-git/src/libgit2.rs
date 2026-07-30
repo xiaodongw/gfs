@@ -1092,6 +1092,74 @@ impl GitRepository for Libgit2Repository {
     })
   }
 
+  fn index_for_commit(
+    &self,
+    commit: &ObjectId,
+    snapshot_time: gfs_types::Timestamp,
+  ) -> Result<Vec<u8>, GfsError> {
+    let pooled = self.checkout()?;
+    let repo: &git2::Repository = &pooled;
+    let commit_oid = self.git_oid(commit)?;
+    let root = self.find_commit(repo, commit_oid)?.tree_id();
+    let odb = repo
+      .odb()
+      .map_err(|e| GfsError::internal(format!("opening the object database: {e}")))?;
+
+    // Recursive descent in tree-entry order, recursing into a directory at the
+    // point it appears. That interleaving is what yields Git's index order --
+    // byte-wise by full path -- because tree entries sort directories as
+    // `name/`. The explicit-stack walks in this file visit a tree's files
+    // first and its subtrees after, which is a *different* order, and an index
+    // whose entries are out of order is silently misread; `write_index_v2`
+    // asserts the order as a backstop.
+    fn descend(
+      this: &Libgit2Repository,
+      repo: &git2::Repository,
+      odb: &git2::Odb<'_>,
+      tree_oid: git2::Oid,
+      prefix: &gfs_types::BytePath,
+      out: &mut Vec<crate::index::IndexEntry>,
+    ) -> Result<(), GfsError> {
+      let tree = this.decoded_tree(repo, tree_oid)?;
+      for entry in tree.entries() {
+        let path = prefix.join(&entry.name);
+        if entry.mode == mode::DIRECTORY {
+          descend(this, repo, odb, this.git_oid(&entry.oid)?, &path, out)?;
+          continue;
+        }
+        // A gitlink names a commit in *another* repository; reading its header
+        // here would fail on an object this database has no reason to hold.
+        // Git compares a gitlink by the recorded OID, never by size.
+        let size = if entry.mode == mode::GITLINK {
+          0
+        } else {
+          let (size, _) = odb
+            .read_header(this.git_oid(&entry.oid)?)
+            .map_err(|e| not_found(&e, "blob"))?;
+          size as u64
+        };
+        out.push(crate::index::IndexEntry {
+          path: path.as_bytes().to_vec(),
+          mode: entry.mode,
+          oid: entry.oid.clone(),
+          size,
+        });
+      }
+      Ok(())
+    }
+
+    let mut entries = Vec::new();
+    descend(
+      self,
+      repo,
+      &odb,
+      root,
+      &gfs_types::BytePath::root(),
+      &mut entries,
+    )?;
+    crate::index::write_index_v2(&entries, snapshot_time)
+  }
+
   fn read_blob(&self, blob: &ObjectId) -> Result<Vec<u8>, GfsError> {
     let pooled = self.checkout()?;
     let bytes = {

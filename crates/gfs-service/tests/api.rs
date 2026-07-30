@@ -1154,3 +1154,115 @@ async fn a_webhook_records_a_ref_event_idempotently() {
   .await;
   assert_eq!(status, http::StatusCode::BAD_REQUEST);
 }
+
+// ---------------------------------------------------------------------------
+// The projected object database (ADR 0009)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn the_odb_manifest_lists_the_store_and_ranges_read_the_named_bytes() {
+  let f = start().await;
+  let url = format!("{}/v1/repos/{}/odb", f.http, f.repo_id);
+  let (status, headers, body) = http_get(&url, Some(OWNER_TOKEN), &[]).await;
+  assert_eq!(status, http::StatusCode::OK);
+  // A fetch or repack changes the listing under this URL, so nothing may cache
+  // it: a mount refreshing on repin must see the new truth.
+  assert_eq!(headers.get("cache-control").unwrap(), "no-store");
+  let files: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
+  assert!(!files.is_empty());
+
+  // Read a range of the first file and compare against the mirror's own bytes,
+  // which is the property the projection's block cache depends on.
+  let first = &files[0];
+  let path = first["path"].as_str().unwrap();
+  let size = first["size"].as_u64().unwrap();
+  let want = std::fs::read(f.repo_path.join("objects").join(path)).unwrap();
+  assert_eq!(want.len() as u64, size);
+
+  let end = (size - 1).min(63);
+  let url = format!("{}/v1/repos/{}/odb/{path}", f.http, f.repo_id);
+  let (status, headers, body) = http_get(
+    &url,
+    Some(OWNER_TOKEN),
+    &[("range", &format!("bytes=0-{end}"))],
+  )
+  .await;
+  assert_eq!(status, http::StatusCode::PARTIAL_CONTENT, "{body:?}");
+  assert_eq!(body, want[..=end as usize]);
+  // Immutable by name: a pack's name is its own checksum.
+  assert_eq!(
+    headers.get("cache-control").unwrap(),
+    "public, max-age=31536000, immutable"
+  );
+}
+
+#[tokio::test]
+async fn the_odb_path_grammar_refuses_escape_and_the_outsider_learns_nothing() {
+  let f = start().await;
+  // `..` cannot match any rule of the grammar, so traversal is refused as
+  // invalid rather than detected as malicious.
+  let url = format!(
+    "{}/v1/repos/{}/odb/pack%2F..%2F..%2Fconfig",
+    f.http, f.repo_id
+  );
+  let (status, _, _) = http_get(&url, Some(OWNER_TOKEN), &[]).await;
+  assert_eq!(status, http::StatusCode::BAD_REQUEST);
+
+  // Repository-level authorization, same masking as every other route.
+  let url = format!("{}/v1/repos/{}/odb", f.http, f.repo_id);
+  let (status, _, _) = http_get(&url, Some(OUTSIDER_TOKEN), &[]).await;
+  assert_eq!(status, http::StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn the_shipped_index_is_immutable_per_commit_and_git_readable() {
+  let f = start().await;
+  let mut grpc = client(&f, OWNER_TOKEN).await;
+  let resolved = grpc
+    .resolve_revision(v1::ResolveRevisionRequest {
+      repository_id: f.repo_id.to_string(),
+      revision_selector: "main".into(),
+    })
+    .await
+    .unwrap()
+    .into_inner();
+
+  let url = format!(
+    "{}/v1/repos/{}/index?commit={}",
+    f.http, f.repo_id, resolved.commit_oid
+  );
+  let (status, headers, body) = http_get(&url, Some(OWNER_TOKEN), &[]).await;
+  assert_eq!(status, http::StatusCode::OK);
+  assert_eq!(&body[0..4], b"DIRC", "a Git index file starts with DIRC");
+  assert_eq!(
+    headers.get("cache-control").unwrap(),
+    "public, max-age=31536000, immutable"
+  );
+
+  // Stock Git must be able to read what was shipped: `ls-files` against the
+  // bytes, no worktree involved.
+  let dir = tempfile::tempdir().unwrap();
+  let gitdir = dir.path().join("g");
+  std::fs::create_dir_all(gitdir.join("objects/info")).unwrap();
+  std::fs::create_dir_all(gitdir.join("refs")).unwrap();
+  std::fs::write(gitdir.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+  std::fs::write(
+    gitdir.join("config"),
+    "[core]\n\trepositoryformatversion = 0\n",
+  )
+  .unwrap();
+  std::fs::write(gitdir.join("index"), &body).unwrap();
+  let out = std::process::Command::new("git")
+    .env_clear()
+    .env("GIT_CONFIG_GLOBAL", "/dev/null")
+    .env("GIT_CONFIG_SYSTEM", "/dev/null")
+    .env("PATH", "/usr/bin:/bin")
+    .env("GIT_DIR", &gitdir)
+    .args(["ls-files"])
+    .output()
+    .unwrap();
+  assert!(out.status.success());
+  let listing = String::from_utf8_lossy(&out.stdout);
+  assert!(listing.contains("README.md"), "{listing}");
+  assert!(listing.contains("src/main.rs"), "{listing}");
+}

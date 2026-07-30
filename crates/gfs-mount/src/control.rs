@@ -64,6 +64,10 @@ pub enum Request {
   },
   /// What the workspace has changed, from the journal alone.
   Status,
+  /// The fsmonitor hook's question (ADR 0009): which paths changed since the
+  /// token. Answered from the overlay journal, which the FUSE server maintains
+  /// by construction -- unlike watchman there is no watcher to race.
+  FsMonitorChanges { token: String },
   /// The same change set, rendered as a Git-compatible patch.
   Diff,
   /// Write an atomic, checksummed export bundle.
@@ -136,8 +140,6 @@ pub enum Request {
     /// base64url, for the reason the diff's paths are.
     path_b64url: String,
   },
-  /// Filename search over the merged workspace.
-  Find(Box<crate::find::FindRequest>),
   /// Everything the workspace changed, with the bytes, for the CLI to commit.
   ///
   /// The daemon collects but does not send: the control socket has no server
@@ -335,6 +337,20 @@ pub enum PlannedChange {
   },
 }
 
+/// The fsmonitor v2 answer, one layer above the hook's NUL-separated wire form.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct FsMonitorAnswer {
+  /// Opaque to Git; `gfs:<generation>` here, so a repin -- which changes what
+  /// every unlisted path means -- invalidates every token issued before it.
+  pub token: String,
+  /// Overlay-changed paths, cumulative for this generation. A superset is
+  /// always safe: Git re-checks listed paths and trusts the rest.
+  pub paths: Vec<String>,
+  /// True when the caller's token is not this generation's: Git must forget
+  /// what it cached and stat everything once.
+  pub full_rescan: bool,
+}
+
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct StatusReport {
   pub base_commit: String,
@@ -358,6 +374,7 @@ pub enum Response {
   Refresh(RefreshReport),
   CommitPlan(Box<CommitPlan>),
   Status(Box<StatusReport>),
+  FsMonitorChanges(Box<FsMonitorAnswer>),
   /// The patch, base64url-encoded.
   ///
   /// A patch is bytes -- it contains the workspace's file content, which is not
@@ -379,7 +396,6 @@ pub enum Response {
     commit: String,
     content_b64url: String,
   },
-  Find(Box<crate::find::FindReport>),
   Unmounted,
   Error {
     code: String,

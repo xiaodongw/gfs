@@ -271,6 +271,19 @@ pub trait GitRepository: Send + Sync + std::fmt::Debug {
     max_content_bytes: u64,
   ) -> Result<BlameOutput, GfsError>;
 
+  /// Serialize a commit's tree as a Git index file (ADR 0009).
+  ///
+  /// The gateway builds this once per commit and ships it to every mount,
+  /// because a client building it would walk the whole tree through the
+  /// snapshot API — the sweep the projection exists to avoid. Entry stat data
+  /// records `snapshot_time`, which is what makes one file valid on every host;
+  /// see [`crate::index`] for the format and the racy-clean reasoning.
+  fn index_for_commit(
+    &self,
+    commit: &ObjectId,
+    snapshot_time: gfs_types::Timestamp,
+  ) -> Result<Vec<u8>, GfsError>;
+
   /// Read a whole blob, verifying its object ID against its contents.
   fn read_blob(&self, blob: &ObjectId) -> Result<Vec<u8>, GfsError>;
 
@@ -567,6 +580,16 @@ impl AsyncRepository {
 
   pub async fn read_blob(&self, blob: ObjectId) -> Result<Vec<u8>, GfsError> {
     self.run(move |r| r.read_blob(&blob)).await
+  }
+
+  pub async fn index_for_commit(
+    &self,
+    commit: ObjectId,
+    snapshot_time: gfs_types::Timestamp,
+  ) -> Result<Vec<u8>, GfsError> {
+    self
+      .run(move |r| r.index_for_commit(&commit, snapshot_time))
+      .await
   }
 
   /// Collect a subtree's searchable files.

@@ -153,8 +153,8 @@ impl HydrationBudget {
         // so the text is for the log and for `gfs status`, not for the tool.
         format!(
           "the job's hydration budget is spent: {charged} of {limit} bytes used, \
-           and this read needs {size} more. Use `gfs rg` and `gfs find` instead of \
-           scanning the tree, or raise --hydration-budget."
+           and this read needs {size} more. Use `gfs rg` instead of scanning the tree \
+           (`git ls-files` and `git log` are free), or raise --hydration-budget."
         ),
       ));
     }

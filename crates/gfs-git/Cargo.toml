@@ -8,6 +8,7 @@ license.workspace = true
 description = "GitRepository abstraction and its libgit2-backed implementation"
 
 [dependencies]
+sha1 = { workspace = true }
 gfs-types = { workspace = true }
 
 # Declared in M1.1a, used in M1.3. The dependency lands with the workspace rather

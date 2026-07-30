@@ -375,3 +375,201 @@ mod tests {
     assert_eq!(value["read_only"], true);
   }
 }
+
+// ---------------------------------------------------------------------------
+// The real `.git` (ADR 0009)
+// ---------------------------------------------------------------------------
+
+/// Everything the seeded git dir is built from.
+///
+/// The workspace's `.git` becomes a *file* pointing at a directory of plain
+/// local state — `git worktree`'s own split — and this is what that directory
+/// contains. The object database is never here: `objects/info/alternates`
+/// borrows the per-repository projection, and everything Git writes (index
+/// refreshes, local commits, refs) lands on local disk where lockfiles and
+/// renames behave exactly as Git expects.
+#[derive(Debug)]
+pub struct SeedSpec<'a> {
+  /// The directory to create, `<state_dir>/git`.
+  pub git_dir: &'a std::path::Path,
+  /// The mount point, recorded as `core.worktree`.
+  pub workspace: &'a std::path::Path,
+  /// The projected object database this workspace borrows.
+  pub odb_mountpoint: &'a std::path::Path,
+  pub facts: &'a GitDirFacts,
+  /// The gateway-built index for the pinned commit. `None` reuses whatever
+  /// index is already seeded, which is how a repin that failed to fetch keeps a
+  /// working workspace instead of none.
+  pub index: Option<&'a [u8]>,
+}
+
+/// The synthesized `.git` *file*: how the workspace names its git dir.
+///
+/// One entry instead of ADR 0005's six. Git reads `gitdir: <path>` and treats
+/// the directory containing this file as the worktree root, which is the same
+/// mechanism `git init --separate-git-dir` and linked worktrees use.
+pub fn git_file(git_dir: &std::path::Path) -> GitDir {
+  let mut nodes = BTreeMap::new();
+  nodes.insert(
+    GIT_DIR.to_vec(),
+    SynthNode::File(Arc::new(
+      format!("gitdir: {}\n", git_dir.display()).into_bytes(),
+    )),
+  );
+  GitDir { nodes }
+}
+
+/// Write (or re-point) the real git dir a workspace's `.git` file names.
+///
+/// Idempotent, and called again on every repin: `HEAD`, the branch ref, and the
+/// index are rewritten to the new pin; local loose objects and any local
+/// branches survive, because they are the agent's work and a re-pin is not a
+/// reset. The caller is responsible for refusing the repin when [`local_head`]
+/// shows unpushed commits.
+pub fn seed_git_dir(spec: &SeedSpec<'_>) -> Result<(), gfs_types::error::GfsError> {
+  use gfs_types::error::GfsError;
+  let io = |what: &str, e: std::io::Error| {
+    GfsError::internal(format!("seeding the workspace git dir ({what}): {e}"))
+  };
+  let dir = spec.git_dir;
+  std::fs::create_dir_all(dir.join("objects/info")).map_err(|e| io("objects", e))?;
+  std::fs::create_dir_all(dir.join("refs/heads")).map_err(|e| io("refs", e))?;
+  std::fs::create_dir_all(dir.join("hooks")).map_err(|e| io("hooks", e))?;
+
+  // The pinned ref view: one branch, captured at pin time. A live-projected ref
+  // would move under an index that still describes the old commit, and Git
+  // would report the whole repository as modified.
+  let facts = spec.facts;
+  match facts.ref_name.as_deref() {
+    Some(name) if name.starts_with("refs/heads/") => {
+      std::fs::write(dir.join("HEAD"), format!("ref: {name}\n")).map_err(|e| io("HEAD", e))?;
+      let ref_path = dir.join(name);
+      std::fs::create_dir_all(ref_path.parent().expect("refs/heads/x has a parent"))
+        .map_err(|e| io("ref dir", e))?;
+      std::fs::write(ref_path, format!("{}\n", facts.commit.to_hex()))
+        .map_err(|e| io("branch ref", e))?;
+    }
+    _ => {
+      std::fs::write(dir.join("HEAD"), format!("{}\n", facts.commit.to_hex()))
+        .map_err(|e| io("HEAD", e))?;
+    }
+  }
+
+  std::fs::write(
+    dir.join("objects/info/alternates"),
+    format!("{}\n", spec.odb_mountpoint.display()),
+  )
+  .map_err(|e| io("alternates", e))?;
+
+  // The required configuration, and the reason each line exists. None of this
+  // is enforceable -- `git -c` overrides any of it -- which is why the
+  // hydration budget is mandatory (ADR 0009); this is the fast path, the
+  // budget is the guarantee.
+  let fsmonitor = fsmonitor_hook(dir)?;
+  let mut config = format!(
+    "[core]\n\
+     \trepositoryformatversion = 0\n\
+     \tfilemode = true\n\
+     \tbare = false\n\
+     \tworktree = {worktree}\n\
+     \tautocrlf = false\n\
+     \tlogallrefupdates = false\n\
+     # A shipped index's dev/ino/uid/gid cannot match this host; comparing them\n\
+     # would re-hash the whole tree (1 615 MiB on linux, measured).\n\
+     \tcheckStat = minimal\n\
+     \ttrustctime = false\n\
+     # The untracked cache kills the readdir walk; fsmonitor kills the lstat\n\
+     # sweep. Together: 108 445 lookups to 170 on the kernel tree.\n\
+     \tuntrackedCache = true\n",
+    worktree = spec.workspace.display(),
+  );
+  if let Some(hook) = &fsmonitor {
+    config.push_str(&format!("\tfsmonitor = {}\n", hook.display()));
+  }
+  config.push_str(
+    "# `repack -a` without `-l` copies every borrowed object out of the\n\
+     # projection -- 6.6 GiB on linux, measured. Maintenance is an operator\n\
+     # action against the gateway, never a side effect here.\n\
+     [gc]\n\
+     \tauto = 0\n\
+     [maintenance]\n\
+     \tauto = false\n",
+  );
+  config.push_str(&format!(
+    "[gfs]\n\
+     \trepository = {repository}\n\
+     \tcommit = {commit}\n\
+     \tmount = {mount}\n\
+     \tgeneration = {generation}\n",
+    repository = facts.repository_id.as_str(),
+    commit = facts.commit.to_qualified(),
+    mount = facts.mount_id.as_str(),
+    generation = facts.generation,
+  ));
+  std::fs::write(dir.join("config"), config).map_err(|e| io("config", e))?;
+
+  if let Some(index) = spec.index {
+    std::fs::write(dir.join("index"), index).map_err(|e| io("index", e))?;
+  }
+
+  // The same machine-readable facts the synthesized surface carried, now inside
+  // the real git dir where the shim and the fsmonitor hook find them by
+  // resolving the `.git` file.
+  std::fs::write(dir.join("gfs.json"), gfs_json(facts)).map_err(|e| io("gfs.json", e))?;
+  Ok(())
+}
+
+/// Install the fsmonitor hook when the helper binary can be found.
+///
+/// The hook is a one-line shell script pointing at an absolute binary path,
+/// because `core.fsmonitor` is read by whatever Git the *job* runs and the
+/// job's `PATH` is not ours to assume. Looked for next to this process's own
+/// executable first (the deployment layout), then on `PATH`. Absent: the
+/// config omits `core.fsmonitor` and `git status` pays the lstat sweep --
+/// slower, never wrong.
+fn fsmonitor_hook(
+  git_dir: &std::path::Path,
+) -> Result<Option<std::path::PathBuf>, gfs_types::error::GfsError> {
+  let binary = std::env::current_exe()
+    .ok()
+    .and_then(|exe| exe.parent().map(|d| d.join("gfs-fsmonitor")))
+    .filter(|p| p.is_file())
+    .or_else(|| {
+      let path = std::env::var_os("PATH")?;
+      std::env::split_paths(&path)
+        .map(|d| d.join("gfs-fsmonitor"))
+        .find(|p| p.is_file())
+    });
+  let Some(binary) = binary else {
+    return Ok(None);
+  };
+  let hook = git_dir.join("hooks/gfs-fsmonitor");
+  let script = format!("#!/bin/sh\nexec {} \"$@\"\n", binary.display());
+  std::fs::write(&hook, script).map_err(|e| {
+    gfs_types::error::GfsError::internal(format!("writing the fsmonitor hook: {e}"))
+  })?;
+  let mut perms = std::fs::metadata(&hook)
+    .map_err(|e| gfs_types::error::GfsError::internal(format!("hook metadata: {e}")))?
+    .permissions();
+  use std::os::unix::fs::PermissionsExt;
+  perms.set_mode(0o755);
+  std::fs::set_permissions(&hook, perms)
+    .map_err(|e| gfs_types::error::GfsError::internal(format!("hook permissions: {e}")))?;
+  Ok(Some(hook))
+}
+
+/// The commit the seeded git dir's `HEAD` currently names, if readable.
+///
+/// This is the repin guard: a value different from the pinned commit means the
+/// agent has made local commits, and re-seeding would strand them on a branch
+/// ref the next seed overwrites. Loose refs only -- `gc.auto=0` means nothing
+/// packs them.
+pub fn local_head(git_dir: &std::path::Path) -> Option<String> {
+  let head = std::fs::read_to_string(git_dir.join("HEAD")).ok()?;
+  let head = head.trim();
+  if let Some(name) = head.strip_prefix("ref: ") {
+    let target = std::fs::read_to_string(git_dir.join(name.trim())).ok()?;
+    return Some(target.trim().to_owned());
+  }
+  Some(head.to_owned())
+}

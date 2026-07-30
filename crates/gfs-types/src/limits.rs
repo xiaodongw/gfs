@@ -78,15 +78,6 @@ pub const MAX_BATCH_ENTRIES: usize = 1000;
 pub const DEFAULT_LOG_LIMIT: usize = 50;
 pub const MAX_LOG_LIMIT: usize = 1000;
 
-/// Paths returned by one `FindPaths` page.
-///
-/// Larger than a directory page because a filename search is answered against
-/// the whole tree and a caller that asked for `*.py` across a monorepo wants the
-/// set, not a tour of it. Still bounded: the M0.1 worst case has 94 751 files at
-/// tip and the glob may match all of them.
-pub const DEFAULT_FIND_PATHS_LIMIT: usize = 10_000;
-pub const MAX_FIND_PATHS_LIMIT: usize = 100_000;
-
 /// Largest blob the API will return in a single whole-blob response.
 ///
 /// DESIGN.md section 7.4 takes whole-blob fetch for the MVP, so this is also the
@@ -98,6 +89,23 @@ pub const MAX_BLOB_BYTES: u64 = 512 * 1024 * 1024;
 /// Blobs larger than this are excluded from content search and reported as a
 /// coverage exclusion, never silently omitted (DESIGN.md section 7.5).
 pub const MAX_SEARCHABLE_BLOB_BYTES: u64 = 8 * 1024 * 1024;
+
+/// Largest object-store file served without a `Range` header (ADR 0009).
+///
+/// The projection reads in 64 KiB blocks, so a whole-file GET of anything
+/// large is a misconfigured client about to download a monorepo's pack —
+/// linux's is 8.1 GiB — and is refused loudly rather than served slowly.
+/// Small files (a loose object, a `.rev`) may skip the header.
+pub const MAX_UNRANGED_ODB_READ: u64 = 8 * 1024 * 1024;
+
+/// The projection's block size, shared by client and server accounting.
+///
+/// Measured in `spikes/reports/m05b-git-projection.md`: pack access is sparse
+/// and random (binary search, delta chains), which large chunks punish — 8 MiB
+/// amplified `git log --oneline -20` by 68×. 64 KiB costs 1.0–1.4×, and the
+/// residual is the kernel's own readahead. It also matches FUSE's maximum read,
+/// so one block serves one request.
+pub const ODB_BLOCK_BYTES: u64 = 64 * 1024;
 
 /// Cap on a single non-blob response body, so a pathological tree cannot make
 /// one request consume unbounded server memory.

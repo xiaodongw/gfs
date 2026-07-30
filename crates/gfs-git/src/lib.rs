@@ -20,6 +20,7 @@
 //!   publicly advertised ref.
 
 pub mod format;
+pub mod index;
 pub mod libgit2;
 pub mod pool;
 pub mod repository;

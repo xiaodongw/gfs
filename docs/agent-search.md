@@ -1,7 +1,8 @@
 # Searching a GFS workspace: instructions for agents and tools
 
-Status: current as of M4, extended after M5 with `gfs find` and `gfs log`, and on
-2026-07-29 with `gfs show`, `gfs diff <rev>` and `gfs blame`  
+Status: current as of M9 (ADR 0009). `gfs find` and `gfs log` are **retired**:
+the workspace has a real `.git` over a projected object store, so `git ls-files`
+and `git log` answer natively and cost blocks proportional to the question.  
 Companion: [DESIGN.md](DESIGN.md) section 7.5, [ADR 0004](adr/0004-search-representation.md),
 [ADR 0005](adr/0005-git-command-surface.md)
 
@@ -16,11 +17,11 @@ commit:
 | Question | Do not run | Run |
 | --- | --- | --- |
 | what does this content say? | `rg pattern` | `gfs rg pattern` |
-| which files are called this? | `find . -name` / `git ls-files` | `gfs find '<glob>'` |
-| what changed recently? | `git log` | `gfs log` |
-| what did this commit change? | `git show` | `gfs show <rev>` |
-| what changed between these two? | `git diff a b` | `gfs diff <a> <b>` |
-| who last touched this line? | `git blame` | `gfs blame <path>` |
+| which files are called this? | `find . -name` | `git ls-files '<glob>'` — free: the index is local |
+| what changed recently? | — | `git log` — answered through the projection, commit-graph backed |
+| what did this commit change? | `git show --stat` on a monorepo | `gfs show <rev>` — a tree diff moves ~90 MiB wherever it runs; the gateway already has the objects |
+| what changed between these two? | `git diff a b` on a monorepo | `gfs diff <a> <b>` |
+| who last touched this line? | `git blame` on a monorepo | `gfs blame <path>` — measured 196 MiB through the projection |
 
 All of them are answered by the **server**, which has the object database and the
 search index; none of them reads the mount. A warm run of all of them against
@@ -65,67 +66,32 @@ gfs rg -i needle -g '*.rs'
 `gfs search --workspace <path> <pattern>` is the same search with an explicit
 workspace, for an orchestrator that is not standing inside the mount.
 
-## Use `gfs find`, not `find` or `git ls-files`
+## Use `git ls-files` and `git log` — they are free now
 
-`find` inside the mount walks every directory, for the same reason `rg` does.
-`git ls-files` through the shim avoids the walk but replaces it with one
-snapshot-API round trip per directory — measured at 28.9–53.7 s on django's
-7 077 files, for a question the server answers in one request.
-
-```
-gfs find '*.py'
-gfs find '*admin*' django/contrib      # a glob, then an optional scope
-gfs find -g '*.rs' -g '*.toml' --exclude '*/tests/*'
-gfs find '*.py' -0 | xargs -0 wc -l
-```
-
-The result set is `git ls-files`'s: files, symlinks, and gitlinks, with
-directories recursed into but not listed. **Symlinks are included** — the
-searchable corpus drops them to agree with `rg`, and answering a name query from
-that corpus silently loses 4 paths in django and 99 in the Linux kernel.
-
-Your edits are merged the same way they are for content search: a file you
-created is found, a deleted one is not, and a renamed one is found at its **new**
-path and no longer matches a glob that only matched its old name.
-
-## Use `gfs log`, not `git log`
-
-The workspace has no object database — [ADR 0005](adr/0005-git-command-surface.md)
-chose a synthesized `.git` over a real partial clone — so the shim's `log` is
-frozen at `-1`. A `--depth 1` clone, the raw-Git equivalent, has the same single
-commit. `gfs log` asks the server to walk instead.
+ADR 0009 gave the workspace a real `.git`: a local index and a projected
+object database. That retired `gfs find` and `gfs log`, because the questions
+they answered are what Git answers natively:
 
 ```
-gfs log -10 --oneline
-gfs log -n 50 --format='%h %ad %an %s'
-gfs log --skip 20 -20                  # paging
-gfs log -3 -p                          # with each commit's diff
-gfs log --first-parent -20             # ignore what merges brought in
-gfs log -10 -- src/flask/cli.py        # only commits that touched a path
+git ls-files '*.py'                    # the index is local disk: zero fetches
+git ls-files -- 'src/**/*.rs'
+git log --oneline -20                  # commit-graph backed, ~0.2 MiB of blocks
+git log -10 -- src/flask/cli.py        # changed-path Bloom filters make this cheap
+git log -3 -p
 ```
 
-Three behaviours worth knowing:
+The costs were measured (`spikes/reports/m05b-git-projection.md`): `ls-files`
+touches the projection not at all, and a bounded `log` fetches blocks
+proportional to the question. Two forms remain expensive on a monorepo and are
+refused or better asked of the server: `git gc`/`repack`/`fsck` are refused by
+the shim outright, and `git blame` / `git show --stat` work but move 90–196 MiB
+through the projection — `gfs blame` and `gfs show` answer server-side for
+free.
 
-- **The order is `git log`'s default — by commit time, not topological.**
-  `--topo-order` has to buffer the reachable graph before it can emit anything:
-  `git log -10` on linux.git is 0.007 s in date order and **10.383 s** with
-  `--topo-order`. The visible cost is that two commits sharing a commit
-  timestamp may appear in the opposite order to Git's. The set is the same.
-- **`%h` abbreviates to 7 characters.** Git scales its abbreviation with the
-  repository's object count — 10 for django — so `%h` here is stable rather than
-  identical to Git's. `%H` is the full ID and always matches.
-- **`-- <path>` does not imply `--follow`.** A commit is shown when it is not
-  TREESAME to any parent for that path, which is Git's own default
-  simplification. Rename following is a similarity search per commit and is a
-  different, much larger question.
-
-Format verbs: `%H %h %T %t %P %p`, `%s %b %B`, `%an %ae %at %ad %ai %aI %ar`,
-the `%c…` committer equivalents, `%n` and `%%`. `%b` is the commit **body** —
-the subject says what changed and the body says why, which for a review is
-usually the point.
-
-Local edits do not create commits, so they never appear in a log. Use
-`gfs status` for what the workspace changed.
+One behavioural note that survives from the old tools: `git ls-files` lists the
+**index** — a file you created is `??` in `git status` and unlisted until
+`git add`, and a file you deleted stays listed until the deletion is staged.
+That is stock Git's contract, which is the point.
 
 `-S`, `--follow`, `--graph` and `--topo-order` are **refused**, not
 approximated. The first two search *across* commits rather than comparing each

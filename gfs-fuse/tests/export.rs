@@ -363,7 +363,12 @@ async fn status_costs_no_base_metadata_and_no_blob_bytes() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn the_shim_reports_the_overlay_rather_than_a_clean_tree() {
+async fn the_shim_passes_status_and_diff_through_to_real_git() {
+  // ADR 0009: the shim routes cost, not correctness, so `status` and `diff`
+  // reach stock Git against the seeded `.git` -- and report *Git's* truth. An
+  // unstaged new file is `??`, not the overlay journal's `A `; that difference
+  // is the compatibility this design buys, because `??` is what every tool
+  // parsing porcelain output expects.
   let backend = Backend::start("basic").await;
   let job = Job::start(&backend, "main").await;
   let ws = job.workspace.clone();
@@ -382,11 +387,11 @@ async fn the_shim_reports_the_overlay_rather_than_a_clean_tree() {
   .await;
 
   assert!(porcelain.0, "{}", porcelain.2);
-  assert!(porcelain.1.contains("A  added.txt"), "{}", porcelain.1);
-  assert!(porcelain.1.contains("M  README.md"), "{}", porcelain.1);
+  assert!(porcelain.1.contains("?? added.txt"), "{}", porcelain.1);
+  assert!(porcelain.1.contains(" M README.md"), "{}", porcelain.1);
 
   assert!(long.1.contains("On branch main"), "{}", long.1);
-  assert!(long.1.contains("new file:   added.txt"), "{}", long.1);
+  assert!(long.1.contains("added.txt"), "{}", long.1);
 
   assert!(diff.0, "{}", diff.2);
   assert!(
@@ -396,28 +401,61 @@ async fn the_shim_reports_the_overlay_rather_than_a_clean_tree() {
   );
   assert!(diff.1.contains("+# edited"), "{}", diff.1);
 
+  // `diff --name-only` is worktree-vs-index: the untracked file is absent,
+  // which is Git's answer and the right one.
   let listed: Vec<&str> = names.1.lines().collect();
-  assert!(listed.contains(&"added.txt"), "{listed:?}");
   assert!(listed.contains(&"README.md"), "{listed:?}");
+  assert!(!listed.contains(&"added.txt"), "{listed:?}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn the_shim_lists_the_merged_workspace_not_the_pinned_commit() {
+async fn ls_files_through_the_shim_answers_from_the_real_index() {
   let backend = Backend::start("basic").await;
   let job = Job::start(&backend, "main").await;
   let ws = job.workspace.clone();
 
-  let listed = on_fs(move || {
+  let (listed, status) = on_fs(move || {
     std::fs::write(ws.join("added.txt"), b"new\n").unwrap();
     std::fs::remove_file(ws.join("src/lib/util.rs")).unwrap();
-    run_in(&ws, shim(), &["ls-files"]).1
+    (
+      run_in(&ws, shim(), &["ls-files"]).1,
+      run_in(&ws, shim(), &["status", "--porcelain"]).1,
+    )
   })
   .await;
 
+  // Git's semantics, exactly: `ls-files` lists the index, so the deleted-but-
+  // unstaged file is still listed and the untracked one is not -- while
+  // `status` reports both transitions. ADR 0005's shim answered from the
+  // overlay and inverted both, which is the incompatibility ADR 0009 removes.
   let listed: Vec<&str> = listed.lines().collect();
-  assert!(listed.contains(&"added.txt"), "{listed:?}");
-  assert!(!listed.contains(&"src/lib/util.rs"), "{listed:?}");
+  assert!(listed.contains(&"src/lib/util.rs"), "{listed:?}");
+  assert!(!listed.contains(&"added.txt"), "{listed:?}");
   assert!(listed.contains(&"README.md"), "{listed:?}");
+  assert!(status.contains(" D src/lib/util.rs"), "{status}");
+  assert!(status.contains("?? added.txt"), "{status}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_shim_refuses_object_database_maintenance_with_the_reason() {
+  let backend = Backend::start("basic").await;
+  let job = Job::start(&backend, "main").await;
+  let ws = job.workspace.clone();
+
+  let (gc, repack) = on_fs(move || {
+    (
+      run_in(&ws, shim(), &["gc"]),
+      run_in(&ws, shim(), &["repack", "-a", "-d"]),
+    )
+  })
+  .await;
+
+  // Exit 2, not 1: several subcommands use 1 as a data-bearing answer.
+  assert!(!gc.0);
+  assert!(gc.2.contains("refused"), "{}", gc.2);
+  assert!(gc.2.contains("object database"), "{}", gc.2);
+  assert!(!repack.0);
+  assert!(repack.2.contains("6.6 GiB"), "{}", repack.2);
 }
 
 // ---------------------------------------------------------------------------

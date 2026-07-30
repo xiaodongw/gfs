@@ -257,3 +257,31 @@ stricter limit and evasion fails safe.
 - ADR 0007's question — whether these tools occupy the standard names on `PATH` —
   is narrowed rather than answered: `git` needs only the short routing list above,
   and `grep`/`find` need a degrade rule rather than a refusal.
+
+## Amendment, 2026-07-29: two deltas from the build
+
+M9.1–M9.6 were implemented the same day, and two decisions changed shape on
+contact with the code.
+
+**The `Log` RPC survives, as `gfs show`'s internal fetch.** The retirement
+table above says `gfs log` + `Log` both go. The CLI command is gone, but
+`gfs show` — which stays, on the measured 91.5 MiB cost of a monorepo tree
+diff — fetches its one-commit header through the same `Log` walk, so the RPC
+remains as internal support. Deleting it would have meant rebuilding `show` on
+a second header path for no caller-visible change.
+
+**`blame` advises instead of routing.** Routing `git blame` to `gfs blame`
+would substitute output in a different format, and a tool parsing
+`git blame --porcelain` would break — the `ls-files`-lies failure mode this ADR
+exists to end, reintroduced by its own shim. So the shim runs real `git blame`
+after a stderr note naming `gfs blame` and the measured cost. stderr reaches
+the agent; stdout stays byte-exact for tools. The routing table's other rows
+are unchanged: five maintenance commands fail with the reason, everything else
+passes through, and outside a GFS workspace the shim is fully transparent —
+which closes ADR 0005's recorded objection to a `PATH`-wide install.
+
+One test consequence worth recording: the old shim's tests asserted overlay
+semantics (`A  added.txt` for any new file). Stock Git reports `?? added.txt`
+until `git add`, and `git ls-files` keeps listing a deleted-but-unstaged file.
+The rewritten tests assert Git's behaviour, because Git's behaviour is the
+compatibility this ADR buys.

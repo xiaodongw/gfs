@@ -182,6 +182,98 @@ pub fn init_bare(repo_path: &Path, git_binary: &Path) -> Result<(), GfsError> {
       format!("git init failed: {}", stderr.trim()),
     ));
   }
+  set_retention_policy(repo_path, git_binary)?;
+  Ok(())
+}
+
+/// ADR 0009's pack retention policy, written into the mirror's own config.
+///
+/// A workspace's `.git` borrows this repository's object database through the
+/// projection, and a mount holds no file descriptor on the gateway's packs — so
+/// the retention POSIX gives a local worktree for free (an unlinked pack survives
+/// while open) has to be restated as policy here. A pack's name is its own
+/// checksum, so a pruned object can only be *missing* to a borrower, never wrong;
+/// this config is what keeps it from going missing under a live lease.
+///
+/// Set on the repository rather than passed per command, so a stray manual `git
+/// gc` run by an operator against the mirror obeys the same policy the service
+/// does.
+fn set_retention_policy(repo_path: &Path, git_binary: &Path) -> Result<(), GfsError> {
+  // ADR 0006's lease policy bounds how long an expired mount's objects must stay
+  // recoverable; a pack referenced by a *live* lease is protected because prune
+  // only removes unreachable objects and every mounted commit is anchored under
+  // refs/gfs/. The prune delay covers the gap between expiry and re-anchor.
+  let prune_delay_secs = gfs_types::LeasePolicy::adr_0006().prune_delay.as_secs();
+  let settings: &[(&str, String)] = &[
+    // "<n> seconds ago" is Git's approxidate; an absolute duration relative to
+    // now at prune time, which is exactly the grace period wanted.
+    ("gc.pruneExpire", format!("{prune_delay_secs} seconds ago")),
+    // Nothing repacks a served mirror as a side effect of another command. A
+    // repack is an operator action taken with the lease table in view.
+    ("gc.auto", "0".to_owned()),
+    ("maintenance.auto", "false".to_owned()),
+    // When an operator does repack, keep unreachable objects in a cruft pack
+    // instead of exploding them loose -- Git's own answer to pruning under
+    // concurrent readers, and the shape the projection serves best.
+    ("repack.cruftPacks", "true".to_owned()),
+  ];
+  for (key, value) in settings {
+    let out = Command::new(git_binary)
+      .env_clear()
+      .env("GIT_CONFIG_GLOBAL", "/dev/null")
+      .env("GIT_CONFIG_SYSTEM", "/dev/null")
+      .env("PATH", "/usr/bin:/bin")
+      .arg("-C")
+      .arg(repo_path)
+      .args(["config", "set", "--local", key, value])
+      .output()
+      .map_err(|e| GfsError::new(ErrorCode::Internal, format!("cannot run git config: {e}")))?;
+    if !out.status.success() {
+      let stderr = String::from_utf8_lossy(&out.stderr);
+      return Err(GfsError::new(
+        ErrorCode::Internal,
+        format!("git config {key} failed: {}", stderr.trim()),
+      ));
+    }
+  }
+  Ok(())
+}
+
+/// Write the commit-graph with changed-path Bloom filters (ADR 0009).
+///
+/// `--split` so a sync after a small fetch appends an increment instead of
+/// rewriting the whole graph — linux's is 120 MiB and rewriting it per webhook
+/// would dominate the sync. The projection serves the chain files as readily as
+/// the single file; both are in the odb path grammar.
+pub fn write_commit_graph(repo_path: &Path, git_binary: &Path) -> Result<(), GfsError> {
+  let out = Command::new(git_binary)
+    .env_clear()
+    .env("GIT_CONFIG_GLOBAL", "/dev/null")
+    .env("GIT_CONFIG_SYSTEM", "/dev/null")
+    .env("PATH", "/usr/bin:/bin")
+    .arg("-C")
+    .arg(repo_path)
+    .args([
+      "commit-graph",
+      "write",
+      "--reachable",
+      "--changed-paths",
+      "--split",
+    ])
+    .output()
+    .map_err(|e| {
+      GfsError::new(
+        ErrorCode::Internal,
+        format!("cannot run git commit-graph: {e}"),
+      )
+    })?;
+  if !out.status.success() {
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    return Err(GfsError::new(
+      ErrorCode::Internal,
+      format!("git commit-graph write failed: {}", stderr.trim()),
+    ));
+  }
   Ok(())
 }
 
@@ -457,6 +549,36 @@ mod tests {
     assert!(gfs_git::verdict(&format).is_supported());
     // And it opens through the production path.
     gfs_git::Libgit2Repository::open(&path, 2, 1 << 20).unwrap();
+  }
+
+  #[test]
+  fn a_new_mirror_carries_the_retention_policy_in_its_own_config() {
+    // ADR 0009: a projected workspace borrows this object database with no file
+    // descriptor protecting it, so retention is repository config rather than a
+    // property of who runs the command. Asserted via `git config get` so what is
+    // checked is what any git invocation against the mirror would actually obey.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("new.git");
+    init_bare(&path, Path::new("git")).unwrap();
+
+    let get = |key: &str| -> String {
+      let out = Command::new("git")
+        .env_clear()
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .env("PATH", "/usr/bin:/bin")
+        .arg("-C")
+        .arg(&path)
+        .args(["config", "get", key])
+        .output()
+        .unwrap();
+      String::from_utf8_lossy(&out.stdout).trim().to_owned()
+    };
+    let prune_delay = gfs_types::LeasePolicy::adr_0006().prune_delay.as_secs();
+    assert_eq!(get("gc.pruneExpire"), format!("{prune_delay} seconds ago"));
+    assert_eq!(get("gc.auto"), "0");
+    assert_eq!(get("maintenance.auto"), "false");
+    assert_eq!(get("repack.cruftPacks"), "true");
   }
 
   #[test]

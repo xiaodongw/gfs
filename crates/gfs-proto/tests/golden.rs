@@ -264,32 +264,11 @@ const PINNED: &[(&str, &[Field])] = &[
     &[(1, "commits", ".gfs.v1.LogCommit"), (2, "has_more", "bool")],
   ),
   (
-    "FindPathsRequest",
-    &[
-      (1, "repository_id", "string"),
-      (2, "commit_oid", "string"),
-      (3, "authorization", ".gfs.v1.SnapshotAuthorization"),
-      (4, "scope", "bytes"),
-      (5, "include_globs", "string"),
-      (6, "exclude_globs", "string"),
-      (7, "limit", "uint32"),
-      (8, "start_after_path", "bytes"),
-    ],
-  ),
-  (
     "FoundPath",
     &[
       (1, "path", "bytes"),
       (2, "kind", ".gfs.v1.EntryKind"),
       (3, "mode", "uint32"),
-    ],
-  ),
-  (
-    "FindPathsResponse",
-    &[
-      (1, "paths", ".gfs.v1.FoundPath"),
-      (2, "truncated", "bool"),
-      (3, "next_start_after_path", "bytes"),
     ],
   ),
   (
@@ -703,7 +682,6 @@ fn service_methods_are_stable() {
     "SnapshotService/Blame(.gfs.v1.BlameRequest) -> .gfs.v1.BlameResponse",
     "SnapshotService/CreateMount(.gfs.v1.CreateMountRequest) -> .gfs.v1.CreateMountResponse",
     "SnapshotService/DiffCommits(.gfs.v1.DiffCommitsRequest) -> .gfs.v1.DiffCommitsResponse",
-    "SnapshotService/FindPaths(.gfs.v1.FindPathsRequest) -> .gfs.v1.FindPathsResponse",
     "SnapshotService/GetCommit(.gfs.v1.GetCommitRequest) -> .gfs.v1.GetCommitResponse",
     "SnapshotService/GetEntry(.gfs.v1.GetEntryRequest) -> .gfs.v1.GetEntryResponse",
     "SnapshotService/ListDirectory(.gfs.v1.ListDirectoryRequest) -> .gfs.v1.ListDirectoryResponse",

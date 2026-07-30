@@ -75,7 +75,7 @@ use crate::cache::BlobCache;
 use crate::client::{MountBinding, SnapshotClient};
 use crate::control::{MountReport, RefreshReport, Request, Response};
 use crate::fs::{FsConfig, Gfs, GfsFilesystem};
-use crate::gitdir::{GitDir, GitDirFacts};
+use crate::gitdir::GitDirFacts;
 use crate::lease::{LeaseHealth, LeaseMonitor};
 use crate::publish::{DirectMountPublisher, MountPublisher};
 use crate::session::MountConfig;
@@ -264,6 +264,10 @@ pub struct Mount {
   /// to know which ref to advance.
   work_branch: Mutex<Option<String>>,
   cache: Arc<BlobCache>,
+  /// The per-repository object-database projection this workspace borrows
+  /// through `objects/info/alternates`. Held so the projection outlives every
+  /// workspace that references it (ADR 0009).
+  odb: Arc<crate::odb::OdbProjection>,
   publisher: Box<dyn MountPublisher>,
   /// The filesystem, created once and re-pointed by every switch. Outlives every
   /// [`Pin`], which is what makes the workspace path stable.
@@ -296,7 +300,11 @@ impl Mount {
   /// host share it, and a cache opened per mount would make `--cache-quota` mean
   /// "per mount" rather than "per host". [`crate::host::MountHost`] keeps the
   /// registry that decides which mounts get the same handle.
-  pub async fn start(config: MountSpec, cache: Arc<BlobCache>) -> Result<Arc<Self>, GfsError> {
+  pub async fn start(
+    config: MountSpec,
+    cache: Arc<BlobCache>,
+    odb: Arc<crate::odb::OdbProjection>,
+  ) -> Result<Arc<Self>, GfsError> {
     // Absolute before anything else, so the daemon keeps working if something
     // later changes its working directory, and so `mount.json` names a path an
     // orchestrator cleaning up after a crash can act on without knowing where
@@ -314,10 +322,23 @@ impl Mount {
       Box::new(DirectMountPublisher::new(config.workspace.clone())?);
 
     let resolved = resolve_pin(&config, &config.revision_selector.clone(), 1).await?;
+    // The real `.git` (ADR 0009): seeded on local disk, named by a synthesized
+    // `.git` *file* in the mount. The index the gateway built is fetched once;
+    // a failure there degrades to no index -- `git status` would report every
+    // file deleted, which is wrong -- so it fails the mount instead.
+    let git_dir_path = config.state_dir.join("git");
+    let index = odb.client.commit_index(&resolved.pin.commit).await?;
+    crate::gitdir::seed_git_dir(&crate::gitdir::SeedSpec {
+      git_dir: &git_dir_path,
+      workspace: &config.workspace,
+      odb_mountpoint: &odb.mountpoint,
+      facts: &resolved.facts,
+      index: Some(&index),
+    })?;
     let fs = Gfs::new(
       Arc::clone(&resolved.pin.client),
       Arc::clone(&cache),
-      resolved.gitdir,
+      Arc::new(crate::gitdir::git_file(&git_dir_path)),
       Arc::clone(&resolved.pin.overlay),
       resolved.root,
       config.fs.clone(),
@@ -335,6 +356,7 @@ impl Mount {
 
     let mount = Arc::new(Mount {
       cache,
+      odb,
       publisher,
       fs,
       session: Mutex::new(Some(session)),
@@ -575,13 +597,47 @@ impl Mount {
     };
     let next_epoch = previous_epoch + 1;
     let selector = self.selector.lock().expect("selector").clone();
+
+    // Local commits are the agent's work and a re-seed would overwrite the
+    // branch ref they hang from. `git push` (or an export) is how they leave;
+    // until then the workspace stays where it is. The overlay-dirty check made
+    // by the callers does not see these, because a commit empties nothing in
+    // `.git`.
+    let git_dir_path = self.config.state_dir.join("git");
+    if let Some(local) = crate::gitdir::local_head(&git_dir_path) {
+      if local != previous_commit.to_hex() {
+        return Err(GfsError::new(
+          ErrorCode::FailedPrecondition,
+          format!(
+            "the workspace has local commits ({} is ahead of the pinned {}); \
+             push them before switching",
+            local.get(..12).unwrap_or(&local),
+            previous_commit.to_hex()
+          ),
+        ));
+      }
+    }
+
     let resolved = resolve_pin(&self.config, &selector, next_epoch).await?;
     let commit = resolved.pin.commit.clone();
+
+    // Re-seed HEAD, the branch ref, and the index to the new pin. The index
+    // fetch is the only network dependency; failing the switch here leaves the
+    // old pin fully intact, which is the same guarantee resolve_pin's ordering
+    // already gives.
+    let index = self.odb.client.commit_index(&commit).await?;
+    crate::gitdir::seed_git_dir(&crate::gitdir::SeedSpec {
+      git_dir: &git_dir_path,
+      workspace: &self.config.workspace,
+      odb_mountpoint: &self.odb.mountpoint,
+      facts: &resolved.facts,
+      index: Some(&index),
+    })?;
 
     let stale = self.fs.repin(
       crate::fs::Pinned {
         client: Arc::clone(&resolved.pin.client),
-        gitdir: resolved.gitdir,
+        gitdir: Arc::new(crate::gitdir::git_file(&git_dir_path)),
         overlay: Arc::clone(&resolved.pin.overlay),
         snapshot_time: resolved.pin.snapshot_time,
       },
@@ -830,6 +886,57 @@ impl Mount {
   }
 
   /// The change set, from the journal alone.
+  /// Answer the fsmonitor hook (ADR 0009).
+  ///
+  /// The contract with Git: return every path changed since the caller's
+  /// token, or tell it to rescan. The overlay journal is cumulative for a
+  /// generation, so the answer is *all* overlay-changed paths — a superset of
+  /// changes since any token in the generation, and a superset is always safe
+  /// because Git re-checks listed paths and trusts only the unlisted ones.
+  ///
+  /// The token is `gfs:<generation>`. A repin discards or re-bases the
+  /// overlay, which changes what an unlisted path means, so a token from
+  /// another generation forces the one full rescan that re-grounds Git.
+  pub async fn fsmonitor_changes(
+    &self,
+    caller_token: &str,
+  ) -> Result<crate::control::FsMonitorAnswer, GfsError> {
+    let (overlay, commit, generation) = {
+      let current = self.current.lock().expect("current pin");
+      (
+        Arc::clone(&current.overlay),
+        current.commit.clone(),
+        current.epoch,
+      )
+    };
+    let token = format!("gfs:{generation}");
+    let full_rescan = caller_token != token;
+    let algorithm = commit.algorithm();
+    let status = tokio::task::spawn_blocking(move || overlay.status(algorithm))
+      .await
+      .map_err(|e| GfsError::internal(format!("the fsmonitor task failed: {e}")))?
+      .map_err(crate::fs::overlay_as_service_error)?;
+    let mut paths = Vec::with_capacity(status.changes.len() * 2);
+    for change in &status.changes {
+      paths.push(String::from_utf8_lossy(change.path.as_bytes()).into_owned());
+      // A rename changed both names: the new one exists, the old one is gone,
+      // and Git must re-stat both.
+      if let Some(from) = &change.from {
+        paths.push(String::from_utf8_lossy(from.as_bytes()).into_owned());
+      }
+    }
+    for dir in &status.directory_deletions {
+      // Git's protocol: a trailing slash marks a directory whose contents all
+      // changed.
+      paths.push(format!("{}/", String::from_utf8_lossy(dir.as_bytes())));
+    }
+    Ok(crate::control::FsMonitorAnswer {
+      token,
+      paths,
+      full_rescan,
+    })
+  }
+
   pub async fn status(&self) -> Result<crate::control::StatusReport, GfsError> {
     let (overlay, commit, ref_name) = {
       let current = self.current.lock().expect("current pin");
@@ -1156,33 +1263,6 @@ impl Mount {
     })
   }
 
-  /// Filename search over the merged workspace.
-  ///
-  /// Takes the generation's client and overlay under the lock and releases it
-  /// before the request, for the reason `search` gives: a walk of a monorepo's
-  /// tree must not hold `refresh` and `status` behind it.
-  pub async fn find(
-    &self,
-    request: &crate::find::FindRequest,
-  ) -> Result<crate::find::FindReport, GfsError> {
-    let (client, overlay, commit, ref_name) = {
-      let current = self.current.lock().expect("current pin");
-      (
-        Arc::clone(&current.client),
-        Arc::clone(&current.overlay),
-        current.commit.clone(),
-        current.ref_name.clone(),
-      )
-    };
-    let (paths, truncated) = crate::find::find(&client, &overlay, request).await?;
-    Ok(crate::find::FindReport {
-      base_commit: commit.to_qualified(),
-      ref_name,
-      paths,
-      truncated,
-    })
-  }
-
   pub async fn export(&self, bundle: &Path) -> Result<gfs_overlay::ExportReport, GfsError> {
     let (status, base, overlay, commit) = self.export_inputs().await?;
     let exporter = gfs_overlay::Exporter::new(
@@ -1385,6 +1465,10 @@ impl Mount {
         Ok(report) => Response::Status(Box::new(report)),
         Err(e) => Response::from_error(&e),
       },
+      Request::FsMonitorChanges { token } => match self.fsmonitor_changes(&token).await {
+        Ok(answer) => Response::FsMonitorChanges(Box::new(answer)),
+        Err(e) => Response::from_error(&e),
+      },
       Request::Diff => match self.diff().await {
         Ok(patch) => Response::Diff {
           patch_b64url: gfs_types::path::b64url_encode(&patch),
@@ -1479,10 +1563,6 @@ impl Mount {
         }
         Err(e) => Response::from_error(&e),
       },
-      Request::Find(request) => match self.find(&request).await {
-        Ok(report) => Response::Find(Box::new(report)),
-        Err(e) => Response::from_error(&e),
-      },
       Request::Unmount => {
         self.shutdown().await;
         Response::Unmounted
@@ -1531,7 +1611,7 @@ fn absolute(path: &Path) -> Result<PathBuf, GfsError> {
 /// [`Gfs::repin`] and not stored twice.
 struct Resolved {
   pin: Pin,
-  gitdir: Arc<GitDir>,
+  facts: GitDirFacts,
   root: gfs_types::TreeEntryInfo,
 }
 
@@ -1589,7 +1669,7 @@ async fn resolve_pin(config: &MountSpec, selector: &str, epoch: u64) -> Result<R
     }
   };
 
-  let gitdir = Arc::new(GitDir::new(&GitDirFacts {
+  let facts = GitDirFacts {
     repository_id: config.repository_id.clone(),
     commit: commit.clone(),
     tree: tree.clone(),
@@ -1601,7 +1681,7 @@ async fn resolve_pin(config: &MountSpec, selector: &str, epoch: u64) -> Result<R
     http_endpoint: config.http_endpoint.clone(),
     generation: epoch,
     commit_meta,
-  }));
+  };
 
   // One overlay per pin, in its own directory. The binding check inside
   // `Overlay::open` then does real work: a daemon restarted against a moved
@@ -1642,7 +1722,7 @@ async fn resolve_pin(config: &MountSpec, selector: &str, epoch: u64) -> Result<R
   let root = crate::fs::root_entry(tree.clone());
 
   Ok(Resolved {
-    gitdir,
+    facts,
     root,
     pin: Pin {
       epoch,

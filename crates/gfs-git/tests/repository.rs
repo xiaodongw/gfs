@@ -1086,3 +1086,131 @@ fn a_path_walk_of_a_missing_directory_is_an_error_not_an_empty_result() {
     .unwrap_err();
   assert_eq!(err.code, gfs_types::error::ErrorCode::NotFound);
 }
+
+// ---------------------------------------------------------------------------
+// The shipped index (ADR 0009)
+// ---------------------------------------------------------------------------
+
+/// The only assertion about the index format that matters: stock Git reads it.
+///
+/// The file is checked out with every mtime set to `snapshot_time` -- which is
+/// what a projected worktree reports by construction -- and `git status` against
+/// the shipped index must then find nothing to say without re-hashing anything.
+/// If any stat field disagreed with what `core.checkStat=minimal` compares, every
+/// entry would be stat-dirty and this reports the whole tree modified.
+#[test]
+fn stock_git_reads_the_shipped_index_and_reports_a_clean_tree() {
+  let repo = open("basic");
+  let head = repo
+    .resolve(&RevisionSelector::parse("main", HashAlgorithm::Sha1).unwrap())
+    .unwrap();
+  let snapshot_time = gfs_types::Timestamp {
+    secs: 1_600_000_000,
+    nanos: 0,
+  };
+  let index_bytes = repo.index_for_commit(&head.commit, snapshot_time).unwrap();
+
+  // A worktree whose stat data matches what a projection would report.
+  let dir = tempfile::tempdir().unwrap();
+  let gitdir = dir.path().join("git");
+  let worktree = dir.path().join("tree");
+  std::fs::create_dir_all(gitdir.join("refs/heads")).unwrap();
+  std::fs::create_dir_all(&worktree).unwrap();
+  std::fs::write(gitdir.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+  std::fs::write(
+    gitdir.join("refs/heads/main"),
+    format!("{}\n", head.commit.to_hex()),
+  )
+  .unwrap();
+  std::fs::write(
+    gitdir.join("config"),
+    "[core]\n\trepositoryformatversion = 0\n\tbare = false\n\tautocrlf = false\n\
+     \tcheckStat = minimal\n\ttrustctime = false\n",
+  )
+  .unwrap();
+  std::fs::create_dir_all(gitdir.join("objects/info")).unwrap();
+  std::fs::write(
+    gitdir.join("objects/info/alternates"),
+    format!("{}\n", gfs_test::bare("basic").join("objects").display()),
+  )
+  .unwrap();
+  std::fs::write(gitdir.join("index"), &index_bytes).unwrap();
+
+  // Materialize the tree the way the projection presents it.
+  repo
+    .walk_paths(&head.commit, &BytePath::root(), &mut |path, mode| {
+      let full = worktree.join(String::from_utf8(path.as_bytes().to_vec()).unwrap());
+      std::fs::create_dir_all(full.parent().unwrap()).unwrap();
+      let entry = repo.entry(&head.commit, &path).unwrap().unwrap();
+      let bytes = repo.read_blob(&entry.oid).unwrap();
+      assert_ne!(
+        mode,
+        gfs_types::mode::SYMLINK,
+        "this test materializes with std, which cannot set a symlink's mtime; \
+         use a fixture without symlinks"
+      );
+      std::fs::write(&full, bytes).unwrap();
+      if mode == gfs_types::mode::EXECUTABLE {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&full, std::fs::Permissions::from_mode(0o755)).unwrap();
+      }
+      let t = std::time::SystemTime::UNIX_EPOCH
+        + std::time::Duration::new(snapshot_time.secs as u64, snapshot_time.nanos);
+      std::fs::File::options()
+        .append(true)
+        .open(&full)
+        .unwrap()
+        .set_modified(t)
+        .unwrap();
+      Ok(())
+    })
+    .unwrap();
+
+  let out = std::process::Command::new("git")
+    .env_clear()
+    .env("GIT_CONFIG_GLOBAL", "/dev/null")
+    .env("GIT_CONFIG_SYSTEM", "/dev/null")
+    .env("PATH", "/usr/bin:/bin")
+    .env("GIT_DIR", &gitdir)
+    .env("GIT_WORK_TREE", &worktree)
+    .args(["status", "--porcelain"])
+    .output()
+    .unwrap();
+  assert!(
+    out.status.success(),
+    "{}",
+    String::from_utf8_lossy(&out.stderr)
+  );
+  assert_eq!(
+    String::from_utf8_lossy(&out.stdout),
+    "",
+    "a clean projected tree must read clean through the shipped index"
+  );
+
+  // And `ls-files` agrees with the walk, which is the question `gfs find` used
+  // to answer.
+  let out = std::process::Command::new("git")
+    .env_clear()
+    .env("GIT_CONFIG_GLOBAL", "/dev/null")
+    .env("GIT_CONFIG_SYSTEM", "/dev/null")
+    .env("PATH", "/usr/bin:/bin")
+    .env("GIT_DIR", &gitdir)
+    .env("GIT_WORK_TREE", &worktree)
+    .args(["ls-files"])
+    .output()
+    .unwrap();
+  let mut walked = Vec::new();
+  repo
+    .walk_paths(&head.commit, &BytePath::root(), &mut |path, _| {
+      walked.push(String::from_utf8(path.as_bytes().to_vec()).unwrap());
+      Ok(())
+    })
+    .unwrap();
+  walked.sort();
+  let mut listed: Vec<String> = String::from_utf8_lossy(&out.stdout)
+    .lines()
+    .map(|l| l.to_owned())
+    .collect();
+  listed.sort();
+  assert_eq!(listed, walked);
+}

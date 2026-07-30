@@ -530,70 +530,6 @@ impl SnapshotClient {
     })
   }
 
-  /// Paths in the pinned commit's tree matching the globs.
-  ///
-  /// Pages internally until the server stops truncating, so a caller gets the
-  /// whole matching set or an error — never a silently short list. The bound is
-  /// the caller's `limit`, which is what stops a `*` glob over a monorepo from
-  /// becoming an unbounded loop.
-  pub async fn find_paths(
-    &self,
-    scope: &BytePath,
-    include_globs: &[String],
-    exclude_globs: &[String],
-    limit: usize,
-  ) -> Result<(Vec<TreeEntryInfo>, bool), GfsError> {
-    let mut found: Vec<TreeEntryInfo> = Vec::new();
-    let mut start_after = Vec::new();
-    loop {
-      let remaining = limit.saturating_sub(found.len());
-      if remaining == 0 {
-        return Ok((found, true));
-      }
-      let request = self.authed(v1::FindPathsRequest {
-        repository_id: self.binding.repository_id.as_str().to_owned(),
-        commit_oid: self.binding.commit.to_qualified(),
-        authorization: self.authorization(),
-        scope: scope.as_bytes().to_vec(),
-        include_globs: include_globs.to_vec(),
-        exclude_globs: exclude_globs.to_vec(),
-        limit: remaining.min(u32::MAX as usize) as u32,
-        start_after_path: start_after.clone(),
-      })?;
-      let response = self
-        .grpc
-        .clone()
-        .find_paths(request)
-        .await
-        .map_err(|s| convert::from_status(&s))?
-        .into_inner();
-
-      for path in response.paths {
-        found.push(TreeEntryInfo {
-          path: convert::try_path(path.path)?,
-          kind: gfs_types::EntryKind::from_mode(path.mode),
-          mode: path.mode,
-          // A filename search answers about names, not content. The object ID is
-          // not on the wire because carrying one would invite a caller to read a
-          // blob from a result that never proved the blob was authorized.
-          oid: self.binding.commit.clone(),
-          size: 0,
-          symlink_target: None,
-          blob_ticket: None,
-        });
-      }
-      if !response.truncated {
-        return Ok((found, false));
-      }
-      // A truncated page with no cursor cannot be continued, and looping on it
-      // would spin forever against a server that always says "more".
-      if response.next_start_after_path.is_empty() {
-        return Ok((found, true));
-      }
-      start_after = response.next_start_after_path;
-    }
-  }
-
   /// Ask the server to build the pinned commit's search index.
   ///
   /// Nothing else in the client path calls this, which is why it exists: the
@@ -784,7 +720,7 @@ impl SnapshotClient {
 /// The status alone is not enough: 503 is both `UNAVAILABLE` (retry) and
 /// `SNAPSHOT_BUILDING` (retry, but a different message), and the retry policy in
 /// `ErrorCode::retryable` is written against the codes, not against HTTP.
-fn http_error(status: http::StatusCode, body: &[u8]) -> GfsError {
+pub(crate) fn http_error(status: http::StatusCode, body: &[u8]) -> GfsError {
   #[derive(serde::Deserialize)]
   struct Body {
     code: String,
