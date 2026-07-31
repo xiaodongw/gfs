@@ -68,6 +68,15 @@ struct Cli {
   /// DESIGN.md section 8.4's hard hydration budget. Zero disables it.
   #[arg(long, default_value_t = 0)]
   worktree_budget: u64,
+  /// Mount writable and serve Git's mutations of the lower directory. This is
+  /// the single-mount spike: the lower directory is a live `.git` and the
+  /// question is what its traffic costs through FUSE. Modes and mtimes pass
+  /// through rather than being projected.
+  #[arg(long, default_value_t = false)]
+  rw: bool,
+  /// Cache negative lookups in the kernel for this many seconds (0 = don't).
+  #[arg(long, default_value_t = 0)]
+  negative_ttl: u64,
   /// Written to the mount point path as `$GFS_MNT` for each command.
   #[arg(long)]
   json: Option<PathBuf>,
@@ -102,16 +111,25 @@ fn main() -> Result<()> {
   let snapshot_time = cli
     .snapshot_time
     .map(|t| UNIX_EPOCH + Duration::from_secs(t.max(0) as u64));
-  let shared = Arc::new(Shared::new(lower.clone(), cli.ttl, snapshot_time, cli.worktree_budget));
+  let shared = Arc::new(Shared::new(
+    lower.clone(),
+    cli.ttl,
+    snapshot_time,
+    cli.worktree_budget,
+    cli.rw,
+    Duration::from_secs(cli.negative_ttl),
+  ));
   // `Config` is #[non_exhaustive] in fuser 0.18, so it is built by mutation.
   let mut config = Config::default();
   config.mount_options = vec![
     MountOption::FSName("gfs-projection".into()),
-    MountOption::RO,
     MountOption::NoSuid,
     MountOption::NoDev,
     MountOption::NoAtime,
   ];
+  if !cli.rw {
+    config.mount_options.push(MountOption::RO);
+  }
   config.acl = SessionACL::Owner;
   // Git reads packfiles from several threads and `status` is parallel by
   // default; one event-loop thread would serialize the mount and make the wall
@@ -176,7 +194,9 @@ fn main() -> Result<()> {
       "git_meta",
     ] {
       if let Some(c) = ops.get(class) {
-        if c.lookup + c.getattr + c.read + c.readdir + c.readlink == 0 {
+        if c.lookup + c.getattr + c.read + c.readdir + c.readlink + c.write + c.mutate + c.fsync
+          == 0
+        {
           continue;
         }
         println!(
@@ -191,6 +211,12 @@ fn main() -> Result<()> {
           c.readdir,
           c.readdir_entries
         );
+        if c.write + c.mutate + c.fsync > 0 {
+          println!(
+            "    {:<13} write {:>6} = {:>10} B  mutate {:>5}  fsync {:>4}",
+            "", c.write, c.write_bytes, c.mutate, c.fsync
+          );
+        }
         // What a chunked fetcher would have to download for the same reads. The
         // gap between this and `read_bytes` is the amplification a chunk size
         // costs, which is the whole question when the access pattern is a binary
