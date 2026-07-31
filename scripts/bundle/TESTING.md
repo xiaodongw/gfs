@@ -100,6 +100,41 @@ gfs diff HEAD~3..HEAD
 gfs blame src/flask/cli.py -L 40,80
 ```
 
+## Browse it over WebDAV
+
+The same server speaks read-only WebDAV at `/dav/` — no `gfs`, no `git`,
+no FUSE. Any repository the server holds is browsable at
+`/dav/<repo-id>/<branch>/...`, where `<repo-id>` is what `gfs clone`
+printed (e.g. `github.com_pallets_flask`). This server runs the no-token
+dev posture, so no credentials anywhere:
+
+```sh
+curl -s -X PROPFIND -H 'Depth: 1' http://127.0.0.1:8430/dav/           # repos
+curl -s -X PROPFIND -H 'Depth: 1' \
+  http://127.0.0.1:8430/dav/<repo-id>/main/ | grep -o '<D:href>[^<]*'  # tree
+curl -s http://127.0.0.1:8430/dav/<repo-id>/main/README.md             # bytes
+```
+
+A branch with a slash in its name is nested folders (`topic/deep` is
+`topic/` containing `deep/`). Writes answer `405`; a `PROPFIND` without a
+`Depth` header answers `403` on purpose (Depth infinity over a monorepo is
+a tree walk nobody meant to request).
+
+As a mounted volume:
+
+- **macOS Finder**: Go → Connect to Server → `http://<host>:8430/dav`.
+  Mounts read-only — the server advertises no LOCK support.
+- **Windows Explorer**: `net start webclient` once (admin; error 67 means
+  it is not running), then `net use Z: http://<host>:8430/dav` — or the
+  redirector's native `net use Z: \\<host>@8430\dav`. In `cmd.exe`, the
+  curl examples need double quotes: `-H "Depth: 1"` — single quotes are
+  literal there, and the mangled header earns the `403`.
+
+The server binds 127.0.0.1. From another machine, start it with
+`GFS_HTTP_ADDR=0.0.0.0:8430 ./start-server.sh` — and remember anyone who
+can reach the port is `dev`. A Windows host reaches a WSL2-hosted server
+at `localhost` with no rebinding.
+
 ## Teardown
 
 Ctrl+C in the server terminal does everything: unmounts the lab's
