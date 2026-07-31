@@ -5,7 +5,10 @@
 //! accepts, does `status` read clean without sweeping, does an overlay edit
 //! show up as a modification, and do local commits stay local.
 
-use gfs_test::mount::{on_fs, Backend, Job};
+use std::sync::Arc;
+
+use gfs_mount::MountHost;
+use gfs_test::mount::{host_config, mount_spec, on_fs, Backend, Job};
 
 fn git_in(workspace: &std::path::Path, args: &[&str]) -> (bool, String) {
   let out = std::process::Command::new("git")
@@ -225,4 +228,145 @@ async fn a_switch_over_local_commits_is_refused_rather_than_stranding_them() {
   // And the commit is still reachable in the seeded git dir.
   let head = gfs_mount::gitdir::local_head(&job.state_dir.join("git")).unwrap();
   assert_eq!(head.len(), 40, "{head}");
+}
+
+/// Run git against the mirror itself, the way an upstream push would move it.
+fn git_mirror(repo: &std::path::Path, args: &[&str]) -> String {
+  let out = std::process::Command::new("git")
+    .env_clear()
+    .env("PATH", "/usr/bin:/bin")
+    .env("GIT_CONFIG_GLOBAL", "/dev/null")
+    .env("GIT_CONFIG_SYSTEM", "/dev/null")
+    .env("GIT_AUTHOR_NAME", "upstream")
+    .env("GIT_AUTHOR_EMAIL", "upstream@example.com")
+    .env("GIT_COMMITTER_NAME", "upstream")
+    .env("GIT_COMMITTER_EMAIL", "upstream@example.com")
+    .arg("-C")
+    .arg(repo)
+    .args(args)
+    .output()
+    .unwrap();
+  assert!(
+    out.status.success(),
+    "git {args:?}: {}",
+    String::from_utf8_lossy(&out.stderr)
+  );
+  String::from_utf8_lossy(&out.stdout).trim().to_owned()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_remount_over_an_edit_free_state_dir_follows_the_moved_branch() {
+  // The re-clone flow: mount, unmount cleanly, the branch moves upstream,
+  // mount the same state directory again. The leftover overlay holds no edits,
+  // so it adopts the new base — the binding refusal exists to protect edits,
+  // and refusing here would block every re-clone for the sake of nothing.
+  let backend = Backend::start("basic").await;
+  let tmp = tempfile::tempdir().unwrap();
+  let cache = tempfile::tempdir().unwrap();
+  let workspace = tmp.path().join("ws");
+  let state_dir = tmp.path().join("ws.gfs");
+
+  {
+    let sockets = tempfile::tempdir().unwrap();
+    let (host, listener) = MountHost::bind(host_config(&backend, sockets.path())).unwrap();
+    tokio::spawn(Arc::clone(&host).serve(listener));
+    let daemon = host
+      .mount(mount_spec(
+        &backend,
+        "main",
+        &workspace,
+        &state_dir,
+        cache.path(),
+        gfs_overlay::OverlayConfig::default(),
+      ))
+      .await
+      .unwrap();
+    daemon.shutdown().await;
+  }
+
+  let old = git_mirror(&backend.repo_path, &["rev-parse", "refs/heads/main"]);
+  let tree = git_mirror(&backend.repo_path, &["rev-parse", "refs/heads/main^{tree}"]);
+  let moved = git_mirror(
+    &backend.repo_path,
+    &["commit-tree", &tree, "-p", &old, "-m", "moved upstream"],
+  );
+  git_mirror(&backend.repo_path, &["update-ref", "refs/heads/main", &moved]);
+
+  let sockets = tempfile::tempdir().unwrap();
+  let (host, listener) = MountHost::bind(host_config(&backend, sockets.path())).unwrap();
+  tokio::spawn(Arc::clone(&host).serve(listener));
+  let daemon = host
+    .mount(mount_spec(
+      &backend,
+      "main",
+      &workspace,
+      &state_dir,
+      cache.path(),
+      gfs_overlay::OverlayConfig::default(),
+    ))
+    .await
+    .expect("an edit-free leftover state dir must remount at the moved head");
+
+  let ws = workspace.clone();
+  let (ok, head) = on_fs(move || git_in(&ws, &["rev-parse", "HEAD"])).await;
+  assert!(ok, "{head}");
+  assert_eq!(head.trim(), moved, "the remount serves the moved branch");
+  daemon.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_remount_over_local_commits_is_refused_rather_than_stranding_them() {
+  // The first-mount twin of the switch guard above. There is no in-memory pin
+  // to compare against on a fresh mount, so the guard reads what the last seed
+  // recorded (`gfs.json`) — a `HEAD` past it is local commits, and re-seeding
+  // would move the branch ref off them.
+  let backend = Backend::start("basic").await;
+  let tmp = tempfile::tempdir().unwrap();
+  let cache = tempfile::tempdir().unwrap();
+  let workspace = tmp.path().join("ws");
+  let state_dir = tmp.path().join("ws.gfs");
+
+  {
+    let sockets = tempfile::tempdir().unwrap();
+    let (host, listener) = MountHost::bind(host_config(&backend, sockets.path())).unwrap();
+    tokio::spawn(Arc::clone(&host).serve(listener));
+    let daemon = host
+      .mount(mount_spec(
+        &backend,
+        "main",
+        &workspace,
+        &state_dir,
+        cache.path(),
+        gfs_overlay::OverlayConfig::default(),
+      ))
+      .await
+      .unwrap();
+    let ws = workspace.clone();
+    on_fs(move || {
+      std::fs::write(ws.join("local.txt"), b"unpushed\n").unwrap();
+      let (ok, out) = git_in(&ws, &["add", "local.txt"]);
+      assert!(ok, "{out}");
+      let (ok, out) = git_in(&ws, &["commit", "-q", "-m", "left behind"]);
+      assert!(ok, "{out}");
+    })
+    .await;
+    daemon.shutdown().await;
+  }
+
+  let sockets = tempfile::tempdir().unwrap();
+  let (host, listener) = MountHost::bind(host_config(&backend, sockets.path())).unwrap();
+  tokio::spawn(Arc::clone(&host).serve(listener));
+  let error = host
+    .mount(mount_spec(
+      &backend,
+      "main",
+      &workspace,
+      &state_dir,
+      cache.path(),
+      gfs_overlay::OverlayConfig::default(),
+    ))
+    .await
+    .expect_err("local commits must not be re-seeded over");
+  assert_eq!(error.code, gfs_types::error::ErrorCode::FailedPrecondition);
+  assert!(error.message.contains("local commits"), "{}", error.message);
 }

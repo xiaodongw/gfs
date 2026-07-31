@@ -211,6 +211,51 @@ fn an_overlay_from_another_commit_is_refused_rather_than_merged() {
 }
 
 #[test]
+fn an_empty_overlay_left_behind_is_rebound_rather_than_refused() {
+  // The refusal above protects edits. An overlay holding none is the normal
+  // leftover of an unmounted workspace whose branch moved before the next
+  // mount, and a re-clone over it must serve the new head, not fail.
+  let tmp = tempfile::tempdir().unwrap();
+  drop(open(tmp.path()));
+  let moved = gfs_overlay::Binding {
+    repository_id: "r-model".to_owned(),
+    base_commit: ObjectId::from_raw(HashAlgorithm::Sha1, &[0x22; 20])
+      .unwrap()
+      .to_qualified(),
+  };
+  let overlay = Overlay::open(
+    tmp.path(),
+    &moved,
+    test_snapshot_time(),
+    OverlayConfig::default(),
+  )
+  .expect("an edit-free overlay adopts the moved base");
+  overlay
+    .create_file(&path("a.txt"), None, None, 101, false)
+    .unwrap();
+  drop(overlay);
+
+  // The adoption is durable, and the refusal guards the edit just made.
+  drop(
+    Overlay::open(
+      tmp.path(),
+      &moved,
+      test_snapshot_time(),
+      OverlayConfig::default(),
+    )
+    .expect("reopening at the adopted binding"),
+  );
+  let error = Overlay::open(
+    tmp.path(),
+    &test_binding(),
+    test_snapshot_time(),
+    OverlayConfig::default(),
+  )
+  .expect_err("an edit against the adopted base is protected again");
+  assert_eq!(error.condition, Condition::Invalid);
+}
+
+#[test]
 fn a_newer_schema_is_refused_rather_than_read() {
   let tmp = tempfile::tempdir().unwrap();
   drop(open(tmp.path()));

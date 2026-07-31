@@ -597,3 +597,19 @@ pub fn local_head(git_dir: &std::path::Path) -> Option<String> {
   }
   Some(head.to_owned())
 }
+
+/// The commit the git dir was last seeded at, from its on-disk `gfs.json`.
+///
+/// This is [`local_head`]'s counterpart for the *first* mount over a leftover
+/// state directory, where there is no in-memory pin to compare against: the
+/// last seed recorded what it pinned, and a `HEAD` that has moved past it means
+/// local commits. Returns the bare hex, to match what `local_head` reads out of
+/// a loose ref. Best-effort: anything missing or unparseable is `None`, and the
+/// caller treats that as "no previous seed".
+pub fn seeded_commit(git_dir: &std::path::Path) -> Option<String> {
+  let bytes = std::fs::read(git_dir.join("gfs.json")).ok()?;
+  let value: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+  let qualified = value.get("commit")?.as_str()?;
+  let (_, hex) = qualified.split_once(':')?;
+  Some(hex.to_owned())
+}

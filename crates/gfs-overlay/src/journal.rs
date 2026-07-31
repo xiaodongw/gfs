@@ -100,6 +100,19 @@ impl Journal {
       }
       (Some(repo), Some(commit)) => {
         if repo != binding.repository_id || commit != binding.base_commit {
+          // The refusal protects edits. An overlay with no rows holds none —
+          // the common leftover of an unmounted workspace whose branch moved
+          // before the next mount — and refusing it would block every re-clone
+          // for the sake of nothing.
+          let edits: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM entries", [], |r| r.get(0))
+            .map_err(db)?;
+          if edits == 0 {
+            self.set_meta("repository_id", &binding.repository_id)?;
+            self.set_meta("base_commit", &binding.base_commit)?;
+            return Ok(());
+          }
           return Err(OverlayError::new(
             crate::error::Condition::Invalid,
             format!(

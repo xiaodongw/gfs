@@ -322,6 +322,32 @@ impl Mount {
     prepare_state_dir(&config.state_dir)?;
     adopt_or_refuse_state_dir(&config.state_dir, &config.workspace)?;
 
+    // A leftover `.git` from a previous session may hold local commits. The
+    // re-pin path refuses to move the pin over them (`repin`'s local_head
+    // guard); the first mount must refuse too, or the seed below would move
+    // the branch ref off them and the next gc of the state dir would take
+    // them. Checked before the lease is taken so a refusal costs nothing.
+    let git_dir_path = config.state_dir.join("git");
+    if let (Some(local), Some(seeded)) = (
+      crate::gitdir::local_head(&git_dir_path),
+      crate::gitdir::seeded_commit(&git_dir_path),
+    ) {
+      if local != seeded {
+        return Err(GfsError::new(
+          ErrorCode::FailedPrecondition,
+          format!(
+            "a previous session left local commits in this workspace ({} is ahead of \
+             the last pinned {}); mount at that commit (`gfs mount --rev {}`) to push \
+             or export them, or remove {} to discard them",
+            local.get(..12).unwrap_or(&local),
+            seeded.get(..12).unwrap_or(&seeded),
+            seeded.get(..12).unwrap_or(&seeded),
+            config.state_dir.display(),
+          ),
+        ));
+      }
+    }
+
     let publisher: Box<dyn MountPublisher> =
       Box::new(DirectMountPublisher::new(config.workspace.clone())?);
 
@@ -330,7 +356,6 @@ impl Mount {
     // `.git` *file* in the mount. The index the gateway built is fetched once;
     // a failure there degrades to no index -- `git status` would report every
     // file deleted, which is wrong -- so it fails the mount instead.
-    let git_dir_path = config.state_dir.join("git");
     let index = odb.client.commit_index(&resolved.pin.commit).await?;
     // The workspace's own view of the shared store (per-job odb attribution).
     // In the state directory, so its lifetime and cleanup follow the mount's.
