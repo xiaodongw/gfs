@@ -1088,14 +1088,16 @@ impl OdbProjection {
 
 /// Mount an [`OdbFs`] read-only at `mountpoint`, sweeping a dead predecessor.
 fn spawn_odb_session(fs: OdbFs, mountpoint: &Path) -> Result<fuser::BackgroundSession, GfsError> {
-  // A previous process may have died with the mount half-attached; unmounting
-  // a directory that exists but is not mounted is harmless and quiet with -z.
-  if mountpoint.exists() {
-    let _ = std::process::Command::new("fusermount3")
-      .args(["-uzq"])
-      .arg(mountpoint)
-      .output();
-  }
+  // A previous process may have died with the mount half-attached. The sweep
+  // is unconditional because `exists()` cannot gate it: stat on a dead FUSE
+  // mountpoint fails with ENOTCONN, so the check answers false exactly when
+  // the sweep is needed — and `create_dir_all` then dies on EEXIST because its
+  // own is-it-a-directory recheck fails the same way. Unmounting a path that
+  // is not mounted is harmless and quiet with -z and -q.
+  let _ = std::process::Command::new("fusermount3")
+    .args(["-uzq"])
+    .arg(mountpoint)
+    .output();
   std::fs::create_dir_all(mountpoint)
     .map_err(|e| GfsError::internal(format!("creating the odb mountpoint: {e}")))?;
   let mut config = fuser::Config::default();
