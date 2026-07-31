@@ -192,9 +192,14 @@ fn credential(headers: &HeaderMap) -> Option<String> {
   let decoded = base64_decode(encoded.trim())?;
   let text = String::from_utf8(decoded).ok()?;
   // `user:password`; a password-less form is read as the token itself, because
-  // `https://<token>@host/...` is a shape people write.
+  // `https://<token>@host/...` is a shape people write. The one exception is
+  // the `x-access-token` convention the seeded credential helper uses: there
+  // the password *is* the token even when empty, so a job with no GFS_TOKEN
+  // presents the empty token — which the dev server maps to `dev` and a real
+  // server refuses, exactly like the header-less gRPC path.
   match text.split_once(':') {
     Some((_user, password)) if !password.is_empty() => Some(password.to_owned()),
+    Some(("x-access-token", password)) => Some(password.to_owned()),
     Some((user, _)) => Some(user.to_owned()),
     None => Some(text),
   }
@@ -248,9 +253,19 @@ async fn resolve(
   repository_id: &str,
   headers: &HeaderMap,
 ) -> Result<(Identity, RepositoryId, std::path::PathBuf), GfsError> {
-  let token = credential(headers)
-    .ok_or_else(|| GfsError::new(ErrorCode::Unauthenticated, "no credential presented"))?;
-  let identity = state.authz.authenticate(&token)?;
+  // No header is tried as the empty token rather than refused outright: the
+  // dev server maps the empty token to `dev` (its whole no-configuration
+  // posture, and what lets stock `git clone` work against it the way a
+  // token-less `gfs` already does), while a real server rejects it below. The
+  // error keeps saying what was actually wrong.
+  let token = credential(headers).unwrap_or_default();
+  let identity = state.authz.authenticate(&token).map_err(|error| {
+    if token.is_empty() {
+      GfsError::new(ErrorCode::Unauthenticated, "no credential presented")
+    } else {
+      error
+    }
+  })?;
   let repo_id = RepositoryId::parse(repository_id)?;
   // The same call the snapshot, blob, and search surfaces make. M1.5's
   // "enforce repository permissions uniformly" is only true if it is literally
@@ -944,6 +959,16 @@ mod tests {
       format!("Basic {encoded}").parse().unwrap(),
     );
     assert_eq!(credential(&headers).as_deref(), Some("tok-123"));
+
+    // ...except under the seeded helper's `x-access-token` convention, where
+    // the password is the token even when empty — the dev server's no-auth
+    // posture, not a username named "x-access-token".
+    let encoded = base64_encode(b"x-access-token:");
+    headers.insert(
+      header::AUTHORIZATION,
+      format!("Basic {encoded}").parse().unwrap(),
+    );
+    assert_eq!(credential(&headers).as_deref(), Some(""));
 
     headers.insert(header::AUTHORIZATION, "Digest whatever".parse().unwrap());
     assert_eq!(credential(&headers), None);

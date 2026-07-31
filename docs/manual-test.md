@@ -15,16 +15,22 @@ cd ~/.gfs-lab
 
 gfs clone https://github.com/pallets/flask.git
 cd flask
-gfs status
+export PATH="$(gfs install-shim):$PATH"
+
+git status
 git log --oneline -10
-gfs switch -c my-change
+git switch -c my-change
 echo "a change" >> README.md
-gfs commit -m "a change"
-gfs push
+git commit -am "a change"
+git push                # lands at refs/gfs/work/<you>/my-change on the gateway
+gfs push my-change      # continues outward to the real Git server
 ```
 
-That is the whole loop. Everything below is detail about what each step is doing
-and what is worth looking at while you do it.
+That is the whole loop, and apart from the clone, the shim install, and the
+final outward push it is stock Git — which is the point of ADR 0009: an agent
+that knows nothing about GFS works a workspace with the commands it already
+knows. Everything below is detail about what each step is doing and what is
+worth looking at while you do it.
 
 For an automated check instead, `scripts/dev-stack.sh --smoke` brings a stack up
 against fixtures and exits non-zero if anything is broken. This document is for
@@ -146,66 +152,73 @@ overlay    0 changed paths (0 deleted), 0 of 1073741824 bytes used
 operation actually avoided reading the repository, and it is the one thing a
 plausible-looking result cannot fake. Check it any time with `gfs inspect`.
 
-### `gfs switch -c <branch>`
+### `git switch -c`, `git commit`
 
-Creates the branch **on the gateway** and re-points this view at it. Unpushed
-work lands in `refs/gfs/work/<you>/<branch>`, not `refs/heads/`, because the
-mirror's fetch runs `--prune` over `refs/heads/*` — a branch there that upstream
-does not have is deleted by the next sync, taking every commit on it.
+Both are stock Git against the seeded real `.git`: the branch and the commit
+are **local** to the workspace's state directory, and the view's pin does not
+move. `git status` reads clean after the commit, `git log` shows it, and the
+`hydration` line has not moved — committing writes objects, it reads nothing.
 
-You can see where it went:
+Local means local: like any Git checkout, work that has not been pushed exists
+in exactly one place. The push below is what makes it durable, and a mount
+over leftover local commits is refused rather than re-seeded over them.
+
+### `git push` (to the gateway)
+
+Local commits leave as a pack through the gateway's receive-pack surface. The
+seeded `.git` carries an `origin` remote whose push refspec maps
+`refs/heads/*` into your own `refs/gfs/work/<you>/*` namespace — the only
+subtree the gateway accepts updates for — and a credential helper that reads
+`GFS_TOKEN` from your environment at push time. Against the dev server no
+token is needed: the helper presents the empty token, which is the `dev`
+subject.
 
 ```sh
-git --git-dir=~/.gfs-lab/repos/*.git for-each-ref refs/gfs/work
+git push                  # every local branch, through the wildcard refspec
+git push origin my-change # just the one
 ```
 
-### `gfs commit -m`
+A bare `git push` maps **all** of `refs/heads/*`, so it also (re)creates
+`refs/gfs/work/<you>/main` — harmless, but the reason the output names two
+refs. You can see where they went:
 
-Builds the tree from the overlay journal, makes the commit in the mirror, and
-re-pins the view to it. There is no staging area and no local-only commit: the
-commit is durable on the gateway the moment it is made, which is what lets
-`git log` show it.
+```sh
+git -C ~/.gfs-lab/repos/*.git for-each-ref refs/gfs/work
+```
+
+Work lands in `refs/gfs/work/`, not `refs/heads/`, because the mirror's fetch
+runs `--prune` over `refs/heads/*` — a branch there that upstream does not
+have is deleted by the next sync, taking every commit on it. A push naming
+`refs/heads/*` or another subject's namespace is refused by name.
+
+### `gfs push <branch>`
+
+The gateway pushes the work branch outward to the real Git server with
+**your** credential (`--credential`, or `GFS_UPSTREAM_CREDENTIAL`), so
+upstream sees you and not the service. `refs/gfs/work/<you>/<branch>` is
+mapped to `refs/heads/<branch>` there. The branch must be named in the
+git-native flow above; after `gfs switch -c` it defaults to the view's own
+work branch.
+
+### The server-side alternative: `gfs switch -c`, `gfs commit`
+
+The same write path exists as gateway RPCs, which is what API callers and
+`CommitChanges` users drive. `gfs switch -c <branch>` creates the branch **on
+the gateway** and re-points the view at it; `gfs commit -m` builds the tree
+from the overlay journal, commits in the mirror, and re-pins — no staging
+area, durable the moment it is made.
 
 **Your shell keeps working.** The workspace is the mount point itself and the
 re-pin happens in place, so a shell — or an agent CLI, or a build — standing
-anywhere inside it is standing in the same place afterwards. The same applies to
-`gfs switch` and `gfs refresh`.
-
-Two things behave the way `git switch` behaves, and are worth knowing:
-
-- a working directory that exists on the old commit and not on the new one gives
-  `ENOENT` afterwards, exactly as it would after `git switch`;
-- a file the new commit *adds* can read as absent for up to a second if something
-  looked for it just before the switch. Negative dentries are not enumerable, so
-  they expire rather than being invalidated.
+anywhere inside it is standing in the same place afterwards. The same applies
+to `gfs refresh`. Two things behave the way `git switch` behaves: a working
+directory that exists only on the old commit gives `ENOENT` afterwards, and a
+file the new commit *adds* can read as absent for up to a second (negative
+dentries expire rather than being invalidated).
 
 Before 2026-07-28 the workspace was a symlink into
 `<workspace>.gfs/generations/<n>` and this section said the opposite. See ADR
 0003's second amendment.
-
-### `gfs push`
-
-The gateway pushes outward to the real Git server with **your** credential
-(`--credential`, or `GFS_UPSTREAM_CREDENTIAL`), so upstream sees you and not the
-service. `refs/gfs/work/<you>/<branch>` is mapped to `refs/heads/<branch>` there.
-
-### `git push` (to the gateway)
-
-Stock `git push` works from inside a workspace: local commits leave as a pack
-through the gateway's receive-pack surface. The seeded `.git` carries an
-`origin` remote whose push refspec maps `refs/heads/*` into your own
-`refs/gfs/work/<you>/*` namespace — the only subtree the gateway accepts
-updates for — and a credential helper that reads `GFS_TOKEN` from your
-environment at push time.
-
-```sh
-git commit -m "local work"
-git push origin main      # lands at refs/gfs/work/<you>/main on the gateway
-```
-
-A push to `refs/heads/*` or any other namespace is refused by name: the branch
-namespace mirrors upstream and is written by fetch. `gfs push` above is still
-how a work branch continues outward to the real Git server.
 
 ## Cheap questions: stock Git for names and history, the gateway for content
 
