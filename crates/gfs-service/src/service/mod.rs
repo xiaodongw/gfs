@@ -10,6 +10,7 @@ pub mod http;
 pub mod repository;
 pub mod search;
 pub mod snapshot;
+pub mod webdav;
 
 use std::sync::Arc;
 
@@ -208,12 +209,13 @@ impl Server {
   /// TLS, proxies, and bearer credentials a deployment already has, and asking
   /// for another port would work against that.
   pub fn http_router(&self) -> axum::Router {
-    let base = http::router(http::HttpState {
+    let state = http::HttpState {
       registry: Arc::clone(&self.registry),
       catalog: Arc::clone(&self.catalog),
       authz: Arc::clone(&self.authz),
-    });
-    base.merge(self.git_router())
+    };
+    let base = http::router(state.clone());
+    base.merge(self.git_router()).merge(webdav::router(state))
   }
 
   /// The Git gateway's routes on their own, for a deployment that wants them on

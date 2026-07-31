@@ -196,7 +196,10 @@ negotiation. The first version exposes:
 
 - standard Git smart HTTP endpoints for stock Git clients;
 - a versioned gRPC snapshot/search API for the Rust client;
-- an HTTP immutable-blob endpoint for range requests, CDN caching, and debugging.
+- an HTTP immutable-blob endpoint for range requests, CDN caching, and debugging;
+- a read-only WebDAV surface at `/dav/{repo}/{branch}/{path}`, so macOS — where
+  FUSE is excluded (section 3) — browses a snapshot through Finder with no
+  client software (ADR 0010).
 
 A future server can advertise custom protocol-v2 commands, but they should be a
 gateway onto the same internal services rather than a second implementation.

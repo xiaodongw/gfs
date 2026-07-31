@@ -374,6 +374,57 @@ On a server with a real token, an unauthenticated clone gets `401`, and a clone
 of a repository you cannot see gets `404` rather than `403` — a distinct status
 would answer the existence question.
 
+## The WebDAV surface
+
+Read-only browsing of a branch tip over plain HTTP (ADR 0010). No GFS client,
+no `git` — any WebDAV client works, and so does `curl`. The token rides as a
+Basic password, the same `x-access-token` convention the gateway takes:
+
+```sh
+curl -s -X PROPFIND -H 'Depth: 1' -u "x-access-token:$TOKEN" \
+  http://127.0.0.1:8430/dav/ | grep -c '<D:response>'          # 1 + number of repos you may see
+curl -s -X PROPFIND -H 'Depth: 1' -u "x-access-token:$TOKEN" \
+  http://127.0.0.1:8430/dav/<repo-id>/main/ | grep -o '<D:href>[^<]*'
+curl -s -u "x-access-token:$TOKEN" \
+  http://127.0.0.1:8430/dav/<repo-id>/main/README.md            # the file bytes
+```
+
+A branch with a slash in its name browses as nested folders: `topic/deep` is
+`/dav/<repo-id>/topic/` containing `deep/`. Worth checking by hand:
+
+```sh
+curl -s -o /dev/null -w '%{http_code}\n' -X PROPFIND -H 'Depth: 1' \
+  http://127.0.0.1:8430/dav/                                    # 401 (Basic challenge)
+curl -s -o /dev/null -w '%{http_code}\n' -X PUT -u "x-access-token:$TOKEN" \
+  http://127.0.0.1:8430/dav/<repo-id>/main/README.md            # 405 (read-only)
+curl -s -o /dev/null -w '%{http_code}\n' -X PROPFIND -u "x-access-token:$TOKEN" \
+  http://127.0.0.1:8430/dav/<repo-id>/main/                     # 403 (no Depth header = infinity)
+```
+
+On a Mac, this surface is the whole point: Finder → Go → Connect to Server →
+`http://<host>:8430/dav`, user anything, password the token. The volume mounts
+read-only because the server advertises DAV class 1 (no LOCK). Repositories you
+cannot read are absent from the listing, and named directly they answer `404`,
+exactly like the gateway.
+
+On Windows (validated 2026-07-30 against a WSL2-hosted server, which Windows
+reaches at `localhost`): start the redirector once from an admin prompt with
+`net start webclient` — without it `net use` fails with system error 67 — then
+
+```bat
+net use Z: http://localhost:8430/dav
+rem or the redirector's native form; @8430 is how it spells a non-80 port:
+net use Z: \\localhost@8430\dav
+```
+
+Two traps: `cmd.exe` treats single quotes as literal characters, so the curl
+examples above need `-H "Depth: 1"` with double quotes — the mangled header
+otherwise reads as missing and earns the `403`; and against a server with a
+real token, Windows refuses Basic over plain HTTP by default
+(`HKLM\SYSTEM\CurrentControlSet\Services\WebClient\Parameters\BasicAuthLevel`
+= 2 allows it, or front the server with TLS). The no-token dev posture avoids
+the prompt entirely.
+
 ## Two behaviours worth checking by hand
 
 Both were defects found by `spikes/conformance/pjdfstest.sh` and fixed on

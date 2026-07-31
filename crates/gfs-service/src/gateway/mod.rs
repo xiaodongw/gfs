@@ -181,7 +181,7 @@ pub fn router(state: GatewayState) -> Router {
 /// every ordinary `git clone` fails in a way the user cannot fix from the Git
 /// side. The token is the password; the username is ignored, matching the
 /// `x-access-token:<token>` convention Git hosts already use.
-fn credential(headers: &HeaderMap) -> Option<String> {
+pub(crate) fn credential(headers: &HeaderMap) -> Option<String> {
   let value = headers
     .get(header::AUTHORIZATION)
     .and_then(|v| v.to_str().ok())?;

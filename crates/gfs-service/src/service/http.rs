@@ -92,7 +92,7 @@ fn error_response(e: &GfsError, request_id: &RequestId) -> Response {
   response
 }
 
-fn request_id(headers: &HeaderMap) -> RequestId {
+pub(crate) fn request_id(headers: &HeaderMap) -> RequestId {
   RequestId::from_client(
     headers
       .get(observability::REQUEST_ID_KEY)
@@ -247,7 +247,7 @@ fn path_of(entry: &gfs_types::TreeEntryInfo) -> BytePath {
   entry.path.clone()
 }
 
-fn set(headers: &mut HeaderMap, name: &str, value: &str) {
+pub(crate) fn set(headers: &mut HeaderMap, name: &str, value: &str) {
   if let (Ok(name), Ok(value)) = (
     header::HeaderName::from_bytes(name.as_bytes()),
     header::HeaderValue::from_str(value),
@@ -615,7 +615,7 @@ fn blob_headers(h: &mut HeaderMap, etag: &str, rid: &RequestId) {
 /// Only one range is supported. Multipart ranges need a multipart body, and no
 /// GFS client wants them; a request for several is refused rather than silently
 /// answered with the first, which would return the wrong bytes without saying so.
-fn parse_range(value: &str, total: u64) -> Result<(u64, u64), GfsError> {
+pub(crate) fn parse_range(value: &str, total: u64) -> Result<(u64, u64), GfsError> {
   let bad = || GfsError::new(ErrorCode::InvalidArgument, "unsatisfiable range");
   let spec = value.strip_prefix("bytes=").ok_or_else(bad)?;
   if spec.contains(',') {
