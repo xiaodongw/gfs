@@ -1,3 +1,5 @@
 /.idea
 /spikes/target
 /target
+# Container builds for older-glibc targets (see docs/manual-test.md bundling)
+/target-focal
