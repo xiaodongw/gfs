@@ -35,11 +35,21 @@ Creating a workspace:
    are now shadowed, reachable only through the daemon's retained handles;
 4. present the tree as before, plus `.git` **passed through** to the real
    directory — a normal directory to every tool, no gitfile;
-5. inside `.git/objects/`, present `pack/` and `info/` as a **union**: the
-   projected object-store files (ADR 0009's projection, relocated) merged
-   with whatever Git writes locally — loose objects from commits, packs from
-   fetches. Reads prefer local; writes always land in the real directory;
-   pack names are checksums, so collisions do not occur. `alternates` is gone.
+5. present ADR 0009's object-store projection at **`.git/gfs/objects/`**, and
+   point `objects/info/alternates` at it with the **relative** path
+   `../gfs/objects` — resolved by Git against the objects directory, so the
+   pointer travels with the folder. `objects/` itself stays purely local:
+   loose objects from commits and packs from fetches land there untouched.
+
+The mount therefore has exactly two subtree behaviors — pure passthrough and
+pure projection — and no merged namespace anywhere. An earlier draft of this
+ADR removed `alternates` and unioned the projection into `objects/pack/`;
+that union was the largest piece of novel FUSE logic in the design and its
+riskiest correctness surface (readdir merging under concurrent mutation,
+`tmp_pack_*` renames, `.idx`/`.pack` visibility ordering, repack refresh
+interleaved with local entries). Keeping the one-line alternates file — a
+stock Git mechanism this system already uses, invisible to every Git-speaking
+tool — deletes all of it for no functional loss.
 
 Consequences by construction: `du` no longer lies twice over (the projection
 still advertises pack sizes, but there is exactly one place to measure);
@@ -75,11 +85,10 @@ on object-heavy commands and loses on measurement.
   crash the state sits behind a stale mount. Recovery is: lazy-unmount, reopen
   the real `.git`, remount. The dead-mount sweep (`ca2c6f1`) already walks
   this path; the ordering becomes load-bearing.
-- **Union semantics, minimally.** Only `objects/pack/` and `objects/info/`
-  union projected content with local writes. Loose-object directories are
-  purely local (the projection serves packs); the rest of `.git` is pure
-  passthrough. Readdir merges, local wins on name collision, writes go local
-  unconditionally.
+- **The alternates path must stay relative.** `../gfs/objects` is what makes
+  a copied folder work on another machine; an absolute path would silently
+  re-introduce the location dependence this ADR exists to remove. Adoption
+  (`gfs clone` over a copied folder) should verify and repair it.
 - **Copy-while-mounted is a foot-gun.** `cp -r` on a live workspace walks the
   projection and hydrates the snapshot. The guide must say "unmount first",
   and a `gfs export` that does it safely is the durable answer.
@@ -88,10 +97,16 @@ on object-heavy commands and loses on measurement.
 
 ## Alternatives considered
 
+- **Union the projection into `objects/pack/`, no alternates** — the earlier
+  draft. Rejected as described in the Decision: the union is the design's
+  largest and riskiest new mechanism, bought only to delete a one-line file
+  that no tool ever sees. A raw scanner that reads `.git/objects/pack`
+  without understanding alternates would miss projected packs; git, libgit2,
+  and everything built on them are not that scanner.
 - **Keep two mounts, move both inside the folder** — self-containment without
-  passthrough `.git`. Rejected: keeps the gitfile redirect and alternates
-  seams, and still needs the shadowing trick for the state directory, so it
-  pays the novelty without collecting the compatibility wins.
+  passthrough `.git`. Rejected: keeps the gitfile redirect seam and still
+  needs the shadowing trick for the state directory, so it pays the novelty
+  without collecting the compatibility wins.
 - **Bind-mount the state dir elsewhere instead of retained handles** — a
   second mount by another name; teardown complexity returns.
 - **Status quo** — works, but every seam listed in Context is a real support

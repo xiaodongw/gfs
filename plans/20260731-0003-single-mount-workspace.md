@@ -6,10 +6,11 @@ Collapse the workspace's two mounts and sibling state directory into one
 self-contained folder: mount the workspace filesystem *over* a directory that
 physically contains the real `.git` (with all GFS state under `.git/gfs/`),
 reach the shadowed state through directory handles retained from before the
-mount, pass `.git` through as a normal directory, and union the ADR 0009
-object-store projection into `.git/objects/{pack,info}` in place of the
-`alternates` redirect. Proposed by the user; feasibility and performance
-validated by spike m05c. Design recorded in ADR 0011 (Proposed).
+mount, pass `.git` through as a normal directory, and present the ADR 0009
+object-store projection at `.git/gfs/objects/`, pointed to by a **relative**
+`objects/info/alternates` (`../gfs/objects`) so the pointer travels with the
+folder. Proposed by the user; feasibility and performance validated by spike
+m05c. Design recorded in ADR 0011 (Proposed).
 
 The spike's decisive finding: `.git` through FUSE is at parity with local
 disk **only** with kernel negative-dentry caching on absent-object lookups —
@@ -23,9 +24,10 @@ _To be filled in when work starts on this issue._
 Expected shape (from ADR 0011): mount-over-state lifecycle in gfs-fuse
 (create, retained handles, recovery ordering: lazy-unmount → reopen →
 remount), `.git` passthrough with negative-dentry replies on the object
-namespace, union readdir for `objects/pack` and `objects/info`, adoption of
-copied folders in `gfs clone`, `gfs export` for safe copying, migration of
-the dead-mount sweep, TESTING.md and manual-test.md updates.
+namespace, the projection subtree relocated to `.git/gfs/objects/` with a
+relative alternates pointer, adoption of copied folders in `gfs clone`
+(including alternates verify/repair), `gfs export` for safe copying,
+migration of the dead-mount sweep, TESTING.md and manual-test.md updates.
 
 ## Decisions
 
@@ -40,9 +42,12 @@ the dead-mount sweep, TESTING.md and manual-test.md updates.
   disk (worst measured: `status` +6%, `commit` +10 ms).
 - Attribute TTL is not a lever for this problem: 1 s vs 60 s made no
   difference in any arm.
-- Union scope is minimal: only `objects/pack/` and `objects/info/` merge
-  projected and local content; loose dirs are purely local; the rest of
-  `.git` is pure passthrough.
+- No union at all (user's follow-up, 2026-07-31): keep `objects/info/alternates`
+  with the relative path `../gfs/objects` instead of merging the projection
+  into `objects/pack/`. The union was the design's largest new FUSE mechanism
+  and riskiest correctness surface, bought only to delete a one-line file no
+  Git-speaking tool ever sees. The mount now has exactly two subtree
+  behaviors: pure passthrough and pure projection.
 
 ## Details
 
