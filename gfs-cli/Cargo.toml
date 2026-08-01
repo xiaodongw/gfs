@@ -26,6 +26,9 @@ gfs-proto = { workspace = true }
 # front end to `gfs-fuse`, so it shares the daemon's vocabulary rather than
 # re-declaring it and drifting.
 gfs-mount = { workspace = true }
+# For the overlay's change-kind vocabulary: `gfs find` folds the journal's
+# adds, deletes, and renames into the index's file list.
+gfs-overlay = { workspace = true }
 gfs-search = { workspace = true }
 anyhow = { workspace = true }
 clap = { workspace = true }

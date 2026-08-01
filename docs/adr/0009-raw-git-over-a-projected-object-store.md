@@ -354,3 +354,21 @@ sharing a fork does; per-branch protection (a deny list in receive-pack, where
 the namespace check already lives) is the eventual refinement, deliberately
 not built yet. The work namespace and the RPC commit flow stay as they were,
 for callers that do not speak Git.
+
+## Amendment, 2026-07-31: the scan shims delegate instead of advising
+
+The 2026-07-30 degrade rule made `grep`/`find`/`rg` advise on stderr and run
+the real tool. The note reached nobody a sweep was about to hurt — an agent
+mid-plan does not switch tools because stderr suggested one — so the shims now
+take the cheap route themselves: `rg` becomes `gfs rg` (flag-compatible),
+`find` becomes the new `gfs find` (find's grammar, answered from the git index
+plus the overlay journal — no readdir sweep, no hydration), and a recursive
+`grep` is translated to `gfs rg` when the translation is exact, including
+declining default-BRE patterns that lean on backslash escapes.
+
+The degrade property survives in the fallback: `gfs rg`/`gfs find` refuse an
+unimplemented flag by name at parse time, before any output exists, and the
+shim then runs the real tool over the mount — unsupported invocations still
+work slowly rather than failing or lying, with the hydration budget pricing
+the sweep as before. `GFS_SHIM_BYPASS` forces pass-through, which is how
+`--hydrate` runs the real tool without the shim delegating straight back.

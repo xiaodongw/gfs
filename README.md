@@ -20,8 +20,9 @@ The system has three entry points:
   caching them locally. It synthesizes a minimal read-only `.git` surface so
   tools that probe for a repository root still work.
 - `gfs` (CLI) — the agent-facing tool. Reading: `resolve`, `ls`, `cat`,
-  `search` (and `rg`, an `rg`-flag-compatible spelling), `diff`, `show`,
-  `blame`. Workspace lifecycle: `clone`, `mount`, `switch`, `refresh`,
+  `search` (and `rg`, an `rg`-flag-compatible spelling), `find` (a
+  `find`-compatible subset answered from the index, no tree walk), `diff`,
+  `show`, `blame`. Workspace lifecycle: `clone`, `mount`, `switch`, `refresh`,
   `unmount`, `status`, `daemon`, `lease`, `install-shim`. Writing back:
   `commit` (to the gateway's fork of the upstream), `push` (upstream, with
   your credential), and `export` (a bundle with a `git apply`-compatible

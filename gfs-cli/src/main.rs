@@ -357,6 +357,17 @@ enum Command {
     args: Vec<String>,
   },
 
+  /// Find files with find's flags, without walking the projected tree.
+  ///
+  /// Answered from the git index plus the overlay journal. A predicate `find`
+  /// has but this does not implement is refused by name; `--hydrate` runs real
+  /// `find` over the mount and accepts the cost.
+  #[command(disable_help_flag = true)]
+  Find {
+    #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+    args: Vec<String>,
+  },
+
   /// Move this view to another branch, creating it with `-c`.
   ///
   /// The branch is created on the **gateway**, not locally: the gateway's mirror
@@ -785,6 +796,12 @@ fn host_log_path(socket: &std::path::Path) -> PathBuf {
 }
 
 fn do_mount(cli: &Cli, args: MountArgs) -> Result<()> {
+  // Absolutized against *this* command's working directory, before the path
+  // crosses the socket: the shared host has a working directory of its own,
+  // and a relative `gfs clone <url> dir` resolved there would mount somewhere
+  // other than where the caller stands — `git clone` semantics say here.
+  let workspace = std::path::absolute(&args.workspace).unwrap_or_else(|_| args.workspace.clone());
+  let args = MountArgs { workspace, ..args };
   let cache_dir = args.cache_dir.clone().unwrap_or_else(default_cache_dir);
 
   let socket = host_socket(cli, &args.workspace, args.foreground);
@@ -1504,9 +1521,10 @@ async fn main() -> Result<()> {
       std::os::unix::fs::symlink(&shim, &link)
         .with_context(|| format!("linking {}", link.display()))?;
 
-      // The scan shim (ADR 0009's grep/find degrade rule) under each name it
-      // dispatches on. Its absence is not an error: an image built without it
-      // still has a working `git`, and the budget prices sweeps either way.
+      // The scan shim (grep/find/rg delegated to `gfs rg`/`gfs find`, real
+      // tool as the fallback) under each name it dispatches on. Its absence is
+      // not an error: an image built without it still has a working `git`, and
+      // the budget prices sweeps either way.
       let scan_shim = scan_shim_binary();
       if scan_shim.is_file() {
         let scan_shim = std::path::absolute(&scan_shim).unwrap_or(scan_shim);
@@ -1519,7 +1537,7 @@ async fn main() -> Result<()> {
       } else {
         eprintln!(
           "gfs: {} not found; `grep`/`find`/`rg` keep their stock behaviour \
-           (set GFS_SCAN_SHIM to its path to install the degrade notes)",
+           (set GFS_SCAN_SHIM to its path to route them through the server)",
           scan_shim.display()
         );
       }
@@ -1728,6 +1746,7 @@ async fn main() -> Result<()> {
     // These six never come back: their exit code *is* their answer, and the
     // `Result` path cannot carry it. See `run_tool`.
     Command::Rg { args } => run_tool("rg", gfs_cli::rg::run(args)),
+    Command::Find { args } => run_tool("find", gfs_cli::find::run(args)),
     Command::Show { args } => run_tool("show", gfs_cli::show::run(args)),
     Command::Diff { args } => run_tool("diff", gfs_cli::revdiff::run(args)),
     Command::Blame { args } => run_tool("blame", gfs_cli::blame::run(args)),

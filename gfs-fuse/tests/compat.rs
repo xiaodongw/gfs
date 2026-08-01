@@ -503,17 +503,30 @@ async fn the_shim_works_from_a_subdirectory() {
 }
 
 // ---------------------------------------------------------------------------
-// The scan shim: ADR 0009's grep/find degrade rule
+// The scan shim: the server-side answer first, the real tool as the fallback
 // ---------------------------------------------------------------------------
 
 /// Run the scan shim under a tool's name, the way its symlink install does.
 fn run_scan_shim(directory: &Path, as_tool: &str, args: &[&str]) -> (bool, String, String) {
+  run_scan_shim_env(directory, as_tool, args, &[])
+}
+
+/// [`run_scan_shim`] with environment overrides applied to the child.
+fn run_scan_shim_env(
+  directory: &Path,
+  as_tool: &str,
+  args: &[&str],
+  env: &[(&str, &str)],
+) -> (bool, String, String) {
   let bin_dir = tempfile::tempdir().unwrap();
   let link = bin_dir.path().join(as_tool);
   std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_gfs-scan-shim"), &link).unwrap();
-  let out = Command::new(&link)
-    .current_dir(directory)
-    .args(args)
+  let mut command = Command::new(&link);
+  command.current_dir(directory).args(args);
+  for (key, value) in env {
+    command.env(key, value);
+  }
+  let out = command
     .output()
     .unwrap_or_else(|e| panic!("running the scan shim as {as_tool}: {e}"));
   (
@@ -523,23 +536,77 @@ fn run_scan_shim(directory: &Path, as_tool: &str, args: &[&str]) -> (bool, Strin
   )
 }
 
+/// The `gfs` binary next to the shim under test, when this build produced one.
+///
+/// `cargo test -p gfs-fuse` alone does not build `gfs-cli`, and a delegation
+/// test that silently exercised the fallback instead would pass for the wrong
+/// reason — so the caller skips loudly when the binary is absent.
+fn gfs_binary_for_tests() -> Option<std::path::PathBuf> {
+  let candidate = Path::new(env!("CARGO_BIN_EXE_gfs-scan-shim")).with_file_name("gfs");
+  candidate.is_file().then_some(candidate)
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn the_scan_shim_advises_and_degrades_rather_than_refusing() {
+async fn the_scan_shim_answers_find_from_the_index_without_walking() {
+  let Some(gfs) = gfs_binary_for_tests() else {
+    eprintln!("skipping: the `gfs` binary is not built; run a workspace-level cargo test");
+    return;
+  };
   let backend = Backend::start("basic").await;
   let job = Job::start(&backend, "main").await;
   let root = job.workspace.clone();
 
   on_fs(move || {
-    // A recursive grep: the note on stderr, real grep's answer on stdout.
-    let (ok, out, err) = run_scan_shim(&root, "grep", &["-r", "basic", "."]);
-    assert!(ok, "{err}");
-    assert!(out.contains("README.md"), "real grep still answers: {out}");
-    assert!(
-      err.contains("gfs rg"),
-      "the note names the cheap route: {err}"
-    );
+    let gfs = gfs.to_str().unwrap();
 
-    // A non-recursive grep is not a sweep, so it is not nagged.
+    // Delegated: find-shaped output from the index and journal, no walk.
+    let (ok, out, err) =
+      run_scan_shim_env(&root, "find", &[".", "-name", "*.md"], &[("GFS_BIN", gfs)]);
+    assert!(ok, "{err}");
+    assert!(out.contains("./README.md"), "{out}");
+
+    // A file created through the mount is in the journal before any `git add`,
+    // so the delegated answer sees the worktree, not just the pin.
+    std::fs::write(root.join("fresh.md"), b"new\n").unwrap();
+    let (ok, out, err) =
+      run_scan_shim_env(&root, "find", &[".", "-name", "*.md"], &[("GFS_BIN", gfs)]);
+    assert!(ok, "{err}");
+    assert!(out.contains("./fresh.md"), "{out}");
+
+    // An unsupported predicate: `gfs find` refuses it, the shim hears the
+    // refusal, and real find answers -- work slowly, never fail or lie.
+    let (ok, out, err) = run_scan_shim_env(
+      &root,
+      "find",
+      &[".", "-name", "*.md", "-newer", "README.md"],
+      &[("GFS_BIN", gfs)],
+    );
+    assert!(ok, "{err}");
+    assert!(out.contains("fresh.md"), "real find answers: {out}");
+    assert!(err.contains("running real find"), "{err}");
+
+    // `--hydrate`-style bypass: the shim stands aside entirely.
+    let (ok, _, err) = run_scan_shim_env(
+      &root,
+      "find",
+      &[".", "-name", "*.md"],
+      &[("GFS_BIN", gfs), ("GFS_SHIM_BYPASS", "1")],
+    );
+    assert!(ok, "{err}");
+    assert!(err.is_empty(), "bypass is silent: {err}");
+  })
+  .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_scan_shim_degrades_to_the_real_tool_rather_than_refusing() {
+  let backend = Backend::start("basic").await;
+  let job = Job::start(&backend, "main").await;
+  let root = job.workspace.clone();
+
+  on_fs(move || {
+    // A non-recursive grep reads only the files it was given: real grep,
+    // silently.
     let (ok, out, err) = run_scan_shim(&root, "grep", &["basic", "README.md"]);
     assert!(ok, "{err}");
     assert!(out.contains("basic"));
@@ -550,13 +617,72 @@ async fn the_scan_shim_advises_and_degrades_rather_than_refusing() {
     assert!(!ok, "no match is exit 1, and the shim must not eat it");
     assert!(err.is_empty(), "{err}");
 
-    // find walks by definition; the note names the free listing.
-    let (ok, out, err) = run_scan_shim(&root, "find", &[".", "-name", "*.md"]);
+    // A recursive grep whose flags do not translate (-l) goes to real grep,
+    // with the note saying so.
+    let (ok, out, err) = run_scan_shim(&root, "grep", &["-rl", "basic", "."]);
+    assert!(ok, "{err}");
+    assert!(out.contains("README.md"), "real grep still answers: {out}");
+    assert!(err.contains("cannot honour"), "{err}");
+
+    // A missing `gfs` binary degrades the same way: the tool it shadows keeps
+    // working.
+    let (ok, out, err) = run_scan_shim_env(
+      &root,
+      "find",
+      &[".", "-name", "README.md"],
+      &[("GFS_BIN", "/nonexistent/gfs")],
+    );
     assert!(ok, "{err}");
     assert!(out.contains("README.md"), "{out}");
-    assert!(err.contains("git ls-files"), "{err}");
+    assert!(err.contains("running real find"), "{err}");
   })
   .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_shimmed_clone_falls_back_to_real_git_when_the_gateway_is_out_of_reach() {
+  // The property that makes `clone` delegation safe to have on PATH
+  // everywhere: with no usable `gfs`, `git clone` is real `git clone`. The
+  // delegated happy path needs a live gateway and host and is exercised by
+  // the manual flow; what must hold in every environment is the fallback.
+  let (_tmp, upstream) = gfs_test::scratch_clone("basic").unwrap();
+  let into = tempfile::tempdir().unwrap();
+  let target = into.path().join("cloned");
+
+  let out = Command::new(shim())
+    .current_dir(into.path())
+    .arg("clone")
+    .arg(&upstream)
+    .arg(&target)
+    .env("GIT_CONFIG_GLOBAL", "/dev/null")
+    .env("GIT_CONFIG_SYSTEM", "/dev/null")
+    .env("GFS_BIN", "/nonexistent/gfs")
+    .output()
+    .unwrap();
+  let err = String::from_utf8_lossy(&out.stderr);
+  assert!(out.status.success(), "{err}");
+  assert!(
+    err.contains("falling back to real git clone"),
+    "the fallback says why: {err}"
+  );
+  assert!(target.join(".git").is_dir(), "a real clone happened");
+
+  // Flags with no translation skip the gateway without a detour or a note.
+  let target2 = into.path().join("bare");
+  let out = Command::new(shim())
+    .current_dir(into.path())
+    .args(["clone", "--bare"])
+    .arg(&upstream)
+    .arg(&target2)
+    .env("GIT_CONFIG_GLOBAL", "/dev/null")
+    .env("GIT_CONFIG_SYSTEM", "/dev/null")
+    .env("GFS_BIN", "/nonexistent/gfs")
+    .output()
+    .unwrap();
+  let err = String::from_utf8_lossy(&out.stderr);
+  assert!(out.status.success(), "{err}");
+  assert!(!err.contains("gfs clone"), "no detour was attempted: {err}");
+  assert!(target2.join("HEAD").is_file(), "a bare clone happened");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

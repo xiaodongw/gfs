@@ -162,6 +162,9 @@ fn hydrate(workspace_root: &std::path::Path, argv: &[String]) -> Result<i32> {
   let status = std::process::Command::new("rg")
     .args(forwarded)
     .current_dir(workspace_root)
+    // Real `rg` resolved from PATH may be the scan shim itself; the variable
+    // tells it to stand aside instead of delegating back here.
+    .env("GFS_SHIM_BYPASS", "1")
     .status()
     .context("running rg; is it installed?")?;
   Ok(status.code().unwrap_or(2))

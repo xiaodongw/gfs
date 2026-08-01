@@ -12,6 +12,7 @@
 //! would eventually disagree, so there is one.
 
 pub mod blame;
+pub mod find;
 pub mod gitdate;
 pub mod history;
 pub mod revdiff;

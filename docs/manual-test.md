@@ -10,15 +10,16 @@ scripts/dev-server.sh
 In another terminal:
 
 ```sh
-export PATH="$PWD/target/debug:$PATH"
+export PATH="$PWD/target/debug:$PATH"   # gfs, plus git/grep/find/rg -- the shims
 cd ~/.gfs-lab
 
-gfs clone https://github.com/pallets/flask.git
+git clone https://github.com/pallets/flask.git   # the shim serves this as `gfs clone`
 cd flask
-export PATH="$(gfs install-shim):$PATH"
 
 git status
 git log --oneline -10
+find src -name '*.py' | head            # answered from the index, no walk
+grep -rn "def route" src | head         # answered by the gateway, no hydration
 git switch -c my-change
 echo "a change" >> README.md
 git commit -am "a change"
@@ -26,11 +27,18 @@ git push origin my-change # lands at refs/heads/my-change on the gateway
 gfs push my-change        # continues outward to the real Git server
 ```
 
-That is the whole loop, and apart from the clone, the shim install, and the
-final outward push it is stock Git — which is the point of ADR 0009: an agent
-that knows nothing about GFS works a workspace with the commands it already
-knows. Everything below is detail about what each step is doing and what is
-worth looking at while you do it.
+That is the whole loop, and apart from the final outward push it *is* the
+stock git/grep/find flow — which is the point of ADR 0009: an agent that
+knows nothing about GFS works a workspace with the commands it already knows.
+`target/debug` builds the shims under the tool names (`git`, `grep`, `find`,
+`rg`), so the one `PATH` export is the entire environment setup; `gfs
+install-shim` still exists for building the same arrangement into an agent
+image. Each shim stands aside whenever it cannot serve you: `git clone` with
+flags that do not translate (or no reachable gateway) is a real clone, an
+untranslatable `grep`/`find`/`rg` invocation runs the real tool with a stderr
+note, and `GFS_SHIM_BYPASS=1` forces the real tool unconditionally.
+Everything below is detail about what each step is doing and what is worth
+looking at while you do it.
 
 For an automated check instead, `scripts/dev-stack.sh --smoke` brings a stack up
 against fixtures and exits non-zero if anything is broken. This document is for
@@ -221,17 +229,24 @@ Before 2026-07-28 the workspace was a symlink into
 
 ## Cheap questions: stock Git for names and history, the gateway for content
 
-`gfs log` and `gfs find` are gone — ADR 0009 deleted them. The workspace has a
-real `.git` over the projected object store now, so stock Git answers those
-questions itself; what stays server-side is the question that would otherwise
-read file *content* wholesale:
+The workspace has a real `.git` over the projected object store, so stock Git
+answers name and history questions itself; what stays server-side is the
+question that would otherwise read file *content* wholesale, or sweep the
+tree:
 
 ```sh
 git log --oneline -5             # commits come through the projection -- cheap
 git ls-files | wc -l             # the index is local -- free
+gfs find . -name '*.py'          # find's grammar, from the index + overlay journal
 gfs rg -F 'some-symbol' -m 5     # content search, answered by the gateway
 gfs inspect | grep hydration     # still 0 blobs, 0 bytes
 ```
+
+With the shims installed you rarely type the `gfs` spellings: `rg`, `find`,
+and recursive `grep` inside a workspace delegate to `gfs rg`/`gfs find`
+automatically, and fall back to the real tool (with a stderr note) when an
+invocation uses flags the subset does not honour. `--hydrate`, or
+`GFS_SHIM_BYPASS=1`, runs the real tool deliberately.
 
 `gfs rg` prints matches plus a coverage note on stderr about binary files
 skipped — that note is deliberate, not a warning of failure. The `git`

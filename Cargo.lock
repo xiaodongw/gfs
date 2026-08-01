@@ -587,6 +587,7 @@ dependencies = [
  "anyhow",
  "clap",
  "gfs-mount",
+ "gfs-overlay",
  "gfs-proto",
  "gfs-search",
  "gfs-types",
