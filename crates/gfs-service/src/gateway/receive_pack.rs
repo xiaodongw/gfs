@@ -8,15 +8,22 @@
 //! # The authorization model
 //!
 //! Same repository authorization as every other surface, plus one thing this
-//! surface adds: a pusher may update refs **only inside their own work-branch
-//! subtree**, `refs/gfs/work/<subject>/…`. That is enforced twice, on the same
-//! defence-in-depth grounds as upload-pack's filter validation:
+//! surface adds: a pusher may update **real branches**, `refs/heads/…`, and
+//! their own work-branch subtree, `refs/gfs/work/<subject>/…` — nothing else.
+//! Branches are safe to accept because the upstream sync is fast-forward-only
+//! ([`crate::mirror`]): pushed work is never overwritten by a fetch, exactly a
+//! fork's contract. Everything under `refs/heads/` is shared by every caller of
+//! this repository, the way a shared fork is; protected branches are the
+//! eventual refinement of that, not per-caller hiding. That boundary is
+//! enforced twice, on the same defence-in-depth grounds as upload-pack's
+//! filter validation:
 //!
-//! * `receive.hideRefs=refs/` followed by `receive.hideRefs=!<own subtree>` —
-//!   Git checks the list back to front, so the negation wins for the caller's
-//!   subtree and everything else on the wire is "deny updating a hidden ref".
-//!   The mirror's `refs/heads/*` stays upstream's: a push there would be
-//!   overwritten by the next fetch and shared across every tenant.
+//! * `receive.hideRefs=refs/` followed by `!refs/heads/` and `!<own subtree>` —
+//!   Git checks the list back to front, so the negations win for branches and
+//!   the caller's subtree and everything else on the wire is "deny updating a
+//!   hidden ref". Tags stay fetch-owned: they keep mirroring upstream, pruned
+//!   and forced, so a pushed tag would be silently lost — hiding them keeps
+//!   that a refusal at the door instead.
 //! * [`ReceivePack::validate_commands`] parses the command section before the
 //!   child is spawned and refuses by name, so an out-of-tree push is a legible
 //!   `PERMISSION_DENIED` in the audit log rather than a Git-worded rejection.
@@ -99,10 +106,11 @@ impl ReceivePack {
     };
 
     // Order matters and is load-bearing: Git evaluates hideRefs back to front,
-    // so the caller's subtree must be appended *after* the blanket entry.
+    // so the negations must be appended *after* the blanket entry.
     // Command-line `-c` values are read after the repository's own config, so
     // a repository cannot append a wider negation that wins.
     push("receive.hideRefs", "refs/");
+    push("receive.hideRefs", "!refs/heads/");
     push("receive.hideRefs", &format!("!{}", self.work_root));
 
     // A push that brings corrupt objects is refused at the door rather than
@@ -167,7 +175,8 @@ impl ReceivePack {
     })
   }
 
-  /// Refuse a push whose ref updates leave the caller's work subtree.
+  /// Refuse a push whose ref updates leave the branch namespace and the
+  /// caller's work subtree.
   ///
   /// Runs before a subprocess exists. Only the command section is parsed — the
   /// packfile that follows the flush is raw bytes and is the child's to parse.
@@ -202,12 +211,16 @@ impl ReceivePack {
           format!("a push may update at most {MAX_COMMANDS} refs"),
         ));
       }
-      if !refname.starts_with(&boundary) {
+      let is_branch = refname
+        .strip_prefix("refs/heads/")
+        .is_some_and(gfs_types::revision::is_valid_branch_name);
+      if !is_branch && !refname.starts_with(&boundary) {
         return Err(GfsError::new(
           ErrorCode::PermissionDenied,
           format!(
-            "push may only update {boundary}*; the branch namespace mirrors \
-             upstream and is written by fetch, not by push"
+            "push may only update refs/heads/* or {boundary}*; tags and \
+             everything else follow upstream and are written by fetch, not by \
+             push"
           ),
         ));
       }
@@ -242,19 +255,22 @@ mod tests {
   }
 
   #[test]
-  fn the_config_hides_everything_then_unhides_exactly_the_callers_subtree() {
+  fn the_config_hides_everything_then_unhides_branches_and_the_callers_subtree() {
     let (_tmp, pack) = pack("refs/gfs/work/alice");
     let config = pack.config();
     let rendered = config.join(" ");
-    // Both entries present, blanket first: Git checks the list back to front,
-    // so the negation only wins because it comes second.
+    // All entries present, blanket first: Git checks the list back to front,
+    // so the negations only win because they come after it.
     let blanket = rendered.find("receive.hideRefs=refs/ ").expect("blanket");
+    let branches = rendered
+      .find("receive.hideRefs=!refs/heads/")
+      .expect("branch negation");
     let negation = rendered
       .find("receive.hideRefs=!refs/gfs/work/alice")
       .expect("negation");
     assert!(
-      blanket < negation,
-      "the negation must come after the blanket"
+      blanket < branches && blanket < negation,
+      "the negations must come after the blanket"
     );
     assert!(rendered.contains("receive.autogc=false"));
     assert!(rendered.contains("gc.auto=0"));
@@ -263,7 +279,7 @@ mod tests {
   }
 
   #[test]
-  fn command_validation_confines_pushes_to_the_work_subtree() {
+  fn command_validation_confines_pushes_to_branches_and_the_work_subtree() {
     let (_tmp, pack) = pack("refs/gfs/work/alice");
     let body = |refname: &str| {
       let line = format!(
@@ -277,16 +293,24 @@ mod tests {
       out.extend_from_slice(b"PACK\x00\x00\x00\x02");
       out
     };
-    assert!(pack
-      .validate_commands(&body("refs/gfs/work/alice/feature"))
-      .is_ok());
-    for refused in [
+    for allowed in [
+      // The fork contract: real branches take pushes.
       "refs/heads/main",
+      "refs/heads/feature/nested",
+      "refs/gfs/work/alice/feature",
+    ] {
+      assert!(pack.validate_commands(&body(allowed)).is_ok(), "{allowed}");
+    }
+    for refused in [
       "refs/tags/v1",
       "refs/gfs/work/bob/feature",
       "refs/gfs/mounts/m-1",
       // A prefix that shares the root's spelling without being inside it.
       "refs/gfs/work/alice2/feature",
+      // Branch-shaped but not a usable branch name: reaches a git command
+      // line elsewhere, so the same gate applies here.
+      "refs/heads/-flag",
+      "refs/heads/a..b",
     ] {
       let err = pack.validate_commands(&body(refused)).unwrap_err();
       assert_eq!(err.code, ErrorCode::PermissionDenied, "{refused}");

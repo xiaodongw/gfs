@@ -22,8 +22,8 @@ git log --oneline -10
 git switch -c my-change
 echo "a change" >> README.md
 git commit -am "a change"
-git push                # lands at refs/gfs/work/<you>/my-change on the gateway
-gfs push my-change      # continues outward to the real Git server
+git push origin my-change # lands at refs/heads/my-change on the gateway
+gfs push my-change        # continues outward to the real Git server
 ```
 
 That is the whole loop, and apart from the clone, the shim install, and the
@@ -166,10 +166,11 @@ over leftover local commits is refused rather than re-seeded over them.
 
 ### `git push` (to the gateway)
 
-Local commits leave as a pack through the gateway's receive-pack surface. The
-seeded `.git` carries an `origin` remote whose push refspec maps
-`refs/heads/*` into your own `refs/gfs/work/<you>/*` namespace — the only
-subtree the gateway accepts updates for — and a credential helper that reads
+Local commits leave as a pack through the gateway's receive-pack surface, onto
+the gateway's **real branches**: the gateway is a fork of its upstream, so
+`git push origin my-change` lands at `refs/heads/my-change` exactly as it
+would on any other Git host, and the next clone of that branch sees it. The
+seeded `.git` carries the `origin` remote and a credential helper that reads
 `GFS_TOKEN` from your environment at push time. Against the dev server no
 token is needed: the helper presents the empty token, which is the `dev`
 subject.
@@ -179,25 +180,22 @@ git push                  # every local branch, through the wildcard refspec
 git push origin my-change # just the one
 ```
 
-A bare `git push` maps **all** of `refs/heads/*`, so it also (re)creates
-`refs/gfs/work/<you>/main` — harmless, but the reason the output names two
-refs. You can see where they went:
-
-```sh
-git -C ~/.gfs-lab/repos/*.git for-each-ref refs/gfs/work
-```
-
-Work lands in `refs/gfs/work/`, not `refs/heads/`, because the mirror's fetch
-runs `--prune` over `refs/heads/*` — a branch there that upstream does not
-have is deleted by the next sync, taking every commit on it. A push naming
-`refs/heads/*` or another subject's namespace is refused by name.
+Pushed work is safe from syncing because the upstream sync is
+**fast-forward-only**: upstream state is fetched into
+`refs/remotes/upstream/*`, branches that can follow it do, and a branch that
+has diverged — yours ahead, upstream moved, or both — is left where it is and
+reported. Resolving the divergence is your job, with the tools Git already
+gives you: merge or rebase against `refs/remotes/upstream/<branch>`, or
+force-push. Tags and the reserved `refs/gfs/` namespace are not pushable;
+everyone sharing the gateway shares its branches, so treat `main` with the
+etiquette you would on a shared fork (protected branches are the eventual
+refinement).
 
 ### `gfs push <branch>`
 
-The gateway pushes the work branch outward to the real Git server with
+The gateway pushes the branch outward to the real Git server with
 **your** credential (`--credential`, or `GFS_UPSTREAM_CREDENTIAL`), so
-upstream sees you and not the service. `refs/gfs/work/<you>/<branch>` is
-mapped to `refs/heads/<branch>` there. The branch must be named in the
+upstream sees you and not the service. The branch must be named in the
 git-native flow above; after `gfs switch -c` it defaults to the view's own
 work branch.
 

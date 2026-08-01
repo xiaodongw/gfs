@@ -34,11 +34,10 @@ service RepositoryService {
 
   // Create a branch for work that has not been pushed yet.
   //
-  // The ref lands in the reserved namespace, *not* `refs/heads/`. A branch under
-  // `refs/heads/` that upstream does not have is deleted by the next mirror
-  // fetch, which runs `--prune` -- silently, as routine maintenance, taking the
-  // reachability of every commit on it. The reserved namespace is never a fetch
-  // destination, so it survives.
+  // The ref lands in the caller's reserved work namespace, *not* `refs/heads/`:
+  // this is the RPC surface for callers that do not speak Git, and their
+  // unfinished work stays private to them. `git push` to the gateway is the way
+  // work lands on a real branch.
   rpc CreateBranch(CreateBranchRequest) returns (CreateBranchResponse);
 
   // Turn a set of workspace changes into a commit on a work branch.

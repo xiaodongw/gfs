@@ -84,11 +84,12 @@ async fn a_fresh_workspace_reads_clean_through_stock_git() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_local_commit_pushes_to_the_callers_work_namespace_through_the_seeded_remote() {
+async fn a_local_commit_pushes_to_the_real_branch_through_the_seeded_remote() {
   // The push half of ADR 0009: `git push origin <branch>` out of the box. The
-  // seeded config maps `refs/heads/*` into the caller's work namespace and the
-  // credential helper reads GFS_TOKEN from the job's environment, so stock Git
-  // needs to be told nothing.
+  // seeded config maps `refs/heads/*` onto the gateway's real branches — the
+  // gateway is a fork of its upstream — and the credential helper reads
+  // GFS_TOKEN from the job's environment, so stock Git needs to be told
+  // nothing.
   let backend = Backend::start("basic").await;
   let job = Job::start(&backend, "main").await;
   let ws = job.workspace.clone();
@@ -120,14 +121,15 @@ async fn a_local_commit_pushes_to_the_callers_work_namespace_through_the_seeded_
   .await;
   assert!(pushed_ok, "push failed: {push_out}");
 
-  // The commit is on the server, in this subject's namespace, at exactly the
-  // local HEAD. `job-mount` is the harness token's subject.
+  // The commit is on the server, on the real branch, at exactly the local
+  // HEAD: the gateway is a fork of its upstream, and a push lands where any
+  // other Git host would put it.
   let out = std::process::Command::new("git")
     .env_clear()
     .env("PATH", "/usr/bin:/bin")
     .arg("-C")
     .arg(&backend.repo_path)
-    .args(["rev-parse", "refs/gfs/work/job-mount/main"])
+    .args(["rev-parse", "refs/heads/main"])
     .output()
     .unwrap();
   assert!(
@@ -140,6 +142,76 @@ async fn a_local_commit_pushes_to_the_callers_work_namespace_through_the_seeded_
     local_head,
     "the pushed ref must be the local commit"
   );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_pushed_commit_survives_deleting_the_workspace_and_cloning_again() {
+  // The round trip every other Git host supports: commit, push, delete the
+  // local clone, clone again — the work is on the branch, so it comes back.
+  let backend = Backend::start("basic").await;
+  let tmp = tempfile::tempdir().unwrap();
+  let cache = tempfile::tempdir().unwrap();
+  let workspace = tmp.path().join("ws");
+
+  {
+    let sockets = tempfile::tempdir().unwrap();
+    let (host, listener) = MountHost::bind(host_config(&backend, sockets.path())).unwrap();
+    tokio::spawn(Arc::clone(&host).serve(listener));
+    let daemon = host
+      .mount(mount_spec(
+        &backend,
+        "main",
+        &workspace,
+        cache.path(),
+        gfs_overlay::OverlayConfig::default(),
+      ))
+      .await
+      .unwrap();
+    let ws = workspace.clone();
+    on_fs(move || {
+      std::fs::write(ws.join("kept.txt"), b"pushed, so it comes back\n").unwrap();
+      let (ok, out) = git_in(&ws, &["add", "kept.txt"]);
+      assert!(ok, "{out}");
+      let (ok, out) = git_in(&ws, &["commit", "-q", "-m", "kept"]);
+      assert!(ok, "{out}");
+      let out = std::process::Command::new("git")
+        .env_clear()
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .env("PATH", "/usr/bin:/bin")
+        .env("GFS_TOKEN", gfs_test::mount::TOKEN)
+        .current_dir(&ws)
+        .args(["push", "-q", "origin", "main"])
+        .output()
+        .unwrap();
+      assert!(
+        out.status.success(),
+        "push failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+      );
+    })
+    .await;
+    daemon.shutdown().await;
+  }
+  std::fs::remove_dir_all(&workspace).unwrap();
+
+  let sockets = tempfile::tempdir().unwrap();
+  let (host, listener) = MountHost::bind(host_config(&backend, sockets.path())).unwrap();
+  tokio::spawn(Arc::clone(&host).serve(listener));
+  let daemon = host
+    .mount(mount_spec(
+      &backend,
+      "main",
+      &workspace,
+      cache.path(),
+      gfs_overlay::OverlayConfig::default(),
+    ))
+    .await
+    .expect("a fresh clone of the branch the push landed on");
+  let ws = workspace.clone();
+  let content = on_fs(move || std::fs::read_to_string(ws.join("kept.txt")).unwrap()).await;
+  assert_eq!(content, "pushed, so it comes back\n");
+  daemon.shutdown().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

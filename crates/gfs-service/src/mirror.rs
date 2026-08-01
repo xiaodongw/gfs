@@ -1,10 +1,23 @@
-//! Upstream mirroring, and the refspecs that keep pruning away from
+//! Upstream syncing, fork-style, and the refspecs that keep pruning away from
 //! `refs/gfs/`.
 //!
 //! Fetching runs **stock Git as a subprocess**, not libgit2. ADR 0001 builds
 //! `git2` with `default-features = false`, dropping its `https` and `ssh`
 //! features, precisely so the object path does not link OpenSSL and libssh2: the
 //! server never uses libgit2 as a network client. Fetching is stock Git's job.
+//!
+//! # A fork, not a mirror
+//!
+//! The gateway's `refs/heads/*` is writable by push — the repository behaves
+//! like a fork of its upstream, the way a GitHub fork does, not like a strict
+//! mirror. So upstream state never lands on `refs/heads/*` directly: it is
+//! fetched — forced and pruned — into [`UPSTREAM_REF_ROOT`], a namespace
+//! nothing else writes, and folded into the branches by a **fast-forward-only**
+//! pass. A branch that has diverged from upstream (or is ahead of it) is left
+//! exactly where it is and reported; resolving the divergence is the pusher's
+//! job — merge, rebase, or force-push — the same contract as any other Git
+//! host. A branch upstream deleted is likewise never deleted here, because a
+//! fork keeps its branches.
 //!
 //! # Why not `--mirror`
 //!
@@ -13,10 +26,10 @@
 //! Lease anchors live under `refs/gfs/mounts/*` and exist *only* locally, so a
 //! mirroring prune deletes every one of them -- silently, as part of a routine
 //! fetch -- and the next `git gc` then prunes the pinned commits out from under
-//! every live mount.
+//! every live mount. Pushed work under `refs/heads/*` would go the same way.
 //!
 //! ADR 0006 therefore forbids unrestricted mirror pruning over internal refs. The
-//! refspecs below name exactly the namespaces GFS mirrors, so pruning cannot
+//! refspecs below name exactly the namespaces GFS fetches into, so pruning cannot
 //! reach anything else. This is enforced by construction rather than by review:
 //! [`FETCH_REFSPECS`] is the only set the fetch uses, and
 //! [`refspec_is_safe`] rejects any addition that would cover the reserved
@@ -28,11 +41,24 @@ use std::process::Command;
 use gfs_types::error::{ErrorCode, GfsError};
 use gfs_types::revision::RESERVED_REF_PREFIX;
 
-/// The namespaces GFS mirrors from upstream.
+/// Where the upstream's branch heads land, no trailing slash.
+///
+/// The conventional name for "the remote this was forked from", and outside
+/// both `refs/heads/*` (which pushes own) and `refs/gfs/*` (which the server
+/// owns). Advertised read-only over upload-pack, so a workspace can diff or
+/// merge against what upstream has without the gateway inventing a surface for
+/// it.
+pub const UPSTREAM_REF_ROOT: &str = "refs/remotes/upstream";
+
+/// The namespaces GFS fetches from upstream.
 ///
 /// Deliberately not `+refs/*:refs/*`. Adding a namespace here is a decision that
-/// has to be checked against [`refspec_is_safe`].
-pub const FETCH_REFSPECS: &[&str] = &["+refs/heads/*:refs/heads/*", "+refs/tags/*:refs/tags/*"];
+/// has to be checked against [`refspec_is_safe`] — and branch heads land in
+/// [`UPSTREAM_REF_ROOT`], never `refs/heads/*`, which push owns.
+pub const FETCH_REFSPECS: &[&str] = &[
+  "+refs/heads/*:refs/remotes/upstream/*",
+  "+refs/tags/*:refs/tags/*",
+];
 
 /// Whether a refspec's destination can be pruned without touching the reserved
 /// namespace.
@@ -59,14 +85,20 @@ pub fn refspec_is_safe(refspec: &str) -> bool {
   }
 }
 
-/// The outcome of one fetch.
+/// The outcome of one sync.
 #[derive(Clone, Debug, Default)]
 pub struct FetchOutcome {
   /// Stock Git's summary output, already bounded and safe to log.
   pub summary: String,
+  /// Branches created at, or fast-forwarded to, the upstream head.
+  pub advanced: Vec<String>,
+  /// Branches left where they are because they have diverged from upstream (or
+  /// are ahead of it). Theirs to resolve — merge, rebase, or force-push.
+  pub diverged: Vec<String>,
 }
 
-/// Fetch from upstream into a bare mirror.
+/// Sync from upstream into the bare repository: fetch into
+/// [`UPSTREAM_REF_ROOT`], then fast-forward the branches that can follow.
 ///
 /// `credential` is the resolved secret for this fetch, held only for the duration
 /// of the call. The catalog stores a *reference* to it, never the value, so a
@@ -146,7 +178,129 @@ pub fn fetch(
     .chars()
     .take(2000)
     .collect();
-  Ok(FetchOutcome { summary })
+
+  let (advanced, diverged) = advance_branches(repo_path, git_binary)?;
+  Ok(FetchOutcome {
+    summary,
+    advanced,
+    diverged,
+  })
+}
+
+/// Fold the freshly fetched upstream heads into `refs/heads/*`, fast-forward
+/// only.
+///
+/// Each update is compare-and-swap on the branch's current value, so a push
+/// that lands mid-sync wins over the sync rather than being overwritten: a
+/// failed swap is simply skipped, and the next sync sees the new state.
+fn advance_branches(
+  repo_path: &Path,
+  git_binary: &Path,
+) -> Result<(Vec<String>, Vec<String>), GfsError> {
+  let listed = git_in_repo(
+    repo_path,
+    git_binary,
+    &[
+      "for-each-ref",
+      "--format=%(objectname) %(refname:lstrip=3)",
+      UPSTREAM_REF_ROOT,
+    ],
+  )?;
+  if !listed.status.success() {
+    let stderr = String::from_utf8_lossy(&listed.stderr);
+    return Err(GfsError::internal(format!(
+      "cannot list the upstream namespace: {}",
+      stderr.trim()
+    )));
+  }
+
+  let mut advanced = Vec::new();
+  let mut diverged = Vec::new();
+  let text = String::from_utf8_lossy(&listed.stdout);
+  for line in text.lines() {
+    let Some((upstream_oid, branch)) = line.split_once(' ') else {
+      continue;
+    };
+    // A hostile upstream names the refs this loop touches, so the branch part
+    // passes the same gate every user-supplied branch name does before it is
+    // spliced into `refs/heads/`.
+    if !gfs_types::revision::is_valid_branch_name(branch) {
+      continue;
+    }
+    let local_ref = format!("refs/heads/{branch}");
+
+    let current = git_in_repo(
+      repo_path,
+      git_binary,
+      &["rev-parse", "-q", "--verify", &local_ref],
+    )?;
+    if !current.status.success() {
+      // No such branch yet: born at the upstream head. The empty old-value
+      // makes the create conditional on it still not existing.
+      let made = git_in_repo(
+        repo_path,
+        git_binary,
+        &["update-ref", &local_ref, upstream_oid, ""],
+      )?;
+      if made.status.success() {
+        advanced.push(branch.to_owned());
+      }
+      continue;
+    }
+    let local_oid = String::from_utf8_lossy(&current.stdout).trim().to_owned();
+    if local_oid == upstream_oid {
+      continue;
+    }
+
+    let ancestry = git_in_repo(
+      repo_path,
+      git_binary,
+      &["merge-base", "--is-ancestor", &local_oid, upstream_oid],
+    )?;
+    match ancestry.status.code() {
+      Some(0) => {
+        let moved = git_in_repo(
+          repo_path,
+          git_binary,
+          &["update-ref", &local_ref, upstream_oid, &local_oid],
+        )?;
+        if moved.status.success() {
+          advanced.push(branch.to_owned());
+        }
+      }
+      Some(1) => diverged.push(branch.to_owned()),
+      _ => {
+        let stderr = String::from_utf8_lossy(&ancestry.stderr);
+        return Err(GfsError::internal(format!(
+          "cannot compare {local_ref} with its upstream: {}",
+          stderr.trim()
+        )));
+      }
+    }
+  }
+  Ok((advanced, diverged))
+}
+
+/// One sandboxed git subprocess against the repository, output captured.
+fn git_in_repo(
+  repo_path: &Path,
+  git_binary: &Path,
+  args: &[&str],
+) -> Result<std::process::Output, GfsError> {
+  Command::new(git_binary)
+    .env_clear()
+    .env("GIT_CONFIG_GLOBAL", "/dev/null")
+    .env("GIT_CONFIG_SYSTEM", "/dev/null")
+    .env("PATH", "/usr/bin:/bin")
+    .current_dir(repo_path)
+    .args(args)
+    .output()
+    .map_err(|e| {
+      GfsError::new(
+        ErrorCode::Internal,
+        format!("cannot run git {}: {e}", args.first().unwrap_or(&"")),
+      )
+    })
 }
 
 /// Create an empty bare mirror.
@@ -582,8 +736,10 @@ mod tests {
   }
 
   #[test]
-  fn a_fetch_with_explicit_refspecs_prunes_upstream_deletions_but_not_anchors() {
-    // The end-to-end version of the refspec argument, against real Git.
+  fn a_sync_prunes_the_upstream_namespace_but_keeps_branches_and_anchors() {
+    // The end-to-end version of the refspec argument, against real Git, plus
+    // the fork contract: an upstream deletion vanishes from the upstream
+    // namespace and touches neither the branch nor the lease anchors.
     let (_up_tmp, upstream) = gfs_test::scratch_clone("basic").unwrap();
     let (_tmp, mirror) = gfs_test::scratch_clone("basic").unwrap();
 
@@ -599,9 +755,10 @@ mod tests {
       repo.create_lease_anchor(&anchor, &commit).unwrap();
     }
 
-    // Upstream deletes a branch, so the prune has real work to do.
+    // One sync while the branch still exists, so the deletion has something to
+    // prune out of the upstream namespace.
+    fetch(&mirror, upstream.to_str().unwrap(), None, Path::new("git")).unwrap();
     gfs_test::git(&upstream, &["update-ref", "-d", "refs/heads/feature"]).unwrap();
-
     fetch(&mirror, upstream.to_str().unwrap(), None, Path::new("git")).unwrap();
 
     let repo = gfs_git::Libgit2Repository::open(&mirror, 2, 1 << 20).unwrap();
@@ -611,17 +768,79 @@ mod tests {
       Some(commit),
       "a pruning fetch must not remove the lease anchor"
     );
-    let names: Vec<String> = repo
-      .visible_refs()
-      .unwrap()
-      .into_iter()
-      .map(|(n, _)| n)
-      .collect();
+    let upstream_refs =
+      gfs_test::git(&mirror, &["for-each-ref", "--format=%(refname)", UPSTREAM_REF_ROOT]).unwrap();
     assert!(
-      !names.iter().any(|n| n == "refs/heads/feature"),
-      "the prune must have removed the deleted branch, or this test proves nothing: {names:?}"
+      !upstream_refs.contains("upstream/feature"),
+      "the prune must have removed the deleted branch from the upstream \
+       namespace, or this test proves nothing: {upstream_refs}"
     );
-    assert!(names.iter().any(|n| n == "refs/heads/main"));
+    let branches =
+      gfs_test::git(&mirror, &["for-each-ref", "--format=%(refname)", "refs/heads"]).unwrap();
+    assert!(
+      branches.contains("refs/heads/feature"),
+      "a fork keeps its branches when upstream deletes them: {branches}"
+    );
+    assert!(branches.contains("refs/heads/main"));
+  }
+
+  #[test]
+  fn a_sync_fast_forwards_a_branch_that_can_follow_and_leaves_a_diverged_one() {
+    let (_up_tmp, upstream) = gfs_test::scratch_clone("basic").unwrap();
+    let (_tmp, mirror) = gfs_test::scratch_clone("basic").unwrap();
+
+    // A local push moved `feature` off the shared history; upstream moves both
+    // branches forward.
+    let rev = |repo: &Path, spec: &str| {
+      gfs_test::git(repo, &["rev-parse", spec])
+        .unwrap()
+        .trim()
+        .to_owned()
+    };
+    let base = rev(&mirror, "refs/heads/feature");
+    let tree = rev(&mirror, "refs/heads/feature^{tree}");
+    let local = gfs_test::git(
+      &mirror,
+      &["commit-tree", &tree, "-p", &base, "-m", "pushed work"],
+    )
+    .unwrap()
+    .trim()
+    .to_owned();
+    gfs_test::git(&mirror, &["update-ref", "refs/heads/feature", &local]).unwrap();
+    for branch in ["main", "feature"] {
+      let head = rev(&upstream, &format!("refs/heads/{branch}"));
+      let tree = rev(&upstream, &format!("refs/heads/{branch}^{{tree}}"));
+      let moved = gfs_test::git(
+        &upstream,
+        &["commit-tree", &tree, "-p", &head, "-m", "moved upstream"],
+      )
+      .unwrap()
+      .trim()
+      .to_owned();
+      gfs_test::git(&upstream, &["update-ref", &format!("refs/heads/{branch}"), &moved]).unwrap();
+    }
+
+    let outcome = fetch(&mirror, upstream.to_str().unwrap(), None, Path::new("git")).unwrap();
+
+    assert!(
+      outcome.advanced.iter().any(|b| b == "main"),
+      "main had no local work and must follow upstream: {outcome:?}"
+    );
+    assert_eq!(
+      outcome.diverged,
+      vec!["feature".to_owned()],
+      "the diverged branch is reported, not resolved"
+    );
+    assert_eq!(
+      rev(&mirror, "refs/heads/feature"),
+      local,
+      "a fast-forward-only sync must not move a diverged branch"
+    );
+    assert_eq!(
+      rev(&mirror, "refs/heads/main"),
+      rev(&mirror, &format!("{UPSTREAM_REF_ROOT}/main")),
+      "main follows the upstream head"
+    );
   }
 
   #[test]

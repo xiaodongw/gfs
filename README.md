@@ -23,8 +23,9 @@ The system has three entry points:
   `search` (and `rg`, an `rg`-flag-compatible spelling), `diff`, `show`,
   `blame`. Workspace lifecycle: `clone`, `mount`, `switch`, `refresh`,
   `unmount`, `status`, `daemon`, `lease`, `install-shim`. Writing back:
-  `commit` (to the gateway's mirror), `push` (upstream, with your
-  credential), and `export` (a bundle with a `git apply`-compatible patch).
+  `commit` (to the gateway's fork of the upstream), `push` (upstream, with
+  your credential), and `export` (a bundle with a `git apply`-compatible
+  patch).
 
 Supporting libraries live under `crates/` (`gfs-git`, `gfs-search`,
 `gfs-overlay`, `gfs-mount`, `gfs-service`, `gfs-proto`, `gfs-types`,

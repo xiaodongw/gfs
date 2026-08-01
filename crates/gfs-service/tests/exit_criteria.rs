@@ -354,8 +354,18 @@ async fn lease_refs_are_absent_from_advertisements_and_survive_a_pruning_fetch()
   .unwrap();
   assert!(!advertised.contains("refs/gfs/"), "{advertised}");
 
-  // Survives a pruning upstream fetch with the explicit refspecs.
+  // Survives a pruning upstream fetch with the explicit refspecs. Fetched once
+  // before the upstream deletion so the prune has something to remove from the
+  // upstream namespace -- branches themselves are never pruned (fork
+  // semantics), so the namespace is where the prune proves it ran.
   let (_up_tmp, upstream) = gfs_test::scratch_clone("basic").unwrap();
+  gfs_service::mirror::fetch(
+    &h.repo_path,
+    upstream.to_str().unwrap(),
+    None,
+    std::path::Path::new("git"),
+  )
+  .unwrap();
   gfs_test::git(&upstream, &["update-ref", "-d", "refs/heads/feature"]).unwrap();
   gfs_service::mirror::fetch(
     &h.repo_path,
@@ -373,11 +383,20 @@ async fn lease_refs_are_absent_from_advertisements_and_survive_a_pruning_fetch()
     "a pruning fetch must not remove the anchor"
   );
   // The prune did run, so the assertion above is not vacuous.
-  assert!(repo
-    .visible_refs()
-    .unwrap()
-    .iter()
-    .all(|(n, _)| n != "refs/heads/feature"));
+  let upstream_refs = gfs_test::git(
+    &h.repo_path,
+    &[
+      "for-each-ref",
+      "--format=%(refname)",
+      gfs_service::mirror::UPSTREAM_REF_ROOT,
+    ],
+  )
+  .unwrap();
+  assert!(
+    !upstream_refs.contains("upstream/feature"),
+    "{upstream_refs}"
+  );
+  assert!(upstream_refs.contains("upstream/main"), "{upstream_refs}");
 }
 
 // ---------------------------------------------------------------------------

@@ -428,17 +428,25 @@ impl RepositoryService for RepositoryApi {
         ));
       };
 
-      let local_ref = revision::work_ref(ctx.identity.subject.as_str(), &req.branch);
-      let repo = self.registry.repository(&id)?;
+      // The caller's own work branch when they have one (the RPC commit flow
+      // writes there), otherwise the real branch a git-native push landed on.
       // Checked before the subprocess runs, so "there is no such branch" is a
       // clean `NOT_FOUND` and not a `git push` error mentioning a ref name the
       // caller never typed.
-      if repo.read_ref(local_ref.clone()).await?.is_none() {
+      let repo = self.registry.repository(&id)?;
+      let work_ref = revision::work_ref(ctx.identity.subject.as_str(), &req.branch);
+      let branch_ref = format!("refs/heads/{}", req.branch);
+      let local_ref = if repo.read_ref(work_ref.clone()).await?.is_some() {
+        work_ref
+      } else if repo.read_ref(branch_ref.clone()).await?.is_some() {
+        branch_ref
+      } else {
         return Err(GfsError::not_found(format!(
-          "no work branch {:?} for this caller",
+          "no branch {:?} on the gateway, and no work branch of that name for \
+           this caller",
           req.branch
         )));
-      }
+      };
 
       let credential = if req.credential.is_empty() {
         None

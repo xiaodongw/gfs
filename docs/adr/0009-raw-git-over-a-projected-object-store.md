@@ -327,3 +327,30 @@ read time is racy and was already rejected. Each workspace now mounts its own
 `objects/info/alternates` names the view, so which-mountpoint-was-read is the
 job identity. Blocks and residency stay shared; only the counting is per view.
 `gfs status` reports both the repository's traffic and this job's share.
+
+## Amendment, 2026-07-31: the gateway is a fork, and push lands on real branches
+
+The 2026-07-30 confinement — pushes only into `refs/gfs/work/<subject>/`, the
+branch namespace written by fetch alone — produced a repository no other Git
+host behaves like: commit, push, delete the clone, clone again, and the work
+is invisible, because the push went to a namespace clones do not resolve. The
+diagnosis was that the *sync* was wrong, not the push: `refs/heads/*` was only
+unsafe to accept because the fetch force-mirrored and pruned it.
+
+So the sync now has fork semantics, the way a GitHub fork relates to its
+upstream. Upstream state is fetched — forced, pruned — into
+`refs/remotes/upstream/*`, a namespace nothing else writes, and folded into
+`refs/heads/*` by a fast-forward-only pass: a branch that can follow upstream
+does, a branch that has diverged (or that upstream deleted) is left exactly
+where it is and reported, and resolving the divergence is the pusher's job —
+merge, rebase, or force-push, against the advertised
+`refs/remotes/upstream/<branch>`. With that in place receive-pack un-hides
+`refs/heads/` (tags stay fetch-owned, `refs/gfs/` stays reserved), the seeded
+push refspec became `refs/heads/*:refs/heads/*`, and `gfs push` falls back to
+`refs/heads/<branch>` when the caller has no work branch of that name.
+
+Everyone sharing a gateway repository shares its branches, exactly as a team
+sharing a fork does; per-branch protection (a deny list in receive-pack, where
+the namespace check already lives) is the eventual refinement, deliberately
+not built yet. The work namespace and the RPC commit flow stay as they were,
+for callers that do not speak Git.

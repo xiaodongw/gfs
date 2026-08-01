@@ -162,6 +162,16 @@ pub fn ingest(
     mirror::init_bare(&mirror_path, &config.git_binary)?;
   }
   let outcome = mirror::fetch(&mirror_path, url, credential, &config.git_binary)?;
+  if !outcome.diverged.is_empty() {
+    // Fork semantics: the sync is fast-forward-only, so pushed work is never
+    // overwritten — but the caller deserves to know their branches are no
+    // longer following upstream.
+    tracing::warn!(
+      repository = %repository_id,
+      branches = ?outcome.diverged,
+      "branches diverged from upstream were left as they are"
+    );
+  }
 
   // Asked of the upstream rather than read from the mirror, because a mirror
   // created by `init_bare` has whatever default branch this Git version picked
@@ -194,11 +204,20 @@ pub fn ingest(
 
   let record: RepositoryRecord = registry.activate(&repository_id)?;
 
+  let mut summary = outcome.summary;
+  if !outcome.diverged.is_empty() {
+    // Carried in the summary the clone response already has, so a client that
+    // shows it needs no new field.
+    summary.push_str(&format!(
+      "\nleft as they are, diverged from upstream: {}",
+      outcome.diverged.join(", ")
+    ));
+  }
   Ok(IngestOutcome {
     repository_id: record.repository_id,
     created,
     default_branch,
-    summary: outcome.summary,
+    summary,
   })
 }
 

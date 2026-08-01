@@ -1289,16 +1289,13 @@ async fn a_push_lands_in_the_callers_work_namespace_and_is_fsck_clean() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_push_outside_the_work_namespace_is_refused_by_name() {
+async fn a_push_outside_branches_and_the_work_namespace_is_refused_by_name() {
   let fx = start(&[("r-git", "basic")]).await;
   let tmp = tempfile::tempdir().unwrap();
   let clone = clone_and_verify(&fx, &[], tmp.path());
-  let before = server_ref(&fx, "refs/heads/main");
 
   for refused in [
-    "HEAD:refs/heads/hijack".to_owned(),
     "HEAD:refs/tags/v999".to_owned(),
-    "+HEAD:refs/heads/main".to_owned(),
     "HEAD:refs/gfs/work/job-outsider/steal".to_owned(),
     "HEAD:refs/gfs/mounts/m-fake".to_owned(),
   ] {
@@ -1309,8 +1306,7 @@ async fn a_push_outside_the_work_namespace_is_refused_by_name() {
     assert!(!out.status.success(), "{refused} must be refused");
   }
   // Nothing moved.
-  assert_eq!(server_ref(&fx, "refs/heads/main"), before);
-  assert_eq!(server_ref(&fx, "refs/heads/hijack"), None);
+  assert_eq!(server_ref(&fx, "refs/tags/v999"), None);
   assert_eq!(server_ref(&fx, "refs/gfs/work/job-outsider/steal"), None);
 
   // An outsider cannot push anywhere, including their own would-be namespace:
@@ -1329,7 +1325,53 @@ async fn a_push_outside_the_work_namespace_is_refused_by_name() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn the_push_advertisement_shows_only_the_callers_own_subtree() {
+async fn a_push_to_a_branch_lands_on_the_branch() {
+  // The fork contract, end to end: `git push origin <branch>` updates the
+  // gateway's real branch, the way any other Git host would take it.
+  let fx = start(&[("r-git", "basic")]).await;
+  let tmp = tempfile::tempdir().unwrap();
+  let clone = clone_and_verify(&fx, &[], tmp.path());
+
+  std::fs::write(clone.join("pushed.txt"), "onto a real branch\n").unwrap();
+  let out = git_client(&["-C", clone.to_str().unwrap(), "add", "pushed.txt"], None);
+  assert!(out.status.success(), "{}", stderr(&out));
+  let out = Command::new("git")
+    .env("GIT_CONFIG_GLOBAL", "/dev/null")
+    .env("GIT_CONFIG_SYSTEM", "/dev/null")
+    .env("GIT_AUTHOR_NAME", "a")
+    .env("GIT_AUTHOR_EMAIL", "a@example.com")
+    .env("GIT_COMMITTER_NAME", "a")
+    .env("GIT_COMMITTER_EMAIL", "a@example.com")
+    .args([
+      "-C",
+      clone.to_str().unwrap(),
+      "commit",
+      "-q",
+      "-m",
+      "local work",
+    ])
+    .output()
+    .unwrap();
+  assert!(out.status.success(), "{}", stderr(&out));
+
+  // A fast-forward of `main` itself, and a new branch: both are ordinary
+  // branch pushes now.
+  for refspec in ["HEAD:refs/heads/main", "HEAD:refs/heads/topic"] {
+    let out = git_client(
+      &["-C", clone.to_str().unwrap(), "push", "-q", "origin", refspec],
+      Some(OWNER_TOKEN),
+    );
+    assert!(out.status.success(), "{refspec}: {}", stderr(&out));
+  }
+  let local = git_client(&["-C", clone.to_str().unwrap(), "rev-parse", "HEAD"], None);
+  let local = stdout(&local).trim().to_owned();
+  assert_eq!(server_ref(&fx, "refs/heads/main").as_deref(), Some(&*local));
+  assert_eq!(server_ref(&fx, "refs/heads/topic").as_deref(), Some(&*local));
+  fsck_clean(&fx.repo_path);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_push_advertisement_shows_branches_and_the_callers_own_subtree() {
   let fx = start(&[("r-git", "basic")]).await;
 
   // Plant refs a leak would show: another subject's work branch and a lease
@@ -1367,9 +1409,13 @@ async fn the_push_advertisement_shows_only_the_callers_own_subtree() {
   );
   assert!(
     body.contains(&format!("{OWNER_WORK_ROOT}/mine")),
-    "the caller's own work refs are the advertisement: {body}"
+    "the caller's own work refs are advertised: {body}"
   );
-  for hidden in ["someone-else", "refs/gfs/mounts", "refs/heads/main"] {
+  assert!(
+    body.contains("refs/heads/main"),
+    "branches take pushes, so they are advertised: {body}"
+  );
+  for hidden in ["someone-else", "refs/gfs/mounts"] {
     assert!(
       !body.contains(hidden),
       "{hidden} must not be advertised to a pusher: {body}"

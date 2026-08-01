@@ -221,18 +221,18 @@ pub fn seed_git_dir(spec: &SeedSpec<'_>) -> Result<(), gfs_types::error::GfsErro
      [maintenance]\n\
      \tauto = false\n",
   );
-  if let Some(work_root) = &facts.work_ref_root {
-    // The push path (ADR 0009's receive-pack surface). Local branches map into
-    // the caller's own work namespace -- the only subtree the gateway accepts
-    // updates for -- so a plain `git push origin <branch>` works without the
-    // agent knowing the namespace exists. The credential helper reads the
-    // job's own GFS_TOKEN at push time; the token itself is never written to
-    // disk here.
+  if facts.work_ref_root.is_some() {
+    // The push path (ADR 0009's receive-pack surface). Branches push to real
+    // branches: the gateway is a fork of its upstream, its sync fast-forward
+    // only, so `git push origin <branch>` lands where every other Git host
+    // would put it and the next clone sees it. The credential helper reads
+    // the job's own GFS_TOKEN at push time; the token itself is never written
+    // to disk here.
     config.push_str(&format!(
       "[remote \"origin\"]\n\
        \turl = {url}/v1/repos/{repository}\n\
        \tfetch = +refs/heads/*:refs/remotes/origin/*\n\
-       \tpush = refs/heads/*:{work_root}/*\n\
+       \tpush = refs/heads/*:refs/heads/*\n\
        [credential]\n\
        \thelper = \"!f() {{ echo username=x-access-token; echo password=$GFS_TOKEN; }}; f\"\n",
       url = facts.http_endpoint.trim_end_matches('/'),
