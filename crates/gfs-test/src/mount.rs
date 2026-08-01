@@ -293,6 +293,7 @@ impl Mount {
       git_dir: &real_git,
       facts: &facts,
       index: None,
+      preserve_local_head: false,
     })
     .unwrap();
     let handle = Arc::new(GitDirHandle::open(&real_git).unwrap());

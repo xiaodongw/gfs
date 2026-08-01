@@ -124,6 +124,14 @@ pub struct SeedSpec<'a> {
   /// index is already seeded, which is how a repin that failed to fetch keeps a
   /// working workspace instead of none.
   pub index: Option<&'a [u8]>,
+  /// Leave `HEAD` and the branch ref exactly as they are on disk.
+  ///
+  /// This is the adoption path: a leftover workspace whose `HEAD` has moved
+  /// past the seeded commit holds local commits, and when the pin being seeded
+  /// *is* the commit they were made on, rewriting the refs is the only thing
+  /// that would strand them. The caller passes `index: None` alongside, for the
+  /// same reason — the on-disk index describes the local `HEAD`, not the pin.
+  pub preserve_local_head: bool,
 }
 
 /// Write (or re-point) the real git dir inside a workspace.
@@ -132,7 +140,8 @@ pub struct SeedSpec<'a> {
 /// index are rewritten to the new pin; local loose objects and any local
 /// branches survive, because they are the agent's work and a re-pin is not a
 /// reset. The caller is responsible for refusing the repin when [`local_head`]
-/// shows unpushed commits.
+/// shows unpushed commits — or, when the pin equals the commit they were made
+/// on, for seeding around them with `preserve_local_head`.
 pub fn seed_git_dir(spec: &SeedSpec<'_>) -> Result<(), gfs_types::error::GfsError> {
   use gfs_types::error::GfsError;
   let io = |what: &str, e: std::io::Error| {
@@ -148,6 +157,7 @@ pub fn seed_git_dir(spec: &SeedSpec<'_>) -> Result<(), gfs_types::error::GfsErro
   // would report the whole repository as modified.
   let facts = spec.facts;
   match facts.ref_name.as_deref() {
+    _ if spec.preserve_local_head => {}
     Some(name) if name.starts_with("refs/heads/") => {
       std::fs::write(dir.join("HEAD"), format!("ref: {name}\n")).map_err(|e| io("HEAD", e))?;
       let ref_path = dir.join(name);
@@ -357,6 +367,7 @@ mod tests {
       git_dir: &git,
       facts: &facts(Some("refs/heads/main")),
       index: None,
+      preserve_local_head: false,
     })
     .unwrap();
 
@@ -378,6 +389,7 @@ mod tests {
       git_dir: &git,
       facts: &facts(Some("refs/heads/main")),
       index: None,
+      preserve_local_head: false,
     })
     .unwrap();
     assert_eq!(
@@ -395,11 +407,44 @@ mod tests {
       git_dir: &detached,
       facts: &facts(Some("refs/tags/v1")),
       index: None,
+      preserve_local_head: false,
     })
     .unwrap();
     assert_eq!(
       std::fs::read_to_string(detached.join("HEAD")).unwrap(),
       format!("{}\n", "ab".repeat(20))
+    );
+  }
+
+  #[test]
+  fn a_preserving_seed_leaves_the_moved_head_and_refreshes_everything_else() {
+    // The adoption path: local commits moved the branch ref past the seed, and
+    // a re-seed at their base must not move it back — while the config and
+    // `gfs.json` (endpoints, mount id, generation) are still rewritten.
+    let tmp = tempfile::tempdir().unwrap();
+    let git = tmp.path().join(".git");
+    seed_git_dir(&SeedSpec {
+      git_dir: &git,
+      facts: &facts(Some("refs/heads/main")),
+      index: None,
+      preserve_local_head: false,
+    })
+    .unwrap();
+    let local = "cd".repeat(20);
+    std::fs::write(git.join("refs/heads/main"), format!("{local}\n")).unwrap();
+
+    seed_git_dir(&SeedSpec {
+      git_dir: &git,
+      facts: &facts(Some("refs/heads/main")),
+      index: None,
+      preserve_local_head: true,
+    })
+    .unwrap();
+    assert_eq!(local_head(&git).unwrap(), local, "the local commit survives");
+    assert_eq!(
+      seeded_commit(&git).unwrap(),
+      "ab".repeat(20),
+      "gfs.json still names the base the seed pinned"
     );
   }
 
@@ -419,6 +464,7 @@ mod tests {
       git_dir: &git,
       facts: &facts(None),
       index: None,
+      preserve_local_head: false,
     })
     .unwrap();
     assert_eq!(seeded_commit(&git).unwrap(), "ab".repeat(20));

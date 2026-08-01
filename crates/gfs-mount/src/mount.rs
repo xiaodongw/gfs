@@ -328,30 +328,21 @@ impl Mount {
     // The retained handle: the one way to the state once the mount shadows it.
     let git = Arc::new(GitDirHandle::open(&real_git)?);
 
-    // A leftover `.git` from a previous session may hold local commits. The
-    // re-pin path refuses to move the pin over them (`repin`'s local_head
-    // guard); the first mount must refuse too, or the seed below would move
-    // the branch ref off them and the next gc of the state dir would take
-    // them. Checked before the lease is taken so a refusal costs nothing.
-    if let (Some(local), Some(seeded)) = (
+    // A leftover `.git` from a previous session may hold local commits: a
+    // `HEAD` past the last seeded commit. They are the agent's work, and the
+    // seed below rewriting the branch ref is the one thing that would strand
+    // them — so when the pin resolves to the very commit they were made on,
+    // the mount adopts them instead (seed around the refs, keep the index,
+    // let the overlay's binding check adopt the matching edits). Only a pin
+    // that actually moves off their base is refused, below, once the selector
+    // has been resolved and the two can be compared.
+    let local_commits = match (
       crate::gitdir::local_head(git.root()),
       crate::gitdir::seeded_commit(git.root()),
     ) {
-      if local != seeded {
-        return Err(GfsError::new(
-          ErrorCode::FailedPrecondition,
-          format!(
-            "a previous session left local commits in this workspace ({} is ahead of \
-             the last pinned {}); mount at that commit (`gfs mount --rev {}`) to push \
-             or export them, or remove {} to discard them",
-            local.get(..12).unwrap_or(&local),
-            seeded.get(..12).unwrap_or(&seeded),
-            seeded.get(..12).unwrap_or(&seeded),
-            real_git.display(),
-          ),
-        ));
-      }
-    }
+      (Some(local), Some(seeded)) if local != seeded => Some((local, seeded)),
+      _ => None,
+    };
 
     let publisher: Box<dyn MountPublisher> =
       Box::new(DirectMountPublisher::new(config.workspace.clone())?);
@@ -366,6 +357,36 @@ impl Mount {
     let resolved = resolve_pin(&config, &config.revision_selector.clone(), 1)
       .await
       .map_err(unwind)?;
+    // The refusal half of the local-commits story, now that the selector is a
+    // commit and the two can be compared. Mounting past the base would need a
+    // rebase nobody asked for; mounting *at* it (the arm below) is how the
+    // commits get pushed or exported. Checked before the overlay opens, so
+    // its binding check never sees the moved pin and never drops the edits
+    // that belong with the local commits.
+    if let Some((local, seeded)) = &local_commits {
+      let pinned = resolved.pin.commit.to_hex();
+      if pinned != *seeded {
+        return Err(unwind(GfsError::new(
+          ErrorCode::FailedPrecondition,
+          format!(
+            "this workspace has local commits based on {} ({} is ahead of it), and \
+             the requested revision resolves elsewhere ({}); mount at their base \
+             (`gfs mount --rev {}`) to push or export them, or remove {} to discard \
+             them",
+            seeded.get(..12).unwrap_or(seeded),
+            local.get(..12).unwrap_or(local),
+            pinned.get(..12).unwrap_or(&pinned),
+            seeded.get(..12).unwrap_or(seeded),
+            real_git.display(),
+          ),
+        )));
+      }
+      tracing::info!(
+        local = %local,
+        base = %seeded,
+        "adopting local commits left by a previous session"
+      );
+    }
     // The one overlay, opened at the *on-disk* path while it still resolves
     // to the real directory — this is the last moment that is true, and the
     // SQLite connection opened here is the one the mount keeps for its life.
@@ -377,16 +398,25 @@ impl Mount {
     // shadows it, `objects/info/alternates` pointing at the projection with a
     // relative path. The index the gateway built is fetched once; a failure
     // there degrades to no index -- `git status` would report every file
-    // deleted, which is wrong -- so it fails the mount instead.
-    let index = odb
-      .client
-      .commit_index(&resolved.pin.commit)
-      .await
-      .map_err(unwind)?;
+    // deleted, which is wrong -- so it fails the mount instead. Adopted local
+    // commits keep their own index (and refs) instead: the gateway's index
+    // describes the pin, and their `HEAD` is past it.
+    let index = if local_commits.is_some() {
+      None
+    } else {
+      Some(
+        odb
+          .client
+          .commit_index(&resolved.pin.commit)
+          .await
+          .map_err(unwind)?,
+      )
+    };
     crate::gitdir::seed_git_dir(&crate::gitdir::SeedSpec {
       git_dir: git.root(),
       facts: &resolved.facts,
-      index: Some(&index),
+      index: index.as_deref(),
+      preserve_local_head: local_commits.is_some(),
     })?;
     let fs = Gfs::new(
       Arc::clone(&resolved.pin.client),
@@ -700,6 +730,7 @@ impl Mount {
       git_dir: &git_dir_path,
       facts: &resolved.facts,
       index: Some(&index),
+      preserve_local_head: false,
     })?;
 
     // The one overlay, re-pointed in place. One SQLite transaction, so a
