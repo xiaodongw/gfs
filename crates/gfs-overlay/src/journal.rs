@@ -130,6 +130,34 @@ impl Journal {
     }
   }
 
+  /// Point the journal at a new base, discarding every row.
+  ///
+  /// One transaction, so there is no window in which the overlay is
+  /// half-cleared: a crash either left the old binding with the old rows or
+  /// the new binding with none. The id counters are deliberately not reset —
+  /// an inode number handed out under the old pin must never be reissued for
+  /// a different path (DESIGN.md section 8.2's stable-identity rule).
+  ///
+  /// This is what a repin uses (ADR 0011): the overlay directory and its
+  /// SQLite connection live for the whole mount — opened before the workspace
+  /// is mounted over, never reopened through it — and only the binding moves.
+  pub fn rebind(&self, binding: &Binding) -> Result<()> {
+    self.conn.execute_batch("BEGIN IMMEDIATE;").map_err(db)?;
+    let result = (|| {
+      self.conn.execute("DELETE FROM entries", []).map_err(db)?;
+      self.set_meta("repository_id", &binding.repository_id)?;
+      self.set_meta("base_commit", &binding.base_commit)?;
+      Ok(())
+    })();
+    match result {
+      Ok(()) => self.conn.execute_batch("COMMIT;").map_err(db),
+      Err(e) => {
+        let _ = self.conn.execute_batch("ROLLBACK;");
+        Err(e)
+      }
+    }
+  }
+
   pub fn meta(&self, key: &str) -> Result<Option<String>> {
     self
       .conn

@@ -56,6 +56,10 @@ pub const API_VERSION: &str = "v1";
 /// Bumped when a persisted layout changes incompatibly. Recorded in `mount.json`
 /// (DESIGN.md section 8.3) and in the catalog so a mismatch is refused rather
 /// than misread.
-pub const STATE_FORMAT_VERSION: u32 = 1;
+///
+/// 2: ADR 0011 — state moved inside the workspace (`.git/gfs`), the mount
+/// request lost its state-dir field, and the control socket moved to the
+/// runtime directory.
+pub const STATE_FORMAT_VERSION: u32 = 2;
 
 pub type Result<T> = std::result::Result<T, GfsError>;

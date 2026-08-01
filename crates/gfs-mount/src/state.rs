@@ -31,6 +31,57 @@ use gfs_types::{LeaseState, Timestamp};
 pub const MOUNT_STATE_FILE: &str = "mount.json";
 pub const CONTROL_SOCKET_FILE: &str = "control.sock";
 
+/// Where a workspace keeps its state (ADR 0011): inside the folder, under the
+/// real git dir, at `<workspace>/.git/gfs`.
+pub fn state_dir_for_workspace(workspace: &Path) -> PathBuf {
+  workspace
+    .join(crate::passthrough::GIT_DIR_NAME)
+    .join(crate::passthrough::STATE_SUBDIR)
+}
+
+/// The per-user runtime directory sockets live in.
+///
+/// Under `XDG_RUNTIME_DIR` because that is a per-user directory the system
+/// already clears on logout, which is the right lifetime for a socket naming
+/// a process. The fallback is uid-qualified so two users on one machine never
+/// collide.
+pub fn runtime_dir() -> PathBuf {
+  match std::env::var_os("XDG_RUNTIME_DIR") {
+    Some(dir) => PathBuf::from(dir).join("gfs"),
+    None => {
+      let uid = crate::attr::Ownership::current().uid;
+      std::env::temp_dir().join(format!("gfs-{uid}"))
+    }
+  }
+}
+
+/// The control socket for one workspace.
+///
+/// **Not inside the workspace**, deliberately. The state directory sits under
+/// the mount (ADR 0011), and a Unix socket cannot be connected to through a
+/// FUSE passthrough — `connect(2)` needs the inode the daemon bound, and the
+/// passthrough can only present a look-alike. So the socket lives in the
+/// runtime directory, at a name derived from the workspace path; `gfs.json`
+/// inside the git dir records the same path for tools that discover the
+/// workspace by walking up.
+///
+/// Derived by hash rather than by sanitized path because a Unix socket path is
+/// capped near 108 bytes and the failure when exceeded is an opaque bind
+/// error. SHA-1 here is a name, not a credential.
+pub fn workspace_control_socket(workspace: &Path) -> PathBuf {
+  use sha1::{Digest, Sha1};
+  use std::os::unix::ffi::OsStrExt;
+  let absolute = std::path::absolute(workspace).unwrap_or_else(|_| workspace.to_path_buf());
+  let digest = Sha1::digest(absolute.as_os_str().as_bytes());
+  let mut name = String::with_capacity(3 + 16 + 5);
+  name.push_str("ws-");
+  for byte in &digest[..8] {
+    name.push_str(&format!("{byte:02x}"));
+  }
+  name.push_str(".sock");
+  runtime_dir().join(name)
+}
+
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct LeaseRecord {
   pub state: LeaseState,

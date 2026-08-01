@@ -170,10 +170,10 @@ async fn an_overlay_edit_is_a_modification_and_a_local_commit_stays_local() {
   assert!(show.contains("README.md"), "{show}");
   assert!(log.contains("agent work"), "{log}");
 
-  // The commit is on local disk in the seeded git dir, not in the overlay and
-  // not on the server.
-  let objects = job.state_dir.join("git/objects");
-  let loose = walk_count(&objects);
+  // The commit is on local disk in the workspace's own git dir — reached
+  // through the mount's passthrough, which is the only namespace a tool has.
+  let objects = job.workspace.join(".git/objects");
+  let loose = on_fs(move || walk_count(&objects)).await;
   assert!(loose >= 3, "commit, tree, and blob must be local: {loose}");
 }
 
@@ -225,8 +225,10 @@ async fn a_switch_over_local_commits_is_refused_rather_than_stranding_them() {
     "{text}"
   );
 
-  // And the commit is still reachable in the seeded git dir.
-  let head = gfs_mount::gitdir::local_head(&job.state_dir.join("git")).unwrap();
+  // And the commit is still reachable in the seeded git dir, read through
+  // the mount.
+  let git_dir = job.workspace.join(".git");
+  let head = on_fs(move || gfs_mount::gitdir::local_head(&git_dir).unwrap()).await;
   assert_eq!(head.len(), 40, "{head}");
 }
 
@@ -264,7 +266,6 @@ async fn a_remount_over_an_edit_free_state_dir_follows_the_moved_branch() {
   let tmp = tempfile::tempdir().unwrap();
   let cache = tempfile::tempdir().unwrap();
   let workspace = tmp.path().join("ws");
-  let state_dir = tmp.path().join("ws.gfs");
 
   {
     let sockets = tempfile::tempdir().unwrap();
@@ -275,7 +276,6 @@ async fn a_remount_over_an_edit_free_state_dir_follows_the_moved_branch() {
         &backend,
         "main",
         &workspace,
-        &state_dir,
         cache.path(),
         gfs_overlay::OverlayConfig::default(),
       ))
@@ -290,7 +290,10 @@ async fn a_remount_over_an_edit_free_state_dir_follows_the_moved_branch() {
     &backend.repo_path,
     &["commit-tree", &tree, "-p", &old, "-m", "moved upstream"],
   );
-  git_mirror(&backend.repo_path, &["update-ref", "refs/heads/main", &moved]);
+  git_mirror(
+    &backend.repo_path,
+    &["update-ref", "refs/heads/main", &moved],
+  );
 
   let sockets = tempfile::tempdir().unwrap();
   let (host, listener) = MountHost::bind(host_config(&backend, sockets.path())).unwrap();
@@ -300,12 +303,11 @@ async fn a_remount_over_an_edit_free_state_dir_follows_the_moved_branch() {
       &backend,
       "main",
       &workspace,
-      &state_dir,
       cache.path(),
       gfs_overlay::OverlayConfig::default(),
     ))
     .await
-    .expect("an edit-free leftover state dir must remount at the moved head");
+    .expect("an edit-free leftover workspace must remount at the moved head");
 
   let ws = workspace.clone();
   let (ok, head) = on_fs(move || git_in(&ws, &["rev-parse", "HEAD"])).await;
@@ -324,7 +326,6 @@ async fn a_remount_over_local_commits_is_refused_rather_than_stranding_them() {
   let tmp = tempfile::tempdir().unwrap();
   let cache = tempfile::tempdir().unwrap();
   let workspace = tmp.path().join("ws");
-  let state_dir = tmp.path().join("ws.gfs");
 
   {
     let sockets = tempfile::tempdir().unwrap();
@@ -335,7 +336,6 @@ async fn a_remount_over_local_commits_is_refused_rather_than_stranding_them() {
         &backend,
         "main",
         &workspace,
-        &state_dir,
         cache.path(),
         gfs_overlay::OverlayConfig::default(),
       ))
@@ -361,7 +361,6 @@ async fn a_remount_over_local_commits_is_refused_rather_than_stranding_them() {
       &backend,
       "main",
       &workspace,
-      &state_dir,
       cache.path(),
       gfs_overlay::OverlayConfig::default(),
     ))

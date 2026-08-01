@@ -109,9 +109,10 @@ fn wants_recursion(args: &[String]) -> bool {
 
 /// Whether the working directory is inside a GFS workspace.
 ///
-/// The workspace's `.git` is a *file* whose `gitdir:` names a directory holding
-/// `gfs.json`. Detection must be exact — noting on an ordinary repository would
-/// teach agents to ignore the note — so anything else is "no".
+/// The workspace's `.git` is a real directory holding `gfs.json` (ADR 0011);
+/// the older gitfile shape is still recognized. Detection must be exact —
+/// noting on an ordinary repository would teach agents to ignore the note —
+/// so anything else is "no".
 fn in_gfs_workspace() -> bool {
   let Ok(start) = std::env::current_dir() else {
     return false;
@@ -119,6 +120,9 @@ fn in_gfs_workspace() -> bool {
   let mut current: Option<&Path> = Some(&start);
   while let Some(directory) = current {
     let dotgit = directory.join(".git");
+    if dotgit.is_dir() {
+      return dotgit.join("gfs.json").is_file();
+    }
     if dotgit.exists() {
       let Ok(content) = std::fs::read_to_string(&dotgit) else {
         return false;

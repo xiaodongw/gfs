@@ -14,10 +14,12 @@
 //!   `blob <size>\0<content>` and compared with its object ID before it is
 //!   renamed into place, so a truncated response or a corrupted disk fails
 //!   loudly instead of reaching a compiler as a silently wrong source file.
-//! * **[`gitdir`] synthesizes six entries, not four.** ADR 0005 measured that
-//!   DESIGN.md's list does not form a repository at all, and that the shim is a
-//!   correctness requirement because `ls-files` and `diff` against the raw
-//!   surface exit 0 with empty output.
+//! * **[`gitdir`] seeds a real git dir and [`passthrough`] serves it back.**
+//!   ADR 0009 replaced ADR 0005's synthesized surface with a real `.git` on
+//!   local disk; ADR 0011 moved it inside the workspace, shadowed by the one
+//!   mount and reached through a retained handle, with the object-store
+//!   projection presented at `.git/gfs/objects` and negative dentries on the
+//!   object namespace (m05c: 6,524 ENOENT probes per `read-tree` otherwise).
 //! * **the overlay is the only writer.** Nothing in this crate mutates the base:
 //!   a write copies the blob into `gfs-overlay`'s journal and content store and
 //!   every later read of that path comes from there. That is what makes the
@@ -44,6 +46,7 @@ pub mod inode;
 pub mod lease;
 pub mod mount;
 pub mod odb;
+pub mod passthrough;
 pub mod publish;
 pub mod search;
 pub mod session;
@@ -52,10 +55,11 @@ pub mod state;
 pub use cache::{BlobCache, CacheStats, Hydration};
 pub use client::{MountBinding, SnapshotClient};
 pub use fs::{root_entry, FsConfig, FsStats, Gfs, GfsFilesystem};
-pub use gitdir::{GitDir, GitDirFacts};
+pub use gitdir::GitDirFacts;
 pub use host::{HostConfig, MountHost};
 pub use lease::{HealthState, LeaseHealth, LeaseMonitor};
 pub use mount::{Mount, MountSpec};
+pub use passthrough::{GitDirHandle, GitPassthrough};
 pub use publish::{DirectMountPublisher, MountPublisher};
 pub use session::{spawn_mount, MountConfig};
 pub use state::MountState;

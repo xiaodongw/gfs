@@ -75,10 +75,13 @@ fn main() {
 
 /// Whether the working directory is inside a GFS workspace.
 ///
-/// The new shape: `.git` is a *file* whose `gitdir:` names a directory holding
-/// `gfs.json`. Detection must be exact — answering for an ordinary repository
+/// The single-mount shape (ADR 0011): `.git` is a real directory holding
+/// `gfs.json`, seeded by the daemon and served back through the workspace
+/// mount. Detection must be exact — answering for an ordinary repository
 /// would wrap a working `git` in refusals it does not deserve — so anything
-/// else, including unreadable files, is "no".
+/// else is "no". The gitfile shape (`gitdir: <path>` naming a directory with
+/// `gfs.json`) is still recognized, so this shim keeps working against a
+/// pre-ADR-0011 daemon.
 fn in_gfs_workspace() -> bool {
   let Ok(start) = std::env::current_dir() else {
     return false;
@@ -86,9 +89,11 @@ fn in_gfs_workspace() -> bool {
   let mut current: Option<&Path> = Some(&start);
   while let Some(directory) = current {
     let dotgit = directory.join(".git");
+    if dotgit.is_dir() {
+      return dotgit.join("gfs.json").is_file();
+    }
     if dotgit.exists() {
       let Ok(content) = std::fs::read_to_string(&dotgit) else {
-        // A directory (ordinary repository) or unreadable: not ours.
         return false;
       };
       let Some(git_dir) = content.trim().strip_prefix("gitdir: ") else {

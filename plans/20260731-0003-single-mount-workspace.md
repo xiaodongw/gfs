@@ -19,15 +19,31 @@ a requirement of the design.
 
 ## Plan
 
-_To be filled in when work starts on this issue._
+**Implemented 2026-07-31** (ADR 0011 → Accepted). What landed:
 
-Expected shape (from ADR 0011): mount-over-state lifecycle in gfs-fuse
-(create, retained handles, recovery ordering: lazy-unmount → reopen →
-remount), `.git` passthrough with negative-dentry replies on the object
-namespace, the projection subtree relocated to `.git/gfs/objects/` with a
-relative alternates pointer, adoption of copied folders in `gfs clone`
-(including alternates verify/repair), `gfs export` for safe copying,
-migration of the dead-mount sweep, TESTING.md and manual-test.md updates.
+- `crates/gfs-mount/src/passthrough.rs` (new): retained `GitDirHandle`
+  (`/proc/self/fd/<n>`), `GitPassthrough` serving `.git/**` writably
+  (lockfile `O_EXCL`, rename, unlink, hard links, chmod/truncate/utimens)
+  and the projection tree at `.git/gfs/objects/**` from the shared
+  `BlockStore`, with per-workspace attribution counters.
+- `fs.rs`: subtree routing (passthrough / projection / merged view),
+  negative dentries with a 60 s TTL confined to the object namespace
+  (`FsConfig::object_negative_ttl`), short `git_ttl` for passthrough attrs.
+- `mount.rs`: single-mount lifecycle — sweep (lazy-unmount first), open
+  retained handle, resolve, open the one overlay pre-mount, seed (relative
+  alternates, no `core.worktree`), mount over; legacy `<ws>.gfs` migration;
+  refused mounts unwind a freshly created `.git`.
+- `odb.rs`: FUSE surfaces deleted (`OdbFs`, `OdbView`, projection mount);
+  the store remains, shared per repository.
+- Overlay: one directory, no epochs — `Overlay::rebind` clears and re-binds
+  in a single SQLite transaction on repin (SQLite resolves symlinks, so the
+  connection must be opened pre-mount and kept).
+- Control socket in `$XDG_RUNTIME_DIR/gfs/ws-<hash>.sock` (a socket cannot
+  be connected to through a passthrough); `.git/gfs.json` records it; CLI
+  discovery walks up to `.git/gfs`, with legacy shapes still recognized.
+- Shims (`gfs-git-shim`, `gfs-scan-shim`, `gfs-fsmonitor`) accept the real
+  `.git` directory shape; `STATE_FORMAT_VERSION` = 2; scripts and
+  manual-test.md updated; `gfs export` remains future work.
 
 ## Decisions
 

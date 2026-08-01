@@ -54,10 +54,11 @@ the gateway by design, and an orphaned mount is what makes the next run fail
 confusingly. The host itself is stopped only if the lab's workspaces were the
 last ones it was serving, so a mount you made elsewhere survives.
 
-**Keep the lab path short.** A workspace's control socket is
-`<workspace>.gfs/control.sock` and a Unix socket path cannot exceed 108 bytes.
-The default is short; a lab under a deep scratch directory fails to serve, and
-the failure reads as something else entirely.
+A workspace's control socket lives in the runtime directory
+(`$XDG_RUNTIME_DIR/gfs/ws-<hash>.sock`), named by a hash of the workspace path
+— it cannot live inside the workspace, because the state sits under the mount
+(ADR 0011) and a socket cannot be connected to through a FUSE passthrough. The
+authoritative path is recorded in the workspace's own `.git/gfs.json`.
 
 ## Prerequisites
 
@@ -473,9 +474,9 @@ gfs daemon stop                            # every workspace, then the host
 ```
 
 `gfs daemon stop` unmounts each workspace as it goes, leaving the directory in
-place and empty. An empty workspace beside a `.gfs` state directory is what a
-released mount looks like; `mount.json` is gone, which is what tells cleanup the
-lease was released.
+place holding exactly its own `.git` — a plain working tree with a fat `.git`
+is what a released mount looks like (ADR 0011). `.git/gfs/mount.json` is gone,
+which is what tells cleanup the lease was released.
 
 Unmount before deleting anything by hand. `rm -rf` over a live mount is both
 wrong and slow: the base is read-only so every removal fails, and ADR 0003
@@ -488,12 +489,14 @@ To start from nothing, `rm -rf ~/.gfs-lab` after the server has stopped.
 
 Each of these produced a plausible-looking wrong answer during development.
 
-- **Long lab paths fail the control socket.** Under 108 bytes for
-  `<workspace>.gfs/control.sock`. The default lab directory is short; a deep
-  `GFS_LAB` is not.
-- **A workspace must be empty to mount on.** It is the mount point now, so
-  `gfs clone` into a non-empty directory is refused rather than hiding what is
-  there — the same rule `git clone` has.
+- **A workspace must hold nothing besides its own `.git` to mount on.** It is
+  the mount point, so `gfs clone` into a populated directory is refused rather
+  than hiding what is there — the same rule `git clone` has. A directory
+  holding only `.git` is the layout's own shape and is adopted (ADR 0011).
+- **Copying a live workspace hydrates it.** `cp -r` on a mounted workspace
+  walks the projected tree and downloads what it touches. Unmount first: an
+  unmounted folder is self-contained — copy it anywhere and `gfs clone` (or
+  `gfs mount`) over it adopts it, relative alternates and all.
 - **Killing `gfs-fuse` now kills every workspace, not one.** There is one host for
   the machine, so what used to end a single job now ends all of them. Use
   `gfs unmount --workspace <path>` for one and `gfs daemon stop` for all. (The old
@@ -507,10 +510,10 @@ Each of these produced a plausible-looking wrong answer during development.
 - **The host outlives the gateway on purpose.** A workspace should survive a
   gateway restart. `gfs daemon status` is how you find one left over from an
   earlier session; it exits non-zero when there is none.
-- **`du` on a live mount walks the FUSE tree** and reports ~45 MiB for Django.
-  The real client-side state is around 100 KiB, most of it the installed shim
-  binary: `du -sb <workspace>.gfs`. The state directory no longer contains the
-  mount, so nothing has to be excluded.
+- **`du` on a live mount walks the FUSE tree** and reports the projected
+  sizes. There is exactly one place to measure now (ADR 0011): the workspace
+  itself. The projection at `.git/gfs/objects` still advertises pack sizes;
+  the real local state is what an *unmounted* folder measures.
 - **`core.autocrlf=true`** in your global Git config makes anything you clone
   with shell scripts in it arrive with CRLF endings and fail in ways that look
   like the cloned project is broken. It also corrupts `git apply`.

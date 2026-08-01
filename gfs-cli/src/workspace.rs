@@ -6,22 +6,46 @@ use anyhow::{Context, Result};
 use gfs_mount::control::{self, HostRequest, HostResponse, Request, Response};
 use gfs_mount::state::MountState;
 
-/// Where a workspace keeps its state.
-///
-/// The default is `<workspace>.gfs`, which is what lets every workspace command
-/// find a running daemon from the workspace path alone — the only thing a job
+/// Where a workspace keeps its state (ADR 0011): inside the folder, at
+/// `<workspace>/.git/gfs`. This is what lets every workspace command find a
+/// running daemon from the workspace path alone — the only thing a job
 /// reliably knows about itself.
 pub fn state_dir_for(workspace: &Path, explicit: &Option<PathBuf>) -> PathBuf {
-  explicit.clone().unwrap_or_else(|| {
-    let mut name = workspace.as_os_str().to_os_string();
-    name.push(".gfs");
-    PathBuf::from(name)
-  })
+  explicit
+    .clone()
+    .unwrap_or_else(|| gfs_mount::state::state_dir_for_workspace(workspace))
+}
+
+/// The control socket a state directory's daemon answers on.
+///
+/// The socket cannot live in the state directory any more — the state sits
+/// under the mount, and a Unix socket cannot be connected to through the
+/// passthrough — so the daemon binds in the runtime directory and records the
+/// path in `.git/gfs.json`. That file is the authority; the derived runtime
+/// path and the legacy in-state-dir socket are fallbacks, in that order, so a
+/// new CLI keeps working against an old daemon.
+pub fn control_socket_of(state_dir: &Path) -> PathBuf {
+  if let Some(git_dir) = state_dir.parent() {
+    if let Ok(bytes) = std::fs::read(git_dir.join("gfs.json")) {
+      if let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes) {
+        if let Some(path) = value.get("control_socket").and_then(|v| v.as_str()) {
+          return PathBuf::from(path);
+        }
+      }
+    }
+    if let Some(workspace) = git_dir.parent() {
+      let derived = gfs_mount::state::workspace_control_socket(workspace);
+      if derived.exists() {
+        return derived;
+      }
+    }
+  }
+  MountState::control_socket(state_dir)
 }
 
 /// One request, one response, over the control socket.
 pub fn call(state_dir: &Path, request: &Request) -> Result<Response> {
-  let socket = MountState::control_socket(state_dir);
+  let socket = control_socket_of(state_dir);
   let response = control::call(&socket, request)
     .map_err(|e| anyhow::anyhow!("{}: {}", e.code.as_str(), e.message))?;
   response
@@ -42,36 +66,41 @@ pub fn call_host(socket: &Path, request: &HostRequest) -> Result<HostResponse> {
     .map_err(|e| anyhow::anyhow!("{}: {}", e.code.as_str(), e.message))
 }
 
-/// The suffix a state directory carries, relative to its workspace.
+/// The suffix a pre-ADR-0011 state directory carried, relative to its
+/// workspace. Kept so discovery still answers against an old daemon.
 const STATE_SUFFIX: &str = ".gfs";
+
+/// Whether a state directory has a reachable daemon behind it.
+fn is_workspace_state(state_dir: &Path) -> bool {
+  control_socket_of(state_dir).exists()
+}
 
 /// Find the workspace an agent is standing in.
 ///
 /// `gfs rg` is invoked the way `rg` is — from inside the tree, with no
-/// `--workspace` — so it has to work the path upward looking for the state
-/// directory a mount publishes beside its workspace. Failing loudly when there
-/// is none is the point: `rg`'s behaviour outside a repository is to search the
-/// current directory, and silently doing that here would hydrate the mount.
+/// `--workspace` — so it has to work the path upward looking for the state a
+/// mount leaves inside its workspace. Failing loudly when there is none is
+/// the point: `rg`'s behaviour outside a repository is to search the current
+/// directory, and silently doing that here would hydrate the mount.
 ///
-/// # Two shapes
+/// # Three shapes
 ///
-/// The workspace is the mount point itself, so `canonicalize` on a directory
-/// inside it yields a path under the workspace and the sibling `<current>.gfs`
-/// is found on the way up. That is the ordinary case.
+/// The single-mount layout (ADR 0011) puts everything at
+/// `<workspace>/.git/gfs`, and `.git/gfs.json` names the control socket; the
+/// walk finds it the way `git` finds its own root. Two legacy shapes are kept
+/// because each costs one `exists` call and keeps a new CLI working against
+/// an old daemon:
 ///
-/// The second shape is kept because it costs one `exists` call and covers the
-/// caller standing in the state directory rather than the workspace — which is
-/// also where a mount published by a *symlink* used to leave a resolved current
-/// directory, so this keeps working against a daemon from before ADR 0003's
-/// second amendment.
-///
-/// Both are accepted at every level:
-///
-/// * `<current>.gfs/control.sock` — `current` is the workspace;
-/// * `<current>/control.sock` — `current` *is* the state directory.
+/// * `<current>/.git/gfs/gfs.json`-adjacent state — `current` is the workspace;
+/// * `<current>.gfs/control.sock` — the pre-ADR-0011 sibling state directory;
+/// * `<current>/control.sock` — `current` *is* an old state directory.
 pub fn discover(start: &Path) -> Option<(PathBuf, PathBuf)> {
   let mut current = start.canonicalize().ok()?;
   loop {
+    let inside = gfs_mount::state::state_dir_for_workspace(&current);
+    if is_workspace_state(&inside) {
+      return Some((current, inside));
+    }
     let beside = {
       let mut name = current.as_os_str().to_os_string();
       name.push(STATE_SUFFIX);
@@ -81,10 +110,10 @@ pub fn discover(start: &Path) -> Option<(PathBuf, PathBuf)> {
       return Some((current, beside));
     }
     if MountState::control_socket(&current).exists() {
-      // Standing in (or under) the state directory itself. The workspace is its
-      // name without the suffix; if it does not carry one this is a state
-      // directory that was placed explicitly with `--state-dir`, and the
-      // publication path is the best answer available.
+      // Standing in (or under) an old-layout state directory itself. The
+      // workspace is its name without the suffix; if it does not carry one
+      // this is a state directory that was placed explicitly with
+      // `--state-dir`, and the publication path is the best answer available.
       let workspace = strip_state_suffix(&current).unwrap_or_else(|| current.clone());
       return Some((workspace, current));
     }
@@ -104,10 +133,10 @@ pub fn resolve(explicit: &Option<PathBuf>) -> Result<(PathBuf, PathBuf)> {
   match explicit {
     Some(path) => {
       let state_dir = state_dir_for(path, &None);
-      if !MountState::control_socket(&state_dir).exists() {
+      if !is_workspace_state(&state_dir) {
         anyhow::bail!(
-          "no GFS daemon state at {} (expected the control socket of the \
-           workspace given with --workspace). Is the workspace mounted?",
+          "no GFS daemon state at {} (expected the state of the workspace \
+           given with --workspace). Is the workspace mounted?",
           state_dir.display()
         );
       }
@@ -148,7 +177,7 @@ pub fn locate(
 ) -> Result<(PathBuf, PathBuf)> {
   match (workspace, state_dir) {
     (_, Some(explicit)) => {
-      if !MountState::control_socket(explicit).exists() {
+      if !is_workspace_state(explicit) {
         anyhow::bail!(
           "no GFS daemon state at {} (given with --state-dir). Is the workspace mounted?",
           explicit.display()
@@ -293,9 +322,10 @@ mod tests {
 
   #[test]
   fn the_state_directory_is_derivable_from_the_workspace_alone() {
+    // ADR 0011: inside the folder, under the real git dir.
     assert_eq!(
       state_dir_for(Path::new("/jobs/42/ws"), &None),
-      PathBuf::from("/jobs/42/ws.gfs")
+      PathBuf::from("/jobs/42/ws/.git/gfs")
     );
     assert_eq!(
       state_dir_for(Path::new("/jobs/42/ws"), &Some(PathBuf::from("/elsewhere"))),

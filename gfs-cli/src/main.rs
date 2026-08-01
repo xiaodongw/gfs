@@ -30,7 +30,7 @@ use std::path::PathBuf;
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use gfs_cli::search_output;
-use gfs_cli::workspace::{call, call_host, locate, state_dir_for};
+use gfs_cli::workspace::{call, call_host, locate};
 use gfs_mount::control::{Request, Response};
 use gfs_proto::v1;
 
@@ -140,8 +140,6 @@ enum Command {
     #[arg(long, env = "GFS_UPSTREAM_CREDENTIAL", hide_env_values = true)]
     credential: Option<String>,
     #[arg(long)]
-    state_dir: Option<PathBuf>,
-    #[arg(long)]
     cache_dir: Option<PathBuf>,
     #[arg(long)]
     allow_other: bool,
@@ -161,12 +159,10 @@ enum Command {
     repo: String,
     #[arg(long, default_value = "HEAD")]
     rev: String,
-    /// The path the job will use.
+    /// The path the job will use. State lives inside it, at `.git/gfs`
+    /// (ADR 0011).
     #[arg(long)]
     workspace: PathBuf,
-    /// Defaults to `<workspace>.gfs`.
-    #[arg(long)]
-    state_dir: Option<PathBuf>,
     /// Defaults to `$XDG_CACHE_HOME/gfs`.
     #[arg(long)]
     cache_dir: Option<PathBuf>,
@@ -678,13 +674,15 @@ fn sibling_binary(name: &str, override_var: &str) -> PathBuf {
 
 /// Where this invocation's host daemon listens.
 ///
-/// `--foreground` gets a private socket inside the state directory rather than
-/// the shared one. That is what makes the flag mean what it says: a debugging run
-/// that attached itself to whatever host happened to be running would neither show
-/// that host's logs in this terminal nor stop it on Ctrl-C.
-fn host_socket(cli: &Cli, state_dir: &std::path::Path, foreground: bool) -> PathBuf {
+/// `--foreground` gets a private per-workspace socket rather than the shared
+/// one. That is what makes the flag mean what it says: a debugging run that
+/// attached itself to whatever host happened to be running would neither show
+/// that host's logs in this terminal nor stop it on Ctrl-C. In the runtime
+/// directory, not the state directory: the state sits under the mount
+/// (ADR 0011), where a socket could not be connected to.
+fn host_socket(cli: &Cli, workspace: &std::path::Path, foreground: bool) -> PathBuf {
   if foreground {
-    return state_dir.join("host.sock");
+    return gfs_mount::state::workspace_control_socket(workspace).with_extension("host.sock");
   }
   cli
     .host_socket
@@ -787,12 +785,9 @@ fn host_log_path(socket: &std::path::Path) -> PathBuf {
 }
 
 fn do_mount(cli: &Cli, args: MountArgs) -> Result<()> {
-  let state_dir = state_dir_for(&args.workspace, &args.state_dir);
   let cache_dir = args.cache_dir.clone().unwrap_or_else(default_cache_dir);
-  std::fs::create_dir_all(&state_dir)
-    .with_context(|| format!("creating {}", state_dir.display()))?;
 
-  let socket = host_socket(cli, &state_dir, args.foreground);
+  let socket = host_socket(cli, &args.workspace, args.foreground);
   // In the foreground the host is this command's child, so its exit is what ends
   // the wait at the bottom. In the background it is shared and may already exist.
   let mut foreground_host = if args.foreground {
@@ -807,7 +802,6 @@ fn do_mount(cli: &Cli, args: MountArgs) -> Result<()> {
   let request = gfs_mount::control::MountRequest {
     state_format_version: gfs_types::STATE_FORMAT_VERSION,
     workspace: args.workspace.clone(),
-    state_dir: state_dir.clone(),
     cache_dir,
     repository_id: args.repo.clone(),
     revision_selector: args.rev.clone(),
@@ -847,7 +841,6 @@ struct MountArgs {
   repo: String,
   rev: String,
   workspace: PathBuf,
-  state_dir: Option<PathBuf>,
   cache_dir: Option<PathBuf>,
   allow_other: bool,
   cache_quota: u64,
@@ -1161,7 +1154,6 @@ async fn main() -> Result<()> {
       directory,
       rev,
       credential,
-      state_dir,
       cache_dir,
       allow_other,
       cache_quota,
@@ -1208,7 +1200,6 @@ async fn main() -> Result<()> {
             repo: response.repository_id.clone(),
             rev,
             workspace,
-            state_dir: state_dir.clone(),
             cache_dir: cache_dir.clone(),
             allow_other: *allow_other,
             cache_quota: *cache_quota,
@@ -1224,7 +1215,6 @@ async fn main() -> Result<()> {
       repo,
       rev,
       workspace,
-      state_dir,
       cache_dir,
       allow_other,
       cache_quota,
@@ -1242,7 +1232,6 @@ async fn main() -> Result<()> {
             repo: repo.clone(),
             rev: rev.clone(),
             workspace: workspace.clone(),
-            state_dir: state_dir.clone(),
             cache_dir: cache_dir.clone(),
             allow_other: *allow_other,
             cache_quota: *cache_quota,

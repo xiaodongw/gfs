@@ -47,12 +47,12 @@ async fn the_hook_is_installed_and_status_still_tells_the_truth() {
   let job = Job::start(&backend, "main").await;
 
   // The seed must have found the binary and wired the config.
-  let config = std::fs::read_to_string(job.state_dir.join("git/config")).unwrap();
+  let config = std::fs::read_to_string(job.workspace.join(".git/config")).unwrap();
   assert!(
     config.contains("fsmonitor = "),
     "the hook must be installed when the binary is findable:\n{config}"
   );
-  let hook = job.state_dir.join("git/hooks/gfs-fsmonitor");
+  let hook = job.workspace.join(".git/hooks/gfs-fsmonitor");
   assert!(hook.is_file(), "the hook script must exist");
 
   let ws = job.workspace.clone();

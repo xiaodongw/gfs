@@ -309,32 +309,26 @@ async fn a_file_edited_back_to_its_original_bytes_does_not_block_a_switch() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_superseded_overlay_directory_is_removed_rather_than_accumulated() {
-  // Each pin gets its own overlay directory, so a pin that is superseded without
-  // its directory being removed leaks one SQLite database per re-pin for the
-  // life of the job. The guard used to be `Overlay::is_empty`, which is false
-  // exactly when a `commit` has just put rows in it -- so the one path that
-  // reliably leaves rows behind was the one path that never cleaned up.
+async fn a_repin_rebinds_the_one_overlay_rather_than_accumulating_databases() {
+  // There is exactly one overlay for the life of the mount (ADR 0011): its
+  // SQLite connection is opened before the workspace is mounted over — SQLite
+  // resolves symlinks, so a later open by any path would go through the mount
+  // itself — and a re-pin clears and re-binds it in place. What used to be a
+  // per-epoch directory sweep is now the absence of epochs.
   let backend = Backend::start("basic").await;
   let job = Job::start(&backend, "main").await;
 
-  let overlays = job.state_dir.join("overlay");
-  let count = |dir: &std::path::Path| {
-    std::fs::read_dir(dir)
-      .map(|entries| entries.count())
-      .unwrap_or(0)
-  };
-  assert_eq!(count(&overlays), 1, "one pin, one overlay");
-
-  // Dirty it, so the superseded overlay has rows the old guard would have kept.
+  // Dirty it, so the rebind has rows to discard.
   let ws = job.workspace.clone();
   on_fs(move || std::fs::write(ws.join("src/main.rs"), b"local edit\n").unwrap()).await;
-
-  // `AdoptCommit` is the re-pin `gfs commit` performs, and the only one that
-  // does not require a clean workspace -- which is why it is the leaking path.
   let Response::Inspect(report) = job.call(Request::Inspect).await else {
     panic!("expected an inspect report");
   };
+  assert!(report.overlay.entries > 0, "the edit made a row");
+
+  // `AdoptCommit` is the re-pin `gfs commit` performs, and the only one that
+  // does not require a clean workspace -- which is why it is the path that
+  // reliably has rows to clear.
   let Response::Refresh(_) = job
     .call(Request::AdoptCommit {
       commit: report.commit.clone(),
@@ -344,15 +338,25 @@ async fn a_superseded_overlay_directory_is_removed_rather_than_accumulated() {
     panic!("expected a re-pin report");
   };
 
-  for _ in 0..50 {
-    if count(&overlays) == 1 {
-      return;
-    }
-    tokio::time::sleep(Duration::from_millis(20)).await;
-  }
-  panic!(
-    "the superseded overlay directory was kept: {} remain",
-    count(&overlays)
+  let Response::Inspect(after) = job.call(Request::Inspect).await else {
+    panic!("expected an inspect report");
+  };
+  assert_eq!(after.overlay.entries, 0, "the rebind cleared the rows");
+  // And on disk: one overlay database, no epoch subdirectories.
+  let overlay = job.state_dir.join("overlay");
+  let names: Vec<String> = std::fs::read_dir(&overlay)
+    .unwrap()
+    .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+    .collect();
+  assert!(
+    names.iter().any(|n| n.starts_with("overlay.sqlite")),
+    "{names:?}"
+  );
+  assert!(
+    !names
+      .iter()
+      .any(|n| !n.is_empty() && n.chars().all(|c| c.is_ascii_digit())),
+    "no epoch directories: {names:?}"
   );
 }
 
@@ -411,27 +415,28 @@ async fn unmount_unpublishes_releases_and_leaves_no_live_mount_behind() {
       w.is_dir(),
       "the mount point is readable, so it is not stranded"
     );
-    assert_eq!(
-      std::fs::read_dir(&w).unwrap().count(),
-      0,
-      "the pinned commit is no longer visible through it"
-    );
+    // ADR 0011: unmounting leaves a plain folder holding exactly its own
+    // `.git` — the projected tree is gone, the state is not.
+    let names: Vec<_> = std::fs::read_dir(&w)
+      .unwrap()
+      .map(|e| e.unwrap().file_name())
+      .collect();
+    assert_eq!(names, vec![std::ffi::OsString::from(".git")]);
   })
   .await;
 
   // `mount.json` is removed, so cleanup can tell a released mount from a live one.
   assert!(MountState::load(&job.state_dir).is_err());
-  assert!(!control::is_live(&MountState::control_socket(
-    &job.state_dir
-  )));
+  assert!(!control::is_live(&job.socket()));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_second_host_over_one_state_directory_is_refused() {
+async fn a_second_host_over_one_workspace_is_refused() {
   // Two mounts would each believe they owned the lease, and each would release it
   // on teardown -- so the first teardown would unpin a commit the second is
   // still serving. Across *processes* this is caught by the live control socket
-  // beside the workspace, which is the only evidence one host has of another.
+  // derived from the workspace path, which is the only evidence one host has of
+  // another.
   let backend = Backend::start("basic").await;
   let job = Job::start(&backend, "main").await;
 
@@ -444,8 +449,7 @@ async fn a_second_host_over_one_state_directory_is_refused() {
     .mount(mount_spec(
       &backend,
       "main",
-      &job.workspace.with_extension("second"),
-      &job.state_dir,
+      &job.workspace,
       cache.path(),
       gfs_overlay::OverlayConfig::default(),
     ))
@@ -455,7 +459,7 @@ async fn a_second_host_over_one_state_directory_is_refused() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn one_host_refuses_to_mount_the_same_state_directory_twice() {
+async fn one_host_refuses_to_mount_the_same_workspace_twice() {
   // The same conflict from inside one process, where the registry answers before
   // anything touches the filesystem. Worth its own test because the two checks
   // are independent: the socket check cannot see a mount this host is still
@@ -469,8 +473,7 @@ async fn one_host_refuses_to_mount_the_same_state_directory_twice() {
     .mount(mount_spec(
       &backend,
       "main",
-      &job.workspace.with_extension("second"),
-      &job.state_dir,
+      &job.workspace,
       cache.path(),
       gfs_overlay::OverlayConfig::default(),
     ))
@@ -486,7 +489,6 @@ async fn an_unknown_repository_fails_before_anything_is_mounted() {
   let backend = Backend::start("basic").await;
   let tmp = tempfile::tempdir().unwrap();
   let cache = tempfile::tempdir().unwrap();
-  let state_dir = tmp.path().join("ws.gfs");
 
   let (host, listener) = MountHost::bind(host_config(&backend, tmp.path())).unwrap();
   tokio::spawn(std::sync::Arc::clone(&host).serve(listener));
@@ -495,7 +497,6 @@ async fn an_unknown_repository_fails_before_anything_is_mounted() {
     &backend,
     "main",
     &tmp.path().join("ws"),
-    &state_dir,
     cache.path(),
     gfs_overlay::OverlayConfig::default(),
   );
@@ -510,8 +511,4 @@ async fn an_unknown_repository_fails_before_anything_is_mounted() {
     "{error:?}"
   );
   assert!(!tmp.path().join("ws").exists(), "nothing was published");
-  assert!(
-    MountState::load(&state_dir).is_err(),
-    "no state was written"
-  );
 }

@@ -215,10 +215,32 @@ impl Overlay {
     snapshot_time: Timestamp,
     config: OverlayConfig,
   ) -> Result<Self> {
+    Overlay::open_with_store_root(state_dir, state_dir, binding, snapshot_time, config)
+  }
+
+  /// Open the overlay with the journal at `state_dir` and content I/O rooted
+  /// at `store_root` — two names for the same directory.
+  ///
+  /// The split exists for ADR 0011's shadowed layout. The journal must open
+  /// at the on-disk path while it still resolves to the real directory
+  /// (SQLite resolves symlinks, so a handle-relative path would not help) and
+  /// keeps its connection for the mount's life. The content store opens files
+  /// *per operation*, so after the workspace is mounted over, its root must
+  /// be the retained-handle path — an on-disk path would resolve through the
+  /// mount, and the daemon would be serving its own content I/O; the fsync
+  /// half of a copy-up then deadlocks against the overlay lock the copy-up
+  /// holds.
+  pub fn open_with_store_root(
+    state_dir: &Path,
+    store_root: &Path,
+    binding: &Binding,
+    snapshot_time: Timestamp,
+    config: OverlayConfig,
+  ) -> Result<Self> {
     std::fs::create_dir_all(state_dir)
       .map_err(|e| OverlayError::io(format!("creating the overlay directory: {e}")))?;
     let journal = Journal::open(&state_dir.join(journal::OVERLAY_DB_FILE), binding)?;
-    let store = ContentStore::open(state_dir)?;
+    let store = ContentStore::open(store_root)?;
 
     let loaded = journal.load()?;
     let referenced: HashSet<u64> = loaded.iter().filter_map(|e| e.content.local_id()).collect();
@@ -316,6 +338,28 @@ impl Overlay {
   /// their handles; this is the journal's half.
   pub fn sync(&self) -> Result<()> {
     self.lock().journal.sync()
+  }
+
+  /// Point this overlay at a new base commit, discarding every edit.
+  ///
+  /// The repin path (ADR 0011): the overlay lives at one place for the life
+  /// of the mount, its SQLite connection opened before the workspace was
+  /// mounted over — reopening it by path afterwards would resolve through the
+  /// mount itself, which is how a daemon ends up serving its own journal.
+  /// The journal clears atomically; content files are swept afterwards, and a
+  /// crash between the two leaves only orphans the next open's sweep removes.
+  /// Descriptors still open on discarded content keep reading — they hold the
+  /// file, not the name — which is the same property `Pin::release` relied on
+  /// when a superseded overlay was a directory to delete.
+  pub fn rebind(&self, binding: &Binding) -> Result<()> {
+    let mut inner = self.lock();
+    inner.journal.rebind(binding)?;
+    inner.entries.clear();
+    inner.children.clear();
+    inner.by_content.clear();
+    inner.local_bytes = 0;
+    let _ = self.store.sweep(&HashSet::new());
+    Ok(())
   }
 
   // -------------------------------------------------------------------------

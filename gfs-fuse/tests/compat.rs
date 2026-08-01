@@ -429,34 +429,12 @@ async fn stock_git_finds_the_repository_root_through_the_synthesized_surface() {
   .await;
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn stock_git_ls_files_and_diff_are_silently_empty_against_the_legacy_surface() {
-  // ADR 0005's central measurement, kept against the object-free surface the
-  // direct-mount harness still builds: it is the recorded reason that surface
-  // could never be enough, and the reason ADR 0009 replaced it with a real
-  // `.git` in the production path (`Job`, tested above and in workspace_git.rs).
-  let backend = Backend::start("basic").await;
-  let mount = Mount::new(&backend, "main").await;
-  let root = mount.path.clone();
-
-  on_fs(move || {
-    let (ok, out, _) = run_in(&root, "git", &["ls-files"]);
-    assert!(ok, "stock `git ls-files` still exits 0 against the surface");
-    assert!(
-      out.trim().is_empty(),
-      "and still reports no tracked files at all: {out:?}"
-    );
-
-    let (ok, out, _) = run_in(&root, "git", &["diff", "--stat"]);
-    assert!(ok);
-    assert!(out.trim().is_empty());
-
-    // The commands that fail do so visibly, which is the half the design got right.
-    let (ok, _, _) = run_in(&root, "git", &["status", "--porcelain"]);
-    assert!(!ok, "stock `git status` fails against the surface");
-  })
-  .await;
-}
+// ADR 0005's central measurement — `ls-files` and `diff` silently empty
+// against the object-free synthesized surface — used to be re-run here
+// against the direct-mount harness. ADR 0011 removed that surface entirely:
+// every mount, harness included, now carries a real seeded `.git` served
+// back through the passthrough, so there is no legacy surface left to hold
+// the measurement against. The recorded reason lives in the ADR.
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_shim_passes_through_and_agrees_with_stock_git() {

@@ -245,7 +245,7 @@ async fn unmounting_with_open_descriptors_does_not_lose_a_committed_write() {
 
   // Reopened directly, because the point is that the *state directory* holds it.
   let overlay = gfs_overlay::Overlay::open(
-    &job.state_dir.join("overlay").join("1"),
+    &job.state_dir.join("overlay"),
     &gfs_overlay::Binding {
       repository_id: backend.repo_id.as_str().to_owned(),
       base_commit: job.daemon.inspect().commit,
@@ -277,7 +277,6 @@ async fn a_daemon_restart_resumes_the_workspace_it_left() {
   let backend = Backend::start("basic").await;
   let job = Job::start(&backend, "main").await;
   let ws = job.workspace.clone();
-  let state_dir = job.state_dir.clone();
 
   on_fs({
     let ws = ws.clone();
@@ -289,11 +288,12 @@ async fn a_daemon_restart_resumes_the_workspace_it_left() {
   .await;
   job.daemon.shutdown().await;
   // The `Job` value stays alive on purpose: dropping it would take its temporary
-  // directory -- and the state directory inside it -- with it, which is not what
-  // a supervisor restart looks like.
+  // directory -- and the workspace folder inside it -- with it, which is not
+  // what a supervisor restart looks like.
 
-  // A new daemon over the same state directory: exactly what a supervisor does.
-  let resumed = Job::with_state(&backend, "main", &state_dir).await;
+  // A new daemon over the same workspace folder: exactly what a supervisor
+  // does, and all it has to name — the state travels inside (ADR 0011).
+  let resumed = Job::with_workspace(&backend, "main", &ws).await;
   let workspace = resumed.workspace.clone();
   let (content, missing, names) = on_fs(move || {
     (

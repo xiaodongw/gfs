@@ -1,12 +1,13 @@
 //! The `gfs-fuse` process: one host, many mounts.
 //!
 //! Every mount is still a whole [`Mount`] with its own lease, its own generations,
-//! and its own control socket at `<workspace>.gfs/control.sock`. What changed is
-//! only how many of them a process owns. Nothing that speaks
+//! and its own control socket in the runtime directory (named in its
+//! `.git/gfs.json`; see [`crate::state::workspace_control_socket`]). What changed
+//! is only how many of them a process owns. Nothing that speaks
 //! [`crate::control::Request`] can tell the difference, which is the point: a job
-//! finds its workspace by walking up from the current directory to a socket, and
-//! that walk resolves to exactly one answer whether the process behind it serves
-//! one mount or twenty.
+//! finds its workspace by walking up from the current directory to its `.git`,
+//! and that walk resolves to exactly one answer whether the process behind it
+//! serves one mount or twenty.
 //!
 //! # Why the per-mount socket survived
 //!
@@ -85,14 +86,7 @@ pub struct HostConfig {
 /// both are kept short: a Unix socket path is capped near 108 bytes, and the
 /// failure when it is exceeded is an opaque bind error.
 pub fn default_socket() -> PathBuf {
-  let base = match std::env::var_os("XDG_RUNTIME_DIR") {
-    Some(dir) => PathBuf::from(dir).join("gfs"),
-    None => {
-      let uid = crate::attr::Ownership::current().uid;
-      std::env::temp_dir().join(format!("gfs-{uid}"))
-    }
-  };
-  base.join("host.sock")
+  crate::state::runtime_dir().join("host.sock")
 }
 
 /// A mount, plus the tasks that keep it alive.
@@ -109,8 +103,8 @@ struct MountEntry {
 #[derive(Debug)]
 pub struct MountHost {
   config: HostConfig,
-  /// Keyed by absolute state directory, which is what identifies a mount:
-  /// `adopt_or_refuse_state_dir` already treats it as the thing at most one
+  /// Keyed by absolute workspace path, which is what identifies a mount:
+  /// `adopt_or_refuse_workspace` already treats it as the thing at most one
   /// mount may own.
   mounts: Mutex<HashMap<PathBuf, MountEntry>>,
   /// One odb projection per `(cache directory, repository)`, the same sharing
@@ -226,7 +220,6 @@ impl MountHost {
     }
 
     let spec = MountSpec {
-      state_dir: absolute(&request.state_dir)?,
       workspace: absolute(&request.workspace)?,
       cache_dir: absolute(&request.cache_dir)?,
       grpc_endpoint: request
@@ -267,22 +260,21 @@ impl MountHost {
     // Absolute up front so that the registry key and the cache key are the same
     // strings a second call would produce from a relative path.
     let spec = MountSpec {
-      state_dir: absolute(&spec.state_dir)?,
       workspace: absolute(&spec.workspace)?,
       cache_dir: absolute(&spec.cache_dir)?,
       ..spec
     };
-    let state_dir = spec.state_dir.clone();
+    let workspace = spec.workspace.clone();
 
     // Checked before anything is created, so a duplicate request is refused
     // rather than half-applied. `Mount::start` checks the same thing against the
     // filesystem, which is what catches a mount owned by a *different* process.
-    if self.mounts.lock().expect("mounts").contains_key(&state_dir) {
+    if self.mounts.lock().expect("mounts").contains_key(&workspace) {
       return Err(GfsError::new(
         ErrorCode::Conflict,
         format!(
           "this host already serves a mount at {}; unmount it first",
-          state_dir.display()
+          workspace.display()
         ),
       ));
     }
@@ -306,18 +298,18 @@ impl MountHost {
         return Err(e);
       }
     };
-    self.register(state_dir, Arc::clone(&mount), listener);
+    self.register(workspace, Arc::clone(&mount), listener);
     Ok(mount)
   }
 
-  /// The mount serving a state directory, if this host has one.
-  pub fn mount_at(&self, state_dir: &Path) -> Option<Arc<Mount>> {
-    let state_dir = absolute(state_dir).ok()?;
+  /// The mount serving a workspace, if this host has one.
+  pub fn mount_at(&self, workspace: &Path) -> Option<Arc<Mount>> {
+    let workspace = absolute(workspace).ok()?;
     self
       .mounts
       .lock()
       .expect("mounts")
-      .get(&state_dir)
+      .get(&workspace)
       .map(|entry| Arc::clone(&entry.mount))
   }
 
@@ -340,11 +332,12 @@ impl MountHost {
     Ok(cache)
   }
 
-  /// The object-database projection for one repository, mounting it if this is
-  /// the first workspace to ask (ADR 0009).
+  /// The object-database projection for one repository, opening it if this is
+  /// the first workspace to ask (ADR 0009). No mount any more: the workspace
+  /// filesystem serves the store itself (ADR 0011).
   ///
   /// Weak for the same reason the cache map is: the projection lives exactly as
-  /// long as some mount borrows it, and dropping the last reference unmounts.
+  /// long as some mount borrows it.
   async fn odb_for(
     &self,
     cache_dir: &Path,
@@ -360,12 +353,12 @@ impl MountHost {
       }
       odbs.retain(|_, handle| handle.strong_count() > 0);
     }
-    // Mounted outside the lock: it fetches the manifest over the network, and a
-    // second concurrent asker at worst mounts a duplicate that drops on insert.
+    // Opened outside the lock: it fetches the manifest over the network, and a
+    // second concurrent asker at worst opens a duplicate that drops on insert.
     let client = crate::odb::OdbClient::new(http_endpoint, token, repository_id.clone());
     let root = cache_dir.join(repository_id.as_str()).join("odb");
     let projection =
-      crate::odb::OdbProjection::mount(client, &root, self.config.odb_residency_bytes).await?;
+      crate::odb::OdbProjection::open(client, &root, self.config.odb_residency_bytes).await?;
     let mut odbs = self.odbs.lock().expect("odb projections");
     if let Some(existing) = odbs.get(&key).and_then(Weak::upgrade) {
       return Ok(existing);
@@ -377,7 +370,7 @@ impl MountHost {
   /// Start a mount's tasks and record it.
   fn register(
     self: &Arc<Self>,
-    state_dir: PathBuf,
+    key: PathBuf,
     mount: Arc<Mount>,
     listener: tokio::net::UnixListener,
   ) {
@@ -394,7 +387,7 @@ impl MountHost {
     // under one process per mount the process itself was the answer.
     let span = tracing::info_span!("mount", workspace = %workspace);
     let host = Arc::downgrade(self);
-    let key = state_dir.clone();
+    let forget_key = key.clone();
     let served = Arc::clone(&mount);
     let control = tokio::spawn(
       async move {
@@ -406,14 +399,14 @@ impl MountHost {
         // cannot be reached must not stay in the registry claiming to be live,
         // and its lease has to be released either way.
         if let Some(host) = host.upgrade() {
-          host.forget(&key).await;
+          host.forget(&forget_key).await;
         }
       }
       .instrument(span),
     );
 
     self.mounts.lock().expect("mounts").insert(
-      state_dir,
+      key,
       MountEntry {
         mount,
         heartbeat,
@@ -426,8 +419,8 @@ impl MountHost {
   ///
   /// Called from inside that task, which is why the control handle is dropped
   /// rather than aborted: aborting it here would cancel the caller mid-teardown.
-  async fn forget(&self, state_dir: &Path) {
-    let entry = self.mounts.lock().expect("mounts").remove(state_dir);
+  async fn forget(&self, workspace: &Path) {
+    let entry = self.mounts.lock().expect("mounts").remove(workspace);
     if let Some(entry) = entry {
       entry.heartbeat.abort();
       // Idempotent, and already done when this came from `Request::Unmount`.

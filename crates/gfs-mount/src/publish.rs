@@ -67,13 +67,17 @@ pub struct DirectMountPublisher {
 }
 
 impl DirectMountPublisher {
-  /// Refuses a workspace that exists and is not an empty directory.
+  /// Refuses a workspace that exists and holds anything besides its own
+  /// `.git`.
   ///
   /// Mounting over a populated directory succeeds and *hides* what was there,
   /// which is a data-loss shape rather than an error: the files come back when
-  /// the job ends, having been invisible for its whole run. A symlink left by an
-  /// older build is removed rather than refused, so upgrading over an existing
-  /// lab directory does not need manual cleanup.
+  /// the job ends, having been invisible for its whole run. The one exception
+  /// is the layout's own: ADR 0011 puts the real `.git` inside the workspace
+  /// precisely so the mount can shadow it and serve it back through the
+  /// retained handle. A symlink left by an older build is removed rather than
+  /// refused, so upgrading over an existing lab directory does not need manual
+  /// cleanup.
   pub fn new(workspace: PathBuf) -> Result<Self, GfsError> {
     match std::fs::symlink_metadata(&workspace) {
       Ok(meta) if meta.file_type().is_symlink() => {
@@ -85,19 +89,21 @@ impl DirectMountPublisher {
         })?;
       }
       Ok(meta) if meta.is_dir() => {
-        let empty = std::fs::read_dir(&workspace)
+        let stray = std::fs::read_dir(&workspace)
           .map_err(|e| {
             GfsError::internal(format!("reading the workspace directory: {}", e.kind()))
           })?
-          .next()
-          .is_none();
-        if !empty {
+          .filter_map(Result::ok)
+          .find(|entry| entry.file_name() != crate::passthrough::GIT_DIR_NAME);
+        if let Some(stray) = stray {
           return Err(GfsError::new(
             ErrorCode::FailedPrecondition,
             format!(
-              "{} is not empty; mounting over it would hide its contents for the life of \
-               the job",
-              workspace.display()
+              "{} contains {:?} besides .git; mounting over it would hide it for the \
+               life of the job (unmounted workspaces hold only their .git — if this \
+               folder was copied while mounted, copy it again after unmounting)",
+              workspace.display(),
+              stray.file_name(),
             ),
           ));
         }
@@ -162,11 +168,17 @@ mod tests {
   }
 
   #[test]
-  fn an_empty_directory_is_accepted_and_a_populated_one_is_refused() {
+  fn an_empty_or_git_only_directory_is_accepted_and_a_populated_one_is_refused() {
     let tmp = tempfile::tempdir().unwrap();
     let empty = tmp.path().join("empty");
     std::fs::create_dir(&empty).unwrap();
     DirectMountPublisher::new(empty).unwrap();
+
+    // The single-mount layout: a workspace holding exactly its own `.git` is
+    // what the mount is *supposed* to shadow (ADR 0011).
+    let adopted = tmp.path().join("adopted");
+    std::fs::create_dir_all(adopted.join(".git/gfs")).unwrap();
+    DirectMountPublisher::new(adopted).unwrap();
 
     let populated = tmp.path().join("populated");
     std::fs::create_dir(&populated).unwrap();

@@ -1,6 +1,6 @@
 # ADR 0011: A single-mount, self-contained workspace
 
-- Status: Proposed
+- Status: Accepted (implemented 2026-07-31)
 - Date: 2026-07-31
 - Amends: [ADR 0009](0009-raw-git-over-a-projected-object-store.md) — the
   projection stays; its mountpoint and the state directory move inside the
@@ -94,6 +94,39 @@ on object-heavy commands and loses on measurement.
   and a `gfs export` that does it safely is the durable answer.
 - **Windows/macOS clients are unaffected**: this ADR is about the Linux FUSE
   layout; the WebDAV surface (ADR 0010) is orthogonal.
+
+## What implementation added (2026-07-31)
+
+Two facts surfaced while building this that refine the design without
+changing it:
+
+- **The daemon must never do its own I/O through its own mount, and two
+  overlay details conspired to make it.** SQLite canonicalizes database
+  paths — an overlay journal opened through the retained `/proc/self/fd/<n>`
+  handle *after* mounting resolves back to the on-disk name and opens through
+  the mount itself. So the journal's connection is opened at the on-disk path
+  in the one window it still resolves to the real directory — before the
+  mount — and lives for the mount's life; a re-pin clears and re-points it in
+  one SQLite transaction (`Overlay::rebind`) instead of opening a fresh
+  per-epoch directory. One overlay directory, `.git/gfs/overlay/`, no epochs.
+  The content store is the opposite case: it opens files per operation, so
+  its root must be the handle path (plain opens do not canonicalize) — with
+  the on-disk root, a copy-up's directory fsync arrives back at the daemon as
+  `FUSE_FSYNCDIR` while the copy-up still holds the overlay lock the handler
+  needs, and the mount deadlocks against itself. And even with both fixed,
+  SQLite itself fsyncs the journal's *directory* by canonicalized path on
+  some commits — through the mount, mid-commit, lock held — so the
+  `fsyncdir` handler routes by subtree: a `.git` directory handle syncs the
+  real directory and never touches `Overlay::sync`. The general law all
+  three instances obey: nothing the daemon holds a lock around may reach its
+  own mount, and anything that canonicalizes paths will find its way there.
+- **The control socket lives in the runtime directory, not the folder.** A
+  Unix socket cannot be connected to through a FUSE passthrough — `connect(2)`
+  needs the inode the daemon bound, and the passthrough can only present a
+  look-alike. The socket is a runtime artifact, not state, so it moves to
+  `$XDG_RUNTIME_DIR/gfs/ws-<hash-of-workspace-path>.sock`; `.git/gfs.json`
+  records the path, which is how tools discover it by walking up — mounted or
+  not, the folder itself still carries everything durable.
 
 ## Alternatives considered
 

@@ -77,13 +77,15 @@ use crate::control::{MountReport, RefreshReport, Request, Response};
 use crate::fs::{FsConfig, Gfs, GfsFilesystem};
 use crate::gitdir::GitDirFacts;
 use crate::lease::{LeaseHealth, LeaseMonitor};
+use crate::passthrough::{GitDirHandle, GitPassthrough, GIT_DIR_NAME};
 use crate::publish::{DirectMountPublisher, MountPublisher};
 use crate::session::MountConfig;
-use crate::state::{prepare_state_dir, LeaseRecord, MountState};
+use crate::state::{
+  prepare_state_dir, state_dir_for_workspace, workspace_control_socket, LeaseRecord, MountState,
+};
 
 #[derive(Clone, Debug)]
 pub struct MountSpec {
-  pub state_dir: PathBuf,
   pub workspace: PathBuf,
   pub cache_dir: PathBuf,
   pub grpc_endpoint: String,
@@ -155,8 +157,6 @@ struct Pin {
   /// the `.git` surface reports it and an operator watching `gfs inspect` can
   /// tell one switch from the next.
   epoch: u64,
-  overlay_dir: PathBuf,
-  overlay: Arc<Overlay>,
   client: Arc<SnapshotClient>,
   monitor: Arc<LeaseMonitor>,
   commit: ObjectId,
@@ -216,35 +216,20 @@ async fn unmount_session(session: fuser::BackgroundSession, mountpoint: PathBuf)
 }
 
 impl Pin {
-  /// Release the lease this pin held, and drop its overlay directory.
+  /// Release the lease this pin held.
   ///
   /// Called *after* the filesystem has been re-pointed at the replacement, so
   /// nothing is reading through it any more. There is no unmount here and no
   /// waiting for handles to drain: a descriptor opened before the swap reads a
   /// materialized file, not the pinned commit, so the lease it was created under
-  /// is already unreferenced.
+  /// is already unreferenced. The overlay is not this pin's to clean up any
+  /// more: it lives for the mount and was already re-bound to the new pin.
   async fn release(self) {
     if let Err(e) = self.client.release_mount(self.monitor.mount_id()).await {
       // Not fatal: the lease expires on its own. Logged because a release that
       // keeps failing means orphan leases are accumulating somewhere.
       tracing::warn!(epoch = self.epoch, error = %e.message, "releasing the lease failed");
     }
-    // Removed unconditionally. The guard used to be `is_empty()`, on the stated
-    // grounds that a superseded overlay is always empty -- true for `switch` and
-    // `refresh`, which refuse a dirty workspace, and false for `commit`, which
-    // does not empty the overlay but gives the new pin a *fresh* one. So the one
-    // path that reliably leaves rows behind was the one path that never cleaned
-    // up, and a job that committed repeatedly accumulated one SQLite database
-    // per commit.
-    //
-    // Nothing is discarded by removing it. This runs only after the re-pin has
-    // succeeded, so the filesystem is already reading the new overlay and no
-    // caller can reach this one again; for `commit` its contents are durable in
-    // the commit that was just made. A descriptor still open on overlay content
-    // keeps working, because it holds the file rather than the name -- the same
-    // property `FileState::Local` relies on when the overlay unlinks content
-    // under a live reader.
-    let _ = std::fs::remove_dir_all(&self.overlay_dir);
   }
 }
 
@@ -268,10 +253,18 @@ pub struct Mount {
   /// Held so the projection outlives every workspace that references it
   /// (ADR 0009).
   odb: Arc<crate::odb::OdbProjection>,
-  /// This workspace's own window onto the shared store. `objects/info/
-  /// alternates` names the view's mountpoint rather than the shared one, so
-  /// odb traffic is attributed to this job by construction.
-  odb_view: Arc<crate::odb::OdbView>,
+  /// The retained handle to the real `.git` (ADR 0011). Opened before the
+  /// workspace was mounted over its directory; everything the daemon does to
+  /// its own state afterwards resolves through it, because the on-disk path
+  /// now resolves into the mount.
+  git: Arc<GitDirHandle>,
+  /// The one overlay, for the life of the mount. Opened — SQLite connection
+  /// and all — *before* the workspace was mounted over, because SQLite
+  /// resolves symlinks in database paths: reopening it later, even through
+  /// the retained `/proc` handle, would resolve back to the on-disk path and
+  /// open the daemon's own journal through the daemon's own mount. A repin
+  /// re-binds it in place instead ([`Overlay::rebind`]).
+  overlay: Arc<Overlay>,
   publisher: Box<dyn MountPublisher>,
   /// The filesystem, created once and re-pointed by every switch. Outlives every
   /// [`Pin`], which is what makes the workspace path stable.
@@ -314,23 +307,35 @@ impl Mount {
     // orchestrator cleaning up after a crash can act on without knowing where
     // the daemon was started.
     let config = MountSpec {
-      state_dir: absolute(&config.state_dir)?,
       workspace: absolute(&config.workspace)?,
       cache_dir: absolute(&config.cache_dir)?,
       ..config
     };
-    prepare_state_dir(&config.state_dir)?;
-    adopt_or_refuse_state_dir(&config.state_dir, &config.workspace)?;
+    // Recovery ordering (ADR 0011, load-bearing): lazy-unmount whatever a dead
+    // daemon left over the workspace, *then* open the real `.git`, then mount.
+    // Opening first would open through the dead mount and get ENOTCONN.
+    adopt_or_refuse_workspace(&config.workspace)?;
+
+    let real_git = config.workspace.join(GIT_DIR_NAME);
+    // Whether this call created the git dir, so a mount the server rejects can
+    // remove exactly what it made: `CreateMount` runs after the directories
+    // exist (the overlay needs them), but a refused mount must still leave no
+    // trace behind — an orchestrator distinguishes "never mounted" from
+    // "mounted and crashed" by what is on disk.
+    let fresh = !real_git.exists();
+    prepare_state_dir(&state_dir_for_workspace(&config.workspace))?;
+
+    // The retained handle: the one way to the state once the mount shadows it.
+    let git = Arc::new(GitDirHandle::open(&real_git)?);
 
     // A leftover `.git` from a previous session may hold local commits. The
     // re-pin path refuses to move the pin over them (`repin`'s local_head
     // guard); the first mount must refuse too, or the seed below would move
     // the branch ref off them and the next gc of the state dir would take
     // them. Checked before the lease is taken so a refusal costs nothing.
-    let git_dir_path = config.state_dir.join("git");
     if let (Some(local), Some(seeded)) = (
-      crate::gitdir::local_head(&git_dir_path),
-      crate::gitdir::seeded_commit(&git_dir_path),
+      crate::gitdir::local_head(git.root()),
+      crate::gitdir::seeded_commit(git.root()),
     ) {
       if local != seeded {
         return Err(GfsError::new(
@@ -342,7 +347,7 @@ impl Mount {
             local.get(..12).unwrap_or(&local),
             seeded.get(..12).unwrap_or(&seeded),
             seeded.get(..12).unwrap_or(&seeded),
-            config.state_dir.display(),
+            real_git.display(),
           ),
         ));
       }
@@ -351,35 +356,51 @@ impl Mount {
     let publisher: Box<dyn MountPublisher> =
       Box::new(DirectMountPublisher::new(config.workspace.clone())?);
 
-    let resolved = resolve_pin(&config, &config.revision_selector.clone(), 1).await?;
-    // The real `.git` (ADR 0009): seeded on local disk, named by a synthesized
-    // `.git` *file* in the mount. The index the gateway built is fetched once;
-    // a failure there degrades to no index -- `git status` would report every
-    // file deleted, which is wrong -- so it fails the mount instead.
-    let index = odb.client.commit_index(&resolved.pin.commit).await?;
-    // The workspace's own view of the shared store (per-job odb attribution).
-    // In the state directory, so its lifetime and cleanup follow the mount's.
-    let odb_view =
-      crate::odb::OdbView::mount(Arc::clone(&odb.store), &config.state_dir.join("odb"))?;
+    let unwind = |e: GfsError| {
+      if fresh {
+        let _ = std::fs::remove_dir_all(&real_git);
+        let _ = std::fs::remove_dir(&config.workspace);
+      }
+      e
+    };
+    let resolved = resolve_pin(&config, &config.revision_selector.clone(), 1)
+      .await
+      .map_err(unwind)?;
+    // The one overlay, opened at the *on-disk* path while it still resolves
+    // to the real directory — this is the last moment that is true, and the
+    // SQLite connection opened here is the one the mount keeps for its life.
+    // The binding check inside `Overlay::open` does real work: a daemon
+    // restarted against a moved branch cannot silently adopt the previous
+    // pin's edits.
+    let overlay = open_overlay(&config, &git, &resolved).map_err(unwind)?;
+    // The real `.git` (ADR 0009): seeded on local disk before the mount
+    // shadows it, `objects/info/alternates` pointing at the projection with a
+    // relative path. The index the gateway built is fetched once; a failure
+    // there degrades to no index -- `git status` would report every file
+    // deleted, which is wrong -- so it fails the mount instead.
+    let index = odb
+      .client
+      .commit_index(&resolved.pin.commit)
+      .await
+      .map_err(unwind)?;
     crate::gitdir::seed_git_dir(&crate::gitdir::SeedSpec {
-      git_dir: &git_dir_path,
-      workspace: &config.workspace,
-      odb_mountpoint: &odb_view.mountpoint,
+      git_dir: git.root(),
       facts: &resolved.facts,
       index: Some(&index),
     })?;
     let fs = Gfs::new(
       Arc::clone(&resolved.pin.client),
       Arc::clone(&cache),
-      Arc::new(crate::gitdir::git_file(&git_dir_path)),
-      Arc::clone(&resolved.pin.overlay),
+      Arc::new(GitPassthrough::new(
+        Arc::clone(&git),
+        Arc::clone(&odb.store),
+      )),
+      Arc::clone(&overlay),
       resolved.root,
       config.fs.clone(),
     );
 
     let mountpoint = publisher.mountpoint().to_path_buf();
-    std::fs::create_dir_all(&mountpoint)
-      .map_err(|e| GfsError::internal(format!("creating the mount point: {e}")))?;
     let session = crate::session::spawn_mount(
       GfsFilesystem::new(Arc::clone(&fs), tokio::runtime::Handle::current()),
       &mountpoint,
@@ -390,7 +411,8 @@ impl Mount {
     let mount = Arc::new(Mount {
       cache,
       odb,
-      odb_view,
+      git,
+      overlay,
       publisher,
       fs,
       session: Mutex::new(Some(session)),
@@ -405,6 +427,18 @@ impl Mount {
     Ok(mount)
   }
 
+  /// Where this mount's state lives, through the retained handle: valid after
+  /// the workspace is shadowed, which is when it is needed.
+  fn state_dir(&self) -> PathBuf {
+    self.git.state_dir()
+  }
+
+  /// The state directory's on-disk location, for reports: what an operator or
+  /// an orchestrator would act on from outside this process.
+  fn state_dir_on_disk(&self) -> PathBuf {
+    state_dir_for_workspace(&self.config.workspace)
+  }
+
   pub fn config(&self) -> &MountSpec {
     &self.config
   }
@@ -414,7 +448,7 @@ impl Mount {
     let current = self.current.lock().expect("current pin");
     crate::control::MountSummary {
       workspace: self.config.workspace.clone(),
-      state_dir: self.config.state_dir.clone(),
+      state_dir: self.state_dir_on_disk(),
       repository_id: self.config.repository_id.as_str().to_owned(),
       mount_id: current.monitor.mount_id().as_str().to_owned(),
       revision_selector: self.selector.lock().expect("selector").clone(),
@@ -425,7 +459,7 @@ impl Mount {
   }
 
   pub fn control_socket(&self) -> PathBuf {
-    MountState::control_socket(&self.config.state_dir)
+    workspace_control_socket(&self.config.workspace)
   }
 
   fn persist(&self) -> Result<(), GfsError> {
@@ -453,7 +487,7 @@ impl Mount {
       },
       daemon_pid: std::process::id(),
     }
-    .store(&self.config.state_dir)
+    .store(&self.state_dir())
   }
 
   pub fn health(&self) -> LeaseHealth {
@@ -479,17 +513,17 @@ impl Mount {
       workspace: self.config.workspace.display().to_string(),
       publication: self.publisher.describe(),
       generation: current.epoch,
-      state_dir: self.config.state_dir.display().to_string(),
+      state_dir: self.state_dir_on_disk().display().to_string(),
       daemon_pid: std::process::id(),
       owner_uid: crate::attr::Ownership::current().uid,
       read_only: false,
-      overlay: current.overlay.stats(),
+      overlay: self.overlay.stats(),
       health: current.monitor.health(),
       stats: self.fs.stats(),
       cache: self.cache.stats(),
       budget: self.fs.budget_report(),
       odb: self.odb.store.stats(),
-      odb_job: self.odb_view.stats(),
+      odb_job: self.fs.git().view_stats(),
       live_inodes: self.fs.inode_counts().0,
       assigned_inodes: self.fs.inode_counts().1,
     }
@@ -638,8 +672,8 @@ impl Mount {
     // branch ref they hang from. `git push` (or an export) is how they leave;
     // until then the workspace stays where it is. The overlay-dirty check made
     // by the callers does not see these, because a commit empties nothing in
-    // `.git`.
-    let git_dir_path = self.config.state_dir.join("git");
+    // `.git`. Read through the retained handle: the on-disk path is shadowed.
+    let git_dir_path = self.git.root().to_path_buf();
     if let Some(local) = crate::gitdir::local_head(&git_dir_path) {
       if local != previous_commit.to_hex() {
         return Err(GfsError::new(
@@ -664,17 +698,26 @@ impl Mount {
     let index = self.odb.client.commit_index(&commit).await?;
     crate::gitdir::seed_git_dir(&crate::gitdir::SeedSpec {
       git_dir: &git_dir_path,
-      workspace: &self.config.workspace,
-      odb_mountpoint: &self.odb_view.mountpoint,
       facts: &resolved.facts,
       index: Some(&index),
     })?;
 
+    // The one overlay, re-pointed in place. One SQLite transaction, so a
+    // crash leaves either the old binding with its rows or the new one with
+    // none; the callers already decided the rows are disposable (`switch` and
+    // `refresh` refused a dirty workspace, `commit` made them durable).
+    self
+      .overlay
+      .rebind(&Binding {
+        repository_id: self.config.repository_id.as_str().to_owned(),
+        base_commit: commit.to_qualified(),
+      })
+      .map_err(crate::fs::overlay_as_service_error)?;
+
     let stale = self.fs.repin(
       crate::fs::Pinned {
         client: Arc::clone(&resolved.pin.client),
-        gitdir: Arc::new(crate::gitdir::git_file(&git_dir_path)),
-        overlay: Arc::clone(&resolved.pin.overlay),
+        overlay: Arc::clone(&self.overlay),
         snapshot_time: resolved.pin.snapshot_time,
       },
       resolved.root,
@@ -794,9 +837,10 @@ impl Mount {
   /// workspace does not have -- so they travel separately and the server, which
   /// does have it, expands them.
   pub async fn changes_for_commit(&self) -> Result<PendingCommit, GfsError> {
-    let (overlay, commit) = {
+    let overlay = Arc::clone(&self.overlay);
+    let commit = {
       let current = self.current.lock().expect("current pin");
-      (Arc::clone(&current.overlay), current.commit.clone())
+      current.commit.clone()
     };
     let algorithm = commit.algorithm();
 
@@ -937,13 +981,10 @@ impl Mount {
     &self,
     caller_token: &str,
   ) -> Result<crate::control::FsMonitorAnswer, GfsError> {
-    let (overlay, commit, generation) = {
+    let overlay = Arc::clone(&self.overlay);
+    let (commit, generation) = {
       let current = self.current.lock().expect("current pin");
-      (
-        Arc::clone(&current.overlay),
-        current.commit.clone(),
-        current.epoch,
-      )
+      (current.commit.clone(), current.epoch)
     };
     let token = format!("gfs:{generation}");
     let full_rescan = caller_token != token;
@@ -974,13 +1015,10 @@ impl Mount {
   }
 
   pub async fn status(&self) -> Result<crate::control::StatusReport, GfsError> {
-    let (overlay, commit, ref_name) = {
+    let overlay = Arc::clone(&self.overlay);
+    let (commit, ref_name) = {
       let current = self.current.lock().expect("current pin");
-      (
-        Arc::clone(&current.overlay),
-        current.commit.clone(),
-        current.ref_name.clone(),
-      )
+      (current.commit.clone(), current.ref_name.clone())
     };
     let algorithm = commit.algorithm();
     let status = tokio::task::spawn_blocking(move || overlay.status(algorithm))
@@ -1019,11 +1057,11 @@ impl Mount {
     &self,
     request: &crate::search::SearchRequest,
   ) -> Result<crate::search::SearchReport, GfsError> {
-    let (client, overlay, commit, ref_name) = {
+    let overlay = Arc::clone(&self.overlay);
+    let (client, commit, ref_name) = {
       let current = self.current.lock().expect("current pin");
       (
         Arc::clone(&current.client),
-        Arc::clone(&current.overlay),
         current.commit.clone(),
         current.ref_name.clone(),
       )
@@ -1332,13 +1370,10 @@ impl Mount {
     GfsError,
   > {
     let report = self.status().await?;
-    let (overlay, client, commit) = {
+    let overlay = Arc::clone(&self.overlay);
+    let (client, commit) = {
       let current = self.current.lock().expect("current pin");
-      (
-        Arc::clone(&current.overlay),
-        Arc::clone(&current.client),
-        current.commit.clone(),
-      )
+      (Arc::clone(&current.client), current.commit.clone())
     };
     let base =
       crate::blobs::PreloadedBase::fetch(&client, &self.cache, &report.status, &overlay).await?;
@@ -1361,9 +1396,10 @@ impl Mount {
   /// why the cheap version was reached for; the cost is bounded by the number of
   /// *modified* paths, not by the tree, and this runs only on a re-pin.
   async fn workspace_is_clean(&self) -> Result<bool, GfsError> {
-    let (overlay, algorithm) = {
+    let overlay = Arc::clone(&self.overlay);
+    let algorithm = {
       let current = self.current.lock().expect("current pin");
-      (Arc::clone(&current.overlay), current.commit.algorithm())
+      current.commit.algorithm()
     };
     let status = tokio::task::spawn_blocking(move || overlay.status(algorithm))
       .await
@@ -1393,9 +1429,6 @@ impl Mount {
     if let Some(session) = session {
       unmount_session(session, mountpoint.clone()).await;
     }
-    // The view holds no state of its own; unmounted after the workspace so no
-    // job read can land on a dead alternates path while the mount still serves.
-    self.odb_view.unmount();
     let (client, monitor) = {
       let current = self.current.lock().expect("current pin");
       (Arc::clone(&current.client), Arc::clone(&current.monitor))
@@ -1404,8 +1437,10 @@ impl Mount {
       tracing::warn!(error = %e.message, "releasing the lease failed during shutdown");
     }
     // The workspace directory is the mount point now, so removing it is removing
-    // what the job was told to use. Only the daemon's own state goes.
-    let _ = std::fs::remove_file(MountState::path(&self.config.state_dir));
+    // what the job was told to use. Only the daemon's own runtime state goes:
+    // `mount.json` (through the handle — the unmount just made the on-disk path
+    // valid again, but the handle is still the reliable route) and the socket.
+    let _ = std::fs::remove_file(MountState::path(&self.state_dir()));
     let _ = std::fs::remove_file(self.control_socket());
   }
 
@@ -1424,6 +1459,12 @@ impl Mount {
     use std::os::unix::fs::PermissionsExt;
 
     let path = self.control_socket();
+    if let Some(parent) = path.parent() {
+      std::fs::create_dir_all(parent)
+        .map_err(|e| GfsError::internal(format!("creating the socket directory: {e}")))?;
+      // 0700, the same boundary as the host socket's directory.
+      let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
+    }
     let _ = std::fs::remove_file(&path);
     let listener = tokio::net::UnixListener::bind(&path)
       .map_err(|e| GfsError::internal(format!("binding the control socket: {e}")))?;
@@ -1628,11 +1669,6 @@ fn log_entry(c: gfs_types::CommitMeta) -> crate::control::LogEntry {
   }
 }
 
-/// Where one pin's overlay lives.
-fn overlay_dir(state_dir: &Path, epoch: u64) -> PathBuf {
-  state_dir.join("overlay").join(epoch.to_string())
-}
-
 /// Make a path absolute without requiring it to exist.
 ///
 /// `canonicalize` would be stronger but demands that every component already
@@ -1714,7 +1750,7 @@ async fn resolve_pin(config: &MountSpec, selector: &str, epoch: u64) -> Result<R
     tree: tree.clone(),
     ref_name: grant.ref_name.clone(),
     mount_id: mount_id.clone(),
-    control_socket: MountState::control_socket(&config.state_dir),
+    control_socket: workspace_control_socket(&config.workspace),
     snapshot_time,
     grpc_endpoint: config.grpc_endpoint.clone(),
     http_endpoint: config.http_endpoint.clone(),
@@ -1723,18 +1759,44 @@ async fn resolve_pin(config: &MountSpec, selector: &str, epoch: u64) -> Result<R
     work_ref_root: (!grant.work_ref_root.is_empty()).then(|| grant.work_ref_root.clone()),
   };
 
-  // One overlay per pin, in its own directory. The binding check inside
-  // `Overlay::open` then does real work: a daemon restarted against a moved
-  // branch cannot silently adopt the previous pin's edits.
-  let overlay_dir = overlay_dir(&config.state_dir, epoch);
+  let root = crate::fs::root_entry(tree.clone());
+
+  Ok(Resolved {
+    facts,
+    root,
+    pin: Pin {
+      epoch,
+      client,
+      monitor: LeaseMonitor::new(mount_id, expiry, interval, config.lease_policy),
+      commit,
+      tree,
+      ref_name: grant.ref_name,
+      snapshot_time,
+    },
+  })
+}
+
+/// Open (or adopt) the mount's one overlay, pre-mount.
+///
+/// The journal opens at the on-disk path — the last moment it resolves to
+/// the real directory — and its connection is kept; content I/O roots at the
+/// retained handle, which stays true after the mount shadows the path.
+fn open_overlay(
+  config: &MountSpec,
+  git: &GitDirHandle,
+  resolved: &Resolved,
+) -> Result<Arc<Overlay>, GfsError> {
+  let overlay_dir = state_dir_for_workspace(&config.workspace).join("overlay");
+  let store_root = git.state_dir().join("overlay");
   let overlay = Arc::new(
-    Overlay::open(
+    Overlay::open_with_store_root(
       &overlay_dir,
+      &store_root,
       &Binding {
         repository_id: config.repository_id.as_str().to_owned(),
-        base_commit: commit.to_qualified(),
+        base_commit: resolved.pin.commit.to_qualified(),
       },
-      snapshot_time,
+      resolved.pin.snapshot_time,
       config.overlay.clone(),
     )
     .map_err(crate::fs::overlay_as_service_error)?,
@@ -1758,24 +1820,7 @@ async fn resolve_pin(config: &MountSpec, selector: &str, epoch: u64) -> Result<R
       "overlay content referenced by the journal is missing"
     );
   }
-
-  let root = crate::fs::root_entry(tree.clone());
-
-  Ok(Resolved {
-    facts,
-    root,
-    pin: Pin {
-      epoch,
-      overlay_dir,
-      overlay,
-      client,
-      monitor: LeaseMonitor::new(mount_id, expiry, interval, config.lease_policy),
-      commit,
-      tree,
-      ref_name: grant.ref_name,
-      snapshot_time,
-    },
-  })
+  Ok(overlay)
 }
 
 async fn create_mount(
@@ -1817,18 +1862,19 @@ async fn create_mount(
 ///
 /// ADR 0003 measured that a mount point survives its daemon and returns
 /// `ENOTCONN` until something calls `fusermount3 -u`, so orphan cleanup is an
-/// explicit responsibility rather than something the kernel does. This is the
-/// daemon's half of it: whatever the previous occupant of this state directory
-/// left behind is removed before a new mount is created in it.
-fn adopt_or_refuse_state_dir(state_dir: &Path, workspace: &Path) -> Result<(), GfsError> {
-  let socket = MountState::control_socket(state_dir);
+/// explicit responsibility rather than something the kernel does. The ordering
+/// here is ADR 0011's load-bearing recovery sequence: **lazy-unmount first**,
+/// so that opening the real `.git` afterwards reaches the disk and not a dead
+/// mount, then reopen, then remount.
+fn adopt_or_refuse_workspace(workspace: &Path) -> Result<(), GfsError> {
+  let socket = workspace_control_socket(workspace);
   if socket.exists() {
     if crate::control::is_live(&socket) {
       return Err(GfsError::new(
         ErrorCode::Conflict,
         format!(
-          "a live GFS daemon already owns {}; unmount it before mounting again",
-          state_dir.display()
+          "a live GFS daemon already serves {}; unmount it before mounting again",
+          workspace.display()
         ),
       ));
     }
@@ -1836,18 +1882,17 @@ fn adopt_or_refuse_state_dir(state_dir: &Path, workspace: &Path) -> Result<(), G
   }
 
   // Unmount anything a killed daemon left behind. Every operation on such a
-  // mount point returns ENOTCONN, so a new mount over it would be unreachable --
-  // and, now that the workspace *is* the mount point, so would the check
-  // `DirectMountPublisher` makes for a non-empty directory: `read_dir` on a dead
-  // FUSE mount fails, and the publisher would refuse a path that holds nothing.
+  // mount point returns ENOTCONN, so a new mount over it would be unreachable
+  // -- and so would the real `.git` beneath it, which the retained-handle open
+  // needs next. Unmounting a path that is not mounted is harmless and quiet.
   //
-  // The workspace is swept rather than the old `generations/` tree. A daemon
-  // killed before this change left its mounts there instead, so both are
-  // cleaned: an upgrade must not require the operator to know that the layout
-  // moved.
-  let mut orphans = vec![workspace.to_path_buf()];
-  let legacy = state_dir.join("generations");
-  if let Ok(entries) = std::fs::read_dir(&legacy) {
+  // The legacy sweep set stays: a daemon killed before ADR 0011 left a
+  // sibling state directory with its own odb view mount (and, before ADR
+  // 0003's second amendment, a `generations/` tree). An upgrade must not
+  // require the operator to know that the layout moved.
+  let legacy_state = legacy_state_dir(workspace);
+  let mut orphans = vec![workspace.to_path_buf(), legacy_state.join("odb")];
+  if let Ok(entries) = std::fs::read_dir(legacy_state.join("generations")) {
     orphans.extend(entries.flatten().map(|entry| entry.path()));
   }
   for path in orphans {
@@ -1858,9 +1903,73 @@ fn adopt_or_refuse_state_dir(state_dir: &Path, workspace: &Path) -> Result<(), G
       .stderr(std::process::Stdio::null())
       .status();
   }
-  let _ = std::fs::remove_dir_all(&legacy);
-  let _ = std::fs::remove_file(MountState::path(state_dir));
+
+  migrate_legacy_state(workspace, &legacy_state);
+  let _ = std::fs::remove_file(MountState::path(&state_dir_for_workspace(workspace)));
   Ok(())
+}
+
+/// Where a pre-ADR-0011 mount kept its state: the sibling `<workspace>.gfs`.
+fn legacy_state_dir(workspace: &Path) -> PathBuf {
+  let mut name = workspace.as_os_str().to_os_string();
+  name.push(".gfs");
+  PathBuf::from(name)
+}
+
+/// Adopt a two-place workspace into the single-mount layout.
+///
+/// Moves the real git dir to `<workspace>/.git` and the overlay under
+/// `.git/gfs/overlay`, which is a rename on the same filesystem — the state
+/// directory was a sibling of the workspace. Local commits and unexported
+/// edits survive because they are moved, not recreated; the alternates file
+/// is rewritten by the seed that follows. Best-effort beyond the git dir
+/// move: a failure leaves the old directory in place and the mount proceeds
+/// as a fresh workspace, which is what a missing legacy directory means too.
+fn migrate_legacy_state(workspace: &Path, legacy: &Path) {
+  let legacy_git = legacy.join("git");
+  if !legacy_git.is_dir() {
+    return;
+  }
+  let real_git = workspace.join(GIT_DIR_NAME);
+  if real_git.exists() {
+    // Both layouts present: the new one wins, and the old one is left for the
+    // operator rather than guessed about.
+    tracing::warn!(
+      legacy = %legacy.display(),
+      "both a legacy state directory and a workspace .git exist; ignoring the legacy one"
+    );
+    return;
+  }
+  if std::fs::create_dir_all(workspace).is_err() || std::fs::rename(&legacy_git, &real_git).is_err()
+  {
+    tracing::warn!(legacy = %legacy.display(), "could not adopt the legacy git dir");
+    return;
+  }
+  let state = real_git.join(crate::passthrough::STATE_SUBDIR);
+  let _ = std::fs::create_dir_all(&state);
+  // The old layout kept one overlay directory per epoch; the new one keeps
+  // exactly one. The highest epoch is the live overlay — the others were
+  // superseded and only survived a crash before their cleanup ran.
+  let legacy_overlay = legacy.join("overlay");
+  if let Ok(entries) = std::fs::read_dir(&legacy_overlay) {
+    let newest = entries
+      .flatten()
+      .filter_map(|entry| {
+        let epoch: u64 = entry.file_name().to_str()?.parse().ok()?;
+        Some((epoch, entry.path()))
+      })
+      .max_by_key(|(epoch, _)| *epoch);
+    if let Some((_, dir)) = newest {
+      let _ = std::fs::rename(&dir, state.join("overlay"));
+    }
+  }
+  // What remains is runtime debris: the old mount.json, socket, odb view
+  // mountpoint. The directory goes with it.
+  let _ = std::fs::remove_dir_all(legacy);
+  tracing::info!(
+    workspace = %workspace.display(),
+    "adopted a pre-ADR-0011 state directory into the workspace"
+  );
 }
 
 #[cfg(test)]
@@ -1870,18 +1979,51 @@ mod tests {
   #[test]
   fn a_stale_socket_is_removed_and_a_live_one_is_refused() {
     let tmp = tempfile::tempdir().unwrap();
-    prepare_state_dir(tmp.path()).unwrap();
-    let socket = MountState::control_socket(tmp.path());
+    let workspace = tmp.path().join("ws");
+    std::fs::create_dir_all(&workspace).unwrap();
+    let socket = workspace_control_socket(&workspace);
+    std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
 
     // A stale socket file with nothing listening: adopted.
     std::fs::write(&socket, b"").unwrap();
-    adopt_or_refuse_state_dir(tmp.path(), &tmp.path().join("ws")).unwrap();
+    adopt_or_refuse_workspace(&workspace).unwrap();
     assert!(!socket.exists());
 
-    // A real listener: refused, because two daemons over one state directory
-    // would each believe they own the lease.
+    // A real listener: refused, because two daemons over one workspace would
+    // each believe they own the lease.
     let _listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
-    let e = adopt_or_refuse_state_dir(tmp.path(), &tmp.path().join("ws")).unwrap_err();
+    let e = adopt_or_refuse_workspace(&workspace).unwrap_err();
     assert_eq!(e.code, ErrorCode::Conflict);
+    let _ = std::fs::remove_file(&socket);
+  }
+
+  #[test]
+  fn a_legacy_state_directory_is_adopted_into_the_workspace() {
+    // The upgrade path: `<ws>.gfs/git` becomes `<ws>/.git`, the *newest*
+    // epoch's overlay becomes the one `.git/gfs/overlay`, and local state
+    // survives the move.
+    let tmp = tempfile::tempdir().unwrap();
+    let workspace = tmp.path().join("ws");
+    let legacy = tmp.path().join("ws.gfs");
+    std::fs::create_dir_all(legacy.join("git/refs/heads")).unwrap();
+    std::fs::write(legacy.join("git/HEAD"), b"ref: refs/heads/main\n").unwrap();
+    std::fs::create_dir_all(legacy.join("overlay/1")).unwrap();
+    std::fs::write(legacy.join("overlay/1/overlay.sqlite"), b"old").unwrap();
+    std::fs::create_dir_all(legacy.join("overlay/2")).unwrap();
+    std::fs::write(legacy.join("overlay/2/overlay.sqlite"), b"live").unwrap();
+    std::fs::write(legacy.join("mount.json"), b"{}").unwrap();
+
+    adopt_or_refuse_workspace(&workspace).unwrap();
+
+    assert_eq!(
+      std::fs::read_to_string(workspace.join(".git/HEAD")).unwrap(),
+      "ref: refs/heads/main\n"
+    );
+    assert_eq!(
+      std::fs::read(workspace.join(".git/gfs/overlay/overlay.sqlite")).unwrap(),
+      b"live",
+      "the newest epoch is the one adopted"
+    );
+    assert!(!legacy.exists(), "the legacy directory is gone");
   }
 }

@@ -16,7 +16,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use gfs_mount::client::MountBinding;
-use gfs_mount::{BlobCache, FsConfig, Gfs, GitDir, GitDirFacts, MountConfig, SnapshotClient};
+use gfs_mount::{
+  BlobCache, FsConfig, Gfs, GitDirFacts, GitDirHandle, GitPassthrough, MountConfig, SnapshotClient,
+};
 use gfs_overlay::{Binding, Overlay, OverlayConfig};
 use gfs_proto::v1;
 use gfs_service::auth::{AllowList, CapabilityKey, StaticTokens};
@@ -246,7 +248,7 @@ impl Mount {
     )
     .unwrap();
 
-    let gitdir = Arc::new(GitDir::new(&GitDirFacts {
+    let facts = GitDirFacts {
       repository_id: backend.repo_id.clone(),
       commit: commit.clone(),
       tree: tree.clone(),
@@ -263,7 +265,7 @@ impl Mount {
       // exercised against real metadata rather than a hand-built value.
       commit_meta: client.get_commit().await.ok(),
       work_ref_root: (!grant.work_ref_root.is_empty()).then(|| grant.work_ref_root.clone()),
-    }));
+    };
 
     let overlay_dir = tempfile::tempdir().unwrap();
     let overlay = Arc::new(
@@ -279,18 +281,38 @@ impl Mount {
       .unwrap(),
     );
 
+    let mount_dir = tempfile::tempdir().unwrap();
+    let path = mount_dir.path().join("workspace");
+
+    // The single-mount layout (ADR 0011): a real `.git` inside the workspace,
+    // seeded before mounting over it, retained through a handle, and served
+    // back by the same filesystem alongside the projected object store.
+    let real_git = path.join(".git");
+    std::fs::create_dir_all(real_git.join("gfs")).unwrap();
+    gfs_mount::gitdir::seed_git_dir(&gfs_mount::gitdir::SeedSpec {
+      git_dir: &real_git,
+      facts: &facts,
+      index: None,
+    })
+    .unwrap();
+    let handle = Arc::new(GitDirHandle::open(&real_git).unwrap());
+    let odb = gfs_mount::odb::OdbProjection::open(
+      gfs_mount::odb::OdbClient::new(&backend.http, TOKEN, backend.repo_id.clone()),
+      &cache_dir.path().join("odb"),
+      0,
+    )
+    .await
+    .unwrap();
+    let git = Arc::new(GitPassthrough::new(handle, Arc::clone(&odb.store)));
+
     let fs = Gfs::new(
       client,
       cache,
-      gitdir,
+      git,
       Arc::clone(&overlay),
       gfs_mount::root_entry(tree),
       config,
     );
-
-    let mount_dir = tempfile::tempdir().unwrap();
-    let path = mount_dir.path().join("workspace");
-    std::fs::create_dir(&path).unwrap();
 
     let session = gfs_mount::spawn_mount(
       gfs_mount::GfsFilesystem::new(Arc::clone(&fs), tokio::runtime::Handle::current()),
@@ -359,12 +381,10 @@ pub fn mount_spec(
   backend: &Backend,
   revision: &str,
   workspace: &Path,
-  state_dir: &Path,
   cache_dir: &Path,
   overlay: gfs_overlay::OverlayConfig,
 ) -> gfs_mount::MountSpec {
   gfs_mount::MountSpec {
-    state_dir: state_dir.to_path_buf(),
     workspace: workspace.to_path_buf(),
     cache_dir: cache_dir.to_path_buf(),
     grpc_endpoint: backend.grpc.clone(),
@@ -412,14 +432,15 @@ impl Job {
     Job::with_overlay(backend, revision, gfs_overlay::OverlayConfig::default()).await
   }
 
-  /// Start a daemon over an *existing* state directory, which is what a
-  /// supervisor restarting a killed job does.
-  pub async fn with_state(backend: &Backend, revision: &str, state_dir: &Path) -> Job {
+  /// Start a daemon over an *existing* workspace folder, which is what a
+  /// supervisor restarting a killed job does. The state travels inside the
+  /// folder (ADR 0011), so the folder is all there is to name.
+  pub async fn with_workspace(backend: &Backend, revision: &str, workspace: &Path) -> Job {
     Job::build(
       backend,
       revision,
       gfs_overlay::OverlayConfig::default(),
-      Some(state_dir.to_path_buf()),
+      Some(workspace.to_path_buf()),
     )
     .await
   }
@@ -436,12 +457,12 @@ impl Job {
     backend: &Backend,
     revision: &str,
     overlay: gfs_overlay::OverlayConfig,
-    existing_state: Option<PathBuf>,
+    existing_workspace: Option<PathBuf>,
   ) -> Job {
     let tmp = tempfile::tempdir().unwrap();
     let cache = tempfile::tempdir().unwrap();
-    let workspace = tmp.path().join("ws");
-    let state_dir = existing_state.unwrap_or_else(|| tmp.path().join("ws.gfs"));
+    let workspace = existing_workspace.unwrap_or_else(|| tmp.path().join("ws"));
+    let state_dir = gfs_mount::state::state_dir_for_workspace(&workspace);
 
     let (host, listener) = gfs_mount::MountHost::bind(host_config(backend, tmp.path())).unwrap();
     tokio::spawn(Arc::clone(&host).serve(listener));
@@ -453,7 +474,6 @@ impl Job {
         backend,
         revision,
         &workspace,
-        &state_dir,
         cache.path(),
         overlay,
       ))
@@ -482,14 +502,13 @@ impl Job {
     name: &str,
   ) -> (Arc<gfs_mount::Mount>, PathBuf, PathBuf) {
     let workspace = self._tmp.path().join(name);
-    let state_dir = self._tmp.path().join(format!("{name}.gfs"));
+    let state_dir = gfs_mount::state::state_dir_for_workspace(&workspace);
     let mount = self
       .host
       .mount(mount_spec(
         backend,
         revision,
         &workspace,
-        &state_dir,
         self._cache.path(),
         gfs_overlay::OverlayConfig::default(),
       ))
@@ -499,9 +518,47 @@ impl Job {
   }
 
   pub fn socket(&self) -> PathBuf {
-    gfs_mount::state::MountState::control_socket(&self.state_dir)
+    gfs_mount::state::workspace_control_socket(&self.workspace)
   }
 
+  /// Tear down every mount this job's host serves, on a scratch runtime.
+  ///
+  /// Called from `Drop`, which cannot await — a plain thread with its own
+  /// small runtime is the one place a synchronous teardown can run without
+  /// blocking the workers the daemon answers on.
+  fn teardown(&self) {
+    let host = Arc::clone(&self.host);
+    let _ = std::thread::spawn(move || {
+      let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("a teardown runtime");
+      runtime.block_on(host.shutdown());
+      // `unmount_session`'s timeout path abandons a blocking task stuck in
+      // `Session::join` when a busy mount had to be lazily detached. A plain
+      // runtime drop would wait for that task forever; a bounded shutdown
+      // abandons it the way the timeout already decided to.
+      runtime.shutdown_timeout(std::time::Duration::from_secs(15));
+    })
+    .join();
+  }
+}
+
+impl Drop for Job {
+  fn drop(&mut self) {
+    // Unmount before the process can exit with live sessions. A FUSE mount
+    // leaked to `exit_group` is an exit-time deadlock in waiting: a thread
+    // caught mid-request into a mount whose daemon threads have just been
+    // killed waits in the kernel for an answer that will never come, and the
+    // process wedges as a zombie. Tearing down here, while the runtime that
+    // answers requests is still alive, closes that window — and is also what
+    // a real job supervisor does. `shutdown` is idempotent, so tests that
+    // already unmounted explicitly lose nothing.
+    self.teardown();
+  }
+}
+
+impl Job {
   pub async fn call(&self, request: gfs_mount::control::Request) -> gfs_mount::control::Response {
     let socket = self.socket();
     on_fs(move || gfs_mount::control::call(&socket, &request).unwrap())

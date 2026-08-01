@@ -105,44 +105,41 @@ async fn directory_listing_merges_the_synthesized_git_surface() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn the_git_surface_has_the_six_entries_adr_0005_requires() {
+async fn the_git_dir_is_the_real_seeded_one_served_back_through_the_mount() {
+  // ADR 0011: `.git` is a real directory, shadowed by the mount and passed
+  // through — what a tool reads is exactly what the seed wrote, plus the
+  // projection injected at `gfs/objects`.
   let backend = Backend::start("basic").await;
   let mount = Mount::new(&backend, "main").await;
   let git = mount.join(".git");
 
-  let (names, head, config, json) = on_fs(move || {
+  let (names, head, config, json, alternates) = on_fs(move || {
     let names = read_dir_names(&git);
     let head = std::fs::read(git.join("HEAD")).unwrap();
     let config = std::fs::read_to_string(git.join("config")).unwrap();
     let json = std::fs::read(git.join("gfs.json")).unwrap();
-    // The two entries DESIGN.md omitted; without them Git does not recognize the
-    // directory as a repository at all.
+    let alternates = std::fs::read_to_string(git.join("objects/info/alternates")).unwrap();
+    // Without these Git does not recognize the directory as a repository.
     assert!(git.join("objects").is_dir());
     assert!(git.join("refs").is_dir());
-    (names, head, config, json)
+    // The projection, presented inside the git dir under the one name the
+    // alternates points at.
+    assert!(git.join("gfs/objects").is_dir());
+    (names, head, config, json, alternates)
   })
   .await;
 
-  let mut names: Vec<String> = names
+  let names: Vec<String> = names
     .into_iter()
     .map(|n| String::from_utf8(n).unwrap())
     .collect();
-  names.sort();
-  assert_eq!(
-    names,
-    // Byte order, because `names` is sorted above. `gfs.json` sorts before
-    // `objects`, where the old `xvfs.json` sorted last.
-    vec![
-      "HEAD",
-      "config",
-      "gfs.json",
-      "objects",
-      "packed-refs",
-      "refs"
-    ]
-  );
+  for required in ["HEAD", "config", "gfs", "gfs.json", "objects", "refs"] {
+    assert!(names.contains(&required.to_owned()), "{names:?}");
+  }
   assert_eq!(head, b"ref: refs/heads/main\n");
   assert!(config.contains("repositoryformatversion = 0"));
+  // Relative, so the folder can travel (ADR 0011).
+  assert_eq!(alternates, "../gfs/objects\n");
 
   let value: serde_json::Value = serde_json::from_slice(&json).unwrap();
   assert_eq!(value["commit"], mount.commit.to_qualified());
@@ -152,14 +149,14 @@ async fn the_git_surface_has_the_six_entries_adr_0005_requires() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_git_surface_costs_no_server_traffic() {
   // DESIGN.md section 8.6: whatever occupies `.git` is outside change tracking
-  // and hydration accounting. It is synthesized in memory, so reading all of it
-  // must not fetch a single blob.
+  // and hydration accounting. It is the real local directory passed through,
+  // so reading its metadata must not fetch a single blob.
   let backend = Backend::start("basic").await;
   let mount = Mount::new(&backend, "main").await;
   let git = mount.join(".git");
 
   on_fs(move || {
-    for name in ["HEAD", "packed-refs", "config", "gfs.json"] {
+    for name in ["HEAD", "config", "gfs.json"] {
       std::fs::read(git.join(name)).unwrap();
     }
   })
@@ -342,33 +339,45 @@ async fn repeated_stats_of_one_path_do_not_reach_the_server() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn only_the_synthesized_git_surface_is_read_only() {
-  // The mount became writable in M3, but `.git` did not: ADR 0005 fixes it as a
-  // synthesized read-only surface, and there is no overlay content behind it to
-  // copy up. `EROFS` and specifically not `ENOSYS`, because the operation is
-  // understood and refused rather than unimplemented.
+async fn the_git_dir_is_writable_and_only_the_projection_is_not() {
+  // ADR 0011 inverted ADR 0005's rule: `.git` is the real directory passed
+  // through, and Git's own write protocol (lockfile create, rename, unlink)
+  // must work against it. What stays read-only is exactly the projection at
+  // `.git/gfs/objects` — a write there could only corrupt the shared store.
   let backend = Backend::start("basic").await;
   let mount = Mount::new(&backend, "main").await;
   let root = mount.path.clone();
 
   on_fs(move || {
-    // `EACCES` rather than `EROFS` for these three, and that is the mount option
-    // `DefaultPermissions` doing its job: the surface reports 0444 files inside
-    // a 0555 directory, so the kernel refuses before the request becomes an
-    // upcall. The handlers below answer `EROFS` if it ever reaches them, which is
-    // the second line of the same defence rather than the first.
+    // The lockfile protocol, verbatim: exclusive create, write, rename over.
+    let lock = root.join(".git/config.lock");
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    let mut file = options.open(&lock).unwrap();
+    use std::io::Write as _;
+    file.write_all(b"[gfs]\n\ttest = true\n").unwrap();
+    drop(file);
+    let second = options.open(&lock).unwrap_err();
+    assert_eq!(
+      second.raw_os_error(),
+      Some(libc::EEXIST),
+      "O_EXCL is forwarded, or every lock race is invisible"
+    );
+    std::fs::rename(&lock, root.join(".git/config.test")).unwrap();
+    assert!(root.join(".git/config.test").is_file());
+    std::fs::remove_file(root.join(".git/config.test")).unwrap();
+
+    // The projection refuses writes: `EACCES` from `DefaultPermissions` over
+    // its 0444/0555 modes, or `EROFS` from the handler as the second line of
+    // the same defence.
     for (label, error) in [
       (
-        "write into .git",
-        std::fs::write(root.join(".git/HEAD"), b"x").unwrap_err(),
+        "create in the projection",
+        std::fs::write(root.join(".git/gfs/objects/intruder"), b"x").unwrap_err(),
       ),
       (
-        "mkdir in .git",
-        std::fs::create_dir(root.join(".git/newdir")).unwrap_err(),
-      ),
-      (
-        "unlink in .git",
-        std::fs::remove_file(root.join(".git/config")).unwrap_err(),
+        "mkdir in the projection",
+        std::fs::create_dir(root.join(".git/gfs/objects/newdir")).unwrap_err(),
       ),
     ] {
       assert!(
@@ -377,8 +386,9 @@ async fn only_the_synthesized_git_surface_is_read_only() {
       );
     }
 
-    // And the boundary Git itself never gets to cross: a hard link is `EPERM`
-    // for the life of the MVP, not a consequence of read-only.
+    // And the boundary Git itself never gets to cross in the *tree*: a hard
+    // link outside `.git` is `EPERM` for the life of the MVP, not a
+    // consequence of read-only.
     let e = std::fs::hard_link(root.join("README.md"), root.join("linked")).unwrap_err();
     assert_eq!(e.raw_os_error(), Some(libc::EPERM), "hard link");
   })
@@ -604,7 +614,7 @@ async fn losing_the_server_produces_eio_and_leaves_cached_reads_working() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn an_unmounted_path_is_empty_rather_than_stale() {
+async fn an_unmounted_path_holds_only_its_git_rather_than_stale_content() {
   let backend = Backend::start("basic").await;
   let mut mount = Mount::new(&backend, "main").await;
   let root = mount.path.clone();
@@ -613,11 +623,10 @@ async fn an_unmounted_path_is_empty_rather_than_stale() {
 
   mount.unmount();
 
-  let listed = on_fs(move || std::fs::read_dir(&root).unwrap().count()).await;
-  assert_eq!(
-    listed, 0,
-    "the mount point is a plain empty directory again"
-  );
+  // ADR 0011: what unmounting leaves is a plain folder with a fat `.git` —
+  // the projected tree is gone, the state travels with the folder.
+  let names = on_fs(move || read_dir_names(&root)).await;
+  assert_eq!(names, vec![b".git".to_vec()]);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -694,4 +703,32 @@ async fn the_budget_charges_a_blob_once_and_cached_reads_stay_free() {
   let report = mount.fs.budget_report();
   assert_eq!(report.charged_bytes, 8, "{report:?}");
   assert_eq!(report.refusals, 0, "{report:?}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn fsync_of_a_git_directory_syncs_the_real_directory_not_the_overlay() {
+  // The routing this asserts is load-bearing (ADR 0011 implementation notes):
+  // SQLite fsyncs the overlay journal's own directory by its canonicalized
+  // on-disk path — through this very mount — on some commits, while the
+  // committing thread holds the overlay lock. An `fsyncdir` that reached
+  // `Overlay::sync` from a `.git` subtree handle would therefore deadlock the
+  // mount against its own journal, which is exactly how the first
+  // `echo >> README.md` into a real workspace hung.
+  let backend = Backend::start("basic").await;
+  let mount = Mount::new(&backend, "main").await;
+  let root = mount.path.clone();
+
+  on_fs(move || {
+    for dir in [".git", ".git/gfs", ".git/objects"] {
+      let handle = std::fs::File::open(root.join(dir)).unwrap();
+      handle
+        .sync_all()
+        .unwrap_or_else(|e| panic!("fsync of {dir} through the mount: {e}"));
+    }
+    // The projection has nothing local to make durable, and must say so
+    // rather than stall.
+    let projected = std::fs::File::open(root.join(".git/gfs/objects")).unwrap();
+    projected.sync_all().unwrap();
+  })
+  .await;
 }

@@ -1,10 +1,13 @@
-//! The projected object database: one read-only mount per repository per host.
+//! The projected object database: one block store per repository per host.
 //!
 //! ADR 0009's workspace has a real `.git` on local disk whose
-//! `objects/info/alternates` points here. This module is the client half of that
-//! projection: a manifest of the gateway's `objects/` tree, a 64 KiB block cache
-//! under it, and a small FUSE filesystem serving the two to every workspace of
-//! the repository on this host.
+//! `objects/info/alternates` points at a projection of the gateway's `objects/`
+//! tree. This module is the client half of that projection: a manifest of the
+//! gateway's tree and a 64 KiB block cache under it. ADR 0011 moved the serving
+//! half *into the workspace filesystem* — the projection appears at
+//! `.git/gfs/objects/` inside the one workspace mount ([`crate::passthrough`]) —
+//! so there is no separate FUSE session here any more, only the store that every
+//! workspace of the repository shares.
 //!
 //! # Why blocks, and why this size
 //!
@@ -60,23 +63,18 @@
 //!
 //! The store's counters are per repository — the projection is shared, so
 //! per-job identity does not exist at the store. Attribution lives one layer
-//! up: every workspace mounts its own [`OdbView`] over the shared store and
-//! points its `objects/info/alternates` there, so *which mountpoint was read*
-//! is the job identity. That is unforgeable and free, where a pid lookup at
-//! read time is racy and was rejected by the spike. The blocks stay shared;
-//! only the counting is per view.
+//! up: every workspace serves the shared store through its own mount with its
+//! own [`ViewCounters`], so *which mount was read through* is the job identity.
+//! That is unforgeable and free, where a pid lookup at read time is racy and
+//! was rejected by the spike. The blocks stay shared; only the counting is per
+//! view.
 
 use std::collections::HashMap;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, UNIX_EPOCH};
 
-use fuser::{
-  Errno, FileAttr, FileHandle, FileType, Filesystem, FopenFlags, Generation, INodeNo, LockOwner,
-  OpenFlags, ReplyAttr, ReplyData, ReplyDirectory, ReplyEntry, ReplyOpen, Request,
-};
 use gfs_types::error::{ErrorCode, GfsError};
 use gfs_types::{limits, RepositoryId};
 
@@ -236,9 +234,9 @@ pub struct OdbStats {
 ///
 /// The store's own counters are per repository — the projection is shared — so
 /// per-job attribution cannot live there. It lives one layer up instead: each
-/// workspace mounts its own [`OdbView`] over the shared store, every read
+/// workspace serves the store through its own [`ViewCounters`], every read
 /// returns its cost, and the view accumulates. Identity comes from *which
-/// mountpoint was read*, which is unforgeable, instead of from a racy pid
+/// mount was read through*, which is unforgeable, instead of from a racy pid
 /// lookup (rejected in `spikes/reports/m05b-git-projection.md`).
 #[derive(Clone, Copy, Default, Debug)]
 pub struct ReadCost {
@@ -255,15 +253,16 @@ pub struct OdbViewStats {
   pub block_hits: u64,
 }
 
+/// One workspace's share of the shared store's traffic.
 #[derive(Debug, Default)]
-struct ViewCounters {
+pub struct ViewCounters {
   blocks_fetched: AtomicU64,
   bytes_fetched: AtomicU64,
   block_hits: AtomicU64,
 }
 
 impl ViewCounters {
-  fn add(&self, cost: &ReadCost) {
+  pub fn add(&self, cost: &ReadCost) {
     self
       .blocks_fetched
       .fetch_add(cost.blocks_fetched, Ordering::Relaxed);
@@ -275,7 +274,7 @@ impl ViewCounters {
       .fetch_add(cost.block_hits, Ordering::Relaxed);
   }
 
-  fn snapshot(&self) -> OdbViewStats {
+  pub fn snapshot(&self) -> OdbViewStats {
     OdbViewStats {
       blocks_fetched: self.blocks_fetched.load(Ordering::Relaxed),
       bytes_fetched: self.bytes_fetched.load(Ordering::Relaxed),
@@ -805,379 +804,47 @@ impl Drop for UnpinGuard<'_> {
 }
 
 // ---------------------------------------------------------------------------
-// The filesystem
-// ---------------------------------------------------------------------------
-
-const TTL: Duration = Duration::from_secs(3600);
-
-#[derive(Debug)]
-enum Node {
-  Dir { children: Vec<(String, u64)> },
-  File { path: String, size: u64 },
-}
-
-/// The projection: a read-only tree of exactly the manifest's files.
-pub struct OdbFs {
-  store: Arc<BlockStore>,
-  nodes: Vec<Node>,
-  by_name: HashMap<(u64, String), u64>,
-  runtime: tokio::runtime::Handle,
-  /// This mount's share of the store's traffic (per-job attribution).
-  view: Arc<ViewCounters>,
-}
-
-impl OdbFs {
-  pub fn new(store: Arc<BlockStore>, runtime: tokio::runtime::Handle) -> Self {
-    Self::with_view(store, runtime, Arc::new(ViewCounters::default()))
-  }
-
-  fn with_view(
-    store: Arc<BlockStore>,
-    runtime: tokio::runtime::Handle,
-    view: Arc<ViewCounters>,
-  ) -> Self {
-    // Inode 0 unused, 1 is the root. Directories are interned as paths appear;
-    // the manifest is small (dozens of entries) so this is all cheap.
-    let mut nodes = vec![
-      Node::Dir { children: vec![] }, // 0: unused
-      Node::Dir { children: vec![] }, // 1: root
-    ];
-    let mut dirs: HashMap<String, u64> = HashMap::new();
-    dirs.insert(String::new(), 1);
-    let mut by_name = HashMap::new();
-
-    let mut listing = store.listing();
-    listing.sort();
-    for (path, size) in listing {
-      let mut parent = 1u64;
-      let mut walked = String::new();
-      let components: Vec<&str> = path.split('/').collect();
-      for dir in &components[..components.len() - 1] {
-        if !walked.is_empty() {
-          walked.push('/');
-        }
-        walked.push_str(dir);
-        parent = match dirs.get(&walked) {
-          Some(ino) => *ino,
-          None => {
-            let ino = nodes.len() as u64;
-            nodes.push(Node::Dir { children: vec![] });
-            if let Node::Dir { children } = &mut nodes[parent as usize] {
-              children.push(((*dir).to_owned(), ino));
-            }
-            by_name.insert((parent, (*dir).to_owned()), ino);
-            dirs.insert(walked.clone(), ino);
-            ino
-          }
-        };
-      }
-      let name = components[components.len() - 1].to_owned();
-      let ino = nodes.len() as u64;
-      nodes.push(Node::File {
-        path: path.clone(),
-        size,
-      });
-      if let Node::Dir { children } = &mut nodes[parent as usize] {
-        children.push((name.clone(), ino));
-      }
-      by_name.insert((parent, name), ino);
-    }
-    OdbFs {
-      store,
-      nodes,
-      by_name,
-      runtime,
-      view,
-    }
-  }
-
-  fn attr(&self, ino: u64) -> Option<FileAttr> {
-    let node = self.nodes.get(ino as usize)?;
-    let owner = crate::attr::Ownership::current();
-    // A fixed timestamp: nothing reads a pack's mtime for correctness, and a
-    // stable value keeps two mounts of one store identical.
-    let t = UNIX_EPOCH + Duration::from_secs(1);
-    let (kind, size, perm) = match node {
-      Node::Dir { .. } => (FileType::Directory, 0, 0o555),
-      Node::File { size, .. } => (FileType::RegularFile, *size, 0o444),
-    };
-    Some(FileAttr {
-      ino: INodeNo(ino),
-      size,
-      blocks: size.div_ceil(512),
-      atime: t,
-      mtime: t,
-      ctime: t,
-      crtime: t,
-      kind,
-      perm,
-      nlink: 1,
-      uid: owner.uid,
-      gid: owner.gid,
-      rdev: 0,
-      blksize: BLOCK as u32,
-      flags: 0,
-    })
-  }
-}
-
-impl std::fmt::Debug for OdbFs {
-  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-    f.debug_struct("OdbFs").finish_non_exhaustive()
-  }
-}
-
-impl Filesystem for OdbFs {
-  fn lookup(&self, _req: &Request, parent: INodeNo, name: &std::ffi::OsStr, reply: ReplyEntry) {
-    let key = (parent.0, name.to_string_lossy().into_owned());
-    match self.by_name.get(&key).and_then(|ino| self.attr(*ino)) {
-      Some(attr) => reply.entry(&TTL, &attr, Generation(0)),
-      None => reply.error(Errno::ENOENT),
-    }
-  }
-
-  fn getattr(&self, _req: &Request, ino: INodeNo, _fh: Option<FileHandle>, reply: ReplyAttr) {
-    match self.attr(ino.0) {
-      Some(attr) => reply.attr(&TTL, &attr),
-      None => reply.error(Errno::ENOENT),
-    }
-  }
-
-  fn open(&self, _req: &Request, ino: INodeNo, flags: OpenFlags, reply: ReplyOpen) {
-    if flags.acc_mode() != fuser::OpenAccMode::O_RDONLY {
-      return reply.error(Errno::EROFS);
-    }
-    match self.nodes.get(ino.0 as usize) {
-      Some(Node::File { .. }) => reply.opened(FileHandle(0), FopenFlags::FOPEN_KEEP_CACHE),
-      Some(Node::Dir { .. }) => reply.error(Errno::EISDIR),
-      None => reply.error(Errno::ENOENT),
-    }
-  }
-
-  #[allow(clippy::too_many_arguments)]
-  fn read(
-    &self,
-    _req: &Request,
-    ino: INodeNo,
-    _fh: FileHandle,
-    offset: u64,
-    size: u32,
-    _flags: OpenFlags,
-    _lock_owner: Option<LockOwner>,
-    reply: ReplyData,
-  ) {
-    let Some(Node::File { path, .. }) = self.nodes.get(ino.0 as usize) else {
-      return reply.error(Errno::EBADF);
-    };
-    let path = path.clone();
-    let store = Arc::clone(&self.store);
-    let view = Arc::clone(&self.view);
-    // Handed to the runtime rather than awaited on the FUSE thread: a block
-    // fetch is a network wait, and one blocking callback serializes the mount
-    // (M0.2's measured rule).
-    self.runtime.spawn(async move {
-      match store.read(&path, offset, size).await {
-        Ok((bytes, cost)) => {
-          view.add(&cost);
-          reply.data(&bytes)
-        }
-        Err(e) => {
-          // "Repacked away" is the one expected failure, and ESTALE is its
-          // errno: the name is gone, not wrong. Everything else is EIO.
-          let errno = if e.code == ErrorCode::FailedPrecondition {
-            Errno::ESTALE
-          } else {
-            Errno::EIO
-          };
-          tracing::warn!(path, offset, "odb read failed: {e}");
-          reply.error(errno);
-        }
-      }
-    });
-  }
-
-  fn readdir(
-    &self,
-    _req: &Request,
-    ino: INodeNo,
-    _fh: FileHandle,
-    offset: u64,
-    mut reply: ReplyDirectory,
-  ) {
-    let Some(Node::Dir { children }) = self.nodes.get(ino.0 as usize) else {
-      return reply.error(Errno::ENOTDIR);
-    };
-    let mut listing: Vec<(u64, FileType, String)> = vec![
-      (ino.0, FileType::Directory, ".".into()),
-      (ino.0, FileType::Directory, "..".into()),
-    ];
-    for (name, child) in children {
-      let kind = match self.nodes.get(*child as usize) {
-        Some(Node::Dir { .. }) => FileType::Directory,
-        _ => FileType::RegularFile,
-      };
-      listing.push((*child, kind, name.clone()));
-    }
-    for (i, (child, kind, name)) in listing.into_iter().enumerate().skip(offset as usize) {
-      if reply.add(INodeNo(child), (i + 1) as u64, kind, name) {
-        break;
-      }
-    }
-    reply.ok();
-  }
-}
-
-// ---------------------------------------------------------------------------
 // The projection handle
 // ---------------------------------------------------------------------------
 
-/// One repository's projection: the store, the mount, and its lifetime.
+/// One repository's projection: the shared block store and the client that
+/// feeds it.
+///
+/// No FUSE session lives here any more. ADR 0011 made the workspace mount
+/// itself serve the store at `.git/gfs/objects/`, so what the host shares per
+/// repository is exactly the state that cannot disagree between workspaces:
+/// the manifest and the blocks.
 pub struct OdbProjection {
   pub store: Arc<BlockStore>,
   /// A handle for the workspace seed: fetching the shipped index for a pinned
   /// commit goes to the same endpoint the blocks come from.
   pub client: OdbClient,
-  /// Where the projection is mounted; what a workspace's alternates points at.
-  pub mountpoint: PathBuf,
-  /// Dropping the session unmounts, so this handle's lifetime *is* the mount's.
-  session: Mutex<Option<fuser::BackgroundSession>>,
 }
 
 impl std::fmt::Debug for OdbProjection {
   fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
     f.debug_struct("OdbProjection")
-      .field("mountpoint", &self.mountpoint)
+      .field("root", &self.store.root)
       .finish_non_exhaustive()
   }
 }
 
 impl OdbProjection {
-  /// Mount the projection for one repository.
+  /// Open the projection for one repository.
   ///
-  /// `root` holds both the block store (`blocks/`) and the mountpoint
-  /// (`mnt/`), so one directory per repository owns everything the projection
-  /// touches on disk. `residency_limit` bounds the block store's bytes held;
-  /// zero is unbounded.
-  pub async fn mount(
+  /// `root` holds the block store (`blocks/`); `residency_limit` bounds the
+  /// store's bytes held, zero is unbounded.
+  pub async fn open(
     client: OdbClient,
     root: &Path,
     residency_limit: u64,
   ) -> Result<Arc<Self>, GfsError> {
-    let mountpoint = root.join("mnt");
     let seed_client = client.clone();
     let store = Arc::new(BlockStore::open(client, root.join("blocks"), residency_limit).await?);
-    let fs = OdbFs::new(Arc::clone(&store), tokio::runtime::Handle::current());
-    let session = spawn_odb_session(fs, &mountpoint)?;
-
     Ok(Arc::new(OdbProjection {
       store,
       client: seed_client,
-      mountpoint,
-      session: Mutex::new(Some(session)),
     }))
-  }
-
-  /// Unmount explicitly. Also happens on drop, but an unmount that can fail
-  /// loudly belongs on the shutdown path, not in a destructor.
-  pub fn unmount(&self) {
-    if let Some(session) = self.session.lock().expect("odb session").take() {
-      let _ = session.umount_and_join();
-    }
-  }
-}
-
-/// Mount an [`OdbFs`] read-only at `mountpoint`, sweeping a dead predecessor.
-fn spawn_odb_session(fs: OdbFs, mountpoint: &Path) -> Result<fuser::BackgroundSession, GfsError> {
-  // A previous process may have died with the mount half-attached. The sweep
-  // is unconditional because `exists()` cannot gate it: stat on a dead FUSE
-  // mountpoint fails with ENOTCONN, so the check answers false exactly when
-  // the sweep is needed — and `create_dir_all` then dies on EEXIST because its
-  // own is-it-a-directory recheck fails the same way. Unmounting a path that
-  // is not mounted is harmless and quiet with -z and -q.
-  let _ = std::process::Command::new("fusermount3")
-    .args(["-uzq"])
-    .arg(mountpoint)
-    .output();
-  std::fs::create_dir_all(mountpoint)
-    .map_err(|e| GfsError::internal(format!("creating the odb mountpoint: {e}")))?;
-  let mut config = fuser::Config::default();
-  config.mount_options = vec![
-    fuser::MountOption::FSName("gfs-odb".into()),
-    fuser::MountOption::RO,
-    fuser::MountOption::NoSuid,
-    fuser::MountOption::NoDev,
-    fuser::MountOption::NoAtime,
-  ];
-  config.acl = fuser::SessionACL::Owner;
-  // Git reads packs from several threads; more than one event loop keeps a
-  // slow block fetch from serializing its neighbours.
-  config.n_threads = Some(4);
-  config.clone_fd = true;
-  fuser::spawn_mount(fs, mountpoint, &config)
-    .map_err(|e| GfsError::internal(format!("mounting the odb projection: {e}")))
-}
-
-/// One workspace's window onto the shared store: the per-job attribution layer.
-///
-/// Serves exactly the same immutable tree as the repository's shared
-/// projection, from the same block cache — a read through any view fills the
-/// blocks for all of them. What is per view is the *counting*: a workspace's
-/// `objects/info/alternates` names its own view mountpoint, so every odb byte
-/// its tools pull is attributed to that workspace and reported in
-/// `gfs status`, without any process identity being guessed at.
-pub struct OdbView {
-  pub store: Arc<BlockStore>,
-  pub mountpoint: PathBuf,
-  counters: Arc<ViewCounters>,
-  session: Mutex<Option<fuser::BackgroundSession>>,
-}
-
-impl std::fmt::Debug for OdbView {
-  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-    f.debug_struct("OdbView")
-      .field("mountpoint", &self.mountpoint)
-      .finish_non_exhaustive()
-  }
-}
-
-impl OdbView {
-  /// Mount a view of `store` at `mountpoint`.
-  pub fn mount(store: Arc<BlockStore>, mountpoint: &Path) -> Result<Arc<Self>, GfsError> {
-    let counters = Arc::new(ViewCounters::default());
-    let fs = OdbFs::with_view(
-      Arc::clone(&store),
-      tokio::runtime::Handle::current(),
-      Arc::clone(&counters),
-    );
-    let session = spawn_odb_session(fs, mountpoint)?;
-    Ok(Arc::new(OdbView {
-      store,
-      mountpoint: mountpoint.to_path_buf(),
-      counters,
-      session: Mutex::new(Some(session)),
-    }))
-  }
-
-  pub fn stats(&self) -> OdbViewStats {
-    self.counters.snapshot()
-  }
-
-  pub fn unmount(&self) {
-    if let Some(session) = self.session.lock().expect("odb view session").take() {
-      let _ = session.umount_and_join();
-    }
-  }
-}
-
-impl Drop for OdbView {
-  fn drop(&mut self) {
-    self.unmount();
-  }
-}
-
-impl Drop for OdbProjection {
-  fn drop(&mut self) {
-    self.unmount();
   }
 }
 

@@ -22,10 +22,12 @@
 //!
 //! # Two sockets, two vocabularies
 //!
-//! [`Request`] is what a job asks *its own workspace*, and it is answered on the
-//! per-mount socket at `<workspace>.gfs/control.sock`. It carries no mount
-//! selector because the socket it arrives on is the selector — which is what lets
-//! `gfs rg` work by walking up from the current directory with no flags at all.
+//! [`Request`] is what a job asks *its own workspace*, and it is answered on
+//! the per-mount socket in the runtime directory (named in the workspace's
+//! `.git/gfs.json`; see [`crate::state::workspace_control_socket`] for why it
+//! cannot live under the mount). It carries no mount selector because the
+//! socket it arrives on is the selector — which is what lets `gfs rg` work by
+//! walking up from the current directory with no flags at all.
 //!
 //! [`HostRequest`] is what the CLI asks the `gfs-fuse` *process*: create a mount,
 //! list them, tear one down. It is answered on a single host socket shared by
@@ -441,8 +443,9 @@ pub struct MountRequest {
   /// state directory format is the thing a CLI and a host have to agree about,
   /// and a long-lived host is exactly where a version skew shows up.
   pub state_format_version: u32,
+  /// The one path a mount needs (ADR 0011): state lives inside it, at
+  /// `.git/gfs`, and the control socket is derived from it.
   pub workspace: PathBuf,
-  pub state_dir: PathBuf,
   pub cache_dir: PathBuf,
   pub repository_id: String,
   pub revision_selector: String,

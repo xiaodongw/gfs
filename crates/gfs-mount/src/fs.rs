@@ -26,13 +26,17 @@
 //! runs on a blocking pool through `Gfs::blocking`, which keeps the same rule
 //! for the same reason.
 //!
-//! # Three worlds, resolved in one order
+//! # Four worlds, routed by subtree
 //!
-//! `lookup` consults, in order: the synthesized `.git` surface, the overlay, and
-//! the pinned base. The order is not arbitrary — the overlay's answer *replaces*
-//! the base's, including the answer "this path is gone" — and it is implemented
-//! once, in `Gfs::resolve_path`, so `readdir` and every mutation agree with
-//! `lookup` about what exists.
+//! ADR 0011's rule: the mount has exactly two subtree behaviours besides the
+//! projected tree, and nothing merged. `.git/**` is pure passthrough to the
+//! retained real directory; `.git/gfs/objects/**` is the pure object-store
+//! projection; everything else is the merged overlay-over-base view. The
+//! routing happens once per callback, on the parent's world, and inside the
+//! merged view the resolution order lives in `Gfs::resolve_path` — the
+//! overlay's answer *replaces* the base's, including the answer "this path is
+//! gone" — so `readdir` and every mutation agree with `lookup` about what
+//! exists.
 //!
 //! # Caching TTLs are long, and the overlay is what makes that need care
 //!
@@ -64,8 +68,10 @@ use gfs_types::{BytePath, EntryKind, ObjectId, Timestamp, TreeEntryInfo};
 use crate::attr::{attr_of, errno_of, errno_of_overlay, Ownership};
 use crate::cache::{BlobCache, CacheStats};
 use crate::client::SnapshotClient;
-use crate::gitdir::{GitDir, SynthNode, GIT_DIR};
 use crate::inode::{InodeTable, Node, Record, ROOT_INO};
+use crate::passthrough::{
+  errno_io, git_rel, in_object_namespace, odb_rel, GitMeta, GitPassthrough, OdbNode, GIT_DIR_NAME,
+};
 
 /// Inode numbers are never reused for a different path, so there is nothing for a
 /// generation to disambiguate. See the module docs on [`crate::inode`].
@@ -77,6 +83,25 @@ pub struct FsConfig {
   pub ttl: Duration,
   /// How long the kernel may cache the absence of a name.
   pub negative_ttl: Duration,
+  /// How long the kernel may cache `.git` passthrough entries and attributes.
+  ///
+  /// Short, and deliberately so: the daemon rewrites the shadowed state from
+  /// behind the mount on a repin (`HEAD`, refs, the index), so a long TTL
+  /// here would serve those files stale. m05c measured that the attribute TTL
+  /// is *not* the performance lever for the git subtree — negative dentries
+  /// are — so shortness costs nothing measured.
+  pub git_ttl: Duration,
+  /// How long the kernel may cache the absence of a name in the **object
+  /// namespace**: `.git/objects/**` and the `.git/gfs/objects/**` projection.
+  ///
+  /// This is ADR 0011's requirement, not an optimization: Git probes its
+  /// primary loose-object directories before packs and alternates — 6,524
+  /// ENOENT lookups for one linux `read-tree` (m05c) — and each probe is a
+  /// FUSE round trip unless the kernel remembers the absence. Coherent by
+  /// construction: the kernel drops a negative dentry when a name is created
+  /// through the mount, nothing mutates the shadowed state behind the
+  /// daemon's back, and the daemon itself never writes loose objects.
+  pub object_negative_ttl: Duration,
   pub directory_page_size: u32,
   /// Attempts for a retryable failure, including the first.
   pub attempts: u32,
@@ -98,6 +123,10 @@ impl Default for FsConfig {
       // entry the overlay could *create* is not, and the kernel invalidates on
       // its own creates but not on another process's.
       negative_ttl: Duration::from_secs(1),
+      git_ttl: Duration::from_secs(1),
+      // The m05c number: with 60 s every measured command lands within a few
+      // ms of local disk on the worst-case repository.
+      object_negative_ttl: Duration::from_secs(60),
       directory_page_size: gfs_types::limits::DEFAULT_DIRECTORY_PAGE_SIZE as u32,
       attempts: 3,
       // 1 GiB, on by default, which is the point of ADR 0009: a budget that has
@@ -136,7 +165,8 @@ pub struct FsStats {
 enum Child {
   Base(TreeEntryInfo),
   Overlay(Box<OverlayEntry>),
-  Synth { name: Vec<u8>, node: SynthNode },
+  Git { name: Vec<u8>, meta: GitMeta },
+  Odb { name: Vec<u8>, node: OdbNode },
 }
 
 impl Child {
@@ -144,7 +174,7 @@ impl Child {
     match self {
       Child::Base(entry) => entry.path.file_name().unwrap_or_default().to_vec(),
       Child::Overlay(entry) => entry.name(),
-      Child::Synth { name, .. } => name.clone(),
+      Child::Git { name, .. } | Child::Odb { name, .. } => name.clone(),
     }
   }
 
@@ -152,7 +182,8 @@ impl Child {
     match self {
       Child::Base(entry) => Node::Base(entry.clone()),
       Child::Overlay(entry) => Node::Overlay(entry.clone()),
-      Child::Synth { node, .. } => Node::Synth(node.clone()),
+      Child::Git { meta, .. } => Node::Git(*meta),
+      Child::Odb { node, .. } => Node::Odb(node.clone()),
     }
   }
 
@@ -160,7 +191,8 @@ impl Child {
     match self {
       Child::Base(entry) => file_type(entry.kind),
       Child::Overlay(entry) => file_type(entry.kind.to_entry_kind()),
-      Child::Synth { node, .. } => {
+      Child::Git { meta, .. } => meta.kind,
+      Child::Odb { node, .. } => {
         if node.is_dir() {
           fuser::FileType::Directory
         } else {
@@ -185,6 +217,10 @@ struct DirState {
   /// Names the base listing produced, which is what decides whether an overlay
   /// child still has to be appended.
   base_names: HashSet<Vec<u8>>,
+  /// A passthrough directory (git-relative path) whose real listing is still
+  /// pending. Deferred out of `opendir` so the `read_dir` walk runs on a
+  /// blocking worker inside `fill_directory`, never on the event loop.
+  git_pending: Option<Vec<u8>>,
 }
 
 #[derive(Debug)]
@@ -202,7 +238,15 @@ enum FileState {
     file: Arc<std::fs::File>,
     writable: bool,
   },
-  Synth(Arc<Vec<u8>>),
+  /// A real file of the shadowed `.git`, held open through the passthrough.
+  /// The handle keeps working across rename and unlink, exactly as a local
+  /// descriptor would — because it is one.
+  Git {
+    file: Arc<std::fs::File>,
+    writable: bool,
+  },
+  /// A projected object-store file, read block-wise from the shared store.
+  Odb { path: String },
 }
 
 /// What a path is, and what the pinned base has there.
@@ -217,16 +261,14 @@ struct Resolved {
 
 /// Everything about the pinned commit, swapped as one value.
 ///
-/// One struct behind one lock rather than four locks, because these four are
-/// only meaningful together: a reader that got the new commit's client and the
-/// old commit's `.git` surface would report a `HEAD` that does not describe the
-/// tree it is reading. The tree a job sees may change under it — that is what
-/// `git switch` does — but it must never be an interleaving of two commits'
-/// plumbing.
+/// One struct behind one lock rather than three locks, because these are only
+/// meaningful together: a reader that got the new commit's client and the old
+/// commit's overlay would answer about a tree neither describes. The `.git`
+/// passthrough is deliberately *not* in here: a repin re-seeds the real git
+/// dir on disk, but where the git dir lives never changes.
 #[derive(Debug)]
 pub struct Pinned {
   pub client: Arc<SnapshotClient>,
-  pub gitdir: Arc<GitDir>,
   pub overlay: Arc<Overlay>,
   pub snapshot_time: Timestamp,
 }
@@ -237,6 +279,9 @@ pub struct Gfs {
   /// clones the `Arc` and releases the lock — a guard held across an `await`
   /// would let a re-pin block every reader on the mount.
   pinned: RwLock<Arc<Pinned>>,
+  /// The `.git` passthrough and the embedded object projection (ADR 0011).
+  /// Constant across repins.
+  git: Arc<GitPassthrough>,
   cache: Arc<BlobCache>,
   config: FsConfig,
   owner: Ownership,
@@ -263,7 +308,7 @@ impl Gfs {
   pub fn new(
     client: Arc<SnapshotClient>,
     cache: Arc<BlobCache>,
-    gitdir: Arc<GitDir>,
+    git: Arc<GitPassthrough>,
     overlay: Arc<Overlay>,
     root: TreeEntryInfo,
     config: FsConfig,
@@ -276,10 +321,10 @@ impl Gfs {
     Arc::new(Gfs {
       pinned: RwLock::new(Arc::new(Pinned {
         client,
-        gitdir,
         overlay,
         snapshot_time,
       })),
+      git,
       cache,
       config,
       owner: Ownership::current(),
@@ -350,6 +395,11 @@ impl Gfs {
 
   pub fn overlay(&self) -> Arc<Overlay> {
     Arc::clone(&self.pinned().overlay)
+  }
+
+  /// The `.git` passthrough, for the daemon's odb attribution report.
+  pub fn git(&self) -> &Arc<GitPassthrough> {
+    &self.git
   }
 
   /// Live inodes and distinct paths ever numbered. Reported by `gfs inspect`.
@@ -475,24 +525,57 @@ impl Gfs {
     }
   }
 
-  /// Resolve one name under a parent.
+  /// Whether a lookup goes to the `.git` passthrough or the projection.
+  ///
+  /// True for the root's `.git` entry and for anything under a git or odb
+  /// parent. Everything else is the merged overlay-over-base view.
+  fn routes_to_git(parent: &Record, name: &[u8]) -> bool {
+    (parent.ino == ROOT_INO && name == GIT_DIR_NAME.as_bytes())
+      || parent.node.is_git()
+      || parent.node.is_odb()
+  }
+
+  /// Resolve one name inside the git subtree, and pick the negative TTL the
+  /// caller must use when the answer is "absent".
+  ///
+  /// The stat runs on a blocking worker: it is local disk, but ADR 0003's rule
+  /// is checked in one place and this keeps it checkable.
+  async fn lookup_git(&self, path: &BytePath) -> Result<Option<Node>, fuser::Errno> {
+    let Some(rel) = git_rel(path) else {
+      return Err(fuser::Errno::ENOENT);
+    };
+    // The projection boundary: `.git/gfs/objects` and everything below it is
+    // the manifest's tree, never the disk — the on-disk `gfs/` has no
+    // `objects`, and a real one would be skipped rather than merged.
+    if let Some(orel) = odb_rel(rel) {
+      return Ok(self.git.odb_node(orel).map(Node::Odb));
+    }
+    let git = Arc::clone(&self.git);
+    let rel = rel.to_vec();
+    let stat = tokio::task::spawn_blocking(move || git.stat(&rel))
+      .await
+      .map_err(|_| fuser::Errno::EIO)?;
+    match stat {
+      Ok(meta) => Ok(Some(Node::Git(meta))),
+      Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+      Err(e) => Err(errno_io(&e)),
+    }
+  }
+
+  /// The negative-entry TTL for an absent name under a git-subtree parent.
+  fn git_negative_ttl(&self, parent_rel: &[u8]) -> Duration {
+    if in_object_namespace(parent_rel) {
+      self.config.object_negative_ttl
+    } else {
+      // A repin creates names under `.git` (refs, the overlay's journal
+      // sidecars) from behind the mount, which the kernel cannot see — so
+      // absences outside the object namespace expire on the short TTL.
+      self.config.negative_ttl
+    }
+  }
+
+  /// Resolve one name under a parent in the merged view.
   async fn lookup_child(&self, parent: &Record, name: &[u8]) -> Result<Option<Node>, GfsError> {
-    // The synthesized surface first, so a repository that somehow contained a
-    // `.git` entry could not shadow it. Git refuses to record one, but the
-    // ordering costs nothing and removes the question.
-    if parent.ino == ROOT_INO && name == GIT_DIR {
-      return Ok(
-        self
-          .pinned()
-          .gitdir
-          .get(&BytePath::new(GIT_DIR.to_vec()))
-          .map(Node::Synth),
-      );
-    }
-    if parent.node.is_synth() {
-      let path = parent.path.join(name);
-      return Ok(self.pinned().gitdir.get(&path).map(Node::Synth));
-    }
     Ok(self.resolve_path(&parent.path.join(name)).await?.node)
   }
 
@@ -505,7 +588,7 @@ impl Gfs {
       Node::Base(entry) => base_facts(entry),
       // The overlay resolves the parent itself in that case, so the value is
       // unused -- but a wrong value would be worse than an absent one.
-      Node::Overlay(_) | Node::Synth(_) => None,
+      Node::Overlay(_) | Node::Git(_) | Node::Odb(_) => None,
     }
   }
 
@@ -614,6 +697,33 @@ impl Gfs {
 
   /// Fetch and merge directory pages until `wanted` children are known.
   async fn fill_directory(&self, state: &mut DirState, wanted: usize) -> Result<(), GfsError> {
+    // A passthrough directory lists once, from the real disk, on a blocking
+    // worker. `.git` directories are small; there is nothing to page.
+    if let Some(rel) = state.git_pending.take() {
+      let git = Arc::clone(&self.git);
+      let listing_rel = rel.clone();
+      let listed = tokio::task::spawn_blocking(move || git.list(&listing_rel))
+        .await
+        .map_err(|e| GfsError::internal(format!("the git listing task failed: {e}")))?
+        .map_err(|e| match e.kind() {
+          std::io::ErrorKind::NotFound => GfsError::not_found("the git directory vanished"),
+          _ => GfsError::internal(format!("listing a git directory: {e}")),
+        })?;
+      state.children = listed
+        .into_iter()
+        .map(|(name, meta)| Child::Git { name, meta })
+        .collect();
+      // The projection appears at `.git/gfs/objects` — injected as an Odb
+      // child, so the record behind its inode routes to the projection and
+      // never to a disk stat of a name the disk does not have.
+      if rel == crate::passthrough::STATE_SUBDIR.as_bytes() {
+        state.children.push(Child::Odb {
+          name: b"objects".to_vec(),
+          node: OdbNode::Dir,
+        });
+      }
+      state.complete = true;
+    }
     while !state.complete && state.children.len() < wanted {
       if state.base_done {
         // The base listing is exhausted, so anything the overlay holds that the
@@ -734,7 +844,11 @@ impl Gfs {
     let (base, source_oid) = match &record.node {
       Node::Overlay(entry) => (entry.base.clone(), entry.content.base_oid().cloned()),
       Node::Base(entry) => (base_facts(entry), Some(entry.oid.clone())),
-      Node::Synth(_) => return Err(GfsError::invalid("the .git surface is read-only")),
+      // Passthrough and projection entries never copy up: `.git` writes go to
+      // the real disk, and the projection is read-only.
+      Node::Git(_) | Node::Odb(_) => {
+        return Err(GfsError::invalid("the .git subtree has no overlay"))
+      }
     };
 
     if truncating {
@@ -915,12 +1029,48 @@ impl Filesystem for GfsFilesystem {
       let Some(parent) = fs.record(parent.0) else {
         return reply.error(Errno::ESTALE);
       };
+
+      // The `.git` subtree first, so a repository that somehow contained a
+      // `.git` entry could not shadow it. Git refuses to record one, but the
+      // ordering costs nothing and removes the question.
+      if Gfs::routes_to_git(&parent, &name) {
+        let path = parent.path.join(&name);
+        let parent_rel = git_rel(&parent.path).unwrap_or_default().to_vec();
+        match fs.lookup_git(&path).await {
+          Ok(Some(node)) => {
+            let record = fs
+              .inodes
+              .lock()
+              .expect("inode table")
+              .insert_lookup(path, node);
+            fs.bump(|s| s.lookups += 1);
+            reply.entry(&fs.config.git_ttl, &fs.attr(&record), GENERATION);
+          }
+          Ok(None) => {
+            fs.bump(|s| s.negative_lookups += 1);
+            // The negative dentry ADR 0011 requires on the object namespace:
+            // Git probes thousands of absent loose objects per command, and
+            // this is what keeps the repeats inside the kernel.
+            reply.entry(
+              &fs.git_negative_ttl(&parent_rel),
+              &negative_attr(),
+              GENERATION,
+            );
+          }
+          Err(errno) => {
+            fs.bump(|s| s.errors += 1);
+            reply.error(errno);
+          }
+        }
+        return;
+      }
+
       match fs.lookup_child(&parent, &name).await {
         Ok(Some(node)) => {
           let path = match &node {
             Node::Base(entry) => entry.path.clone(),
             Node::Overlay(entry) => entry.path.clone(),
-            Node::Synth(_) => parent.path.join(&name),
+            Node::Git(_) | Node::Odb(_) => parent.path.join(&name),
           };
           let record = fs
             .inodes
@@ -963,10 +1113,36 @@ impl Filesystem for GfsFilesystem {
     _fh: Option<FileHandle>,
     reply: fuser::ReplyAttr,
   ) {
-    // Answered inline: it never touches the network. Everything `getattr` needs
-    // was recorded by the `lookup` that made the kernel aware of the inode, and a
-    // mutation replies with the attributes it produced.
+    // Answered inline for the merged view: it never touches the network.
+    // Everything `getattr` needs was recorded by the `lookup` that made the
+    // kernel aware of the inode, and a mutation replies with the attributes it
+    // produced. Git passthrough entries re-stat instead — the real file's
+    // size and mtime move under lockfile churn, and Git compares them.
     match self.fs.record(ino.0) {
+      Some(record) if record.node.is_git() => {
+        let fs = Arc::clone(&self.fs);
+        self.spawn(async move {
+          let Some(rel) = git_rel(&record.path).map(<[u8]>::to_vec) else {
+            return reply.error(Errno::ESTALE);
+          };
+          let git = Arc::clone(&fs.git);
+          match tokio::task::spawn_blocking(move || git.stat(&rel)).await {
+            Ok(Ok(meta)) => {
+              let refreshed = {
+                let mut table = fs.inodes.lock().expect("inode table");
+                table.refresh(record.ino, Node::Git(meta));
+                table.get(record.ino).cloned()
+              };
+              match refreshed {
+                Some(record) => reply.attr(&fs.config.git_ttl, &fs.attr(&record)),
+                None => reply.error(Errno::ESTALE),
+              }
+            }
+            Ok(Err(e)) => reply.error(errno_io(&e)),
+            Err(_) => reply.error(Errno::EIO),
+          }
+        });
+      }
       Some(record) => reply.attr(&self.fs.config.ttl, &self.fs.attr(&record)),
       None => reply.error(Errno::ESTALE),
     }
@@ -978,6 +1154,21 @@ impl Filesystem for GfsFilesystem {
       let Some(record) = fs.record(ino.0) else {
         return reply.error(Errno::ESTALE);
       };
+      if let Node::Git(meta) = &record.node {
+        if meta.kind != fuser::FileType::Symlink {
+          return reply.error(Errno::EINVAL);
+        }
+        let git = Arc::clone(&fs.git);
+        let Some(rel) = git_rel(&record.path).map(<[u8]>::to_vec) else {
+          return reply.error(Errno::ESTALE);
+        };
+        let target = tokio::task::spawn_blocking(move || std::fs::read_link(git.real(&rel))).await;
+        return match target {
+          Ok(Ok(target)) => reply.data(target.as_os_str().as_bytes()),
+          Ok(Err(e)) => reply.error(errno_io(&e)),
+          Err(_) => reply.error(Errno::EIO),
+        };
+      }
       let (oid, expected) = match &record.node {
         Node::Overlay(entry) => {
           if entry.kind != OverlayKind::Symlink {
@@ -1005,7 +1196,7 @@ impl Filesystem for GfsFilesystem {
           }
           (entry.oid.clone(), entry.size)
         }
-        Node::Synth(_) => return reply.error(Errno::EINVAL),
+        Node::Git(_) | Node::Odb(_) => return reply.error(Errno::EINVAL),
       };
       match fs.open_blob(&blob_path(&record), &oid).await {
         Ok(file) => match read_all(&file, expected) {
@@ -1025,14 +1216,44 @@ impl Filesystem for GfsFilesystem {
       let Some(record) = fs.record(ino.0) else {
         return reply.error(Errno::ESTALE);
       };
-      if writable && record.node.is_synth() {
-        // ADR 0005 fixes the synthesized surface as read-only. It is not overlay
-        // content and there is nothing to copy it up into.
+      if writable && record.node.is_odb() {
+        // The projection is read-only by construction: its files are immutable
+        // by name, and a write here could only corrupt the shared store.
         return reply.error(Errno::EROFS);
       }
       let state = match &record.node {
-        Node::Synth(SynthNode::File(bytes)) => FileState::Synth(Arc::clone(bytes)),
-        Node::Synth(SynthNode::Dir) => return reply.error(Errno::EISDIR),
+        Node::Git(meta) => match meta.kind {
+          fuser::FileType::Directory => return reply.error(Errno::EISDIR),
+          fuser::FileType::Symlink => return reply.error(Errno::ELOOP),
+          _ => {
+            let Some(rel) = git_rel(&record.path).map(<[u8]>::to_vec) else {
+              return reply.error(Errno::ESTALE);
+            };
+            let git = Arc::clone(&fs.git);
+            let acc = flags.0 & libc::O_ACCMODE;
+            // O_APPEND is deliberately not forwarded: the kernel resolves
+            // append offsets before they reach FUSE, and a double-append
+            // would corrupt whatever Git was appending to (m05c's note).
+            let opened = tokio::task::spawn_blocking(move || {
+              std::fs::OpenOptions::new()
+                .read(acc != libc::O_WRONLY)
+                .write(acc != libc::O_RDONLY)
+                .truncate(truncating && acc != libc::O_RDONLY)
+                .open(git.real(&rel))
+            })
+            .await;
+            match opened {
+              Ok(Ok(file)) => FileState::Git {
+                file: Arc::new(file),
+                writable,
+              },
+              Ok(Err(e)) => return reply.error(errno_io(&e)),
+              Err(_) => return reply.error(Errno::EIO),
+            }
+          }
+        },
+        Node::Odb(OdbNode::Dir) => return reply.error(Errno::EISDIR),
+        Node::Odb(OdbNode::File { path, .. }) => FileState::Odb { path: path.clone() },
         Node::Overlay(entry) if entry.kind.is_dir() => return reply.error(Errno::EISDIR),
         Node::Overlay(entry) if entry.kind == OverlayKind::Symlink => {
           return reply.error(Errno::ELOOP)
@@ -1119,7 +1340,7 @@ impl Filesystem for GfsFilesystem {
     name: &OsStr,
     mode: u32,
     umask: u32,
-    _flags: i32,
+    flags: i32,
     reply: fuser::ReplyCreate,
   ) {
     let fs = Arc::clone(&self.fs);
@@ -1128,13 +1349,79 @@ impl Filesystem for GfsFilesystem {
       let Some(parent) = fs.record(parent.0) else {
         return reply.error(Errno::ESTALE);
       };
-      if parent.node.is_synth() {
+      if parent.node.is_odb() {
         return reply.error(Errno::EROFS);
       }
       if let Err(e) = check_name(&name) {
         return reply.error(e);
       }
       let path = parent.path.join(&name);
+      // The passthrough create. O_EXCL is forwarded faithfully — it is Git's
+      // lockfile protocol, and mapping it to a plain create would make every
+      // lock race invisible.
+      if parent.node.is_git() {
+        let Some(rel) = git_rel(&path).map(<[u8]>::to_vec) else {
+          return reply.error(Errno::EROFS);
+        };
+        if odb_rel(&rel).is_some() {
+          return reply.error(Errno::EROFS);
+        }
+        let git = Arc::clone(&fs.git);
+        let created = tokio::task::spawn_blocking(move || {
+          use std::os::unix::fs::OpenOptionsExt;
+          let mut opts = std::fs::OpenOptions::new();
+          let acc = flags & libc::O_ACCMODE;
+          opts
+            .read(acc != libc::O_WRONLY)
+            .write(true)
+            .truncate(flags & libc::O_TRUNC != 0)
+            .mode(mode & !umask & 0o7777);
+          if flags & libc::O_EXCL != 0 {
+            opts.create_new(true);
+          } else {
+            opts.create(true);
+          }
+          let file = opts.open(git.real(&rel))?;
+          let meta = GitMeta::of(&file.metadata()?);
+          Ok::<_, std::io::Error>((file, meta))
+        })
+        .await;
+        return match created {
+          Ok(Ok((file, meta))) => {
+            let record = fs
+              .inodes
+              .lock()
+              .expect("inode table")
+              .insert_lookup(path, Node::Git(meta));
+            let attr = fs.attr(&record);
+            let handle = fs.new_handle();
+            fs.inodes.lock().expect("inode table").open(record.ino);
+            fs.files.lock().expect("file handles").insert(
+              handle,
+              Arc::new(FileState::Git {
+                file: Arc::new(file),
+                writable: true,
+              }),
+            );
+            fs.bump(|s| {
+              s.lookups += 1;
+              s.opens += 1;
+            });
+            reply.created(
+              &fs.config.git_ttl,
+              &attr,
+              GENERATION,
+              FileHandle(handle),
+              fuser::FopenFlags::empty(),
+            )
+          }
+          Ok(Err(e)) => {
+            fs.bump(|s| s.errors += 1);
+            reply.error(errno_io(&e))
+          }
+          Err(_) => reply.error(Errno::EIO),
+        };
+      }
       let resolved = match fs.resolve_path(&path).await {
         Ok(resolved) => resolved,
         Err(e) => return reply.error(errno_of(&e)),
@@ -1216,16 +1503,38 @@ impl Filesystem for GfsFilesystem {
     };
     self.spawn(async move {
       let file = match &*state {
-        FileState::Synth(bytes) => {
-          let start = (offset as usize).min(bytes.len());
-          let end = start.saturating_add(size as usize).min(bytes.len());
-          fs.bump(|s| {
-            s.reads += 1;
-            s.read_bytes += (end - start) as u64;
-          });
-          return reply.data(&bytes[start..end]);
+        FileState::Odb { path } => {
+          // The projection read: absent blocks are fetched, resident ones
+          // served, and the cost attributed to this workspace's view.
+          let path = path.clone();
+          let store = Arc::clone(fs.git.store());
+          match store.read(&path, offset, size).await {
+            Ok((bytes, cost)) => {
+              fs.git.counters().add(&cost);
+              fs.bump(|s| {
+                s.reads += 1;
+                s.read_bytes += bytes.len() as u64;
+              });
+              return reply.data(&bytes);
+            }
+            Err(e) => {
+              // "Repacked away" is the one expected failure, and ESTALE is
+              // its errno: the name is gone, not wrong (ADR 0009's retention
+              // policy). Everything else is EIO.
+              let errno = if e.code == ErrorCode::FailedPrecondition {
+                Errno::ESTALE
+              } else {
+                Errno::EIO
+              };
+              tracing::warn!(path, offset, "odb read failed: {e}");
+              fs.bump(|s| s.errors += 1);
+              return reply.error(errno);
+            }
+          }
         }
-        FileState::Blob { file, .. } | FileState::Local { file, .. } => Arc::clone(file),
+        FileState::Blob { file, .. }
+        | FileState::Local { file, .. }
+        | FileState::Git { file, .. } => Arc::clone(file),
       };
       // Even a page-cache hit is a blocking syscall, and ADR 0003's measurement
       // is about what one blocked worker costs the whole mount.
@@ -1271,6 +1580,29 @@ impl Filesystem for GfsFilesystem {
     };
     let data = data.to_vec();
     self.spawn(async move {
+      // The passthrough write: straight to the real file. No overlay row, no
+      // journal — `.git` is Git's own state and the disk is its journal.
+      if let FileState::Git { file, writable } = &*state {
+        if !writable {
+          return reply.error(Errno::EBADF);
+        }
+        let file = Arc::clone(file);
+        let written = tokio::task::spawn_blocking(move || file.write_at(&data, offset)).await;
+        return match written {
+          Ok(Ok(n)) => {
+            fs.bump(|s| {
+              s.writes += 1;
+              s.written_bytes += n as u64;
+            });
+            reply.written(n as u32)
+          }
+          Ok(Err(e)) => {
+            fs.bump(|s| s.errors += 1);
+            reply.error(errno_io(&e))
+          }
+          Err(_) => reply.error(Errno::EIO),
+        };
+      }
       let (content_id, file) = match &*state {
         FileState::Local {
           content_id,
@@ -1371,6 +1703,21 @@ impl Filesystem for GfsFilesystem {
     let fs = Arc::clone(&self.fs);
     let state = fs.files.lock().expect("file handles").get(&fh.0).cloned();
     self.spawn(async move {
+      // A passthrough descriptor syncs the real file and nothing else: Git's
+      // durability protocol (lockfile, fsync, rename) is talking to its own
+      // directory, and the overlay journal has no part in it.
+      if let Some(FileState::Git { file, .. }) = state.as_deref() {
+        let file = Arc::clone(file);
+        return match tokio::task::spawn_blocking(move || file.sync_all()).await {
+          Ok(Ok(())) => reply.ok(),
+          Ok(Err(e)) => reply.error(errno_io(&e)),
+          Err(_) => reply.error(Errno::EIO),
+        };
+      }
+      // A projected file has nothing local to make durable.
+      if let Some(FileState::Odb { .. }) = state.as_deref() {
+        return reply.ok();
+      }
       // Both halves, and in this order: the content file, then the journal that
       // names it. The store's invariant is that a committed row's content
       // exists, and syncing the journal first would invert it for exactly the
@@ -1400,13 +1747,39 @@ impl Filesystem for GfsFilesystem {
   fn fsyncdir(
     &self,
     _req: &Request,
-    _ino: INodeNo,
+    ino: INodeNo,
     _fh: FileHandle,
     _datasync: bool,
     reply: fuser::ReplyEmpty,
   ) {
     let fs = Arc::clone(&self.fs);
     self.spawn(async move {
+      // Routed by subtree, and this routing is load-bearing rather than tidy:
+      // SQLite fsyncs the journal's own *directory* by its canonicalized
+      // on-disk path — which resolves through this very mount — on some
+      // commits. That request must sync the real directory and nothing else;
+      // reaching `overlay.sync()` here would try to take the overlay lock the
+      // committing thread already holds, and the mount would deadlock against
+      // its own journal (found live, on the first `echo >>` into a workspace).
+      if let Some(record) = fs.record(ino.0) {
+        if record.node.is_git() {
+          let git = Arc::clone(&fs.git);
+          let Some(rel) = git_rel(&record.path).map(<[u8]>::to_vec) else {
+            return reply.error(Errno::ESTALE);
+          };
+          let synced =
+            tokio::task::spawn_blocking(move || std::fs::File::open(git.real(&rel))?.sync_all())
+              .await;
+          return match synced {
+            Ok(Ok(())) => reply.ok(),
+            Ok(Err(e)) => reply.error(errno_io(&e)),
+            Err(_) => reply.error(Errno::EIO),
+          };
+        }
+        if record.node.is_odb() {
+          return reply.ok();
+        }
+      }
       let overlay = fs.overlay();
       match tokio::task::spawn_blocking(move || overlay.sync()).await {
         Ok(Ok(())) => reply.ok(),
@@ -1434,7 +1807,8 @@ impl Filesystem for GfsFilesystem {
     let size = match &record.node {
       Node::Base(entry) => entry.size,
       Node::Overlay(entry) => entry.size,
-      Node::Synth(node) => node.size(),
+      Node::Git(meta) => meta.size,
+      Node::Odb(node) => node.size(),
     } as i64;
     if offset < 0 || offset >= size {
       return reply.error(Errno::ENXIO);
@@ -1457,20 +1831,39 @@ impl Filesystem for GfsFilesystem {
       base_done: false,
       complete: false,
       base_names: HashSet::new(),
+      git_pending: None,
     };
     match &record.node {
-      Node::Synth(SynthNode::Dir) => {
+      Node::Git(meta) => {
+        if !meta.is_dir() {
+          return reply.error(Errno::ENOTDIR);
+        }
+        // The real listing is deferred to `fill_directory`, where it runs on
+        // a blocking worker rather than on this event-loop thread.
+        let Some(rel) = git_rel(&record.path).map(<[u8]>::to_vec) else {
+          return reply.error(Errno::ESTALE);
+        };
+        state.git_pending = Some(rel);
+      }
+      Node::Odb(node) => {
+        if !node.is_dir() {
+          return reply.error(Errno::ENOTDIR);
+        }
+        // The projection's tree is interned in memory, so this is a map walk,
+        // not disk.
+        let rel = git_rel(&record.path)
+          .and_then(odb_rel)
+          .unwrap_or_default()
+          .to_vec();
         state.children = self
           .fs
-          .pinned()
-          .gitdir
-          .children(&record.path)
+          .git
+          .odb_children(&rel)
           .into_iter()
-          .map(|(name, node)| Child::Synth { name, node })
+          .map(|(name, node)| Child::Odb { name, node })
           .collect();
         state.complete = true;
       }
-      Node::Synth(SynthNode::File(_)) => return reply.error(Errno::ENOTDIR),
       Node::Overlay(entry) if entry.kind.is_dir() => {
         // A created directory shadows the base, so there is nothing to page.
         state.base_done = self.fs.overlay().masks_base(&record.path);
@@ -1481,22 +1874,23 @@ impl Filesystem for GfsFilesystem {
         // erroring, which is what DESIGN.md section 8.2 specifies.
         EntryKind::Gitlink => state.complete = true,
         EntryKind::Directory => {
-          // The root carries the synthesized `.git` as its first child, so the
-          // offset of every other entry stays the same no matter how the listing
-          // pages. Appending it last would require exhausting the listing before
-          // the first entry could be emitted.
+          // The root carries `.git` as its first child, so the offset of
+          // every other entry stays the same no matter how the listing pages.
+          // Appending it last would require exhausting the listing before the
+          // first entry could be emitted. The meta is a placeholder a
+          // directory always satisfies; lookup and getattr re-stat.
           if ino.0 == ROOT_INO {
-            if let Some(node) = self
-              .fs
-              .pinned()
-              .gitdir
-              .get(&BytePath::new(GIT_DIR.to_vec()))
-            {
-              state.children.push(Child::Synth {
-                name: GIT_DIR.to_vec(),
-                node,
-              });
-            }
+            state.children.push(Child::Git {
+              name: GIT_DIR_NAME.as_bytes().to_vec(),
+              meta: GitMeta {
+                kind: fuser::FileType::Directory,
+                size: 0,
+                perm: 0o755,
+                nlink: 2,
+                mtime: std::time::UNIX_EPOCH,
+                ctime: std::time::UNIX_EPOCH,
+              },
+            });
           }
         }
         _ => return reply.error(Errno::ENOTDIR),
@@ -1651,11 +2045,18 @@ impl Filesystem for GfsFilesystem {
           .expect("inode table")
           .insert_readdirplus(path, child.node());
         let attr = fs.attr(&record);
+        // Passthrough entries take the short TTL for the reason lookup does:
+        // the daemon rewrites the shadowed state from behind the mount.
+        let ttl = if record.node.is_git() {
+          fs.config.git_ttl
+        } else {
+          fs.config.ttl
+        };
         if reply.add(
           INodeNo(record.ino),
           index + 1,
           OsStr::from_bytes(&name),
-          &fs.config.ttl,
+          &ttl,
           &attr,
           GENERATION,
         ) {
@@ -1689,10 +2090,10 @@ impl Filesystem for GfsFilesystem {
       return reply.error(Errno::ESTALE);
     };
     let attr = self.fs.attr(&record);
-    if mask.contains(AccessFlags::W_OK) && record.node.is_synth() {
-      // `EROFS` for the synthesized surface only. The rest of the mount is
-      // writable through the overlay, and POSIX distinguishes "you may not" from
-      // "nobody may, because this is read-only".
+    if mask.contains(AccessFlags::W_OK) && record.node.is_odb() {
+      // `EROFS` for the projection only. The rest of the mount — the overlay
+      // view and the real `.git` — is writable, and POSIX distinguishes "you
+      // may not" from "nobody may, because this is read-only".
       return reply.error(Errno::EROFS);
     }
     if mask.contains(AccessFlags::X_OK) && attr.perm & 0o111 == 0 {
@@ -1771,13 +2172,59 @@ impl Filesystem for GfsFilesystem {
       let Some(record) = fs.record(ino.0) else {
         return reply.error(Errno::ESTALE);
       };
-      if record.node.is_synth() {
+      if record.node.is_odb() {
         return reply.error(Errno::EROFS);
+      }
+      // The passthrough setattr: chmod, truncate, and utimens land on the real
+      // file, exactly as they would without the mount in between. `tar -x` and
+      // `cp -a` over a `.git` are the callers that need the times.
+      if record.node.is_git() {
+        let Some(rel) = git_rel(&record.path).map(<[u8]>::to_vec) else {
+          return reply.error(Errno::ESTALE);
+        };
+        let git = Arc::clone(&fs.git);
+        let requested_mtime = mtime.map(|m| match m {
+          fuser::TimeOrNow::SpecificTime(t) => t,
+          fuser::TimeOrNow::Now => std::time::SystemTime::now(),
+        });
+        let outcome = tokio::task::spawn_blocking(move || {
+          let real = git.real(&rel);
+          if let Some(mode) = mode {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&real, std::fs::Permissions::from_mode(mode & 0o7777))?;
+          }
+          if let Some(size) = size {
+            std::fs::OpenOptions::new()
+              .write(true)
+              .open(&real)
+              .and_then(|f| f.set_len(size))?;
+          }
+          if requested_mtime.is_some() {
+            crate::passthrough::set_times(&real, None, requested_mtime)?;
+          }
+          git.stat(&rel)
+        })
+        .await;
+        return match outcome {
+          Ok(Ok(meta)) => {
+            let refreshed = {
+              let mut table = fs.inodes.lock().expect("inode table");
+              table.refresh(record.ino, Node::Git(meta));
+              table.get(record.ino).cloned()
+            };
+            match refreshed {
+              Some(record) => reply.attr(&fs.config.git_ttl, &fs.attr(&record)),
+              None => reply.error(Errno::ESTALE),
+            }
+          }
+          Ok(Err(e)) => reply.error(errno_io(&e)),
+          Err(_) => reply.error(Errno::EIO),
+        };
       }
       let base = match &record.node {
         Node::Overlay(entry) => entry.base.clone(),
         Node::Base(entry) => base_facts(entry),
-        Node::Synth(_) => None,
+        Node::Git(_) | Node::Odb(_) => None,
       };
 
       if let Some(size) = size {
@@ -1849,13 +2296,27 @@ impl Filesystem for GfsFilesystem {
       let Some(parent) = fs.record(parent.0) else {
         return reply.error(Errno::ESTALE);
       };
-      if parent.node.is_synth() {
+      if parent.node.is_odb() {
         return reply.error(Errno::EROFS);
       }
       if let Err(e) = check_name(&name) {
         return reply.error(e);
       }
       let path = parent.path.join(&name);
+      if parent.node.is_git() {
+        // The passthrough mkdir: loose-object fan-out directories
+        // (`objects/ab/`) are the common caller.
+        return match fs
+          .git_mutate_entry(&path, |real| std::fs::create_dir(real))
+          .await
+        {
+          Ok(record) => reply.entry(&fs.config.git_ttl, &fs.attr(&record), GENERATION),
+          Err(errno) => {
+            fs.bump(|s| s.errors += 1);
+            reply.error(errno)
+          }
+        };
+      }
       let resolved = match fs.resolve_path(&path).await {
         Ok(resolved) => resolved,
         Err(e) => return reply.error(errno_of(&e)),
@@ -1898,13 +2359,26 @@ impl Filesystem for GfsFilesystem {
       let Some(parent) = fs.record(parent.0) else {
         return reply.error(Errno::ESTALE);
       };
-      if parent.node.is_synth() {
+      if parent.node.is_odb() {
         return reply.error(Errno::EROFS);
       }
       if let Err(e) = check_name(&name) {
         return reply.error(e);
       }
       let path = parent.path.join(&name);
+      if parent.node.is_git() {
+        let target = std::path::PathBuf::from(std::ffi::OsStr::from_bytes(&target).to_os_string());
+        return match fs
+          .git_mutate_entry(&path, move |real| std::os::unix::fs::symlink(&target, real))
+          .await
+        {
+          Ok(record) => reply.entry(&fs.config.git_ttl, &fs.attr(&record), GENERATION),
+          Err(errno) => {
+            fs.bump(|s| s.errors += 1);
+            reply.error(errno)
+          }
+        };
+      }
       let resolved = match fs.resolve_path(&path).await {
         Ok(resolved) => resolved,
         Err(e) => return reply.error(errno_of(&e)),
@@ -1985,16 +2459,49 @@ impl Filesystem for GfsFilesystem {
   fn link(
     &self,
     _req: &Request,
-    _ino: INodeNo,
-    _newparent: INodeNo,
-    _newname: &OsStr,
+    ino: INodeNo,
+    newparent: INodeNo,
+    newname: &OsStr,
     reply: fuser::ReplyEntry,
   ) {
-    // `EPERM`, not `EROFS`: DESIGN.md section 8.2 fixes hard links as unsupported
-    // for the life of the MVP because Git has no hard links and the overlay does
-    // not model them. Reporting it as a consequence of read-only would be
-    // misleading now that the mount is writable.
-    reply.error(Errno::EPERM);
+    // Inside `.git`, hard links are real: `git clone --local` and pack
+    // plumbing use them, and the passthrough forwards to a filesystem that
+    // has them. Everywhere else `EPERM` stands — not `EROFS` — because
+    // DESIGN.md section 8.2 fixes hard links as unsupported in the tree: Git
+    // has no hard links to model and the overlay does not model them either.
+    let fs = Arc::clone(&self.fs);
+    let newname = newname.as_bytes().to_vec();
+    self.spawn(async move {
+      let (Some(source), Some(parent)) = (fs.record(ino.0), fs.record(newparent.0)) else {
+        return reply.error(Errno::ESTALE);
+      };
+      if !(source.node.is_git() && parent.node.is_git()) {
+        return reply.error(Errno::EPERM);
+      }
+      if let Err(e) = check_name(&newname) {
+        return reply.error(e);
+      }
+      let Some(source_rel) = git_rel(&source.path).map(<[u8]>::to_vec) else {
+        return reply.error(Errno::EPERM);
+      };
+      if odb_rel(&source_rel).is_some() {
+        return reply.error(Errno::EROFS);
+      }
+      let path = parent.path.join(&newname);
+      let git = Arc::clone(&fs.git);
+      match fs
+        .git_mutate_entry(&path, move |real| {
+          std::fs::hard_link(git.real(&source_rel), real)
+        })
+        .await
+      {
+        Ok(record) => reply.entry(&fs.config.git_ttl, &fs.attr(&record), GENERATION),
+        Err(errno) => {
+          fs.bump(|s| s.errors += 1);
+          reply.error(errno)
+        }
+      }
+    });
   }
 
   fn mknod(
@@ -2037,8 +2544,26 @@ impl Filesystem for GfsFilesystem {
       let Some(record) = fs.record(ino.0) else {
         return reply.error(Errno::ESTALE);
       };
-      if record.node.is_synth() {
+      if record.node.is_odb() {
         return reply.error(Errno::EROFS);
+      }
+      if record.node.is_git() {
+        // Plain allocation on a real file: extend it, matching the overlay's
+        // semantics below. Git itself never calls this; `pjdfstest` does.
+        let wanted = offset.saturating_add(length);
+        return match fs
+          .git_mutate(&record.path, move |real| {
+            let file = std::fs::OpenOptions::new().write(true).open(real)?;
+            if file.metadata()?.len() < wanted {
+              file.set_len(wanted)?;
+            }
+            Ok(())
+          })
+          .await
+        {
+          Ok(()) => reply.ok(),
+          Err(errno) => reply.error(errno),
+        };
       }
       if let Err(e) = fs.copy_up(&record, false).await {
         return reply.error(errno_of(&e));
@@ -2097,13 +2622,76 @@ impl Filesystem for GfsFilesystem {
 }
 
 impl Gfs {
+  /// Run a passthrough mutation that creates `path`, stat what it made, and
+  /// publish the record for the reply.
+  ///
+  /// The projection subtree is refused before the disk is touched: `.git/gfs/
+  /// objects` is not backed by the real directory, and a mutation that landed
+  /// there on disk would create the merged namespace ADR 0011 forbids.
+  async fn git_mutate_entry<F>(&self, path: &BytePath, op: F) -> Result<Record, Errno>
+  where
+    F: FnOnce(&std::path::Path) -> std::io::Result<()> + Send + 'static,
+  {
+    let Some(rel) = git_rel(path).map(<[u8]>::to_vec) else {
+      return Err(Errno::EROFS);
+    };
+    if odb_rel(&rel).is_some() {
+      return Err(Errno::EROFS);
+    }
+    let git = Arc::clone(&self.git);
+    let meta = tokio::task::spawn_blocking(move || {
+      op(&git.real(&rel))?;
+      git.stat(&rel)
+    })
+    .await
+    .map_err(|_| Errno::EIO)?
+    .map_err(|e| errno_io(&e))?;
+    let record = self
+      .inodes
+      .lock()
+      .expect("inode table")
+      .insert_lookup(path.clone(), Node::Git(meta));
+    self.bump(|s| s.lookups += 1);
+    Ok(record)
+  }
+
+  /// A passthrough removal or rename: the operation itself, no record to
+  /// publish.
+  async fn git_mutate<F>(&self, path: &BytePath, op: F) -> Result<(), Errno>
+  where
+    F: FnOnce(&std::path::Path) -> std::io::Result<()> + Send + 'static,
+  {
+    let Some(rel) = git_rel(path).map(<[u8]>::to_vec) else {
+      return Err(Errno::EROFS);
+    };
+    if odb_rel(&rel).is_some() {
+      return Err(Errno::EROFS);
+    }
+    let git = Arc::clone(&self.git);
+    tokio::task::spawn_blocking(move || op(&git.real(&rel)))
+      .await
+      .map_err(|_| Errno::EIO)?
+      .map_err(|e| errno_io(&e))
+  }
+
   /// `unlink` and `rmdir`, which differ only in what they expect to find.
   async fn remove_child(&self, parent: u64, name: &[u8], expect_dir: bool) -> Result<(), Errno> {
     let parent = self.record(parent).ok_or(Errno::ESTALE)?;
-    if parent.node.is_synth() {
+    if parent.node.is_odb() {
       return Err(Errno::EROFS);
     }
     let path = parent.path.join(name);
+    if parent.node.is_git() {
+      return self
+        .git_mutate(&path, move |real| {
+          if expect_dir {
+            std::fs::remove_dir(real)
+          } else {
+            std::fs::remove_file(real)
+          }
+        })
+        .await;
+    }
     let resolved = self.resolve_path(&path).await.map_err(|e| errno_of(&e))?;
     if resolved.node.is_none() {
       return Err(Errno::ENOENT);
@@ -2142,7 +2730,8 @@ impl Gfs {
   /// the empty path an overlay row would create a second spelling of the root for
   /// every resolver that walks ancestors.
   async fn touch_parent(&self, parent: &Record) {
-    if parent.path.is_empty() || parent.node.is_synth() {
+    if parent.path.is_empty() || parent.node.is_git() || parent.node.is_odb() {
+      // A real directory's mtime advances by itself; the projection has none.
       return;
     }
     let overlay = self.overlay();
@@ -2186,12 +2775,51 @@ impl Gfs {
 
     let from_parent = self.record(parent).ok_or(Errno::ESTALE)?;
     let to_parent = self.record(newparent).ok_or(Errno::ESTALE)?;
-    if from_parent.node.is_synth() || to_parent.node.is_synth() {
+    if from_parent.node.is_odb() || to_parent.node.is_odb() {
       return Err(Errno::EROFS);
+    }
+    // A rename never crosses the passthrough boundary: `.git` and the tree
+    // are different worlds with different backing, and `EXDEV` is what makes
+    // `mv` fall back to copy+delete — the only correct translation.
+    if from_parent.node.is_git() != to_parent.node.is_git() {
+      return Err(Errno::EXDEV);
     }
     check_name(newname)?;
     let from = from_parent.path.join(name);
     let to = to_parent.path.join(newname);
+
+    if from_parent.node.is_git() {
+      let (Some(from_rel), Some(to_rel)) = (git_rel(&from), git_rel(&to)) else {
+        return Err(Errno::EXDEV);
+      };
+      if odb_rel(from_rel).is_some() || odb_rel(to_rel).is_some() {
+        return Err(Errno::EROFS);
+      }
+      let (from_rel, to_rel) = (from_rel.to_vec(), to_rel.to_vec());
+      let git = Arc::clone(&self.git);
+      tokio::task::spawn_blocking(move || {
+        let target = git.real(&to_rel);
+        // Emulated rather than `renameat2`: Git's own atomicity protocol is
+        // `O_EXCL` create plus plain rename, so the small window here is not
+        // one Git stands in.
+        if no_replace && std::fs::symlink_metadata(&target).is_ok() {
+          return Err(std::io::Error::from_raw_os_error(libc::EEXIST));
+        }
+        std::fs::rename(git.real(&from_rel), target)
+      })
+      .await
+      .map_err(|_| Errno::EIO)?
+      .map_err(|e| errno_io(&e))?;
+      // The kernel relinks the dentry it has; the table must follow, exactly
+      // as in the overlay case below. Git records carry no per-path state
+      // beyond the meta snapshot, so no refresh pass is needed.
+      let _ = self
+        .inodes
+        .lock()
+        .expect("inode table")
+        .rename_subtree(&from, &to);
+      return Ok(());
+    }
 
     let source = self.resolve_path(&from).await.map_err(|e| errno_of(&e))?;
     let Some(source_node) = &source.node else {
@@ -2202,7 +2830,7 @@ impl Gfs {
     let source_is_dir = match source_node {
       Node::Base(entry) => entry.kind.is_dir_like(),
       Node::Overlay(entry) => entry.kind.is_dir(),
-      Node::Synth(_) => return Err(Errno::EROFS),
+      Node::Git(_) | Node::Odb(_) => return Err(Errno::EXDEV),
     };
     let descendants = if source_is_dir {
       self
@@ -2217,7 +2845,8 @@ impl Gfs {
     let target_is_dir = match &target.node {
       Some(Node::Base(entry)) => entry.kind.is_dir_like(),
       Some(Node::Overlay(entry)) => entry.kind.is_dir(),
-      Some(Node::Synth(node)) => node.is_dir(),
+      Some(Node::Git(meta)) => meta.is_dir(),
+      Some(Node::Odb(node)) => node.is_dir(),
       None => false,
     };
     let to_empty = if target_is_dir {

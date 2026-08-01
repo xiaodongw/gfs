@@ -176,11 +176,13 @@ if [ -c /dev/fuse ] && command -v fusermount3 >/dev/null 2>&1; then
   # read-only, so every removal fails, and ADR 0003 measured that a mount point
   # outlives its daemon and answers ENOTCONN until something unmounts it.
   $GFS unmount --workspace "$WS" >/dev/null 2>&1 || true
+  fusermount3 -u -z "$WS" >/dev/null 2>&1 || true
+  # Legacy layouts: the pre-ADR-0011 sibling state directory and the
+  # pre-ADR-0003 generations tree.
   for gen in "$WS.gfs"/generations/*; do
     [ -d "$gen" ] && fusermount3 -u -z "$gen" >/dev/null 2>&1 || true
   done
-  rm -f "$WS"
-  rm -rf "$WS.gfs"
+  rm -rf "$WS" "$WS.gfs"
   # Whatever happens below, do not leave a daemon behind.
   # shellcheck disable=SC2317
   cleanup_mount() { $GFS unmount --workspace "$WS" >/dev/null 2>&1 || true; }
@@ -248,7 +250,9 @@ if [ -c /dev/fuse ] && command -v fusermount3 >/dev/null 2>&1; then
 
   say "discard the workspace, and refresh publishes a new generation atomically"
   $GFS unmount --workspace "$WS" >/dev/null
-  rm -rf "$WS.gfs"
+  # The state travels inside the folder (ADR 0011), so discarding the
+  # workspace is one removal.
+  rm -rf "$WS"
   $GFS mount --repo basic --rev main --workspace "$WS" >/dev/null
   $GFS refresh --workspace "$WS"
 

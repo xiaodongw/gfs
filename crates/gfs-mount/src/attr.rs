@@ -24,8 +24,9 @@
 //! documented MVP boundary rather than an oversight — an exported tree could not
 //! reproduce them.
 //!
-//! The synthesized `.git` surface stays read-only. It is not overlay content and
-//! there is nothing to copy it up into.
+//! The `.git` passthrough reports the real file's own mode (ADR 0011) — Git
+//! checks `access(W_OK)` on files it rewrites — and the object projection at
+//! `.git/gfs/objects` stays read-only.
 //!
 //! # Ownership
 //!
@@ -48,8 +49,8 @@ use gfs_types::{EntryKind, Timestamp};
 
 use gfs_overlay::{Condition, OverlayError, OverlayKind};
 
-use crate::gitdir::SynthNode;
 use crate::inode::{Node, Record};
+use crate::passthrough::OdbNode;
 
 /// Who the mount reports as owner, fixed at daemon start.
 #[derive(Clone, Copy, Debug)]
@@ -130,14 +131,19 @@ pub fn attr_of(record: &Record, snapshot_time: Timestamp, owner: Ownership) -> F
       OverlayKind::Symlink => (FileType::Symlink, 0o777, entry.size, 1),
       OverlayKind::Directory => (FileType::Directory, 0o755, 0, 2),
     },
-    Node::Synth(node) => match node {
-      SynthNode::Dir => (FileType::Directory, 0o555, 0, 2),
-      SynthNode::File(bytes) => (FileType::RegularFile, 0o444, bytes.len() as u64, 1),
+    // The passthrough's snapshot of the real file. Its short TTL, plus the
+    // fresh stat every lookup/getattr does, is what keeps this honest.
+    Node::Git(meta) => (meta.kind, meta.perm, meta.size, meta.nlink),
+    Node::Odb(node) => match node {
+      OdbNode::Dir => (FileType::Directory, 0o555, 0, 2),
+      OdbNode::File { size, .. } => (FileType::RegularFile, 0o444, *size, 1),
     },
   };
 
   let (mtime, ctime) = match &record.node {
     Node::Overlay(entry) => (to_system_time(entry.mtime), to_system_time(entry.ctime)),
+    // The real file's own times: Git compares index stat data against them.
+    Node::Git(meta) => (meta.mtime, meta.ctime),
     _ => {
       let time = to_system_time(snapshot_time);
       (time, time)

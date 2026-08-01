@@ -26,10 +26,10 @@
 //!
 //! # Why `.git` shares the table
 //!
-//! Git refuses to record a tree entry named `.git` at any level, so a synthesized
-//! `.git` path can never collide with a base path. One table therefore needs no
-//! namespace tag, and `lookup` does not have to ask which world a path belongs to
-//! before it can answer.
+//! Git refuses to record a tree entry named `.git` at any level, so a `.git`
+//! path can never collide with a base path. One table therefore needs no
+//! namespace tag, and `lookup` does not have to ask which world a path belongs
+//! to before it can answer.
 
 use std::collections::HashMap;
 
@@ -37,7 +37,7 @@ use gfs_types::{BytePath, TreeEntryInfo};
 
 use gfs_overlay::OverlayEntry;
 
-use crate::gitdir::SynthNode;
+use crate::passthrough::{GitMeta, OdbNode};
 
 /// The FUSE root inode. Fixed by the protocol, not by us.
 pub const ROOT_INO: u64 = 1;
@@ -50,13 +50,23 @@ pub enum Node {
   /// An entry the overlay supplies: created, copied up, renamed, or with a mode
   /// the base does not have.
   Overlay(Box<OverlayEntry>),
-  /// Part of the synthesized read-only `.git` surface (ADR 0005).
-  Synth(SynthNode),
+  /// A real entry of the shadowed `.git`, passed through (ADR 0011). The meta
+  /// is a snapshot; the passthrough re-stats on lookup and getattr.
+  Git(GitMeta),
+  /// An entry of the object-store projection at `.git/gfs/objects` (ADR 0009,
+  /// presented inside the one mount by ADR 0011).
+  Odb(OdbNode),
 }
 
 impl Node {
-  pub fn is_synth(&self) -> bool {
-    matches!(self, Node::Synth(_))
+  /// Whether this inode belongs to the `.git` passthrough subtree.
+  pub fn is_git(&self) -> bool {
+    matches!(self, Node::Git(_))
+  }
+
+  /// Whether this inode belongs to the read-only object projection.
+  pub fn is_odb(&self) -> bool {
+    matches!(self, Node::Odb(_))
   }
 
   /// The inode number the node insists on, if it has one of its own.

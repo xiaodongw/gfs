@@ -50,6 +50,12 @@ cleanup() {
   shopt -s nullglob
   # Ask each daemon to unmount first, while the gateway is still up, so it can
   # release its lease rather than leaving the gateway holding one until expiry.
+  # A workspace is any lab directory carrying its own `.git/gfs` (ADR 0011);
+  # the `*.gfs` sibling shape is the pre-ADR-0011 layout, swept for a lab left
+  # behind by an older build.
+  for ws in "$LAB"/*/; do
+    [ -d "$ws/.git/gfs" ] && ./target/debug/gfs unmount --workspace "${ws%/}" >/dev/null 2>&1 || true
+  done
   for state in "$LAB"/*.gfs; do
     ./target/debug/gfs unmount --workspace "${state%.gfs}" >/dev/null 2>&1 || true
   done
@@ -58,6 +64,9 @@ cleanup() {
   # the *next* run fail confusingly. The workspace is the mount point, so that is
   # what gets forced; `generations/*` is swept too, for a lab left behind by a
   # build from before ADR 0003's second amendment.
+  for ws in "$LAB"/*/; do
+    fusermount3 -u -z "${ws%/}" >/dev/null 2>&1 || true
+  done
   for state in "$LAB"/*.gfs; do
     fusermount3 -u -z "${state%.gfs}" >/dev/null 2>&1 || true
   done

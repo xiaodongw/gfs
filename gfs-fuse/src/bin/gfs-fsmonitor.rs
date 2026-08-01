@@ -82,15 +82,21 @@ fn answer(version_ok: bool, token: &str) -> Option<(String, Vec<String>, bool)> 
 
 /// Walk from the worktree root to the daemon's control socket.
 ///
-/// cwd is the worktree root (Git sets it for hooks). `.git` there is a file
-/// whose `gitdir:` names the seeded git dir; `gfs.json` inside names the
-/// socket. Nothing else is trusted: a workspace this walk does not recognize
-/// gets a full-rescan answer, never a guess.
+/// cwd is the worktree root (Git sets it for hooks). `.git` there is a real
+/// directory (ADR 0011) holding `gfs.json`, which names the socket; the
+/// gitfile shape is still read so this hook keeps working against a
+/// pre-ADR-0011 daemon. Nothing else is trusted: a workspace this walk does
+/// not recognize gets a full-rescan answer, never a guess.
 fn find_control_socket() -> Option<PathBuf> {
   let cwd = std::env::current_dir().ok()?;
-  let git_file = std::fs::read_to_string(cwd.join(".git")).ok()?;
-  let git_dir = git_file.trim().strip_prefix("gitdir: ")?;
-  let facts = std::fs::read_to_string(PathBuf::from(git_dir).join("gfs.json")).ok()?;
+  let dotgit = cwd.join(".git");
+  let git_dir = if dotgit.is_dir() {
+    dotgit
+  } else {
+    let git_file = std::fs::read_to_string(&dotgit).ok()?;
+    PathBuf::from(git_file.trim().strip_prefix("gitdir: ")?)
+  };
+  let facts = std::fs::read_to_string(git_dir.join("gfs.json")).ok()?;
   let facts: serde_json::Value = serde_json::from_str(&facts).ok()?;
   Some(PathBuf::from(facts.get("control_socket")?.as_str()?))
 }

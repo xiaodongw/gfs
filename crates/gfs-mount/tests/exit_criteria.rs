@@ -39,7 +39,6 @@ async fn criterion_1_cold_mount_meets_the_startup_and_download_target() {
       &backend,
       "main",
       &workspace,
-      &tmp.path().join("ws.gfs"),
       cache.path(),
       gfs_overlay::OverlayConfig::default(),
     ))
@@ -235,7 +234,6 @@ async fn criterion_6_daemon_failure_does_not_corrupt_the_shared_cache() {
         &backend,
         "main",
         &tmp.path().join("ws"),
-        &tmp.path().join("ws.gfs"),
         cache_dir.path(),
         gfs_overlay::OverlayConfig::default(),
       ))
@@ -284,7 +282,6 @@ async fn criterion_6_daemon_failure_does_not_corrupt_the_shared_cache() {
       &backend,
       "main",
       &tmp.path().join("ws"),
-      &tmp.path().join("ws.gfs"),
       cache_dir.path(),
       gfs_overlay::OverlayConfig::default(),
     ))

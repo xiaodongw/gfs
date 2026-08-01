@@ -8,7 +8,6 @@
 use std::sync::Arc;
 
 use gfs_mount::control::{self, HostRequest, HostResponse, Request, Response};
-use gfs_mount::state::MountState;
 use gfs_mount::MountHost;
 use gfs_test::mount::{host_config, on_fs, Backend, Job};
 
@@ -19,7 +18,7 @@ async fn two_workspaces_on_one_host_are_served_independently() {
   // that is what every command below `gfs mount` assumes.
   let backend = Backend::start("basic").await;
   let job = Job::start(&backend, "main").await;
-  let (second, second_workspace, second_state) = job.alongside(&backend, "main", "other").await;
+  let (second, second_workspace, _second_state) = job.alongside(&backend, "main", "other").await;
 
   let (first_bytes, second_bytes) = {
     let a = job.workspace.clone();
@@ -36,16 +35,16 @@ async fn two_workspaces_on_one_host_are_served_independently() {
   assert_eq!(second_bytes, first_bytes);
 
   // Two sockets, two mount identities, one process.
-  assert!(control::is_live(&MountState::control_socket(
-    &job.state_dir
-  )));
-  assert!(control::is_live(&MountState::control_socket(&second_state)));
+  assert!(control::is_live(&job.socket()));
+  assert!(control::is_live(
+    &gfs_mount::state::workspace_control_socket(&second_workspace)
+  ));
   assert_ne!(job.daemon.inspect().mount_id, second.inspect().mount_id);
   assert_eq!(job.daemon.inspect().daemon_pid, second.inspect().daemon_pid);
 
   // Unmounting one must not disturb the other. This is the property the old
   // one-process-per-mount model got for free and the host has to earn.
-  let socket = MountState::control_socket(&second_state);
+  let socket = gfs_mount::state::workspace_control_socket(&second_workspace);
   let reply = on_fs(move || control::call(&socket, &Request::Unmount).unwrap()).await;
   assert!(matches!(reply, Response::Unmounted));
 
@@ -54,14 +53,18 @@ async fn two_workspaces_on_one_host_are_served_independently() {
     on_fs(move || std::fs::read(a.join("README.md")).unwrap()).await
   };
   assert_eq!(still_there, b"# basic\n");
-  // The other workspace is an empty directory again. The mount point survives
-  // the unmount -- see `lifecycle.rs` -- so "empty" rather than "absent" is what
-  // distinguishes a released mount from a live one.
+  // The other workspace holds only its own `.git` again (ADR 0011). The mount
+  // point survives the unmount -- see `lifecycle.rs` -- so "just .git" rather
+  // than "absent" is what distinguishes a released mount from a live one.
   let released = second_workspace.clone();
   on_fs(move || {
+    let names: Vec<_> = std::fs::read_dir(&released)
+      .unwrap()
+      .map(|e| e.unwrap().file_name())
+      .collect();
     assert_eq!(
-      std::fs::read_dir(&released).unwrap().count(),
-      0,
+      names,
+      vec![std::ffi::OsString::from(".git")],
       "the other workspace stopped serving its commit"
     );
   })
@@ -141,9 +144,14 @@ async fn the_host_socket_reports_and_tears_down_its_mounts() {
     call(&socket, destroy).await,
     HostResponse::Destroyed
   ));
+  // Holding only its own `.git` again (ADR 0011): the projected tree is gone.
+  let released: Vec<_> = std::fs::read_dir(&second_workspace)
+    .unwrap()
+    .map(|e| e.unwrap().file_name())
+    .collect();
   assert_eq!(
-    std::fs::read_dir(&second_workspace).unwrap().count(),
-    0,
+    released,
+    vec![std::ffi::OsString::from(".git")],
     "the destroyed mount stopped serving its commit"
   );
 
@@ -182,7 +190,6 @@ async fn a_client_from_another_state_format_is_refused_rather_than_served() {
   let request = gfs_mount::control::MountRequest {
     state_format_version: gfs_types::STATE_FORMAT_VERSION + 1,
     workspace: tmp.path().join("ws"),
-    state_dir: tmp.path().join("ws.gfs"),
     cache_dir: tmp.path().join("cache"),
     repository_id: backend.repo_id.as_str().to_owned(),
     revision_selector: "main".to_owned(),
@@ -223,11 +230,9 @@ async fn a_mount_created_over_the_host_socket_is_usable_immediately() {
   tokio::spawn(Arc::clone(&host).serve(listener));
 
   let workspace = tmp.path().join("ws");
-  let state_dir = tmp.path().join("ws.gfs");
   let request = gfs_mount::control::MountRequest {
     state_format_version: gfs_types::STATE_FORMAT_VERSION,
     workspace: workspace.clone(),
-    state_dir: state_dir.clone(),
     cache_dir: tmp.path().join("cache"),
     repository_id: backend.repo_id.as_str().to_owned(),
     revision_selector: "main".to_owned(),
@@ -246,7 +251,9 @@ async fn a_mount_created_over_the_host_socket_is_usable_immediately() {
   };
 
   // No sleep, no polling: both of these must hold the instant the reply lands.
-  assert!(control::is_live(&MountState::control_socket(&state_dir)));
+  assert!(control::is_live(
+    &gfs_mount::state::workspace_control_socket(&workspace)
+  ));
   let content = {
     let w = workspace.clone();
     on_fs(move || std::fs::read(w.join("README.md")).unwrap()).await

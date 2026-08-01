@@ -1,73 +1,17 @@
-//! The synthesized read-only `.git` surface.
+//! The real `.git`: what the daemon seeds it with, and what it reads back.
 //!
-//! ADR 0005 chose this over a real shallow blobless partial clone, and corrected
-//! DESIGN.md section 8.6's contents while doing so. The measurement behind the
-//! choice: a partial clone of the Linux kernel costs a 9.7 MiB per-job index and
-//! **101 180 `stat` syscalls per `git status`**, which inside a mount become 94 850
-//! distinct first-time FUSE lookups — a full metadata sweep of the monorepo, which
-//! is the exact cost GFS exists to avoid.
-//!
-//! # Six entries, not four
-//!
-//! DESIGN.md listed `HEAD`, `packed-refs`, `config`, and `gfs.json`. ADR 0005
-//! measured that with exactly those four **Git does not recognize the directory as
-//! a repository at all**, and every command fails with `not a git repository`, so
-//! the surface satisfies nothing. Empty `objects/` and `refs/` directories are what
-//! make repository detection work, and they are load-bearing rather than
-//! decorative.
-//!
-//! # What works and what does not
-//!
-//! Measured in `spikes/git-surface` and recorded in ADR 0005:
-//!
-//! | Command | Result |
-//! | --- | --- |
-//! | `rev-parse --show-toplevel`, `--git-dir`, `HEAD`, `--abbrev-ref HEAD` | works |
-//! | `symbolic-ref --short HEAD` | works |
-//! | `status`, `log -1`, `show HEAD:<path>`, `cat-file -t HEAD` | fails visibly |
-//! | `ls-files`, `diff --stat` | **exit 0, empty output — silently wrong** |
-//!
-//! The last row is why the `git` shim is a correctness requirement and not a
-//! usability measure. A tool asking "what files are tracked?" is told "none".
-//! Tools that invoke Git by absolute path bypass the shim and see that behaviour;
-//! that is a documented limitation of the MVP boundary, not a bug to be fixed
-//! here.
-//!
-//! # Collision safety
-//!
-//! Git refuses to record a tree entry named `.git` at any level, so nothing in the
-//! pinned commit can shadow or be shadowed by this surface.
-
-use std::collections::BTreeMap;
-use std::sync::Arc;
+//! ADR 0009 replaced ADR 0005's synthesized read-only surface with a real git
+//! directory on local disk; ADR 0011 moved that directory *inside* the
+//! workspace (`<workspace>/.git`), shadowed by the mount and served back
+//! through [`crate::passthrough`]. What remains here is the seeding: `HEAD`,
+//! the pinned branch ref, the shipped index, the configuration Git needs to
+//! be fast over a projection, and `gfs.json`, the machine-readable facts the
+//! shim and the fsmonitor hook read.
 
 use gfs_types::path::b64url_encode;
-use gfs_types::{BytePath, CommitMeta, MountId, ObjectId, RepositoryId, Timestamp};
+use gfs_types::{CommitMeta, MountId, ObjectId, RepositoryId, Timestamp};
 
-/// The directory name, and the reason there is no configuration for it: a
-/// different name would not be found by any of the tooling this exists for.
-pub const GIT_DIR: &[u8] = b".git";
-
-#[derive(Clone, Debug)]
-pub enum SynthNode {
-  Dir,
-  File(Arc<Vec<u8>>),
-}
-
-impl SynthNode {
-  pub fn size(&self) -> u64 {
-    match self {
-      SynthNode::Dir => 0,
-      SynthNode::File(bytes) => bytes.len() as u64,
-    }
-  }
-
-  pub fn is_dir(&self) -> bool {
-    matches!(self, SynthNode::Dir)
-  }
-}
-
-/// What the surface describes.
+/// What the seeded git dir describes.
 #[derive(Clone, Debug)]
 pub struct GitDirFacts {
   pub repository_id: RepositoryId,
@@ -102,118 +46,6 @@ pub struct GitDirFacts {
   /// local branches into; `None` on servers that predate the field, which
   /// seeds no remote and leaves `gfs push` as the only push path.
   pub work_ref_root: Option<String>,
-}
-
-#[derive(Debug)]
-pub struct GitDir {
-  nodes: BTreeMap<Vec<u8>, SynthNode>,
-}
-
-impl GitDir {
-  pub fn new(facts: &GitDirFacts) -> Self {
-    let mut nodes = BTreeMap::new();
-    nodes.insert(GIT_DIR.to_vec(), SynthNode::Dir);
-    nodes.insert(b".git/objects".to_vec(), SynthNode::Dir);
-    nodes.insert(b".git/refs".to_vec(), SynthNode::Dir);
-    nodes.insert(
-      b".git/HEAD".to_vec(),
-      SynthNode::File(Arc::new(head(facts))),
-    );
-    nodes.insert(
-      b".git/packed-refs".to_vec(),
-      SynthNode::File(Arc::new(packed_refs(facts))),
-    );
-    nodes.insert(
-      b".git/config".to_vec(),
-      SynthNode::File(Arc::new(config(facts))),
-    );
-    nodes.insert(
-      b".git/gfs.json".to_vec(),
-      SynthNode::File(Arc::new(gfs_json(facts))),
-    );
-    GitDir { nodes }
-  }
-
-  /// Whether a path is inside the synthesized surface.
-  pub fn owns(path: &BytePath) -> bool {
-    let bytes = path.as_bytes();
-    bytes == GIT_DIR || bytes.starts_with(b".git/")
-  }
-
-  pub fn get(&self, path: &BytePath) -> Option<SynthNode> {
-    self.nodes.get(path.as_bytes()).cloned()
-  }
-
-  /// The immediate children of a synthesized directory, in Git's byte order.
-  pub fn children(&self, path: &BytePath) -> Vec<(Vec<u8>, SynthNode)> {
-    let mut prefix = path.as_bytes().to_vec();
-    prefix.push(b'/');
-    self
-      .nodes
-      .iter()
-      .filter_map(|(candidate, node)| {
-        let rest = candidate.strip_prefix(prefix.as_slice())?;
-        // Immediate children only.
-        if rest.is_empty() || rest.contains(&b'/') {
-          return None;
-        }
-        Some((rest.to_vec(), node.clone()))
-      })
-      .collect()
-  }
-}
-
-/// `HEAD`, symbolic when the selector named a branch.
-///
-/// A tag or a bare object ID produces a detached `HEAD` holding the raw hex,
-/// because a symbolic ref to `refs/tags/...` would make `git symbolic-ref
-/// --short HEAD` report a tag as if it were the current branch.
-fn head(facts: &GitDirFacts) -> Vec<u8> {
-  match facts.ref_name.as_deref() {
-    Some(name) if name.starts_with("refs/heads/") => format!("ref: {name}\n").into_bytes(),
-    _ => format!("{}\n", facts.commit.to_hex()).into_bytes(),
-  }
-}
-
-/// `packed-refs` in stock Git's format, including the trailing space Git writes
-/// after `sorted`.
-fn packed_refs(facts: &GitDirFacts) -> Vec<u8> {
-  let mut out = String::from("# pack-refs with: peeled fully-peeled sorted \n");
-  if let Some(name) = &facts.ref_name {
-    out.push_str(&format!("{} {}\n", facts.commit.to_hex(), name));
-  }
-  out.into_bytes()
-}
-
-/// A minimal `config`.
-///
-/// `repositoryformatversion = 0` and no `extensions.*`: a version Git does not
-/// recognize makes it refuse the repository outright, which would defeat the root
-/// discovery this surface exists to provide. `bare = false` so the mount root is
-/// inferred as the working tree.
-///
-/// The `[gfs]` section is inert to Git — an unknown section is ignored — and
-/// gives a human reading `.git/config` the same facts `gfs.json` carries.
-fn config(facts: &GitDirFacts) -> Vec<u8> {
-  format!(
-    "[core]\n\
-     \trepositoryformatversion = 0\n\
-     \tfilemode = true\n\
-     \tbare = false\n\
-     \tlogallrefupdates = false\n\
-     [gfs]\n\
-     \trepository = {repository}\n\
-     \tcommit = {commit}\n\
-     \tmount = {mount}\n\
-     \tgeneration = {generation}\n\
-     \tendpoint = {endpoint}\n",
-    repository = facts.repository_id.as_str(),
-    commit = facts.commit.to_qualified(),
-    mount = facts.mount_id.as_str(),
-    generation = facts.generation,
-    endpoint = facts.grpc_endpoint,
-  )
-  .into_bytes()
 }
 
 /// A commit's identity lines, with the byte-exact fields base64url-encoded.
@@ -257,12 +89,13 @@ fn gfs_json(facts: &GitDirFacts) -> Vec<u8> {
     "snapshot_time": { "secs": facts.snapshot_time.secs, "nanos": facts.snapshot_time.nanos },
     "grpc_endpoint": facts.grpc_endpoint,
     "http_endpoint": facts.http_endpoint,
-    // The `.git` surface is read-only; the workspace around it is not.
+    // Historical shape, kept for readers: the seeded metadata is read-only in
+    // spirit (the daemon rewrites it on a repin), the workspace is not.
     "read_only": true,
     "workspace_writable": true,
     "control_socket": facts.control_socket.display().to_string(),
-    "surface": "synthesized",
-    "adr": "docs/adr/0005-git-command-surface.md",
+    "surface": "real",
+    "adr": "docs/adr/0011-single-mount-workspace.md",
     "commit_meta": facts.commit_meta.as_ref().map(commit_json),
   });
   let mut bytes = serde_json::to_vec_pretty(&value).unwrap_or_else(|_| b"{}".to_vec());
@@ -270,138 +103,22 @@ fn gfs_json(facts: &GitDirFacts) -> Vec<u8> {
   bytes
 }
 
-#[cfg(test)]
-mod tests {
-  use super::*;
-  use gfs_types::HashAlgorithm;
-
-  fn facts(ref_name: Option<&str>) -> GitDirFacts {
-    GitDirFacts {
-      repository_id: RepositoryId::parse("r-git").unwrap(),
-      commit: ObjectId::from_raw(HashAlgorithm::Sha1, &[0xab; 20]).unwrap(),
-      tree: ObjectId::from_raw(HashAlgorithm::Sha1, &[0xcd; 20]).unwrap(),
-      ref_name: ref_name.map(str::to_owned),
-      mount_id: MountId::parse("m-1").unwrap(),
-      control_socket: std::path::PathBuf::from("/run/gfs/control.sock"),
-      snapshot_time: Timestamp::from_secs(1_600_000_000),
-      grpc_endpoint: "http://127.0.0.1:8431".to_owned(),
-      http_endpoint: "http://127.0.0.1:8430".to_owned(),
-      generation: 1,
-      commit_meta: None,
-      work_ref_root: Some("refs/gfs/work/job-owner".to_owned()),
-    }
-  }
-
-  #[test]
-  fn the_surface_has_exactly_the_six_entries_adr_0005_specifies() {
-    let dir = GitDir::new(&facts(Some("refs/heads/main")));
-    let mut names: Vec<String> = dir
-      .children(&BytePath::new(GIT_DIR.to_vec()))
-      .into_iter()
-      .map(|(name, _)| String::from_utf8(name).unwrap())
-      .collect();
-    names.sort();
-    assert_eq!(
-      names,
-      // Compared against a sorted `names`, so this list is in byte order, not
-      // in the order `children` happens to emit. `gfs.json` sorts before
-      // `objects`; the old `xvfs.json` sorted last, which is why the rename
-      // moved it.
-      vec![
-        "HEAD",
-        "config",
-        "gfs.json",
-        "objects",
-        "packed-refs",
-        "refs"
-      ]
-    );
-  }
-
-  #[test]
-  fn objects_and_refs_are_directories() {
-    // The two entries DESIGN.md omitted. Without them Git does not recognize the
-    // directory as a repository at all, so this assertion is the ADR's correction.
-    let dir = GitDir::new(&facts(Some("refs/heads/main")));
-    assert!(dir
-      .get(&BytePath::new(b".git/objects".to_vec()))
-      .unwrap()
-      .is_dir());
-    assert!(dir
-      .get(&BytePath::new(b".git/refs".to_vec()))
-      .unwrap()
-      .is_dir());
-  }
-
-  #[test]
-  fn a_branch_produces_a_symbolic_head() {
-    let bytes = head(&facts(Some("refs/heads/main")));
-    assert_eq!(bytes, b"ref: refs/heads/main\n");
-  }
-
-  #[test]
-  fn a_tag_or_object_id_produces_a_detached_head() {
-    // `symbolic-ref --short HEAD` on a tag would otherwise report the tag as the
-    // current branch, which is a wrong answer rather than a missing one.
-    assert_eq!(
-      head(&facts(Some("refs/tags/v1"))),
-      b"abababababababababababababababababababab\n"
-    );
-    assert_eq!(
-      head(&facts(None)),
-      b"abababababababababababababababababababab\n"
-    );
-  }
-
-  #[test]
-  fn packed_refs_uses_stock_gits_header_including_its_trailing_space() {
-    let bytes = packed_refs(&facts(Some("refs/heads/main")));
-    let text = String::from_utf8(bytes).unwrap();
-    assert!(text.starts_with("# pack-refs with: peeled fully-peeled sorted \n"));
-    assert!(text.contains("abababababababababababababababababababab refs/heads/main\n"));
-  }
-
-  #[test]
-  fn the_surface_owns_only_dot_git_paths() {
-    assert!(GitDir::owns(&BytePath::new(b".git".to_vec())));
-    assert!(GitDir::owns(&BytePath::new(b".git/HEAD".to_vec())));
-    // A real tracked file whose name merely starts with the same bytes.
-    assert!(!GitDir::owns(&BytePath::new(b".gitignore".to_vec())));
-    assert!(!GitDir::owns(&BytePath::new(b"src/.gitkeep".to_vec())));
-  }
-
-  #[test]
-  fn gfs_json_is_valid_json_naming_the_pinned_commit() {
-    let bytes = gfs_json(&facts(Some("refs/heads/main")));
-    let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-    assert_eq!(
-      value["commit"],
-      "sha1:abababababababababababababababababababab"
-    );
-    assert_eq!(value["read_only"], true);
-  }
-}
-
 // ---------------------------------------------------------------------------
-// The real `.git` (ADR 0009)
+// Seeding the real `.git` (ADR 0009, layout per ADR 0011)
 // ---------------------------------------------------------------------------
 
 /// Everything the seeded git dir is built from.
 ///
-/// The workspace's `.git` becomes a *file* pointing at a directory of plain
-/// local state — `git worktree`'s own split — and this is what that directory
-/// contains. The object database is never here: `objects/info/alternates`
-/// borrows the per-repository projection, and everything Git writes (index
-/// refreshes, local commits, refs) lands on local disk where lockfiles and
-/// renames behave exactly as Git expects.
+/// The workspace's `.git` is a real directory at the workspace root. The
+/// object database is never fully here: `objects/info/alternates` borrows the
+/// projection presented at `.git/gfs/objects`, and everything Git writes
+/// (index refreshes, local commits, refs) lands on local disk where lockfiles
+/// and renames behave exactly as Git expects.
 #[derive(Debug)]
 pub struct SeedSpec<'a> {
-  /// The directory to create, `<state_dir>/git`.
+  /// The real git dir, `<workspace>/.git` — through the retained handle when
+  /// the workspace is already mounted over.
   pub git_dir: &'a std::path::Path,
-  /// The mount point, recorded as `core.worktree`.
-  pub workspace: &'a std::path::Path,
-  /// The projected object database this workspace borrows.
-  pub odb_mountpoint: &'a std::path::Path,
   pub facts: &'a GitDirFacts,
   /// The gateway-built index for the pinned commit. `None` reuses whatever
   /// index is already seeded, which is how a repin that failed to fetch keeps a
@@ -409,23 +126,7 @@ pub struct SeedSpec<'a> {
   pub index: Option<&'a [u8]>,
 }
 
-/// The synthesized `.git` *file*: how the workspace names its git dir.
-///
-/// One entry instead of ADR 0005's six. Git reads `gitdir: <path>` and treats
-/// the directory containing this file as the worktree root, which is the same
-/// mechanism `git init --separate-git-dir` and linked worktrees use.
-pub fn git_file(git_dir: &std::path::Path) -> GitDir {
-  let mut nodes = BTreeMap::new();
-  nodes.insert(
-    GIT_DIR.to_vec(),
-    SynthNode::File(Arc::new(
-      format!("gitdir: {}\n", git_dir.display()).into_bytes(),
-    )),
-  );
-  GitDir { nodes }
-}
-
-/// Write (or re-point) the real git dir a workspace's `.git` file names.
+/// Write (or re-point) the real git dir inside a workspace.
 ///
 /// Idempotent, and called again on every repin: `HEAD`, the branch ref, and the
 /// index are rewritten to the new pin; local loose objects and any local
@@ -461,9 +162,14 @@ pub fn seed_git_dir(spec: &SeedSpec<'_>) -> Result<(), gfs_types::error::GfsErro
     }
   }
 
+  // Relative on purpose, and load-bearing (ADR 0011): Git resolves it against
+  // the objects directory, so `objects/../gfs/objects` names the projection
+  // wherever the folder happens to sit — copied to another machine included.
+  // An absolute path would silently re-introduce the location dependence the
+  // single-mount layout exists to remove.
   std::fs::write(
     dir.join("objects/info/alternates"),
-    format!("{}\n", spec.odb_mountpoint.display()),
+    format!("{}\n", crate::passthrough::ALTERNATES_POINTER),
   )
   .map_err(|e| io("alternates", e))?;
 
@@ -472,12 +178,14 @@ pub fn seed_git_dir(spec: &SeedSpec<'_>) -> Result<(), gfs_types::error::GfsErro
   // hydration budget is mandatory (ADR 0009); this is the fast path, the
   // budget is the guarantee.
   let fsmonitor = fsmonitor_hook(dir)?;
-  let mut config = format!(
+  // No `core.worktree`: the git dir sits inside the working tree, so Git
+  // infers the parent directory — and an absolute worktree path here would
+  // break the copied-folder story the relative alternates exists for.
+  let mut config = String::from(
     "[core]\n\
      \trepositoryformatversion = 0\n\
      \tfilemode = true\n\
      \tbare = false\n\
-     \tworktree = {worktree}\n\
      \tautocrlf = false\n\
      \tlogallrefupdates = false\n\
      # A shipped index's dev/ino/uid/gid cannot match this host; comparing them\n\
@@ -487,10 +195,12 @@ pub fn seed_git_dir(spec: &SeedSpec<'_>) -> Result<(), gfs_types::error::GfsErro
      # The untracked cache kills the readdir walk; fsmonitor kills the lstat\n\
      # sweep. Together: 108 445 lookups to 170 on the kernel tree.\n\
      \tuntrackedCache = true\n",
-    worktree = spec.workspace.display(),
   );
-  if let Some(hook) = &fsmonitor {
-    config.push_str(&format!("\tfsmonitor = {}\n", hook.display()));
+  if fsmonitor.is_some() {
+    // Relative to the worktree root, where Git runs the hook — never the
+    // daemon's own handle path, which no other process can exec, and never
+    // an absolute path, which would break the copied folder (ADR 0011).
+    config.push_str("\tfsmonitor = .git/hooks/gfs-fsmonitor\n");
   }
   config.push_str(
     "# `repack -a` without `-l` copies every borrowed object out of the\n\
@@ -612,4 +322,105 @@ pub fn seeded_commit(git_dir: &std::path::Path) -> Option<String> {
   let qualified = value.get("commit")?.as_str()?;
   let (_, hex) = qualified.split_once(':')?;
   Some(hex.to_owned())
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+  use gfs_types::HashAlgorithm;
+
+  fn facts(ref_name: Option<&str>) -> GitDirFacts {
+    GitDirFacts {
+      repository_id: RepositoryId::parse("r-git").unwrap(),
+      commit: ObjectId::from_raw(HashAlgorithm::Sha1, &[0xab; 20]).unwrap(),
+      tree: ObjectId::from_raw(HashAlgorithm::Sha1, &[0xcd; 20]).unwrap(),
+      ref_name: ref_name.map(str::to_owned),
+      mount_id: MountId::parse("m-1").unwrap(),
+      control_socket: std::path::PathBuf::from("/run/gfs/control.sock"),
+      snapshot_time: Timestamp::from_secs(1_600_000_000),
+      grpc_endpoint: "http://127.0.0.1:8431".to_owned(),
+      http_endpoint: "http://127.0.0.1:8430".to_owned(),
+      generation: 1,
+      commit_meta: None,
+      work_ref_root: Some("refs/gfs/work/job-owner".to_owned()),
+    }
+  }
+
+  #[test]
+  fn the_seed_writes_a_relative_alternates_and_no_worktree() {
+    // The two lines ADR 0011 legislates. A copied folder works because the
+    // alternates travels with it, and would stop working if either an absolute
+    // odb path or a `core.worktree` naming the old location crept back in.
+    let tmp = tempfile::tempdir().unwrap();
+    let git = tmp.path().join(".git");
+    seed_git_dir(&SeedSpec {
+      git_dir: &git,
+      facts: &facts(Some("refs/heads/main")),
+      index: None,
+    })
+    .unwrap();
+
+    let alternates = std::fs::read_to_string(git.join("objects/info/alternates")).unwrap();
+    assert_eq!(alternates, "../gfs/objects\n");
+    let config = std::fs::read_to_string(git.join("config")).unwrap();
+    assert!(
+      !config.contains("worktree"),
+      "no location dependence:\n{config}"
+    );
+    assert!(config.contains("checkStat = minimal"));
+  }
+
+  #[test]
+  fn a_branch_seed_produces_a_symbolic_head_and_a_tag_a_detached_one() {
+    let tmp = tempfile::tempdir().unwrap();
+    let git = tmp.path().join("a/.git");
+    seed_git_dir(&SeedSpec {
+      git_dir: &git,
+      facts: &facts(Some("refs/heads/main")),
+      index: None,
+    })
+    .unwrap();
+    assert_eq!(
+      std::fs::read_to_string(git.join("HEAD")).unwrap(),
+      "ref: refs/heads/main\n"
+    );
+    assert_eq!(
+      local_head(&git).unwrap(),
+      "ab".repeat(20),
+      "the branch ref names the pinned commit"
+    );
+
+    let detached = tmp.path().join("b/.git");
+    seed_git_dir(&SeedSpec {
+      git_dir: &detached,
+      facts: &facts(Some("refs/tags/v1")),
+      index: None,
+    })
+    .unwrap();
+    assert_eq!(
+      std::fs::read_to_string(detached.join("HEAD")).unwrap(),
+      format!("{}\n", "ab".repeat(20))
+    );
+  }
+
+  #[test]
+  fn gfs_json_is_valid_json_naming_the_pinned_commit() {
+    let bytes = gfs_json(&facts(Some("refs/heads/main")));
+    let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(
+      value["commit"],
+      "sha1:abababababababababababababababababababab"
+    );
+    assert_eq!(value["control_socket"], "/run/gfs/control.sock");
+    // What `seeded_commit` reads back for the adoption guard.
+    let tmp = tempfile::tempdir().unwrap();
+    let git = tmp.path().join(".git");
+    seed_git_dir(&SeedSpec {
+      git_dir: &git,
+      facts: &facts(None),
+      index: None,
+    })
+    .unwrap();
+    assert_eq!(seeded_commit(&git).unwrap(), "ab".repeat(20));
+  }
 }
