@@ -50,6 +50,12 @@ pub type BlobKey = u32;
 pub struct BlobFact {
   pub oid: ObjectId,
   pub size: u64,
+  /// The blob is an LFS pointer on a `filter=lfs` path (ADR 0012). Decided by
+  /// the walker, which has the attribute context this crate does not; the
+  /// registry classifies such a blob `Lfs` without reading it — expanded
+  /// content is unsearchable by nature and the pointer text is noise that
+  /// would match `oid sha256:`.
+  pub lfs: bool,
 }
 
 /// What the registry knows about one blob.
@@ -271,6 +277,15 @@ impl BlobRegistry {
         break;
       }
 
+      // An LFS pointer is classified from the walker's attribute decision
+      // alone: no read, no size test — the recorded size is the pointer
+      // blob's, and what it stands for is unsearchable either way.
+      if fact.lfs {
+        updates.push((*key, ContentClass::Lfs));
+        report.newly_classified += 1;
+        *report.by_class.entry(ContentClass::Lfs).or_default() += 1;
+        continue;
+      }
       // Size first: an oversized blob is excluded without an inflate, which is
       // what ADR 0004's cost model assumes.
       if let Some(class) = classify_size(&self.policy, fact.size) {
@@ -534,10 +549,12 @@ mod tests {
       BlobFact {
         oid: oid(1),
         size: 3,
+        lfs: false,
       },
       BlobFact {
         oid: oid(2),
         size: 4,
+        lfs: false,
       },
     ];
     let first = reg.intern(&facts).unwrap();
@@ -557,10 +574,12 @@ mod tests {
       BlobFact {
         oid: oid(1),
         size: 3,
+        lfs: false,
       },
       BlobFact {
         oid: oid(1),
         size: 3,
+        lfs: false,
       },
     ];
     let keys = reg.intern(&facts).unwrap();
@@ -576,14 +595,17 @@ mod tests {
       BlobFact {
         oid: oid(1),
         size: 12,
+        lfs: false,
       },
       BlobFact {
         oid: oid(2),
         size: 3,
+        lfs: false,
       },
       BlobFact {
         oid: oid(1),
         size: 12,
+        lfs: false,
       },
     ];
 
@@ -627,6 +649,7 @@ mod tests {
     let facts = vec![BlobFact {
       oid: oid(9),
       size: gfs_types::limits::MAX_SEARCHABLE_BLOB_BYTES + 1,
+      lfs: false,
     }];
     let report = reg
       .ingest(&src, &facts, &IngestBudget::default(), |_, _| Ok(()))
@@ -643,10 +666,12 @@ mod tests {
       BlobFact {
         oid: oid(1),
         size: 4,
+        lfs: false,
       },
       BlobFact {
         oid: oid(2),
         size: 4,
+        lfs: false,
       },
     ];
     let budget = IngestBudget {
@@ -671,6 +696,7 @@ mod tests {
     let facts = vec![BlobFact {
       oid: oid(1),
       size: 7,
+      lfs: false,
     }];
     reg
       .ingest(&src, &facts, &IngestBudget::default(), |_, _| Ok(()))
@@ -702,6 +728,7 @@ mod tests {
     let facts = vec![BlobFact {
       oid: oid(1),
       size: 1,
+      lfs: false,
     }];
     assert_eq!(a.intern(&facts).unwrap(), vec![0]);
     assert_eq!(b.intern(&facts).unwrap(), vec![0]);
@@ -722,6 +749,7 @@ mod tests {
         })
         .unwrap(),
         size: 1,
+        lfs: false,
       })
       .collect();
     let keys = reg.intern(&facts).unwrap();

@@ -156,6 +156,17 @@ impl Server {
     self
   }
 
+  /// Give the server an LFS object store (ADR 0012).
+  ///
+  /// Called before the server is shared, like the other builders. Without one,
+  /// every LFS entry degrades to its pointer — the MVP behavior — rather than
+  /// erroring, so a deployment that has never heard of LFS is unchanged.
+  pub fn with_lfs_store(self, root: &std::path::Path) -> Result<Self, GfsError> {
+    let store = Arc::new(crate::lfs::LfsStore::open(root)?);
+    self.registry.set_lfs_store(store);
+    Ok(self)
+  }
+
   /// Keep the search index on disk instead of in memory.
   ///
   /// Called before the server is shared. Persisting it does not change any

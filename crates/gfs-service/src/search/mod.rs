@@ -265,6 +265,19 @@ impl IndexManager {
       postings: Arc::new(self.postings(repository)),
     };
 
+    // Detected once per build and applied to both construction paths, so the
+    // incremental and full manifests agree byte-for-byte. Two jobs (ADR 0012):
+    // undo the entry-metadata expansion — the index interns by the *pointer
+    // blob*, the identity trees actually reference — and mark the facts so the
+    // registry classifies them `Lfs` without reading anything.
+    let lfs: std::collections::HashMap<BytePath, (ObjectId, u64)> = ctx
+      .repo
+      .lfs_pointers(commit.clone())
+      .await?
+      .into_iter()
+      .map(|e| (e.path, (e.blob_oid, e.blob_size)))
+      .collect();
+
     cancel.check()?;
     let manifest = match self.incremental_base(&ctx.repo, commit, snapshots).await? {
       Some((parent, base)) => {
@@ -274,10 +287,10 @@ impl IndexManager {
           "building the manifest from its first parent"
         );
         self
-          .build_incremental(&ctx, commit, &parent, &base, cancel)
+          .build_incremental(&ctx, commit, &parent, &base, &lfs, cancel)
           .await?
       }
-      None => self.build_full(&ctx, commit, cancel, snapshots).await?,
+      None => self.build_full(&ctx, commit, &lfs, cancel, snapshots).await?,
     };
 
     cancel.check()?;
@@ -313,6 +326,7 @@ impl IndexManager {
     commit: &ObjectId,
     parent: &ObjectId,
     base: &Manifest,
+    lfs: &std::collections::HashMap<BytePath, (ObjectId, u64)>,
     cancel: &Cancel,
   ) -> Result<Manifest, GfsError> {
     let deltas = ctx
@@ -329,14 +343,21 @@ impl IndexManager {
           mode,
           oid,
           size,
-        } => Some((
-          path.clone(),
-          *mode,
-          BlobFact {
-            oid: oid.clone(),
-            size: *size,
-          },
-        )),
+        } => {
+          let fact = match lfs.get(path) {
+            Some((blob_oid, blob_size)) => BlobFact {
+              oid: blob_oid.clone(),
+              size: *blob_size,
+              lfs: true,
+            },
+            None => BlobFact {
+              oid: oid.clone(),
+              size: *size,
+              lfs: false,
+            },
+          };
+          Some((path.clone(), *mode, fact))
+        }
         TreeDelta::Removed { .. } => None,
       })
       .collect();
@@ -364,6 +385,7 @@ impl IndexManager {
     &self,
     ctx: &BuildContext,
     commit: &ObjectId,
+    lfs: &std::collections::HashMap<BytePath, (ObjectId, u64)>,
     cancel: &Cancel,
     snapshots: &SnapshotStore,
   ) -> Result<Manifest, GfsError> {
@@ -393,6 +415,7 @@ impl IndexManager {
             BlobFact {
               oid: entry.oid.clone(),
               size: entry.size,
+              lfs: false,
             },
           )),
           // Symlinks, gitlinks, and unsupported modes are outside the searchable
@@ -434,6 +457,7 @@ impl IndexManager {
           BlobFact {
             oid: entry.oid,
             size: entry.size,
+            lfs: false,
           },
         ));
       }
@@ -445,6 +469,19 @@ impl IndexManager {
         },
       )?;
       cancel.check()?;
+    }
+
+    // The LFS overwrite is applied to the merged list so both sources agree:
+    // root entries arrived through `list_directory`, whose metadata expansion
+    // must be undone here, and subtree entries arrived raw from `walk_tree`.
+    for (path, _, fact) in walked.iter_mut() {
+      if let Some((blob_oid, blob_size)) = lfs.get(path) {
+        *fact = BlobFact {
+          oid: blob_oid.clone(),
+          size: *blob_size,
+          lfs: true,
+        };
+      }
     }
 
     let facts: Vec<BlobFact> = walked.iter().map(|(_, _, f)| f.clone()).collect();

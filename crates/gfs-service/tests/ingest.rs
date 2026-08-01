@@ -65,10 +65,8 @@ fn upstream(root: &Path, branch: &str) -> String {
 fn harness(root: &Path) -> (Arc<Catalog>, Arc<Registry>, IngestConfig) {
   let catalog = Arc::new(Catalog::open(&root.join("catalog.sqlite")).unwrap());
   let registry = Arc::new(Registry::new(Arc::clone(&catalog)));
-  let config = IngestConfig {
-    repos_root: root.join("repos"),
-    git_binary: PathBuf::from("git"),
-  };
+  let mut config = IngestConfig::new(root.join("repos"));
+  config.git_binary = PathBuf::from("git");
   (catalog, registry, config)
 }
 

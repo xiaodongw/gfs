@@ -13,10 +13,16 @@ use std::fmt;
 #[derive(
   Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug, serde::Serialize, serde::Deserialize,
 )]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "kebab-case")]
 pub enum HashAlgorithm {
   Sha1,
   Sha256,
+  /// The LFS content key form of ADR 0012: SHA-256 over the *raw* file bytes,
+  /// with no `blob <size>\0` header — the digest a spec v1 pointer's `oid`
+  /// line carries. It is deliberately a distinct algorithm from `Sha256`
+  /// (Git's object format) because the two hash different byte sequences and
+  /// must never compare equal or share a cache shard.
+  LfsSha256,
 }
 
 impl HashAlgorithm {
@@ -24,6 +30,7 @@ impl HashAlgorithm {
     match self {
       HashAlgorithm::Sha1 => 20,
       HashAlgorithm::Sha256 => 32,
+      HashAlgorithm::LfsSha256 => 32,
     }
   }
 
@@ -35,15 +42,29 @@ impl HashAlgorithm {
     match self {
       HashAlgorithm::Sha1 => "sha1",
       HashAlgorithm::Sha256 => "sha256",
+      HashAlgorithm::LfsSha256 => "lfs-sha256",
     }
   }
 
-  /// Parse the value of `extensions.objectformat` / `--object-format`.
+  /// Parse the value of `extensions.objectformat` / `--object-format`, plus
+  /// the `lfs-sha256` key form that never appears in a Git repository but
+  /// does appear in qualified content keys.
   pub fn from_name(s: &str) -> Option<Self> {
     match s {
       "sha1" => Some(HashAlgorithm::Sha1),
       "sha256" => Some(HashAlgorithm::Sha256),
+      "lfs-sha256" => Some(HashAlgorithm::LfsSha256),
       _ => None,
+    }
+  }
+
+  /// Whether this algorithm is a Git object format — something a repository's
+  /// object database can be keyed by. `lfs-sha256` is a content key for the
+  /// blob endpoint, never a Git object ID.
+  pub fn is_git_object_format(self) -> bool {
+    match self {
+      HashAlgorithm::Sha1 | HashAlgorithm::Sha256 => true,
+      HashAlgorithm::LfsSha256 => false,
     }
   }
 }
@@ -219,6 +240,18 @@ mod tests {
     // the concrete failure DESIGN.md section 6.1's rule exists to prevent.
     let err = ObjectId::from_hex(HashAlgorithm::Sha1, &"ab".repeat(32)).unwrap_err();
     assert!(matches!(err, OidError::Length { .. }));
+  }
+
+  #[test]
+  fn lfs_key_round_trips_and_is_not_a_git_object_format() {
+    let lfs = ObjectId::from_hex(HashAlgorithm::LfsSha256, &"ef".repeat(32)).unwrap();
+    assert_eq!(lfs.to_qualified(), format!("lfs-sha256:{}", "ef".repeat(32)));
+    assert_eq!(ObjectId::parse_qualified(&lfs.to_qualified()).unwrap(), lfs);
+    assert!(!HashAlgorithm::LfsSha256.is_git_object_format());
+    // Same digest bytes under Git's sha256 spelling is a different identity:
+    // the two hash different byte sequences (raw vs `blob <size>\0`-prefixed).
+    let git = ObjectId::from_hex(HashAlgorithm::Sha256, &"ef".repeat(32)).unwrap();
+    assert_ne!(lfs, git);
   }
 
   #[test]

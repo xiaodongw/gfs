@@ -187,7 +187,8 @@ pub fn seed_git_dir(spec: &SeedSpec<'_>) -> Result<(), gfs_types::error::GfsErro
   // is enforceable -- `git -c` overrides any of it -- which is why the
   // hydration budget is mandatory (ADR 0009); this is the fast path, the
   // budget is the guarantee.
-  let fsmonitor = fsmonitor_hook(dir)?;
+  let fsmonitor = helper_hook(dir, "gfs-fsmonitor")?;
+  let lfs_filter = helper_hook(dir, "gfs-lfs-filter")?;
   // No `core.worktree`: the git dir sits inside the working tree, so Git
   // infers the parent directory — and an absolute worktree path here would
   // break the copied-folder story the relative alternates exists for.
@@ -211,6 +212,40 @@ pub fn seed_git_dir(spec: &SeedSpec<'_>) -> Result<(), gfs_types::error::GfsErro
     // daemon's own handle path, which no other process can exec, and never
     // an absolute path, which would break the copied folder (ADR 0011).
     config.push_str("\tfsmonitor = .git/hooks/gfs-fsmonitor\n");
+  }
+  if lfs_filter.is_some() {
+    // The filter is a correctness requirement, not an optimization (ADR 0012,
+    // m05d): without a clean filter, `git status` misreports every LFS file
+    // and `git add` writes the expanded content into the object database.
+    // `required = true` makes a broken shim fail the command loudly instead
+    // of silently producing that corruption.
+    // The `process` line is load-bearing beyond performance: a host with
+    // git-lfs installed has `filter.lfs.process = git-lfs filter-process` in
+    // its global config, and Git prefers the process form over clean/smudge
+    // across scopes — real git-lfs would then hijack the driver, derive a
+    // batch endpoint the gateway does not serve, and fail every checkout.
+    // Only a local process entry wins that precedence (a set-but-empty one
+    // poisons the driver rather than falling back; measured on Git 2.53), so
+    // the shim speaks the long-running protocol and is named here. The
+    // clean/smudge pair stays as documentation-by-configuration and for
+    // manual invocation.
+    config.push_str(
+      "[filter \"lfs\"]\n\
+       \tclean = .git/hooks/gfs-lfs-filter clean %f\n\
+       \tsmudge = .git/hooks/gfs-lfs-filter smudge %f\n\
+       \tprocess = .git/hooks/gfs-lfs-filter process\n\
+       \trequired = true\n",
+    );
+  } else {
+    // Without the shim, an expanded workspace is one `git add` away from
+    // committing expanded content. Entries only expand when the server has an
+    // LFS store, so a deployment that never configured one is unaffected —
+    // but a missing binary in an LFS-serving deployment deserves a loud line.
+    tracing::warn!(
+      "gfs-lfs-filter not found next to the daemon or on PATH; \
+       LFS filter config omitted — `git add` of an expanded LFS file would \
+       commit its content"
+    );
   }
   config.push_str(
     "# `repack -a` without `-l` copies every borrowed object out of the\n\
@@ -263,34 +298,36 @@ pub fn seed_git_dir(spec: &SeedSpec<'_>) -> Result<(), gfs_types::error::GfsErro
   Ok(())
 }
 
-/// Install the fsmonitor hook when the helper binary can be found.
+/// Install a helper-binary hook wrapper when the binary can be found.
 ///
 /// The hook is a one-line shell script pointing at an absolute binary path,
-/// because `core.fsmonitor` is read by whatever Git the *job* runs and the
-/// job's `PATH` is not ours to assume. Looked for next to this process's own
-/// executable first (the deployment layout), then on `PATH`. Absent: the
-/// config omits `core.fsmonitor` and `git status` pays the lstat sweep --
-/// slower, never wrong.
-fn fsmonitor_hook(
+/// because the config value is read by whatever Git the *job* runs and the
+/// job's `PATH` is not ours to assume — while the config itself references
+/// the wrapper by a worktree-relative path, so a copied folder keeps working
+/// (ADR 0011). Looked for next to this process's own executable first (the
+/// deployment layout), then on `PATH`. Absent: the caller decides how loud
+/// that is — the fsmonitor degrades to the lstat sweep, the LFS filter warns.
+fn helper_hook(
   git_dir: &std::path::Path,
+  name: &str,
 ) -> Result<Option<std::path::PathBuf>, gfs_types::error::GfsError> {
   let binary = std::env::current_exe()
     .ok()
-    .and_then(|exe| exe.parent().map(|d| d.join("gfs-fsmonitor")))
+    .and_then(|exe| exe.parent().map(|d| d.join(name)))
     .filter(|p| p.is_file())
     .or_else(|| {
       let path = std::env::var_os("PATH")?;
       std::env::split_paths(&path)
-        .map(|d| d.join("gfs-fsmonitor"))
+        .map(|d| d.join(name))
         .find(|p| p.is_file())
     });
   let Some(binary) = binary else {
     return Ok(None);
   };
-  let hook = git_dir.join("hooks/gfs-fsmonitor");
+  let hook = git_dir.join(format!("hooks/{name}"));
   let script = format!("#!/bin/sh\nexec {} \"$@\"\n", binary.display());
   std::fs::write(&hook, script).map_err(|e| {
-    gfs_types::error::GfsError::internal(format!("writing the fsmonitor hook: {e}"))
+    gfs_types::error::GfsError::internal(format!("writing the {name} hook: {e}"))
   })?;
   let mut perms = std::fs::metadata(&hook)
     .map_err(|e| gfs_types::error::GfsError::internal(format!("hook metadata: {e}")))?

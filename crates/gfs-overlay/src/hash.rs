@@ -1,20 +1,24 @@
-//! Canonical Git object hashing for overlay content.
+//! Canonical content hashing for overlay content.
 //!
-//! `blob <size>\0<content>`, the same framing the client's blob cache verifies
-//! against. Status needs it to answer a question the journal cannot: a file that
-//! was written and then written back to its original bytes has a journal row, but
-//! it is *not* a change, and reporting it as one would put a spurious entry in
-//! every `git status` an agent runs after an aborted edit.
+//! Two verifiable forms, matching the client's blob cache: the Git blob frame
+//! `blob <size>\0<content>` under SHA-1, and ADR 0012's LFS key — SHA-256 over
+//! the raw bytes, no frame — for content whose base entry is an expanded LFS
+//! object. Status needs both to answer a question the journal cannot: a file
+//! that was written and then written back to its original bytes has a journal
+//! row, but it is *not* a change, and reporting it as one would put a spurious
+//! entry in every `git status` an agent runs after an aborted edit.
 //!
-//! SHA-1 only, because ADR 0001 measured that SHA-256 repositories are
-//! unreachable through the pinned `git2-rs` build and are rejected at ingest. The
-//! algorithm is still taken from the repository rather than assumed, so the day
-//! that changes this fails loudly instead of producing wrong object IDs.
+//! Git's own SHA-256 object format stays refused, because ADR 0001 measured
+//! that SHA-256 repositories are unreachable through the pinned `git2-rs`
+//! build and are rejected at ingest. The algorithm is still taken from the
+//! caller rather than assumed, so the day that changes this fails loudly
+//! instead of producing wrong object IDs.
 
 use std::io::Read;
 
 use gfs_types::{HashAlgorithm, ObjectId};
 use sha1::{Digest, Sha1};
+use sha2::Sha256;
 
 use crate::error::{OverlayError, Result};
 
@@ -45,21 +49,43 @@ pub fn blob_oid_of_file(
   finish(algorithm, hasher)
 }
 
-fn start(algorithm: HashAlgorithm, size: u64) -> Result<Sha1> {
-  if algorithm != HashAlgorithm::Sha1 {
-    return Err(OverlayError::io(format!(
-      "{algorithm} object hashing is not available in this build (ADR 0001)"
-    )));
-  }
-  let mut hasher = Sha1::new();
-  hasher.update(b"blob ");
-  hasher.update(size.to_string().as_bytes());
-  hasher.update([0u8]);
-  Ok(hasher)
+enum Hasher {
+  Git(Sha1),
+  Lfs(Sha256),
 }
 
-fn finish(algorithm: HashAlgorithm, hasher: Sha1) -> Result<ObjectId> {
-  ObjectId::from_raw(algorithm, &hasher.finalize())
+impl Hasher {
+  fn update(&mut self, bytes: impl AsRef<[u8]>) {
+    match self {
+      Hasher::Git(h) => h.update(bytes),
+      Hasher::Lfs(h) => h.update(bytes),
+    }
+  }
+}
+
+fn start(algorithm: HashAlgorithm, size: u64) -> Result<Hasher> {
+  match algorithm {
+    HashAlgorithm::Sha1 => {
+      let mut hasher = Sha1::new();
+      hasher.update(b"blob ");
+      hasher.update(size.to_string().as_bytes());
+      hasher.update([0u8]);
+      Ok(Hasher::Git(hasher))
+    }
+    // The LFS oid is the raw content hash: no frame, no size prefix.
+    HashAlgorithm::LfsSha256 => Ok(Hasher::Lfs(Sha256::new())),
+    HashAlgorithm::Sha256 => Err(OverlayError::io(format!(
+      "{algorithm} object hashing is not available in this build (ADR 0001)"
+    ))),
+  }
+}
+
+fn finish(algorithm: HashAlgorithm, hasher: Hasher) -> Result<ObjectId> {
+  let digest = match hasher {
+    Hasher::Git(h) => h.finalize().to_vec(),
+    Hasher::Lfs(h) => h.finalize().to_vec(),
+  };
+  ObjectId::from_raw(algorithm, &digest)
     .map_err(|e| OverlayError::io(format!("hashing overlay content: {e}")))
 }
 

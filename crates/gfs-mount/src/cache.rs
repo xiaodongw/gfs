@@ -40,16 +40,21 @@ use std::sync::{Arc, Mutex};
 use gfs_types::error::{ErrorCode, GfsError};
 use gfs_types::{HashAlgorithm, ObjectId, RepositoryId};
 use sha1::{Digest, Sha1};
+use sha2::Sha256;
 use tokio::sync::broadcast;
 
 use crate::client::SnapshotClient;
 
-/// Compute the Git object ID of a blob's content.
+/// Compute the content key of a blob's bytes under the given algorithm.
 ///
-/// Only SHA-1 is implementable today: ADR 0001 measured that SHA-256 is
-/// unreachable through `git2-rs`, and ADR 0006 moved it from "before production"
-/// to out of scope. The `match` is still written as a match so that adding the
-/// algorithm later is a compile error at every call site that assumed one.
+/// Two verifiable forms exist: the Git SHA-1 object hash over
+/// `blob <size>\0<content>`, and the ADR 0012 LFS key, which is SHA-256 over
+/// the raw bytes with no header — the LFS oid *is* the content hash, so the
+/// same no-unverified-bytes rule covers both. Git's own SHA-256 object format
+/// stays unimplementable: ADR 0001 measured that it is unreachable through
+/// `git2-rs`, and ADR 0006 moved it out of scope. The `match` is still written
+/// as a match so that adding an algorithm is a compile error at every call
+/// site that assumed one.
 pub fn hash_blob(algorithm: HashAlgorithm, content: &[u8]) -> Result<ObjectId, GfsError> {
   match algorithm {
     HashAlgorithm::Sha1 => {
@@ -58,6 +63,12 @@ pub fn hash_blob(algorithm: HashAlgorithm, content: &[u8]) -> Result<ObjectId, G
       hasher.update(content);
       ObjectId::from_raw(HashAlgorithm::Sha1, &hasher.finalize())
         .map_err(|e| GfsError::internal(format!("hashing a blob: {e}")))
+    }
+    HashAlgorithm::LfsSha256 => {
+      let mut hasher = Sha256::new();
+      hasher.update(content);
+      ObjectId::from_raw(HashAlgorithm::LfsSha256, &hasher.finalize())
+        .map_err(|e| GfsError::internal(format!("hashing an LFS object: {e}")))
     }
     HashAlgorithm::Sha256 => Err(GfsError::new(
       ErrorCode::UnsupportedRepositoryFormat,
@@ -371,7 +382,12 @@ impl BlobCache {
   ) -> Result<u64, GfsError> {
     let bytes = client.read_blob(oid, ticket).await?;
 
-    let computed = hash_blob(self.algorithm, &bytes)?;
+    // Hashed under the *key's* algorithm, not the cache's: one cache holds the
+    // repository's git blobs (sha1, `blob <size>\0`-prefixed) and its expanded
+    // LFS objects (`lfs-sha256:`, raw bytes) side by side, and each key form
+    // names its own verification rule (ADR 0012). `hash_blob` still refuses
+    // algorithms with no rule, so this cannot silently weaken.
+    let computed = hash_blob(oid.algorithm(), &bytes)?;
     if &computed != oid {
       self
         .stats
@@ -544,6 +560,24 @@ mod tests {
   fn sha256_is_refused_rather_than_silently_hashed_as_sha1() {
     let e = hash_blob(HashAlgorithm::Sha256, b"x").unwrap_err();
     assert_eq!(e.code, ErrorCode::UnsupportedRepositoryFormat);
+  }
+
+  #[test]
+  fn the_lfs_key_is_the_raw_sha256_with_no_header() {
+    // `printf 'hello\n' | sha256sum` — the digest a spec v1 pointer's `oid`
+    // line would carry for this content, which is what makes the download
+    // verifiable without trusting the server.
+    assert_eq!(
+      hash_blob(HashAlgorithm::LfsSha256, b"hello\n")
+        .unwrap()
+        .to_qualified(),
+      "lfs-sha256:5891b5b522d5df086d0ff0b110fbd9d21bb4fc7163af34d08286a2e846f6be03"
+    );
+    // And it must never equal the Git object hash of the same bytes.
+    assert_ne!(
+      hash_blob(HashAlgorithm::LfsSha256, b"hello\n").unwrap(),
+      hash_blob(HashAlgorithm::Sha1, b"hello\n").unwrap()
+    );
   }
 
   #[test]

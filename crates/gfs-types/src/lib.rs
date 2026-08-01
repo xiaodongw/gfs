@@ -22,7 +22,9 @@
 pub mod diff;
 pub mod entry;
 pub mod error;
+pub mod glob;
 pub mod ids;
+pub mod lfs;
 pub mod limits;
 pub mod oid;
 pub mod path;

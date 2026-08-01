@@ -16,11 +16,13 @@ use gfs_types::{
   TreeEntryInfo,
 };
 
+use crate::attributes::{self, AttributeFile};
 use crate::format::{self, RepositoryFormat};
+use crate::lfs::{self, LfsPointer};
 use crate::pool::{PooledRepo, RepoPool};
 use crate::repository::{
   BlameOutput, CommitSignature, DiffOutput, DiffRequest, DirectoryPage, EntryLookup, GitRepository,
-  LogOptions, TreeChange, TreeChangeKind, TreeDelta, WalkEntry,
+  LfsEntry, LogOptions, TreeChange, TreeChangeKind, TreeDelta, WalkEntry,
 };
 
 use crate::tree::{DecodedEntry, DecodedTree, TreeCache, TreeCacheStats};
@@ -41,6 +43,14 @@ pub struct Libgit2Repository {
   pool: Arc<RepoPool>,
   format: RepositoryFormat,
   trees: TreeCache,
+  /// Parsed `.gitattributes` blobs, keyed by blob OID — immutable content, so
+  /// entries never go stale. Attribute files are small and few; the bound is a
+  /// wholesale clear rather than an LRU.
+  attr_files: std::sync::Mutex<std::collections::HashMap<ObjectId, Arc<AttributeFile>>>,
+  /// When present, entry metadata substitutes expanded size and `lfs-sha256:`
+  /// key for LFS entries whose object this check confirms (ADR 0012). Absent
+  /// means every LFS entry is served as its pointer, the pre-0012 behavior.
+  lfs_check: Option<Arc<dyn lfs::LfsObjectCheck>>,
 }
 
 impl std::fmt::Debug for Libgit2Repository {
@@ -68,7 +78,15 @@ impl Libgit2Repository {
       pool: RepoPool::open(path, max_handles)?,
       format,
       trees: TreeCache::new(tree_cache_bytes),
+      attr_files: std::sync::Mutex::new(std::collections::HashMap::new()),
+      lfs_check: None,
     })
+  }
+
+  /// Enable ADR 0012 entry-metadata expansion, gated on `check`.
+  pub fn with_lfs_check(mut self, check: Arc<dyn lfs::LfsObjectCheck>) -> Self {
+    self.lfs_check = Some(check);
+    self
   }
 
   pub fn path(&self) -> &std::path::Path {
@@ -160,10 +178,107 @@ impl Libgit2Repository {
     Ok(Some((tree, last.to_vec())))
   }
 
+  /// Parse (through the cache) the `.gitattributes` blob with this OID.
+  fn attribute_file(
+    &self,
+    repo: &git2::Repository,
+    blob_oid: &ObjectId,
+  ) -> Result<Arc<AttributeFile>, GfsError> {
+    if let Some(hit) = self.attr_files.lock().unwrap().get(blob_oid) {
+      return Ok(hit.clone());
+    }
+    let oid = self.git_oid(blob_oid)?;
+    let blob = repo.find_blob(oid).map_err(|e| not_found(&e, "blob"))?;
+    let parsed = Arc::new(AttributeFile::parse(blob.content()));
+    let mut cache = self.attr_files.lock().unwrap();
+    if cache.len() >= 1024 {
+      cache.clear();
+    }
+    cache.insert(blob_oid.clone(), parsed.clone());
+    Ok(parsed)
+  }
+
+  /// The `.gitattributes` stack for `path`, root-first: element `i` is the
+  /// attribute file of the directory made of `path`'s first `i` components,
+  /// with an empty stand-in where a directory has none. Levels past a missing
+  /// or non-directory component are empty too — the path then has no entry,
+  /// and the caller's own lookup is what reports that.
+  fn attribute_stack(
+    &self,
+    repo: &git2::Repository,
+    commit: &ObjectId,
+    path: &BytePath,
+  ) -> Result<Vec<Arc<AttributeFile>>, GfsError> {
+    let comps: Vec<&[u8]> = path.components().collect();
+    let Some((_, parents)) = comps.split_last() else {
+      return Ok(Vec::new());
+    };
+    let commit_oid = self.git_oid(commit)?;
+    let root = self.find_commit(repo, commit_oid)?.tree_id();
+    let mut tree = Some(self.decoded_tree(repo, root)?);
+    let mut stack = Vec::with_capacity(parents.len() + 1);
+    for step in std::iter::once(None).chain(parents.iter().map(Some)) {
+      if let Some(component) = step {
+        tree = match tree.as_ref().and_then(|t| t.get(component)) {
+          Some(entry) if entry.mode == mode::DIRECTORY => {
+            let child = self.git_oid(&entry.oid)?;
+            Some(self.decoded_tree(repo, child)?)
+          }
+          _ => None,
+        };
+      }
+      let file = match tree.as_ref().and_then(|t| t.get(b".gitattributes")) {
+        Some(entry) if EntryKind::from_mode(entry.mode) == EntryKind::Regular => {
+          self.attribute_file(repo, &entry.oid)?
+        }
+        _ => Arc::new(AttributeFile::default()),
+      };
+      stack.push(file);
+    }
+    Ok(stack)
+  }
+
+  /// Resolve an entry to its LFS pointer, or `None` when the entry is not an
+  /// LFS entry: not a file, too large to be a pointer, not on a `filter=lfs`
+  /// path at this revision, or its content is not a spec v1 pointer. This is
+  /// ADR 0012's detection step; whether the pointer is *expanded* is the
+  /// caller's decision, gated on the LFS store actually holding the object.
+  pub(crate) fn lfs_pointer_for(
+    &self,
+    repo: &git2::Repository,
+    commit: &ObjectId,
+    path: &BytePath,
+    kind: EntryKind,
+    blob_oid: &ObjectId,
+    size: u64,
+  ) -> Result<Option<LfsPointer>, GfsError> {
+    if !matches!(kind, EntryKind::Regular | EntryKind::Executable) {
+      return Ok(None);
+    }
+    if size == 0 || size > lfs::MAX_POINTER_SIZE {
+      return Ok(None);
+    }
+    let stack = self.attribute_stack(repo, commit, path)?;
+    if !attributes::is_lfs(attributes::resolve_filter(&stack, path.as_bytes())) {
+      return Ok(None);
+    }
+    let blob = repo
+      .find_blob(self.git_oid(blob_oid)?)
+      .map_err(|e| not_found(&e, "blob"))?;
+    Ok(lfs::parse_pointer(blob.content()))
+  }
+
   /// Build the API-level entry for one decoded tree entry.
+  ///
+  /// This is where ADR 0012 expansion happens: an LFS entry whose object the
+  /// store holds reports the expanded size and the `lfs-sha256:` content key,
+  /// so every metadata consumer — FUSE attributes, `gfs cat`, WebDAV — expands
+  /// without knowing it did. The commit is needed for the `.gitattributes`
+  /// stack, which is a property of the revision, not of the blob.
   fn entry_info(
     &self,
     repo: &git2::Repository,
+    commit: &ObjectId,
     path: BytePath,
     decoded: &DecodedEntry,
   ) -> Result<TreeEntryInfo, GfsError> {
@@ -192,11 +307,22 @@ impl Libgit2Repository {
       // A directory, gitlink, or unsupported mode has no blob content to size.
       _ => (0, None),
     };
+    let (oid, size) = match &self.lfs_check {
+      Some(check) => {
+        match self.lfs_pointer_for(repo, commit, &path, kind, &decoded.oid, size)? {
+          Some(pointer) if check.contains(&pointer.oid) => (pointer.oid, pointer.size),
+          // Not an LFS entry, or its object is unfetchable: the entry degrades
+          // to its pointer, which is the MVP behavior and stays truthful.
+          _ => (decoded.oid.clone(), size),
+        }
+      }
+      None => (decoded.oid.clone(), size),
+    };
     Ok(TreeEntryInfo {
       path,
       kind,
       mode: decoded.mode,
-      oid: decoded.oid.clone(),
+      oid,
       size,
       symlink_target,
       blob_ticket: None,
@@ -231,7 +357,7 @@ impl Libgit2Repository {
     let Some(decoded) = tree.get(&name) else {
       return Ok(None);
     };
-    Ok(Some(self.entry_info(repo, path.clone(), decoded)?))
+    Ok(Some(self.entry_info(repo, commit, path.clone(), decoded)?))
   }
 
   fn find_commit<'r>(
@@ -659,7 +785,7 @@ impl GitRepository for Libgit2Repository {
       let (page, next_page_token) = tree.page(after, limit);
       let mut entries = Vec::with_capacity(page.len());
       for decoded in page {
-        entries.push(self.entry_info(repo, path.join(&decoded.name), decoded)?);
+        entries.push(self.entry_info(repo, commit, path.join(&decoded.name), decoded)?);
       }
       DirectoryPage {
         entries,
@@ -1115,6 +1241,7 @@ impl GitRepository for Libgit2Repository {
     fn descend(
       this: &Libgit2Repository,
       repo: &git2::Repository,
+      commit: &ObjectId,
       odb: &git2::Odb<'_>,
       tree_oid: git2::Oid,
       prefix: &gfs_types::BytePath,
@@ -1124,7 +1251,7 @@ impl GitRepository for Libgit2Repository {
       for entry in tree.entries() {
         let path = prefix.join(&entry.name);
         if entry.mode == mode::DIRECTORY {
-          descend(this, repo, odb, this.git_oid(&entry.oid)?, &path, out)?;
+          descend(this, repo, commit, odb, this.git_oid(&entry.oid)?, &path, out)?;
           continue;
         }
         // A gitlink names a commit in *another* repository; reading its header
@@ -1137,6 +1264,20 @@ impl GitRepository for Libgit2Repository {
             .read_header(this.git_oid(&entry.oid)?)
             .map_err(|e| not_found(&e, "blob"))?;
           size as u64
+        };
+        // An expanded LFS entry records the *expanded* size with the *pointer*
+        // OID — exactly the index `git lfs pull` leaves behind (m05d). The
+        // size is what stat-compares against the working tree; the OID is what
+        // the clean filter's pointer answer must hash to.
+        let size = match &this.lfs_check {
+          Some(check) => {
+            let kind = EntryKind::from_mode(entry.mode);
+            match this.lfs_pointer_for(repo, commit, &path, kind, &entry.oid, size)? {
+              Some(pointer) if check.contains(&pointer.oid) => pointer.size,
+              _ => size,
+            }
+          }
+          None => size,
         };
         out.push(crate::index::IndexEntry {
           path: path.as_bytes().to_vec(),
@@ -1152,12 +1293,63 @@ impl GitRepository for Libgit2Repository {
     descend(
       self,
       repo,
+      commit,
       &odb,
       root,
       &gfs_types::BytePath::root(),
       &mut entries,
     )?;
     crate::index::write_index_v2(&entries, snapshot_time)
+  }
+
+  fn lfs_pointers(&self, commit: &ObjectId) -> Result<Vec<LfsEntry>, GfsError> {
+    let pooled = self.checkout()?;
+    let repo: &git2::Repository = &pooled;
+    let commit_oid = self.git_oid(commit)?;
+    let root = self.find_commit(repo, commit_oid)?.tree_id();
+    let odb = repo.odb().map_err(|e| not_found(&e, "object database"))?;
+
+    let mut out = Vec::new();
+    let mut stack: Vec<(git2::Oid, BytePath)> = vec![(root, BytePath::root())];
+    while let Some((tree_oid, prefix)) = stack.pop() {
+      let tree = self.decoded_tree(repo, tree_oid)?;
+      for decoded in tree.entries() {
+        let path = prefix.join(&decoded.name);
+        match decoded.mode {
+          mode::DIRECTORY => stack.push((self.git_oid(&decoded.oid)?, path)),
+          mode::REGULAR | mode::EXECUTABLE => {
+            // The header-size gate makes this walk cheap on ordinary trees:
+            // only pointer-sized blobs on `filter=lfs` paths are ever read.
+            let (size, _) = odb
+              .read_header(self.git_oid(&decoded.oid)?)
+              .map_err(|e| not_found(&e, "blob"))?;
+            let kind = EntryKind::from_mode(decoded.mode);
+            if let Some(pointer) =
+              self.lfs_pointer_for(repo, commit, &path, kind, &decoded.oid, size as u64)?
+            {
+              out.push(LfsEntry {
+                path,
+                blob_oid: decoded.oid.clone(),
+                blob_size: size as u64,
+                pointer,
+              });
+            }
+          }
+          _ => {}
+        }
+      }
+    }
+    Ok(out)
+  }
+
+  fn lfs_filtered(&self, commit: &ObjectId, path: &BytePath) -> Result<bool, GfsError> {
+    let pooled = self.checkout()?;
+    let repo: &git2::Repository = &pooled;
+    let stack = self.attribute_stack(repo, commit, path)?;
+    Ok(attributes::is_lfs(attributes::resolve_filter(
+      &stack,
+      path.as_bytes(),
+    )))
   }
 
   fn read_blob(&self, blob: &ObjectId) -> Result<Vec<u8>, GfsError> {

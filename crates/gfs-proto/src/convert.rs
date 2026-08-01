@@ -118,6 +118,27 @@ pub fn try_oid(s: &str, algorithm: HashAlgorithm, field: &str) -> Result<ObjectI
   Ok(oid)
 }
 
+/// Parse an entry's content key: the repository's object algorithm, or the
+/// `lfs-sha256:` form ADR 0012 substitutes for an expanded LFS entry.
+///
+/// Only *entry* oids admit the second form — a commit, tree, or ref target is
+/// always a real Git object, and [`try_oid`] stays strict for those. An entry
+/// key decides which store serves the bytes (the object database or the LFS
+/// store), and the blob cache verifies each form against its own hash rule.
+pub fn try_content_key(
+  s: &str,
+  algorithm: HashAlgorithm,
+  field: &str,
+) -> Result<ObjectId, GfsError> {
+  if s.contains(':') {
+    let oid = ObjectId::parse_qualified(s)?;
+    if oid.algorithm() == HashAlgorithm::LfsSha256 {
+      return Ok(oid);
+    }
+  }
+  try_oid(s, algorithm, field)
+}
+
 /// Validate a caller-supplied path.
 pub fn try_path(bytes: Vec<u8>) -> Result<BytePath, GfsError> {
   let p = BytePath::new(bytes);
@@ -156,7 +177,7 @@ impl v1::TreeEntry {
   /// ID from a buggy or compromised server would otherwise reach the FUSE layer,
   /// where a path is used to build kernel dentries.
   pub fn try_into_domain(self, algorithm: HashAlgorithm) -> Result<TreeEntryInfo, GfsError> {
-    let oid = try_oid(&self.oid, algorithm, "entry.oid")?;
+    let oid = try_content_key(&self.oid, algorithm, "entry.oid")?;
     // Validated, not merely wrapped: a server returning `../etc` inside a
     // directory listing is exactly what DESIGN.md section 10's traversal rules
     // exist for.
@@ -760,5 +781,42 @@ mod tests {
     // A client must not spin on a code it does not understand.
     assert!(!e.is_retryable());
     assert_eq!(e.message, "from a newer server");
+  }
+}
+
+#[cfg(test)]
+mod lfs_key_tests {
+  use super::*;
+
+  #[test]
+  fn an_expanded_entry_key_converts_while_strict_oids_stay_strict() {
+    // The regression the first live LFS mount hit: the server substitutes
+    // `lfs-sha256:` for an expanded entry (ADR 0012) and the client-side
+    // conversion must accept it against a sha1 repository...
+    let lfs = format!("lfs-sha256:{}", "ab".repeat(32));
+    let key = try_content_key(&lfs, HashAlgorithm::Sha1, "entry.oid").unwrap();
+    assert_eq!(key.algorithm(), HashAlgorithm::LfsSha256);
+
+    // ...while a mismatched *git* algorithm is still refused, and non-entry
+    // oids (commits, trees) never admit the LFS form.
+    let sha256 = format!("sha256:{}", "ab".repeat(32));
+    assert!(try_content_key(&sha256, HashAlgorithm::Sha1, "entry.oid").is_err());
+    assert!(try_oid(&lfs, HashAlgorithm::Sha1, "commit_oid").is_err());
+  }
+
+  #[test]
+  fn a_wire_entry_with_an_lfs_key_round_trips_into_the_domain() {
+    let entry = v1::TreeEntry {
+      path: b"model.bin".to_vec(),
+      kind: v1::EntryKind::Regular as i32,
+      mode: 0o100644,
+      oid: format!("lfs-sha256:{}", "cd".repeat(32)),
+      size: 184_292,
+      symlink_target: None,
+      blob_ticket: Some("t".to_owned()),
+    };
+    let domain = entry.try_into_domain(HashAlgorithm::Sha1).unwrap();
+    assert_eq!(domain.oid.algorithm(), HashAlgorithm::LfsSha256);
+    assert_eq!(domain.size, 184_292);
   }
 }

@@ -55,6 +55,10 @@ path = "src/bin/gfs-scan-shim.rs"
 name = "gfs-fsmonitor"
 path = "src/bin/gfs-fsmonitor.rs"
 
+[[bin]]
+name = "gfs-lfs-filter"
+path = "src/bin/gfs-lfs-filter.rs"
+
 [dependencies]
 gfs-mount = { workspace = true }
 gfs-types = { workspace = true }
@@ -62,6 +66,8 @@ gfs-types = { workspace = true }
 # change kinds; both name overlay types directly rather than having `gfs-mount`
 # re-export them.
 gfs-overlay = { workspace = true }
+# The LFS filter shim's hash-and-emit clean path is sha256 over raw bytes.
+sha2 = { workspace = true }
 anyhow = { workspace = true }
 clap = { workspace = true }
 tracing = { workspace = true }

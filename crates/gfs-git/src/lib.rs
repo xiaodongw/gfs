@@ -19,18 +19,38 @@
 //!   are refused outside the reserved namespace so a caller's bug cannot create a
 //!   publicly advertised ref.
 
+pub mod attributes;
 pub mod format;
 pub mod index;
 pub mod libgit2;
+
+/// LFS pointer handling, shared through `gfs_types` (the mount daemon and the
+/// filter shim parse and render the same pointers), plus the injection seam
+/// that is meaningful only on the server side of the boundary.
+pub mod lfs {
+  pub use gfs_types::lfs::*;
+
+  /// Whether an expanded LFS object is actually available to serve.
+  ///
+  /// Implemented by the gateway's LFS store, injected so entry-metadata
+  /// substitution can be gated on it without this crate depending on the
+  /// service crate. "Expanded" is per-entry state (ADR 0012): an entry whose
+  /// object is absent degrades to its pointer rather than advertising content
+  /// the blob endpoint would then 404.
+  pub trait LfsObjectCheck: Send + Sync {
+    fn contains(&self, oid: &gfs_types::ObjectId) -> bool;
+  }
+}
 pub mod pool;
 pub mod repository;
 pub mod tree;
 
 pub use format::{check, read_format, verdict, FormatVerdict, RepositoryFormat};
+pub use lfs::LfsPointer;
 pub use libgit2::Libgit2Repository;
 pub use pool::RepoPool;
 pub use repository::{
-  AsyncRepository, CommitSignature, DirectoryPage, EntryLookup, GitRepository, TreeChange,
-  TreeChangeKind, TreeDelta, WalkEntry,
+  AsyncRepository, CommitSignature, DirectoryPage, EntryLookup, GitRepository, LfsEntry,
+  TreeChange, TreeChangeKind, TreeDelta, WalkEntry,
 };
 pub use tree::{DecodedTree, TreeCache, TreeCacheStats};

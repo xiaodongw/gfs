@@ -23,6 +23,10 @@ pub struct Registry {
   open: RwLock<HashMap<RepositoryId, Arc<Libgit2Repository>>>,
   max_handles: usize,
   tree_cache_bytes: usize,
+  /// The LFS object store (ADR 0012), when the deployment has one. Interior
+  /// mutability because the registry is already shared by the time the server
+  /// builder learns where the store lives; set once at startup.
+  lfs: RwLock<Option<Arc<crate::lfs::LfsStore>>>,
 }
 
 impl std::fmt::Debug for Registry {
@@ -42,7 +46,19 @@ impl Registry {
       open: RwLock::new(HashMap::new()),
       max_handles: limits::DEFAULT_REPO_HANDLES,
       tree_cache_bytes: limits::DEFAULT_TREE_CACHE_ENTRIES * 512,
+      lfs: RwLock::new(None),
     }
+  }
+
+  pub fn set_lfs_store(&self, store: Arc<crate::lfs::LfsStore>) {
+    *self.lfs.write().unwrap_or_else(|e| e.into_inner()) = Some(store);
+    // Any handle opened before the store existed was built without the LFS
+    // check; drop them so the next access reopens with expansion enabled.
+    self.open.write().unwrap_or_else(|e| e.into_inner()).clear();
+  }
+
+  pub fn lfs_store(&self) -> Option<Arc<crate::lfs::LfsStore>> {
+    self.lfs.read().unwrap_or_else(|e| e.into_inner()).clone()
   }
 
   pub fn with_limits(mut self, max_handles: usize, tree_cache_bytes: usize) -> Self {
@@ -100,11 +116,18 @@ impl Registry {
     if let Some(repo) = open.get(id).cloned() {
       return Ok(repo);
     }
-    let repo = Arc::new(Libgit2Repository::open(
+    let mut repo = Libgit2Repository::open(
       &record.repo_path,
       self.max_handles,
       self.tree_cache_bytes,
-    )?);
+    )?;
+    if let Some(store) = self.lfs_store() {
+      repo = repo.with_lfs_check(Arc::new(StoreCheck {
+        store,
+        repository: id.clone(),
+      }));
+    }
+    let repo = Arc::new(repo);
     open.insert(id.clone(), Arc::clone(&repo));
     Ok(repo)
   }
@@ -135,7 +158,7 @@ impl Registry {
       .ok_or_else(|| GfsError::not_found("no such repository"))?;
 
     match Libgit2Repository::open(&record.repo_path, self.max_handles, self.tree_cache_bytes) {
-      Ok(repo) => {
+      Ok(mut repo) => {
         let actual = repo.format().algorithm;
         if actual != record.algorithm {
           let reason = format!(
@@ -151,6 +174,12 @@ impl Registry {
             ErrorCode::UnsupportedRepositoryFormat,
             reason,
           ));
+        }
+        if let Some(store) = self.lfs_store() {
+          repo = repo.with_lfs_check(Arc::new(StoreCheck {
+            store,
+            repository: id.clone(),
+          }));
         }
         self
           .open
@@ -177,5 +206,18 @@ impl Registry {
         Err(e)
       }
     }
+  }
+}
+
+/// The LFS store, scoped to one repository, as the presence check `gfs-git`
+/// gates entry-metadata expansion on.
+struct StoreCheck {
+  store: Arc<crate::lfs::LfsStore>,
+  repository: RepositoryId,
+}
+
+impl gfs_git::lfs::LfsObjectCheck for StoreCheck {
+  fn contains(&self, oid: &gfs_types::ObjectId) -> bool {
+    self.store.contains(&self.repository, oid)
   }
 }

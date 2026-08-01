@@ -160,7 +160,18 @@ impl Overlay {
         continue;
       }
 
-      let new_oid = self.workspace_oid(entry, algorithm)?;
+      // Hash under the *base entry's* key form. An expanded LFS entry's base
+      // oid is `lfs-sha256:` over the raw bytes (ADR 0012), and hashing the
+      // workspace content as a git blob would make a reverted LFS file
+      // compare unequal to its own base forever — a phantom modification
+      // that blocks `gfs switch` and pads every commit plan.
+      let hash_algorithm = match &entry.base {
+        Some(base) if base.oid.algorithm() == HashAlgorithm::LfsSha256 => {
+          HashAlgorithm::LfsSha256
+        }
+        _ => algorithm,
+      };
+      let new_oid = self.workspace_oid(entry, hash_algorithm)?;
       let new_mode = entry.kind.git_mode();
 
       // A rename is a rename when the place it came from is genuinely gone. A

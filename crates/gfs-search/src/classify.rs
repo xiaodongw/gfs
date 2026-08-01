@@ -51,6 +51,12 @@ pub enum ContentClass {
   /// without a second column, and so a policy that excludes it has a reason to
   /// name.
   InvalidUtf8,
+  /// An LFS pointer on a `filter=lfs` path (ADR 0012). Not decidable from the
+  /// bytes — a pointer is perfectly ordinary text — so it is asserted by the
+  /// walker, which has the revision's `.gitattributes` context. Excluded
+  /// always: the expanded content is unsearchable by nature, and the pointer
+  /// text is noise that would match `oid sha256:`.
+  Lfs,
 }
 
 impl ContentClass {
@@ -60,6 +66,7 @@ impl ContentClass {
       ContentClass::Binary => "BINARY",
       ContentClass::Oversized => "OVERSIZED",
       ContentClass::InvalidUtf8 => "INVALID_UTF8",
+      ContentClass::Lfs => "LFS",
     }
   }
 
@@ -69,12 +76,14 @@ impl ContentClass {
       "BINARY" => Some(ContentClass::Binary),
       "OVERSIZED" => Some(ContentClass::Oversized),
       "INVALID_UTF8" => Some(ContentClass::InvalidUtf8),
+      "LFS" => Some(ContentClass::Lfs),
       _ => None,
     }
   }
 
-  /// Whether trigrams should be extracted. `Binary` and `Oversized` produce no
-  /// postings; invalid UTF-8 does, because byte trigrams do not care.
+  /// Whether trigrams should be extracted. `Binary`, `Oversized`, and `Lfs`
+  /// produce no postings; invalid UTF-8 does, because byte trigrams do not
+  /// care.
   pub fn is_indexable(self) -> bool {
     matches!(self, ContentClass::Text | ContentClass::InvalidUtf8)
   }
@@ -103,6 +112,9 @@ pub enum ExclusionReason {
   InvalidUtf8,
   Generated,
   Vendored,
+  /// An LFS entry (ADR 0012). Always excluded, never configurable: the
+  /// expanded content is unsearchable and the pointer text is noise.
+  Lfs,
   /// The index has no answer for this path: its blob was interned but never
   /// classified, was classified but has no posting lists yet, or vanished from
   /// the object database under a running query.
@@ -126,6 +138,7 @@ impl ExclusionReason {
       ExclusionReason::InvalidUtf8 => "invalid_utf8",
       ExclusionReason::Generated => "generated",
       ExclusionReason::Vendored => "vendored",
+      ExclusionReason::Lfs => "lfs",
       ExclusionReason::IndexGap => "index_gap",
     }
   }
@@ -219,6 +232,8 @@ impl CorpusPolicy {
       ContentClass::InvalidUtf8 => self
         .exclude_invalid_utf8
         .then_some(ExclusionReason::InvalidUtf8),
+      // Not policy-conditional; see the variant's docs.
+      ContentClass::Lfs => Some(ExclusionReason::Lfs),
     }
   }
 
@@ -263,6 +278,9 @@ impl CorpusPolicy {
     if self.exclude_vendored {
       out.push(ExclusionReason::Vendored);
     }
+    // Unconditional: every policy skips LFS entries, and declaring it is what
+    // lets an agent distinguish "no LFS files here" from "not skipped".
+    out.push(ExclusionReason::Lfs);
     out
   }
 }

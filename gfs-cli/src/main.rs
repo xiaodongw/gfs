@@ -1160,6 +1160,18 @@ async fn main() -> Result<()> {
         entry.oid
       );
       let bytes = http_get(&url, &cli.token).await?;
+      // The no-unverified-bytes rule, on the one read path that does not go
+      // through the daemon's cache: check the download against the entry's
+      // content key — the git object hash for ordinary blobs, the raw sha256
+      // for `lfs-sha256:` entries (ADR 0012) — before a byte reaches stdout.
+      let claimed = gfs_types::ObjectId::parse_qualified(&entry.oid)
+        .map_err(|e| anyhow::anyhow!("server returned an unparseable oid: {e}"))?;
+      let actual = gfs_mount::cache::hash_blob(claimed.algorithm(), &bytes)?;
+      anyhow::ensure!(
+        actual == claimed,
+        "downloaded content does not hash to {}; refusing to print corrupt bytes",
+        entry.oid
+      );
       use std::io::Write;
       // Written as bytes, not as a string: file content is not guaranteed UTF-8, and
       // `println!` of a lossy conversion would corrupt a binary file.

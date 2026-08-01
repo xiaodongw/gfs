@@ -1322,11 +1322,77 @@ impl Mount {
       .blob_ticket
       .clone()
       .ok_or_else(|| GfsError::invalid("that path has no file content to print"))?;
-    // Read through the blob cache the mount already has, so catting a file at
-    // the pinned commit costs nothing the second time and shares with the
-    // filesystem's own reads.
-    let content = client.read_blob(&entry.oid, &ticket).await?;
+    // Read through the blob cache the mount already has: catting a file at
+    // the pinned commit costs nothing the second time, shares with the
+    // filesystem's own reads, and — the part that is not optional — verifies
+    // the bytes against the content key, for `lfs-sha256:` entries exactly as
+    // for git blobs. A direct `read_blob` here served unverified bytes.
+    let content = self.cache.read(&client, &entry.oid, &ticket).await?;
     Ok((commit.to_qualified(), content))
+  }
+
+  /// The clean filter's fast path (ADR 0012, m05d arm C): a base-identical
+  /// LFS path's canonical pointer, from entry metadata alone — no content
+  /// read, no hashing. `None` sends the shim down the hash-stdin path: the
+  /// path is overlaid (genuinely edited), or is not an expanded LFS entry.
+  pub async fn lfs_clean(&self, path: &gfs_types::BytePath) -> Result<Option<String>, GfsError> {
+    if self.overlay.get(path).is_some() {
+      return Ok(None);
+    }
+    let (client, commit) = {
+      let current = self.current.lock().expect("current pin");
+      (Arc::clone(&current.client), current.commit.clone())
+    };
+    let Some(entry) = client.get_entry_at(&commit, path, false).await? else {
+      return Ok(None);
+    };
+    if entry.oid.algorithm() != gfs_types::HashAlgorithm::LfsSha256 {
+      return Ok(None);
+    }
+    Ok(Some(
+      gfs_types::lfs::LfsPointer {
+        oid: entry.oid,
+        size: entry.size,
+      }
+      .to_pointer_text(),
+    ))
+  }
+
+  /// The smudge filter's hydration (ADR 0012, m05d arm D): bring the expanded
+  /// object into the shared verified cache and return its on-disk path for
+  /// the shim to stream. The ticket is minted from the path's entry at the
+  /// pinned commit, so a pointer this revision does not name is refused —
+  /// hydrating arbitrary oids is exactly what the ticket discipline forbids.
+  pub async fn lfs_smudge(
+    &self,
+    path: &gfs_types::BytePath,
+    oid: &gfs_types::ObjectId,
+  ) -> Result<std::path::PathBuf, GfsError> {
+    let (client, commit) = {
+      let current = self.current.lock().expect("current pin");
+      (Arc::clone(&current.client), current.commit.clone())
+    };
+    let ticket = if self.cache.contains(oid) {
+      String::new()
+    } else {
+      let entry = client
+        .get_entry_at(&commit, path, true)
+        .await?
+        .ok_or_else(|| GfsError::not_found("no such path in the pinned commit"))?;
+      if entry.oid != *oid {
+        return Err(GfsError::invalid(
+          "the pointer names an object the pinned revision does not; \
+           switch revisions with `gfs switch` rather than stock checkout",
+        ));
+      }
+      entry.blob_ticket.unwrap_or_default()
+    };
+    let (cached, _) = self.cache.open_blob(&client, oid, &ticket).await?;
+    // The pin held the entry across the call; from here recency is what keeps
+    // the file alive while the shim streams it, the bounded seam the plan
+    // records.
+    self.cache.release_blob(oid);
+    Ok(cached)
   }
 
   /// Line attribution for one path, answered by the gateway.
@@ -1674,6 +1740,32 @@ impl Mount {
         }
         Err(e) => Response::from_error(&e),
       },
+      Request::LfsClean { ref path_b64url } => match gfs_types::path::b64url_decode(path_b64url) {
+        Ok(path) => match self.lfs_clean(&gfs_types::BytePath::new(path)).await {
+          Ok(pointer) => Response::LfsClean { pointer },
+          Err(e) => Response::from_error(&e),
+        },
+        Err(e) => Response::from_error(&e),
+      },
+      Request::LfsSmudge {
+        ref path_b64url,
+        ref oid,
+      } => {
+        let decoded = gfs_types::path::b64url_decode(path_b64url).and_then(|path| {
+          gfs_types::ObjectId::parse_qualified(oid)
+            .map(|oid| (path, oid))
+            .map_err(|e| GfsError::invalid(format!("not a content key: {e}")))
+        });
+        match decoded {
+          Ok((path, oid)) => {
+            match self.lfs_smudge(&gfs_types::BytePath::new(path), &oid).await {
+              Ok(path) => Response::LfsSmudge { path },
+              Err(e) => Response::from_error(&e),
+            }
+          }
+          Err(e) => Response::from_error(&e),
+        }
+      }
       Request::Unmount => {
         self.shutdown().await;
         Response::Unmounted

@@ -68,6 +68,10 @@ struct Args {
   #[arg(long, env = "GFS_GIT_BINARY", default_value = "git")]
   git_binary: PathBuf,
 
+  /// The `curl` to run for LFS batch-API transfers (ADR 0012).
+  #[arg(long, env = "GFS_CURL_BINARY", default_value = "curl")]
+  curl_binary: PathBuf,
+
   /// Development bearer token, granting read access to every repository.
   ///
   /// Present because M1.5's OIDC integration is a declared seam. A deployment must
@@ -134,17 +138,19 @@ async fn main() -> anyhow::Result<()> {
   };
 
   let index_path = args.state_dir.join("search.sqlite");
+  let lfs_path = args.state_dir.join("lfs");
   let mut server = Server::new(catalog, authenticator, policy, key, LeasePolicy::adr_0006())
-    .with_search_index(&index_path)?;
-  tracing::info!(index = %index_path.display(), "search index opened");
+    .with_search_index(&index_path)?
+    .with_lfs_store(&lfs_path)?;
+  tracing::info!(index = %index_path.display(), lfs = %lfs_path.display(), "search index and LFS store opened");
 
   if let Some(root) = &args.repos_root {
     std::fs::create_dir_all(root)
       .map_err(|e| anyhow::anyhow!("cannot create {}: {e}", root.display()))?;
-    server = server.with_ingest(gfs_service::ingest::IngestConfig {
-      repos_root: root.clone(),
-      git_binary: args.git_binary.clone(),
-    });
+    let mut ingest = gfs_service::ingest::IngestConfig::new(root.clone());
+    ingest.git_binary = args.git_binary.clone();
+    ingest.curl_binary = args.curl_binary.clone();
+    server = server.with_ingest(ingest);
     tracing::info!(repos_root = %root.display(), "clone enabled");
   } else {
     tracing::info!("clone disabled; no --repos-root");

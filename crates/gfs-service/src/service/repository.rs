@@ -344,6 +344,50 @@ impl RepositoryService for RepositoryApi {
         }));
       }
 
+      // ADR 0012's write-path re-clean: content committed to a `filter=lfs`
+      // path goes into the LFS store and the tree gets a fresh pointer — the
+      // same contract the workspace's clean filter honors for stock
+      // `git commit`, applied here for overlay commits. Content that already
+      // is a pointer (a degraded entry, or a filter-cleaned overlay) passes
+      // through unchanged.
+      if let Some(store) = self.registry.lfs_store() {
+        for change in &mut changes {
+          let TreeChangeKind::Upsert { mode, content } = &mut change.kind else {
+            continue;
+          };
+          if *mode != gfs_types::mode::REGULAR && *mode != gfs_types::mode::EXECUTABLE {
+            continue;
+          }
+          if !repo.lfs_filtered(base.clone(), change.path.clone()).await? {
+            continue;
+          }
+          if gfs_types::lfs::parse_pointer(content).is_some() {
+            continue;
+          }
+          let raw = std::mem::take(content);
+          let (pointer, raw) = tokio::task::spawn_blocking(move || {
+            use sha2::Digest as _;
+            let digest = sha2::Sha256::digest(&raw);
+            let oid = ObjectId::from_raw(gfs_types::HashAlgorithm::LfsSha256, &digest)
+              .expect("a sha256 digest");
+            (
+              gfs_types::lfs::LfsPointer {
+                oid,
+                size: raw.len() as u64,
+              },
+              raw,
+            )
+          })
+          .await
+          .map_err(|e| GfsError::internal(format!("LFS clean task: {e}")))?;
+          let (store, repo_id, ptr) = (Arc::clone(&store), id.clone(), pointer.clone());
+          tokio::task::spawn_blocking(move || store.put(&repo_id, &ptr.oid, &raw))
+            .await
+            .map_err(|e| GfsError::internal(format!("LFS store task: {e}")))??;
+          *content = pointer.to_pointer_text().into_bytes();
+        }
+      }
+
       let signature = CommitSignature {
         name: nonempty(&req.author_name, ctx.identity.subject.as_str()),
         email: nonempty(&req.author_email, "gfs@localhost"),
@@ -436,10 +480,10 @@ impl RepositoryService for RepositoryApi {
       let repo = self.registry.repository(&id)?;
       let work_ref = revision::work_ref(ctx.identity.subject.as_str(), &req.branch);
       let branch_ref = format!("refs/heads/{}", req.branch);
-      let local_ref = if repo.read_ref(work_ref.clone()).await?.is_some() {
-        work_ref
-      } else if repo.read_ref(branch_ref.clone()).await?.is_some() {
-        branch_ref
+      let (local_ref, tip) = if let Some(tip) = repo.read_ref(work_ref.clone()).await? {
+        (work_ref, tip)
+      } else if let Some(tip) = repo.read_ref(branch_ref.clone()).await? {
+        (branch_ref, tip)
       } else {
         return Err(GfsError::not_found(format!(
           "no branch {:?} on the gateway, and no work branch of that name for \
@@ -453,6 +497,52 @@ impl RepositoryService for RepositoryApi {
       } else {
         Some(req.credential.clone())
       };
+
+      // ADR 0012: the branch's LFS objects go up *before* the ref does — an
+      // upstream branch whose pointers dangle is broken for every other
+      // clone, so an upload failure fails the push. The batch API dedups:
+      // the tip's full pointer set is offered, upstream answers with upload
+      // actions only for what it lacks, and only store-held objects are sent
+      // (an object the store never had can only have come from upstream).
+      if let Some(store) = self.registry.lfs_store() {
+        if let Some(endpoint) = crate::lfs::BatchClient::endpoint_for(&upstream_url) {
+          let pointers = repo.lfs_pointers(tip.clone()).await?;
+          let mut seen = std::collections::HashSet::new();
+          let objects: Vec<crate::lfs::WantedObject> = pointers
+            .into_iter()
+            .map(|e| e.pointer)
+            .filter(|p| seen.insert(p.oid.clone()))
+            .filter(|p| store.contains(&id, &p.oid))
+            .map(|p| crate::lfs::WantedObject {
+              oid: p.oid,
+              size: p.size,
+            })
+            .collect();
+          if !objects.is_empty() {
+            let (client_repo, cred, curl) =
+              (id.clone(), credential.clone(), config.curl_binary.clone());
+            let uploaded = tokio::task::spawn_blocking(move || {
+              crate::lfs::BatchClient::new(curl).upload(
+                &endpoint,
+                cred.as_deref(),
+                &objects,
+                &store,
+                &client_repo,
+              )
+            })
+            .await
+            .map_err(|e| GfsError::internal(format!("the LFS upload task did not finish: {e}")))??;
+            if uploaded > 0 {
+              tracing::info!(
+                request_id = %ctx.request_id,
+                uploaded,
+                "LFS objects uploaded ahead of the push"
+              );
+            }
+          }
+        }
+      }
+
       let repo_path = record.repo_path.clone();
       let force = req.force;
       let remote = remote_branch.clone();

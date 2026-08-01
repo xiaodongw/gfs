@@ -55,6 +55,19 @@ pub struct WalkEntry {
   pub size: u64,
 }
 
+/// One detected LFS entry at a revision (ADR 0012).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LfsEntry {
+  pub path: BytePath,
+  /// The pointer blob as Git stores it — the identity trees reference and the
+  /// search index interns by, never the expanded content's key.
+  pub blob_oid: ObjectId,
+  /// The pointer blob's own size (~130 bytes), from the object header.
+  pub blob_size: u64,
+  /// What the pointer names: the expanded content's `lfs-sha256:` key and size.
+  pub pointer: crate::lfs::LfsPointer,
+}
+
 /// How one path differs between two commits.
 ///
 /// Deliberately two cases rather than Git's five. A manifest is a map from path
@@ -284,6 +297,18 @@ pub trait GitRepository: Send + Sync + std::fmt::Debug {
     snapshot_time: gfs_types::Timestamp,
   ) -> Result<Vec<u8>, GfsError>;
 
+  /// Every LFS pointer reachable from the commit's tree: `filter=lfs` paths
+  /// whose blobs parse as spec v1 pointers (ADR 0012). Detection only — the
+  /// result is independent of whether any expanded object is available, which
+  /// is what the store-population path needs to know what to fetch and what
+  /// lets the search indexer key LFS paths by their pointer blobs.
+  fn lfs_pointers(&self, commit: &ObjectId) -> Result<Vec<LfsEntry>, GfsError>;
+
+  /// Whether `.gitattributes` at this revision says `filter=lfs` for `path`.
+  /// This is the write path's question (ADR 0012): content committed to such
+  /// a path must be re-cleaned into a pointer, whatever the content is.
+  fn lfs_filtered(&self, commit: &ObjectId, path: &BytePath) -> Result<bool, GfsError>;
+
   /// Read a whole blob, verifying its object ID against its contents.
   fn read_blob(&self, blob: &ObjectId) -> Result<Vec<u8>, GfsError>;
 
@@ -475,6 +500,14 @@ impl AsyncRepository {
 
   pub async fn read_commit(&self, commit: ObjectId) -> Result<CommitMeta, GfsError> {
     self.run(move |r| r.read_commit(&commit)).await
+  }
+
+  pub async fn lfs_filtered(&self, commit: ObjectId, path: BytePath) -> Result<bool, GfsError> {
+    self.run(move |r| r.lfs_filtered(&commit, &path)).await
+  }
+
+  pub async fn lfs_pointers(&self, commit: ObjectId) -> Result<Vec<LfsEntry>, GfsError> {
+    self.run(move |r| r.lfs_pointers(&commit)).await
   }
 
   /// Resolve a selector and then walk its ancestry, in one blocking operation.

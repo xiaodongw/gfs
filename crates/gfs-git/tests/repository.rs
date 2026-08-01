@@ -508,12 +508,97 @@ fn attributes_and_lfs_content_is_served_raw_as_documented() {
   );
   assert!(!bytes.windows(2).any(|w| w == b"\r\n"));
 
-  // An LFS pointer is served as the pointer file. Resolving LFS is out of MVP
-  // scope, and a pointer is what the object database actually contains.
+  // Without an LFS store injected, an LFS pointer is served as the pointer
+  // file — since ADR 0012 this is the *degraded* path (store absent or object
+  // unfetchable) rather than the only behavior; expansion is asserted by
+  // `an_lfs_entry_expands_when_its_object_is_available_and_degrades_when_not`.
   let psd = repo
     .entry(&commit, &BytePath::new("asset.psd"))
     .unwrap()
     .unwrap();
+  let pointer = repo.read_blob(&psd.oid).unwrap();
+  assert!(pointer.starts_with(b"version https://git-lfs.github.com/spec/v1"));
+}
+
+#[test]
+fn an_lfs_entry_expands_when_its_object_is_available_and_degrades_when_not() {
+  // ADR 0012: with an LFS check injected, entry metadata reports the expanded
+  // size and the `lfs-sha256:` content key for a `filter=lfs` path whose
+  // object is available — and degrades to the pointer when it is not. The
+  // fixture's pointer claims the all-zeros oid and size 12345.
+  struct Contains(bool);
+  impl gfs_git::lfs::LfsObjectCheck for Contains {
+    fn contains(&self, oid: &ObjectId) -> bool {
+      assert_eq!(oid.algorithm(), HashAlgorithm::LfsSha256);
+      self.0
+    }
+  }
+  let expanded_key = format!("lfs-sha256:{}", "0".repeat(64));
+
+  let repo = Libgit2Repository::open(gfs_test::bare("attrs"), 4, TREE_CACHE_BYTES)
+    .unwrap()
+    .with_lfs_check(Arc::new(Contains(true)));
+  let commit = head(&repo);
+
+  let psd = repo
+    .entry(&commit, &BytePath::new("asset.psd"))
+    .unwrap()
+    .unwrap();
+  assert_eq!(psd.oid.to_qualified(), expanded_key);
+  assert_eq!(psd.size, 12345);
+
+  // The same entry through a directory listing must agree with GetEntry.
+  let page = repo.list_directory(&commit, &BytePath::root(), None, 100).unwrap();
+  let listed = page
+    .entries
+    .iter()
+    .find(|e| e.path.as_bytes() == b"asset.psd")
+    .unwrap();
+  assert_eq!(listed.oid.to_qualified(), expanded_key);
+  assert_eq!(listed.size, 12345);
+
+  // A non-LFS file is untouched.
+  let txt = repo
+    .entry(&commit, &BytePath::new("converted.txt"))
+    .unwrap()
+    .unwrap();
+  assert_eq!(txt.oid.algorithm(), HashAlgorithm::Sha1);
+
+  // The seeded index is the post-`git lfs pull` shape: expanded size, pointer
+  // OID (index entries must stay real git objects; write_index_v2 enforces
+  // SHA-1, so a leaked content key would fail loudly rather than corrupt).
+  let index = repo
+    .index_for_commit(&commit, gfs_types::Timestamp::from_secs(1_700_000_000))
+    .unwrap();
+  let needle = 12345u32.to_be_bytes();
+  assert!(
+    index.windows(4).any(|w| w == needle),
+    "index must record the expanded size"
+  );
+
+  // The write path's question: which paths must be re-cleaned on commit.
+  assert!(repo.lfs_filtered(&commit, &BytePath::new("asset.psd")).unwrap());
+  assert!(!repo
+    .lfs_filtered(&commit, &BytePath::new("converted.txt"))
+    .unwrap());
+
+  // Detection for store population is independent of availability, and keeps
+  // the pointer blob's own identity for the search indexer.
+  let pointers = repo.lfs_pointers(&commit).unwrap();
+  assert_eq!(pointers.len(), 1);
+  assert_eq!(pointers[0].path.as_bytes(), b"asset.psd");
+  assert_eq!(pointers[0].pointer.size, 12345);
+  assert_eq!(pointers[0].blob_oid.algorithm(), HashAlgorithm::Sha1);
+
+  // Object unavailable: the entry degrades to its pointer.
+  let repo = Libgit2Repository::open(gfs_test::bare("attrs"), 4, TREE_CACHE_BYTES)
+    .unwrap()
+    .with_lfs_check(Arc::new(Contains(false)));
+  let psd = repo
+    .entry(&commit, &BytePath::new("asset.psd"))
+    .unwrap()
+    .unwrap();
+  assert_eq!(psd.oid.algorithm(), HashAlgorithm::Sha1);
   let pointer = repo.read_blob(&psd.oid).unwrap();
   assert!(pointer.starts_with(b"version https://git-lfs.github.com/spec/v1"));
 }

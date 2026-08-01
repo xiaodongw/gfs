@@ -43,6 +43,10 @@ pub struct IngestConfig {
   /// The directory holding one bare mirror per repository.
   pub repos_root: PathBuf,
   pub git_binary: PathBuf,
+  /// Runs the LFS batch download (ADR 0012); network egress is a subprocess's
+  /// job here for the same reason fetching is stock Git's.
+  pub curl_binary: PathBuf,
+  pub lfs_prefetch: crate::lfs::LfsPrefetch,
 }
 
 impl IngestConfig {
@@ -50,6 +54,8 @@ impl IngestConfig {
     IngestConfig {
       repos_root: repos_root.into(),
       git_binary: PathBuf::from("git"),
+      curl_binary: PathBuf::from("curl"),
+      lfs_prefetch: crate::lfs::LfsPrefetch::default(),
     }
   }
 
@@ -204,6 +210,13 @@ pub fn ingest(
 
   let record: RepositoryRecord = registry.activate(&repository_id)?;
 
+  // Populate the LFS store while the caller's credential is still in hand —
+  // this is the one moment the server can reach an authenticated upstream
+  // (the catalog stores credential references, never secrets). Best-effort by
+  // design: an unfetchable object degrades its entries to pointers, and a
+  // clone must not fail because a CDN hiccupped.
+  prefetch_lfs(registry, config, &record.repository_id, url, credential, &default_branch);
+
   let mut summary = outcome.summary;
   if !outcome.diverged.is_empty() {
     // Carried in the summary the clone response already has, so a client that
@@ -219,6 +232,75 @@ pub fn ingest(
     default_branch,
     summary,
   })
+}
+
+/// Fetch the default branch tip's LFS working set into the store (ADR 0012).
+///
+/// Never fails the ingest: every failure path logs and leaves the affected
+/// entries degrading to their pointers, which is the documented behavior for
+/// an unreachable upstream.
+fn prefetch_lfs(
+  registry: &Arc<Registry>,
+  config: &IngestConfig,
+  repository_id: &RepositoryId,
+  url: &str,
+  credential: Option<&str>,
+  default_branch: &str,
+) {
+  if config.lfs_prefetch == crate::lfs::LfsPrefetch::None {
+    return;
+  }
+  let Some(store) = registry.lfs_store() else {
+    return;
+  };
+  let Some(endpoint) = crate::lfs::BatchClient::endpoint_for(url) else {
+    // file:// and ssh upstreams have no derivable batch endpoint. Their LFS
+    // entries stay pointers, which the entry-metadata path reports truthfully.
+    return;
+  };
+  let result = (|| -> Result<crate::lfs::DownloadReport, GfsError> {
+    let repo = registry.blocking_repository(repository_id)?;
+    let selector =
+      gfs_types::RevisionSelector::parse(default_branch, repo.algorithm())?;
+    let tip = repo.resolve(&selector)?.commit;
+    let mut wanted = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for entry in repo.lfs_pointers(&tip)? {
+      let pointer = entry.pointer;
+      if seen.insert(pointer.oid.clone()) && !store.contains(repository_id, &pointer.oid) {
+        wanted.push(crate::lfs::WantedObject {
+          oid: pointer.oid,
+          size: pointer.size,
+        });
+      }
+    }
+    if wanted.is_empty() {
+      return Ok(crate::lfs::DownloadReport::default());
+    }
+    let client = crate::lfs::BatchClient::new(&config.curl_binary);
+    client.download(&endpoint, credential, &wanted, &store, repository_id)
+  })();
+  match result {
+    Ok(report) => {
+      if report.fetched > 0 || !report.degraded.is_empty() {
+        tracing::info!(
+          repository = %repository_id,
+          fetched = report.fetched,
+          degraded = report.degraded.len(),
+          "LFS prefetch finished"
+        );
+      }
+      for (oid, reason) in &report.degraded {
+        tracing::warn!(repository = %repository_id, oid, "LFS object degrades to its pointer: {reason}");
+      }
+    }
+    Err(e) => {
+      tracing::warn!(
+        repository = %repository_id,
+        "LFS prefetch failed; entries degrade to pointers: {e}"
+      );
+    }
+  }
 }
 
 /// A human-facing name for the repository: the URL, when it fits.

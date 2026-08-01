@@ -1,6 +1,6 @@
 # ADR 0012: Server-side LFS expansion
 
-- Status: Proposed
+- Status: Accepted (implemented 2026-07-31)
 - Date: 2026-07-31
 - Extends: [ADR 0009](0009-raw-git-over-a-projected-object-store.md) — the
   projected object store is untouched; expansion happens in entry metadata and
@@ -129,8 +129,15 @@ daemon-backed shims:
   is safe, but pays content hashing on every reconcile, adds a tool to ADR
   0007's surface, and still needs endpoint and credential plumbing per
   workspace. The seeded config deliberately uses the standard `filter.lfs`
-  name so an image that ships git-lfs anyway remains coherent; coexistence
-  beyond that is untested (m05d limitation) and pinned as an open item.
+  name so an image that ships git-lfs anyway remains coherent. Coexistence
+  was settled by the first live test: an installed git-lfs registers
+  `filter.lfs.process` globally, Git prefers the process form across config
+  scopes, and an empty local override poisons the driver rather than
+  falling back — so the shim speaks the long-running filter-process
+  protocol and the workspace seeds it locally, which wins the precedence.
+  The m05d note that the process protocol was "the escalation if spawn
+  overhead ever shows up" understated it: it is a correctness requirement
+  on any host with git-lfs installed.
 - **Proxying `/info/lfs` at the gateway** for client-side git-lfs: less
   server work than a store, but keeps the per-workspace duplication and the
   overlay-journal ambiguity; it solves only the endpoint problem, which is
@@ -152,6 +159,8 @@ daemon-backed shims:
   "expanded" is per-entry state, not per-repository — `gfs status` should say
   which entries degraded, for the same reason search reports scoped coverage.
 - The clean shim may run more than once per git command on stat-dirty paths
-  (m05d arm D measured 4 invocations across 2 files in one `status`); the
-  long-running `filter.<driver>.process` protocol is the escalation if spawn
-  overhead ever shows up in a real workload.
+  (m05d arm D measured 4 invocations across 2 files in one `status`). The
+  long-running `filter.<driver>.process` protocol — originally the escalation
+  for spawn overhead — is implemented and seeded, because it turned out to be
+  the only way to win config precedence over an installed git-lfs (see
+  Alternatives).

@@ -142,6 +142,15 @@ pub enum Request {
     /// base64url, for the reason the diff's paths are.
     path_b64url: String,
   },
+  /// The LFS clean filter's question (ADR 0012): the canonical pointer for a
+  /// base-identical path. Answered `None` when the path is overlaid or is not
+  /// an expanded LFS entry, which tells the shim to clean stdin itself.
+  LfsClean { path_b64url: String },
+  /// The LFS smudge filter's hydration: bring the expanded object into the
+  /// shared verified cache and say where it landed. `oid` is the pointer's
+  /// `lfs-sha256:` key; `path_b64url` is the worktree path, which is what the
+  /// blob ticket is minted from.
+  LfsSmudge { path_b64url: String, oid: String },
   /// Everything the workspace changed, with the bytes, for the CLI to commit.
   ///
   /// The daemon collects but does not send: the control socket has no server
@@ -405,6 +414,17 @@ pub enum Response {
   Cat {
     commit: String,
     content_b64url: String,
+  },
+  /// The pointer text for a base-identical LFS path, or `None` when the shim
+  /// must clean stdin itself. Pointer text is ASCII by construction, so it
+  /// travels unencoded.
+  LfsClean {
+    pointer: Option<String>,
+  },
+  /// Where the hydrated, verified object landed on the local filesystem. The
+  /// shim streams this file to stdout.
+  LfsSmudge {
+    path: std::path::PathBuf,
   },
   Unmounted,
   Error {

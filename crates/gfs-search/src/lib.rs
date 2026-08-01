@@ -53,7 +53,10 @@
 //! drift apart.
 
 pub mod classify;
-pub mod glob;
+// The byte-glob moved to `gfs_types` so `gfs-git`'s attribute matching (ADR
+// 0012) can share it without dragging this crate's index dependencies along;
+// re-exported here so search-side callers keep their paths.
+pub use gfs_types::glob;
 pub mod lines;
 pub mod local;
 pub mod manifest;

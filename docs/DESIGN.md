@@ -946,7 +946,14 @@ must be stated, because they are invisible to the agent unless documented:
   `text`/`eol` conversion, `core.autocrlf`, and clean/smudge filters are not
   applied, so a repository that relies on them presents different bytes than
   `git checkout` would produce for the same commit.
-- **LFS files appear as pointer files.** LFS content is not resolved in the MVP.
+- **LFS files appear expanded, resolved by the server** (ADR 0012). Entry
+  metadata reports the expanded size and an `lfs-sha256:{oid}` content key
+  served from the gateway's LFS store; the mount seeds `filter.lfs.*` shims so
+  stock Git stays truthful against the expanded working tree, and `gfs commit`
+  re-cleans edited LFS content into fresh pointers. "Expanded" is per-entry
+  state: an object the store could not fetch degrades that one entry to its
+  pointer file, which was the MVP behavior. Search skips LFS entries with
+  their own `lfs` coverage reason.
 - **Base timestamps use the server's sanitized stable snapshot time.** Overlay
   timestamps cannot be set below the base-plus-one-tick floor, and base inode
   numbers are stable only within a mount generation, per section 8.2.
@@ -974,8 +981,9 @@ Before production:
 - crash-safe overlay migration;
 - multi-replica server deployment;
 - tokenized search if users need it;
-- LFS pointer awareness;
-- documented large-file behavior;
+- documented large-file behavior — ADR 0012's whole-object fetch of expanded
+  LFS files at first `open()` is the concrete forcing function; range fetch
+  for `lfs-sha256:` objects is the known relief valve;
 - push or a robust patch-application integration;
 - CSI/host-daemon packaging;
 - multi-node retention and derived-index garbage collection, extending the mount

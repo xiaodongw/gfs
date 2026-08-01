@@ -290,8 +290,23 @@ async fn immutable_blob(
       .authz
       .verify_blob_ticket(&identity.subject, &repo_id, &blob, &query.ticket)?;
 
-    let repo = state.registry.repository(&repo_id)?;
-    let bytes = repo.read_blob(blob.clone()).await?;
+    // An `lfs-sha256:` key is served from the LFS store; everything else is a
+    // Git object in the mirror. Same ticket discipline for both — the ticket
+    // was issued for whichever key form entry metadata reported, so an entry
+    // that was served expanded authorizes exactly the expanded content.
+    let bytes = if blob.algorithm() == gfs_types::HashAlgorithm::LfsSha256 {
+      let store = state.registry.lfs_store().ok_or_else(|| {
+        GfsError::not_found("this server has no LFS store; the object is not servable")
+      })?;
+      let (store_repo, store_blob) = (repo_id.clone(), blob.clone());
+      tokio::task::spawn_blocking(move || store.read(&store_repo, &store_blob))
+        .await
+        .map_err(|e| GfsError::internal(format!("LFS read task: {e}")))??
+        .ok_or_else(|| GfsError::not_found("LFS object not in the store"))?
+    } else {
+      let repo = state.registry.repository(&repo_id)?;
+      repo.read_blob(blob.clone()).await?
+    };
     Ok((identity, repo_id, blob, bytes))
   }
   .await;
