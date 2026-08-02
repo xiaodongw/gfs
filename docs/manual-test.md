@@ -184,9 +184,18 @@ token is needed: the helper presents the empty token, which is the `dev`
 subject.
 
 ```sh
-git push                  # every local branch, through the wildcard refspec
-git push origin my-change # just the one
+git push origin my-change # the branch you name
+git push                  # the current branch, once it has an upstream
+git push -u origin my-change   # push it and set the upstream in one go
 ```
+
+`git push` is stock `push.default = simple`: the current branch to its
+upstream, and nothing else. A branch with no upstream yet fails with Git's own
+`--set-upstream` hint rather than guessing. Until 2026-08-02 the seed carried
+`remote.origin.push = refs/heads/*:refs/heads/*`, which overrode `push.default`
+and made the bare form offer *every* local branch — scratch branches included,
+from a branch you were not standing on. If you are ever unsure what a push will
+send, `git push --dry-run` resolves the refspec and transmits nothing.
 
 Pushed work is safe from syncing because the upstream sync is
 **fast-forward-only**: upstream state is fetched into

@@ -360,6 +360,7 @@ merge, rebase, or force-push, against the advertised
 `refs/heads/` (tags stay fetch-owned, `refs/gfs/` stays reserved), the seeded
 push refspec became `refs/heads/*:refs/heads/*`, and `gfs push` falls back to
 `refs/heads/<branch>` when the caller has no work branch of that name.
+(The seeded refspec was removed on 2026-08-02; see the amendment below.)
 
 Everyone sharing a gateway repository shares its branches, exactly as a team
 sharing a fork does; per-branch protection (a deny list in receive-pack, where
@@ -418,3 +419,32 @@ would make it resolvable two ways. Its timestamps now live in the journal's meta
 table, which is the same durability without the second spelling. That half
 matters for anything keyed on directory mtime — builds, watchers, and Git's own
 untracked cache when fsmonitor is *not* configured.
+
+## Amendment, 2026-08-02: no seeded push refspec
+
+The amendment above left `remote.origin.push = refs/heads/*:refs/heads/*` in the
+seeded config. It was load-bearing while pushes were confined to
+`refs/gfs/work/<subject>/` — the mapping from a local branch to its work ref had
+to be spelled out or `git push origin <branch>` went somewhere receive-pack
+refused. Once the gateway became a fork and that mapping became the identity, the
+line stopped affecting explicit pushes at all: `git push origin foo` already
+means `refs/heads/foo:refs/heads/foo`.
+
+What it still did was redefine the *bare* `git push`. A configured
+`remote.<name>.push` overrides `push.default` outright, and a wildcard refspec
+matches every local branch — so `git push`, standing on a feature branch,
+offered to publish every scratch and WIP branch in the workspace. Found by an
+agent session with `--dry-run`, which is the only reason it was found before it
+published something.
+
+So the line is gone, and `push.default = simple` is named explicitly instead.
+Explicit pushes behave exactly as they did; the bare form now pushes the current
+branch to its upstream and nothing else, and on a branch with no upstream it
+fails with Git's own `--set-upstream` hint rather than guessing. Naming
+`push.default` rather than inheriting it is the same reasoning as the rest of
+this config: what the workspace guarantees cannot depend on the host's global
+Git configuration, where `push.default = matching` would restore the fan-out.
+
+The general lesson for this seed: every line in it is a *behaviour override*,
+and an override that has become redundant is not harmless — it keeps overriding
+the thing that would otherwise be correct.

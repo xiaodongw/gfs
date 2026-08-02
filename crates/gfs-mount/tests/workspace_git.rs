@@ -209,6 +209,46 @@ async fn a_local_commit_pushes_to_the_real_branch_through_the_seeded_remote() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_bare_push_never_fans_out_to_branches_the_caller_is_not_on() {
+  // The seeded config used to carry `remote.origin.push =
+  // refs/heads/*:refs/heads/*`, which overrides `push.default` outright — so a
+  // bare `git push` offered to publish every local branch, including scratch
+  // ones the caller was not standing on and had never asked to share. An agent
+  // that makes throwaway branches would publish all of them with the most
+  // ordinary Git command there is.
+  let backend = Backend::start("basic").await;
+  let job = Job::start(&backend, "main").await;
+  let ws = job.workspace.clone();
+
+  let (dry_run, config) = on_fs(move || {
+    let (ok, out) = git_in(&ws, &["switch", "-q", "-c", "scratch-probe"]);
+    assert!(ok, "{out}");
+    let (ok, out) = git_in(&ws, &["switch", "-q", "-c", "the-work"]);
+    assert!(ok, "{out}");
+
+    // `--dry-run` still resolves the refspec, which is the whole question here,
+    // and needs no credential because nothing is transmitted.
+    let (_, dry_run) = git_in(&ws, &["push", "--dry-run"]);
+    let config = std::fs::read_to_string(ws.join(".git/config")).unwrap();
+    (dry_run, config)
+  })
+  .await;
+
+  assert!(
+    !dry_run.contains("scratch-probe"),
+    "a bare push must never offer a branch the caller is not on:\n{dry_run}"
+  );
+  assert!(
+    !config.contains("push = refs/heads/"),
+    "an explicit remote push refspec defeats push.default:\n{config}"
+  );
+  assert!(
+    config.contains("default = simple"),
+    "the workspace names push.default rather than inheriting the host's:\n{config}"
+  );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_pushed_commit_survives_deleting_the_workspace_and_cloning_again() {
   // The round trip every other Git host supports: commit, push, delete the
   // local clone, clone again — the work is on the branch, so it comes back.

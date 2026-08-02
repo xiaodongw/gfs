@@ -90,6 +90,14 @@ stack restarted onto the new binaries (the `gfs-fuse` host serves from the
 image it started with), which is the user's call — the workspace holds a local
 test commit.
 
+**Phase 5 — the seeded push refspec, from the second report.** The follow-up
+session found `remote.origin.push = refs/heads/*:refs/heads/*` turning a bare
+`git push` into "publish every local branch". Removed, with
+`push.default = simple` named explicitly in its place, and pinned by
+`a_bare_push_never_fans_out_to_branches_the_caller_is_not_on` (verified to fail
+with the line restored). ADR 0009 and `docs/manual-test.md` corrected — the
+manual guide had been documenting the fan-out as the intended behaviour.
+
 ## Decisions
 
 * **Cumulative fsmonitor answer, kept.** A per-path change sequence would let the
@@ -109,6 +117,14 @@ test commit.
   would collide with the agent's own branches and resurrect ones Git deleted.
   Remote-tracking is what a clone would have produced, and it is what `git
   describe`, `git log origin/main`, and `@{upstream}` actually want.
+* **The push refspec is dropped rather than narrowed to `HEAD`.** `push = HEAD`
+  would also confine the blast radius and would keep a bare `git push` working
+  on a branch with no upstream — but it still overrides `push.default`, and the
+  reason the old line was dangerous is that it was an override nobody expected
+  to be there. Dropping it restores stock Git semantics exactly, which is the
+  ADR's whole posture. `push.autoSetupRemote` was considered for the
+  branch-with-no-upstream case and left off: publishing a branch should stay an
+  explicit act, and Git's failure already prints the command to run.
 * **No new authorization surface for `ListRefs`.** ADR 0002 already concludes
   that repository read access implies what the Git gateway advertises; this RPC
   serves the same filtered set through gRPC, reusing `visible_refs`'s

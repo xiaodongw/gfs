@@ -271,11 +271,25 @@ pub fn seed_git_dir(spec: &SeedSpec<'_>) -> Result<(), gfs_types::error::GfsErro
     // would put it and the next clone sees it. The credential helper reads
     // the job's own GFS_TOKEN at push time; the token itself is never written
     // to disk here.
+    //
+    // **No `remote.origin.push`.** It used to say `refs/heads/*:refs/heads/*`,
+    // from when pushes were confined to the work namespace and the mapping had
+    // to be spelled out. Once the gateway became a fork, that refspec was
+    // exactly what Git already does for `git push origin <branch>` — so it
+    // changed nothing except the *bare* `git push`, which it silently turned
+    // into "push every local branch": a configured `remote.<name>.push`
+    // overrides `push.default` entirely. An agent that makes scratch branches
+    // would publish all of them by typing the most ordinary Git command there
+    // is. `push.default` is named explicitly rather than left to Git's default
+    // for the same reason: this config is what the workspace guarantees, and a
+    // host's global `push.default = matching` would otherwise reintroduce the
+    // same fan-out.
     config.push_str(&format!(
       "[remote \"origin\"]\n\
        \turl = {url}/v1/repos/{repository}\n\
        \tfetch = +refs/heads/*:refs/remotes/origin/*\n\
-       \tpush = refs/heads/*:refs/heads/*\n\
+       [push]\n\
+       \tdefault = simple\n\
        [credential]\n\
        \thelper = \"!f() {{ echo username=x-access-token; echo password=$GFS_TOKEN; }}; f\"\n",
       url = facts.http_endpoint.trim_end_matches('/'),
