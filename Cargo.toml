@@ -142,3 +142,6 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 clap = { version = "4", features = ["derive", "env"] }
 tempfile = "3"
+# Test-only: mapping the seeded index the way gitstatusd does, to pin that a
+# re-seed replaces it by rename rather than truncating under a live mmap.
+memmap2 = "0.9"

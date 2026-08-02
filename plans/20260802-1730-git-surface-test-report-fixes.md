@@ -141,3 +141,15 @@ manual guide had been documenting the fan-out as the intended behaviour.
 * The `packed-refs` file is rewritten on every seed, so a ref deleted locally
   comes back on the next repin. That is the same "pinned ref view" contract the
   branch ref already has.
+
+**Phase 6 — atomic seed writes, from the terminal-hang investigation.** A
+wedged zsh (2026-08-02) traced to gitstatusd dying mid-request; best candidate
+for the death is SIGBUS from `seed_git_dir` rewriting `.git/index` with
+`std::fs::write` (truncate-in-place) under gitstatusd's live mmap. New
+`write_atomic` (temp + rename beside the target, pid-suffixed) now writes
+index, config, gfs.json, and packed-refs; the mmap-survival property is pinned
+by `a_reseed_replaces_the_index_under_a_live_mmap_without_sigbus` (memmap2 as a
+dev-dependency, documented `allow(unsafe_code)`), verified to fail against the
+truncating write. The cause remains a candidate until the hang stops recurring;
+the deadlock *mechanics* (watchdog holds the response pipe, so a respawn never
+EOFs the reader) are proven and recorded in memory.

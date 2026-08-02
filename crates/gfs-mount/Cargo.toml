@@ -45,6 +45,7 @@ gfs-test = { workspace = true }
 gfs-service = { workspace = true }
 axum = { workspace = true }
 tempfile = { workspace = true }
+memmap2 = { workspace = true }
 tokio-stream = { workspace = true }
 
 [lints]

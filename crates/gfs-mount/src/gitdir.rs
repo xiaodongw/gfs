@@ -142,6 +142,31 @@ pub struct SeedSpec<'a> {
   pub preserve_local_head: bool,
 }
 
+/// Replace a seeded file by rename, never by truncation.
+///
+/// `std::fs::write` truncates in place, and truncation is visible to every
+/// process holding the old file — most dangerously **gitstatusd, which keeps
+/// `.git/index` mmap'ed**: shrink the file under a live mapping and the next
+/// page access is SIGBUS. gitstatusd dying mid-request is what turned a prompt
+/// redraw into a wedged terminal on 2026-08-02 (the plugin's watchdog holds
+/// the response pipe open, so the reader never even sees EOF). A rename swaps
+/// the directory entry while the old inode — and any mmap of it — lives on
+/// untouched, which is also how Git itself replaces the index.
+///
+/// The temp file sits beside the target so the rename cannot cross a
+/// filesystem, and its name is unique per process so two seeding daemons
+/// racing (mount vs. repin cannot race, but belt and braces) never rename each
+/// other's half-written file.
+fn write_atomic(target: &std::path::Path, bytes: &[u8]) -> Result<(), std::io::Error> {
+  let mut temp = target.as_os_str().to_owned();
+  temp.push(format!(".gfs-new.{}", std::process::id()));
+  let temp = std::path::PathBuf::from(temp);
+  std::fs::write(&temp, bytes)?;
+  std::fs::rename(&temp, target).inspect_err(|_| {
+    let _ = std::fs::remove_file(&temp);
+  })
+}
+
 /// Write (or re-point) the real git dir inside a workspace.
 ///
 /// Idempotent, and called again on every repin: `HEAD`, the branch ref, and the
@@ -322,18 +347,19 @@ pub fn seed_git_dir(spec: &SeedSpec<'_>) -> Result<(), gfs_types::error::GfsErro
     mount = facts.mount_id.as_str(),
     generation = facts.generation,
   ));
-  std::fs::write(dir.join("config"), config).map_err(|e| io("config", e))?;
+  write_atomic(&dir.join("config"), config.as_bytes()).map_err(|e| io("config", e))?;
 
   write_packed_refs(dir, facts).map_err(|e| io("packed-refs", e))?;
 
   if let Some(index) = spec.index {
-    std::fs::write(dir.join("index"), index).map_err(|e| io("index", e))?;
+    // Atomic above all for the *index*: this is the file gitstatusd mmaps.
+    write_atomic(&dir.join("index"), index).map_err(|e| io("index", e))?;
   }
 
   // The same machine-readable facts the synthesized surface carried, now inside
   // the real git dir where the shim and the fsmonitor hook find them by
   // resolving the `.git` file.
-  std::fs::write(dir.join("gfs.json"), gfs_json(facts)).map_err(|e| io("gfs.json", e))?;
+  write_atomic(&dir.join("gfs.json"), &gfs_json(facts)).map_err(|e| io("gfs.json", e))?;
   Ok(())
 }
 
@@ -402,12 +428,9 @@ fn write_packed_refs(dir: &std::path::Path, facts: &GitDirFacts) -> Result<(), s
       out.push('\n');
     }
   }
-  // Written beside and renamed: Git reads this file without a lock on the read
-  // path, and a partially written one is a repository that has lost refs.
-  let final_path = dir.join("packed-refs");
-  let temp = dir.join("packed-refs.gfs-new");
-  std::fs::write(&temp, out)?;
-  std::fs::rename(&temp, &final_path)
+  // Git reads this file without a lock on the read path, and a partially
+  // written one is a repository that has lost refs.
+  write_atomic(&dir.join("packed-refs"), out.as_bytes())
 }
 
 /// Install a helper-binary hook wrapper when the binary can be found.
@@ -594,6 +617,60 @@ mod tests {
     assert_eq!(
       std::fs::read_to_string(git.join("packed-refs")).unwrap(),
       before
+    );
+  }
+
+  #[test]
+  // The documented opt-out from the workspace `deny(unsafe_code)`: `Mmap::map`
+  // is unsafe because another process could truncate the file under the map —
+  // which is the exact hazard this test exists to prove absent.
+  #[allow(unsafe_code)]
+  fn a_reseed_replaces_the_index_under_a_live_mmap_without_sigbus() {
+    // gitstatusd keeps `.git/index` mmap'ed for the life of the shell session.
+    // The seed used to rewrite it with `std::fs::write` — truncate-in-place —
+    // and shrinking a file under a live mapping makes the next page access
+    // SIGBUS: gitstatusd dies mid-request and the terminal wedges (2026-08-02).
+    // A rename swaps the directory entry and leaves the mapped inode alone.
+    let tmp = tempfile::tempdir().unwrap();
+    let git = tmp.path().join(".git");
+    let big = vec![b'A'; 8192];
+    seed_git_dir(&SeedSpec {
+      git_dir: &git,
+      facts: &facts(Some("refs/heads/main")),
+      index: Some(&big),
+      preserve_local_head: false,
+    })
+    .unwrap();
+
+    // Map the seeded index the way gitstatusd does, then re-seed with a much
+    // smaller one. Through a truncating write this read faults; through a
+    // rename the old inode still holds every byte.
+    let file = std::fs::File::open(git.join("index")).unwrap();
+    let map = unsafe { memmap2::Mmap::map(&file).unwrap() };
+    seed_git_dir(&SeedSpec {
+      git_dir: &git,
+      facts: &facts(Some("refs/heads/main")),
+      index: Some(b"tiny"),
+      preserve_local_head: false,
+    })
+    .unwrap();
+
+    assert_eq!(map.len(), 8192);
+    assert!(
+      map.iter().all(|b| *b == b'A'),
+      "the old mapping must survive the re-seed byte for byte"
+    );
+    assert_eq!(std::fs::read(git.join("index")).unwrap(), b"tiny");
+    // And no temp file left behind.
+    let leftovers: Vec<_> = std::fs::read_dir(&git)
+      .unwrap()
+      .filter_map(|e| e.ok())
+      .map(|e| e.file_name().to_string_lossy().into_owned())
+      .filter(|n| n.contains(".gfs-new"))
+      .collect();
+    assert!(
+      leftovers.is_empty(),
+      "temp files must not linger: {leftovers:?}"
     );
   }
 
