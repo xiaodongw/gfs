@@ -227,6 +227,126 @@ Before 2026-07-28 the workspace was a symlink into
 `<workspace>.gfs/generations/<n>` and this section said the opposite. See ADR
 0003's second amendment.
 
+## Git LFS: the tree is born expanded
+
+The server resolves LFS (ADR 0012), so a workspace arrives in the state
+`git lfs pull` would have left behind — and you do not need git-lfs installed
+to get it. A small public repository with one tracked file is enough to see
+the whole loop:
+
+```sh
+cd ~/.gfs-lab
+git clone https://github.com/cbeams/lfs-test.git
+cd lfs-test
+
+cat .gitattributes         # *.pdf filter=lfs diff=lfs merge=lfs -text
+ls -l sample.pdf           # 184292 bytes -- the PDF, not a 131-byte pointer
+head -c 8 sample.pdf       # %PDF-1.4
+gfs ls                     # where that size comes from
+```
+
+```
+100644         42 sha1:b634d85f…  .gitattributes
+100644       3713 sha1:28ac6392…  README.md
+100644     184292 lfs-sha256:b1674191…  sample.pdf
+```
+
+The `lfs-sha256:` content key is the whole mechanism visible in one line: entry
+metadata reports the expanded size and an LFS key instead of the pointer blob's
+git oid, and every consumer downstream of metadata — the mount, `gfs cat`,
+WebDAV — expands without knowing it did. The pointer blob is still in the
+object store, unchanged, which is what keeps the projection and stock Git
+coherent.
+
+**Stock Git stays truthful, and cheap.** The mount seeds a `filter.lfs`
+configuration and an index carrying expanded sizes with snapshot-time stat
+data, so a clean tree reads clean at zero filter invocations:
+
+```sh
+git status                                    # clean
+git config --local --get-regexp '^filter\.lfs\.'
+```
+
+```
+filter.lfs.clean .git/hooks/gfs-lfs-filter clean %f
+filter.lfs.smudge .git/hooks/gfs-lfs-filter smudge %f
+filter.lfs.process .git/hooks/gfs-lfs-filter process
+filter.lfs.required true
+```
+
+That configuration is a correctness requirement, not a speed-up: without a
+clean filter, `git status` misreports every LFS file and `git add` writes the
+expanded content into the object database — the branch-corrupting move.
+
+**Editing re-cleans to a fresh pointer**, which is exactly what git-lfs would
+have done:
+
+```sh
+printf '%% edit\n' >> sample.pdf
+git status --short                  # M sample.pdf
+git add sample.pdf
+git cat-file -p :sample.pdf         # a fresh pointer: new oid, size 184299
+git cat-file -s :sample.pdf         # 131 bytes staged, not 184299
+git restore --staged --worktree sample.pdf
+git status --short                  # clean; the smudge hydrated the original back
+```
+
+The same holds through a commit and a branch switch — `git switch` across
+revisions hydrates through the smudge, which is the case that has to work if
+"real `.git`" is to mean anything:
+
+```sh
+git switch -c lfs-edit
+printf '%% edited by hand\n' >> sample.pdf
+git commit -am "edit the pdf"
+git cat-file -p HEAD:sample.pdf     # the commit holds a pointer, not 184 KB
+git switch master
+ls -l sample.pdf                    # 184292 again, and `git status` is clean
+```
+
+`git push origin lfs-edit` behaves like the section above, and `gfs push`
+uploads the branch's new LFS objects through the batch API with your
+credential before pushing the ref.
+
+**Search skips LFS entries with their own coverage reason**, beside `binary`
+and `oversized` — expanded content is unsearchable by nature and pointer text
+would only match on `oid sha256:`:
+
+```sh
+gfs rg -F 'PDF'
+```
+
+```
+gfs search: 2 of 4 paths in scope were not searched: 1 binary, 1 lfs
+```
+
+Four things are worth knowing while you poke at this:
+
+- **The first `open()` of a large LFS file blocks for the whole object** —
+  fetch, verify, cache write — and the `hydration` line counts it. On a host
+  where another workspace already read that object it is a cache hit costing
+  nothing (ADR 0008's per-host cache is shared across workspaces and across
+  labs, so a second run of this walkthrough shows `0 bytes, N cache hits`
+  rather than 184 KB).
+- **A smudge writes into the overlay**, so `git switch` and `git restore` on
+  an LFS path spend overlay quota at expanded size: `gfs inspect` reports
+  `overlay 1 changed paths … 184292 … bytes used` after the steps above even
+  though `git status` is clean.
+- **"Expanded" is per-entry state.** An object the gateway's store could not
+  fetch degrades that one entry to its pointer file, which is the pre-ADR-0012
+  behavior: `gfs ls` shows a `sha1:` key and a ~130-byte size for it, and
+  reading it gives you the pointer text. Ingest prefetches the default
+  branch's tip, so LFS objects that live only on other branches degrade until
+  a sync with a credential brings them in. `gfs status` does not yet name the
+  degraded entries.
+- **git-lfs installed on the host does not collide.** Its global
+  `filter.lfs.process = git-lfs filter-process` would otherwise hijack the
+  driver and derive a batch endpoint the gateway does not serve, so the
+  workspace seeds a *local* `process` entry pointing at the GFS shim, which
+  wins Git's precedence. If the mount could not find `gfs-lfs-filter` it warns
+  at mount time rather than failing; `filter.lfs.required = true` then makes
+  the first use fail loudly instead of silently writing garbage.
+
 ## Cheap questions: stock Git for names and history, the gateway for content
 
 The workspace has a real `.git` over the projected object store, so stock Git
@@ -305,9 +425,10 @@ that commit is an error with a non-zero exit, never an empty listing.
 | `*` | zero or more bytes, **none of them `/`** |
 | `**` | zero or more path components, `/` included |
 
-`git ls-files` — the replacement for the deleted `gfs find` — defaults to the
-*opposite*: its pathspec `*` crosses `/`, and `:(glob)` is what restores
-gitignore semantics:
+`git ls-files` defaults to the *opposite*: its pathspec `*` crosses `/`, and
+`:(glob)` is what restores gitignore semantics. (`gfs find` takes find's own
+grammar — `-name` matches a basename, `-path` the whole path — so it is a
+third dialect, and the one that matches what you would have typed for `find`.)
 
 ```sh
 git ls-files '*options.py'           # deep matches -- `*` crosses `/` here
@@ -357,14 +478,18 @@ wholesale download (`repack -a` measured 6.6 GiB on a kernel-sized
 repository). They exit 2, not 1: several Git subcommands use exit 1 as a
 data-bearing answer, and a refusal must not be readable as one.
 
-`gfs install-shim` also links `grep`, `find`, and `rg` to the scan shim, whose
-rule is weaker still: it never refuses and never substitutes output. Inside a
-workspace it says the cheap route once on stderr — `gfs rg` for a recursive
-`grep` or any `rg`, `git ls-files` for `find` — then execs the real tool, and
-the hydration budget prices whatever the sweep hydrates (`EDQUOT` at open when
-it runs out). Non-recursive `grep` is not nagged. Outside a GFS workspace all
-four names are fully transparent, which is what makes a `PATH`-wide install
-safe.
+`gfs install-shim` also links `grep`, `find`, and `rg` to the scan shim, which
+takes the cheap route rather than advising it: inside a workspace `rg` and
+`find` become `gfs rg` and `gfs find` with the same argv, and a recursive
+`grep` is translated where the translation is faithful. An earlier version only
+printed the cheap route on stderr, which nobody mid-sweep reads. It never
+refuses: `gfs rg`/`gfs find` reject an unimplemented flag by name at parse
+time, before any output exists, and the shim then execs the real tool with a
+note — so an untranslatable invocation works slowly, and the hydration budget
+prices whatever it hydrates (`EDQUOT` at open when it runs out). Non-recursive
+`grep` runs the real tool untouched, since it reads only the files it was
+given. Outside a GFS workspace all four names are fully transparent, which is
+what makes a `PATH`-wide install safe.
 
 ## The smart-HTTP gateway
 

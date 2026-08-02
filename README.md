@@ -11,14 +11,18 @@ The system has three entry points:
 
 - `gfs-server` — the repository service. Imports bare Git repositories, resolves
   revisions, serves trees and blobs over HTTP/gRPC, answers search and history
-  queries (log, diff, show, blame), and exposes a Git smart-HTTP gateway so
+  queries (log, diff, show, blame), resolves Git LFS pointers server-side out
+  of its own LFS store (ADR 0012), and exposes a Git smart-HTTP gateway so
   stock `git clone`/`fetch` work against it, plus a read-only WebDAV surface
   (ADR 0010) so a machine without FUSE — Finder, Explorer — can browse a
   branch tip with no client software.
 - `gfs-fuse` — the host mount daemon. Mounts a pinned commit as a read-only
   base with a writable overlay, lazily fetching blobs from the server and
-  caching them locally. It synthesizes a minimal read-only `.git` surface so
-  tools that probe for a repository root still work.
+  caching them locally. The workspace's `.git` is a real directory passed
+  through the mount (ADR 0011) over the projected object store, so stock Git
+  answers truthfully; the daemon seeds it with a `filter.lfs` configuration
+  and an index carrying expanded LFS sizes, so the tree an agent sees is the
+  post-`git lfs pull` state.
 - `gfs` (CLI) — the agent-facing tool. Reading: `resolve`, `ls`, `cat`,
   `search` (and `rg`, an `rg`-flag-compatible spelling), `find` (a
   `find`-compatible subset answered from the index, no tree walk), `diff`,
@@ -33,6 +37,34 @@ Supporting libraries live under `crates/` (`gfs-git`, `gfs-search`,
 `gfs-test`). The full design rationale is in [docs/DESIGN.md](docs/DESIGN.md);
 architecture decisions are in [docs/adr/](docs/adr/).
 
+## Shims: the pre-configured tool surface
+
+Inside an agent image, `gfs install-shim` symlinks `git`, `grep`, `find`, and
+`rg` in a directory you prepend to `PATH` (ADR 0007, ADR 0009). The shims are a
+cost measure, not a security boundary — a tool that calls a binary by absolute
+path bypasses them and still gets correct answers, just the expensive ones:
+
+- **`git`** (`gfs-git-shim`) — passes through to real Git by default. It
+  delegates `git clone <url>` to `gfs clone` (falling back to real `clone` if
+  the flags do not translate or no gateway is reachable), refuses `gc`,
+  `repack`, `prune`, `fsck`, and `maintenance` with the reason (each walks the
+  whole object store, which through a projection is a monorepo download), and
+  notes on `blame` that `gfs blame` answers server-side.
+- **`grep` / `find` / `rg`** (`gfs-scan-shim`) — take the cheap route
+  themselves: `rg` and `find` become `gfs rg` and `gfs find` with the same
+  argv, recursive `grep` is translated conservatively. An unimplemented flag is
+  refused by name at parse time, before any output exists, and the shim runs
+  the real tool over the mount instead — unsupported invocations work slowly
+  rather than failing.
+- **`gfs-lfs-filter`** — the daemon-backed `filter.lfs` clean/smudge/process
+  driver, installed into `.git/hooks` and seeded into the workspace config by
+  the mount rather than by `install-shim`.
+- **`gfs-fsmonitor`** — the `core.fsmonitor` hook, answered from the overlay
+  journal.
+
+Outside a GFS workspace every shim passes through silently, which is what makes
+a `PATH`-wide install safe; `GFS_SHIM_BYPASS` disables delegation outright.
+
 ## How it compares to raw Git
 
 GFS is not a Git replacement — the server stores real Git repositories and
@@ -45,13 +77,24 @@ speaks the real Git protocol. It changes *how an agent consumes* a repository:
 | Code search | `git grep` needs a local checkout; searching means materializing the working set | Server-side revision-aware search (trigram index over the pinned snapshot) — no hydration at all |
 | Edits | Working tree is the checkout | Copy-on-write overlay over an immutable base; commit to the gateway, push upstream, or export as a patch |
 | History | Local, full fidelity | Server-answered `log`/`diff`/`show`/`blame` against the pinned revision |
-| Protocol | — | Smart-HTTP gateway: stock `git clone`/`fetch` work unchanged |
+| Large files | `git lfs pull` smudges every LFS object into each checkout | Server resolves LFS; the tree is born expanded, objects shared per host, no git-lfs in the image |
+| Protocol | — | Smart-HTTP gateway: stock `git clone`/`fetch` work unchanged (pointers, as any Git host serves) |
 
 Deliberate divergences from a real checkout (see DESIGN.md section 12):
 
-- **No content filters.** The mount serves raw blob bytes; `.gitattributes`
-  `text`/`eol`, `core.autocrlf`, and clean/smudge filters are not applied.
-- **LFS files appear as pointer files** — LFS content is not resolved.
+- **No content filters other than LFS.** The mount serves raw blob bytes:
+  `.gitattributes` `text`/`eol`, `core.autocrlf`, and custom clean/smudge
+  filters are not applied, so a repository that relies on them presents
+  different bytes than `git checkout` would. LFS is the one exception, and it
+  is resolved server-side rather than by the mount running a filter.
+- **LFS files appear expanded** (ADR 0012), resolved by the server rather than
+  by a client-side `git lfs pull`: entry metadata reports the expanded size and
+  an `lfs-sha256:{oid}` content key served from the gateway's LFS store, so the
+  mount, `gfs cat`, and WebDAV expand without knowing they did. "Expanded" is
+  per-entry state — an object the store cannot fetch upstream degrades that one
+  entry to its pointer file. Search skips LFS entries with their own `lfs`
+  coverage reason. First `open()` of a large LFS file blocks for a whole-object
+  fetch and verify; range fetch is not implemented.
 - **SHA-1 repositories with the `files` ref backend only**; `reftable` and
   SHA-256 repositories are rejected, not degraded.
 - **Linux + FUSE3 only**, case-sensitive paths, whole-blob fetch, single-node
@@ -73,6 +116,8 @@ Prerequisites:
   the dev stack)
 - Stock Git 2.53.0 (pinned by ADR 0001; the gateway executes it as
   `upload-pack`. A different version produces a warning, not a failure)
+- `curl` on the server host, which `gfs-server` runs for LFS batch-API
+  transfers (`--curl-binary` / `GFS_CURL_BINARY`)
 - Optional: `cargo-deny` and `cargo-cyclonedx` for the license/SBOM check
   stages (skipped with a notice if absent)
 
@@ -88,7 +133,11 @@ cargo build --workspace --release
 
 Binaries land in `target/debug/` (or `target/release/`): `gfs`, `gfs-server`,
 `gfs-fuse`, plus the mount-support helpers `gfs-git-shim`, `gfs-scan-shim`,
-and `gfs-fsmonitor`.
+`gfs-lfs-filter`, and `gfs-fsmonitor`. The two shims are also built under the
+names they answer to — `git`, `grep`, `find`, `rg` — so putting `target/debug`
+on `PATH` *is* the pre-configured environment, with no `gfs install-shim` step.
+(For the same reason, do not `cargo install --path gfs-fuse`: it would drop a
+binary named `git` into `~/.cargo/bin` and shadow the real tool everywhere.)
 
 ## Test
 
@@ -124,6 +173,13 @@ export GFS_ENDPOINT=http://127.0.0.1:8431 GFS_TOKEN=dev-token
 ./target/debug/gfs cat --repo basic --rev main README.md
 ./target/debug/gfs mount --repo basic --rev main --workspace /tmp/ws
 ```
+
+To drive a real repository by hand instead — one command for a gateway, then
+`git clone` a URL and work the tree with the commands you already know —
+follow [docs/manual-test.md](docs/manual-test.md). It walks the whole loop
+(clone, search, commit, push), the LFS walkthrough against
+`github.com/cbeams/lfs-test`, the WebDAV surface, and the traps that produced
+plausible-looking wrong answers during development.
 
 ## License
 
