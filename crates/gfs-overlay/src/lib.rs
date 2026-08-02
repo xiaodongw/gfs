@@ -186,6 +186,18 @@ struct Inner {
   local_bytes: u64,
   /// The overlay logical clock: the last timestamp issued.
   clock: Timestamp,
+  /// Paths whose row is gone and which [`Status`] can therefore never mention.
+  /// See [`Overlay::vanished`].
+  vanished: HashSet<Vec<u8>>,
+  /// Set once [`journal::VANISHED_LIMIT`] is passed: the names are no longer
+  /// being kept, so the only honest answer left is "rescan everything".
+  vanished_overflow: bool,
+  /// The mount root's times, once something has changed in it.
+  root_times: Option<(Timestamp, Timestamp)>,
+  /// Committed transactions since this process opened the overlay. The
+  /// fsmonitor token carries it so the token advances when the filesystem
+  /// changes, which is what the v2 protocol asks of it.
+  sequence: u64,
 }
 
 pub struct Overlay {
@@ -268,6 +280,11 @@ impl Overlay {
 
     let next_ino = journal.next_ino()?.max(OVERLAY_INO_BASE);
     let next_content_id = journal.next_content_id()?.max(1);
+    let (vanished, vanished_overflow) = journal.vanished()?;
+    let root_times = journal.root_times()?;
+    if let Some((mtime, ctime)) = root_times {
+      clock = clock.max(mtime).max(ctime);
+    }
 
     Ok(Overlay {
       inner: Mutex::new(Inner {
@@ -279,6 +296,10 @@ impl Overlay {
         next_content_id,
         local_bytes,
         clock,
+        vanished: vanished.into_iter().collect(),
+        vanished_overflow,
+        root_times,
+        sequence: 0,
       }),
       store,
       config,
@@ -358,8 +379,77 @@ impl Overlay {
     inner.children.clear();
     inner.by_content.clear();
     inner.local_bytes = 0;
+    inner.vanished.clear();
+    inner.vanished_overflow = false;
+    inner.root_times = None;
+    inner.sequence += 1;
     let _ = self.store.sweep(&HashSet::new());
     Ok(())
+  }
+
+  /// Paths whose journal row is gone, and whether that record overflowed.
+  ///
+  /// The reason this exists: a file created and then deleted leaves *nothing*
+  /// behind — [`Overlay::remove`] drops the row outright when the base has
+  /// nothing at the path to whiteout — so [`Status`] cannot report it, and the
+  /// fsmonitor hook's answer is derived from `Status`. Git, once fsmonitor is
+  /// configured, stops `lstat`ing directories for its untracked cache and stops
+  /// `lstat`ing index entries it was not told about, so a deletion nobody names
+  /// is a deletion Git never sees: `git status` keeps printing `?? f.txt` for a
+  /// file that is gone, and a staged-then-deleted path reports as present.
+  ///
+  /// So the names are kept until the generation ends. The boolean is the cap
+  /// having been hit ([`journal::VANISHED_LIMIT`]), which the caller must turn
+  /// into a full-rescan answer.
+  pub fn vanished(&self) -> (Vec<BytePath>, bool) {
+    let inner = self.lock();
+    (
+      inner
+        .vanished
+        .iter()
+        .map(|p| BytePath::new(p.clone()))
+        .collect(),
+      inner.vanished_overflow,
+    )
+  }
+
+  /// The mount root's times, or `None` while the snapshot time still describes
+  /// it. See [`Overlay::touch_root`].
+  pub fn root_times(&self) -> Option<(Timestamp, Timestamp)> {
+    self.lock().root_times
+  }
+
+  /// Record that the mount root's contents changed.
+  ///
+  /// [`Overlay::touch_directory`] cannot serve the root: it adopts the
+  /// directory into the overlay as a row, and the empty path is what every
+  /// ancestor walk in this crate stops at. So the root's two timestamps live in
+  /// the journal's meta table instead, and the mount reads them back when it
+  /// answers `getattr` for inode 1.
+  ///
+  /// Without this, a create or delete at the workspace root advanced nothing:
+  /// the root reported the pinned commit's snapshot time forever, and Git's
+  /// untracked cache — which keys a directory's extent on exactly that stat
+  /// data — kept a deleted file listed as untracked.
+  pub fn touch_root(&self, mtime: Option<Timestamp>) -> Result<(Timestamp, Timestamp)> {
+    let mut inner = self.lock();
+    let now = self.next_time(&mut inner);
+    let mtime = mtime
+      .map(|t| gfs_types::time::clamp_requested_overlay_time(t, self.snapshot_time))
+      .unwrap_or(now);
+    inner.journal.set_root_times(mtime, now)?;
+    inner.root_times = Some((mtime, now));
+    Ok((mtime, now))
+  }
+
+  /// Committed transactions since this process opened the overlay.
+  ///
+  /// Carried in the fsmonitor token so it advances whenever the workspace
+  /// changes. Deliberately not persisted: the token's *generation* is what
+  /// decides a full rescan, and a restart that reissues a lower sequence within
+  /// the same generation still gets the same cumulative answer.
+  pub fn sequence(&self) -> u64 {
+    self.lock().sequence
   }
 
   // -------------------------------------------------------------------------
@@ -467,9 +557,30 @@ impl Overlay {
 
   /// Commit a change set: journal first, memory second, released content last.
   fn commit(&self, inner: &mut Inner, changes: Vec<Change>, release: Vec<u64>) -> Result<()> {
-    inner
-      .journal
-      .apply(&changes, inner.next_ino, inner.next_content_id)?;
+    // What this transaction does to the vanished set, decided before it is
+    // applied so the journal writes both halves together.
+    let delta = crate::journal::VanishedDelta::of(&changes);
+    let overflow = inner.vanished_overflow
+      || inner.vanished.len() + delta.gone.len() > crate::journal::VANISHED_LIMIT;
+    inner.journal.apply(
+      &changes,
+      &delta,
+      overflow,
+      inner.next_ino,
+      inner.next_content_id,
+    )?;
+    if overflow {
+      inner.vanished.clear();
+      inner.vanished_overflow = true;
+    } else {
+      for path in &delta.returned {
+        inner.vanished.remove(path);
+      }
+      for path in delta.gone {
+        inner.vanished.insert(path);
+      }
+    }
+    inner.sequence += 1;
     for change in &changes {
       match change {
         Change::Put(entry) => {
@@ -974,6 +1085,16 @@ impl Overlay {
   /// the whole reason that variant exists.
   pub fn adopt(&self, path: &BytePath, base: Option<BaseFacts>, ino: u64) -> Result<OverlayEntry> {
     path_condition(path)?;
+    // The root has no row and must not acquire one: the empty path terminates
+    // every ancestor walk here, so a row at it would resolve as its own parent.
+    // Its timestamps live in the journal's meta table instead
+    // ([`Overlay::touch_root`]), and the two callers that could reach this with
+    // an empty path — `setattr` and the parent-timestamp bump — route there.
+    if path.is_empty() {
+      return Err(OverlayError::invalid(
+        "the mount root cannot be adopted into the overlay",
+      ));
+    }
     let mut inner = self.lock();
     // Resolved, not looked up: the path may be masked by a whiteout or an opaque
     // directory several levels above it, in which case there is nothing here to

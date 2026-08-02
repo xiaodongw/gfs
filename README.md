@@ -22,7 +22,10 @@ The system has three entry points:
   through the mount (ADR 0011) over the projected object store, so stock Git
   answers truthfully; the daemon seeds it with a `filter.lfs` configuration
   and an index carrying expanded LFS sizes, so the tree an agent sees is the
-  post-`git lfs pull` state.
+  post-`git lfs pull` state, and with the repository's whole visible ref set as
+  `packed-refs` — tags peeled, branches as `refs/remotes/origin/*` — so
+  `git describe`, `git log origin/main`, and `git status -sb`'s ahead/behind
+  answer without a fetch.
 - `gfs` (CLI) — the agent-facing tool. Reading: `resolve`, `ls`, `cat`,
   `search` (and `rg`, an `rg`-flag-compatible spelling), `find` (a
   `find`-compatible subset answered from the index, no tree walk), `diff`,
@@ -60,7 +63,9 @@ path bypasses them and still gets correct answers, just the expensive ones:
   driver, installed into `.git/hooks` and seeded into the workspace config by
   the mount rather than by `install-shim`.
 - **`gfs-fsmonitor`** — the `core.fsmonitor` hook, answered from the overlay
-  journal.
+  journal: every path the workspace changed this generation, plus the paths
+  whose journal rows are gone, because a file created and then deleted leaves
+  no row and Git trusts what it is not told about.
 
 Outside a GFS workspace every shim passes through silently, which is what makes
 a `PATH`-wide install safe; `GFS_SHIM_BYPASS` disables delegation outright.

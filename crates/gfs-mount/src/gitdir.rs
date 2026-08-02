@@ -41,6 +41,14 @@ pub struct GitDirFacts {
   /// had to call the server would need the mount capability, which would put a
   /// credential in a `PATH`-installed convenience wrapper.
   pub commit_meta: Option<CommitMeta>,
+  /// Every ref the repository shows this credential, fetched once at pin time.
+  ///
+  /// Written as `packed-refs`: tags verbatim, branches as
+  /// `refs/remotes/origin/*`. `None` means the call did not answer — an older
+  /// server, or a transient failure on a repin — and the seed then leaves
+  /// whatever is on disk alone rather than deleting a good ref view because one
+  /// request failed.
+  pub refs: Option<Vec<gfs_types::RefTarget>>,
   /// The caller's push namespace (`refs/gfs/work/<subject>`, no trailing
   /// slash), from `CreateMount`. What the seeded `origin` push refspec maps
   /// local branches into; `None` on servers that predate the field, which
@@ -273,6 +281,21 @@ pub fn seed_git_dir(spec: &SeedSpec<'_>) -> Result<(), gfs_types::error::GfsErro
       url = facts.http_endpoint.trim_end_matches('/'),
       repository = facts.repository_id.as_str(),
     ));
+    // The pinned branch's upstream. Without it `git status -sb` prints a bare
+    // `## main` — no `...origin/main`, no ahead/behind — because a branch with
+    // no configured upstream has nothing to count against, which reads as "this
+    // repository does not know where it came from".
+    if let Some(branch) = facts
+      .ref_name
+      .as_deref()
+      .and_then(|n| n.strip_prefix("refs/heads/"))
+    {
+      config.push_str(&format!(
+        "[branch \"{branch}\"]\n\
+         \tremote = origin\n\
+         \tmerge = refs/heads/{branch}\n"
+      ));
+    }
   }
   config.push_str(&format!(
     "[gfs]\n\
@@ -287,6 +310,8 @@ pub fn seed_git_dir(spec: &SeedSpec<'_>) -> Result<(), gfs_types::error::GfsErro
   ));
   std::fs::write(dir.join("config"), config).map_err(|e| io("config", e))?;
 
+  write_packed_refs(dir, facts).map_err(|e| io("packed-refs", e))?;
+
   if let Some(index) = spec.index {
     std::fs::write(dir.join("index"), index).map_err(|e| io("index", e))?;
   }
@@ -296,6 +321,79 @@ pub fn seed_git_dir(spec: &SeedSpec<'_>) -> Result<(), gfs_types::error::GfsErro
   // resolving the `.git` file.
   std::fs::write(dir.join("gfs.json"), gfs_json(facts)).map_err(|e| io("gfs.json", e))?;
   Ok(())
+}
+
+/// Write the pinned ref view as `packed-refs`.
+///
+/// What the seed produced before this was one branch ref and `HEAD`, which is
+/// why a workspace answered `git describe` with "No names found" and
+/// `origin/main` with "unknown revision" — messages that read as a corrupt
+/// repository rather than as a surface nobody had materialized. The gateway
+/// advertises the whole set; this brings it into `.git`.
+///
+/// Two rules shape the mapping:
+///
+/// * **tags go in verbatim**, with their peel lines. `git describe`,
+///   `hatch-vcs`, and `setuptools-scm` all want `refs/tags/*`, and the peel is
+///   what keeps them from reading an annotated tag object out of the network
+///   projection.
+/// * **branches become `refs/remotes/origin/*`**, never `refs/heads/*`. A local
+///   branch is the agent's own: writing upstream branches into `refs/heads/`
+///   would collide with them, and packing one would resurrect a branch the
+///   agent deleted. Remote-tracking is also what a real `clone` would have
+///   produced, so `git log origin/main` and `@{upstream}` work the ordinary way.
+///
+/// Everything else the repository has — `HEAD`, notes, the mirror's own
+/// remote-tracking refs — is left out: the seeded fetch refspec maps heads and
+/// nothing else, and a ref the configuration cannot refresh is a ref that goes
+/// stale silently.
+///
+/// Rewritten on every seed, so a ref deleted locally comes back on the next
+/// repin. That is the same "pinned view" contract `HEAD` and the index already
+/// have.
+fn write_packed_refs(dir: &std::path::Path, facts: &GitDirFacts) -> Result<(), std::io::Error> {
+  let Some(refs) = facts.refs.as_ref() else {
+    return Ok(());
+  };
+  let mut lines: Vec<(String, String, Option<String>)> = Vec::with_capacity(refs.len());
+  for r in refs {
+    let name = if let Some(tag) = r.name.strip_prefix("refs/tags/") {
+      format!("refs/tags/{tag}")
+    } else if let Some(branch) = r.name.strip_prefix("refs/heads/") {
+      format!("refs/remotes/origin/{branch}")
+    } else {
+      continue;
+    };
+    lines.push((
+      name,
+      r.target.to_hex(),
+      r.peeled.as_ref().map(ObjectId::to_hex),
+    ));
+  }
+  // Sorted because the header claims it, and Git binary-searches a file that
+  // claims it.
+  lines.sort();
+  let mut out = String::with_capacity(lines.len() * 64 + 64);
+  // The trailing space is part of the trait line's grammar: Git parses
+  // space-separated traits up to the newline.
+  out.push_str("# pack-refs with: peeled fully-peeled sorted \n");
+  for (name, target, peeled) in &lines {
+    out.push_str(target);
+    out.push(' ');
+    out.push_str(name);
+    out.push('\n');
+    if let Some(peeled) = peeled {
+      out.push('^');
+      out.push_str(peeled);
+      out.push('\n');
+    }
+  }
+  // Written beside and renamed: Git reads this file without a lock on the read
+  // path, and a partially written one is a repository that has lost refs.
+  let final_path = dir.join("packed-refs");
+  let temp = dir.join("packed-refs.gfs-new");
+  std::fs::write(&temp, out)?;
+  std::fs::rename(&temp, &final_path)
 }
 
 /// Install a helper-binary hook wrapper when the binary can be found.
@@ -389,8 +487,100 @@ mod tests {
       http_endpoint: "http://127.0.0.1:8430".to_owned(),
       generation: 1,
       commit_meta: None,
+      refs: Some(vec![
+        gfs_types::RefTarget {
+          name: "refs/heads/main".to_owned(),
+          target: ObjectId::from_raw(HashAlgorithm::Sha1, &[0xab; 20]).unwrap(),
+          peeled: None,
+        },
+        // An annotated tag: the target is the tag object, the peel is the
+        // commit, and both have to reach `packed-refs` for `git describe` to
+        // answer without reading the projection.
+        gfs_types::RefTarget {
+          name: "refs/tags/v1.0".to_owned(),
+          target: ObjectId::from_raw(HashAlgorithm::Sha1, &[0x11; 20]).unwrap(),
+          peeled: Some(ObjectId::from_raw(HashAlgorithm::Sha1, &[0xab; 20]).unwrap()),
+        },
+        // Neither a head nor a tag: the seeded refspec cannot refresh it, so it
+        // is left out rather than materialized stale.
+        gfs_types::RefTarget {
+          name: "refs/notes/commits".to_owned(),
+          target: ObjectId::from_raw(HashAlgorithm::Sha1, &[0x22; 20]).unwrap(),
+          peeled: None,
+        },
+      ]),
       work_ref_root: Some("refs/gfs/work/job-owner".to_owned()),
     }
+  }
+
+  #[test]
+  fn the_seed_packs_tags_verbatim_and_branches_as_remote_tracking() {
+    let tmp = tempfile::tempdir().unwrap();
+    let git = tmp.path().join(".git");
+    seed_git_dir(&SeedSpec {
+      git_dir: &git,
+      facts: &facts(Some("refs/heads/main")),
+      index: None,
+      preserve_local_head: false,
+    })
+    .unwrap();
+
+    let packed = std::fs::read_to_string(git.join("packed-refs")).unwrap();
+    let expected = format!(
+      "# pack-refs with: peeled fully-peeled sorted \n\
+       {commit} refs/remotes/origin/main\n\
+       {tag} refs/tags/v1.0\n\
+       ^{commit}\n",
+      commit = "ab".repeat(20),
+      tag = "11".repeat(20),
+    );
+    assert_eq!(
+      packed, expected,
+      "branches are remote-tracking, tags keep their name and carry their peel"
+    );
+    assert!(
+      !packed.contains("refs/heads/"),
+      "an upstream branch in refs/heads would collide with the agent's own"
+    );
+    assert!(
+      !packed.contains("refs/notes/"),
+      "a ref the seeded refspec cannot refresh is left out"
+    );
+    // The upstream that makes `git status -sb` print ahead/behind.
+    let config = std::fs::read_to_string(git.join("config")).unwrap();
+    assert!(config.contains("[branch \"main\"]"), "{config}");
+    assert!(config.contains("merge = refs/heads/main"), "{config}");
+  }
+
+  #[test]
+  fn an_unanswered_ref_listing_leaves_the_previous_view_alone() {
+    // A repin whose `ListRefs` failed must not delete a good ref view: an empty
+    // answer and a failed one are indistinguishable at the seed, so `None`
+    // means "do not touch".
+    let tmp = tempfile::tempdir().unwrap();
+    let git = tmp.path().join(".git");
+    seed_git_dir(&SeedSpec {
+      git_dir: &git,
+      facts: &facts(Some("refs/heads/main")),
+      index: None,
+      preserve_local_head: false,
+    })
+    .unwrap();
+    let before = std::fs::read_to_string(git.join("packed-refs")).unwrap();
+
+    let mut unanswered = facts(Some("refs/heads/main"));
+    unanswered.refs = None;
+    seed_git_dir(&SeedSpec {
+      git_dir: &git,
+      facts: &unanswered,
+      index: None,
+      preserve_local_head: false,
+    })
+    .unwrap();
+    assert_eq!(
+      std::fs::read_to_string(git.join("packed-refs")).unwrap(),
+      before
+    );
   }
 
   #[test]

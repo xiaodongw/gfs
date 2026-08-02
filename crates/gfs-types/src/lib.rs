@@ -42,7 +42,8 @@ pub use oid::{HashAlgorithm, ObjectId, OidError};
 pub use path::BytePath;
 pub use revision::{AncestryStep, RevisionExpression, RevisionSelector, RESERVED_REF_PREFIX};
 pub use snapshot::{
-  CommitMeta, LeaseState, MountGrant, ResolvedRevision, Signature, SnapshotState, TreeEntryInfo,
+  CommitMeta, LeaseState, MountGrant, RefTarget, ResolvedRevision, Signature, SnapshotState,
+  TreeEntryInfo,
 };
 pub use time::Timestamp;
 

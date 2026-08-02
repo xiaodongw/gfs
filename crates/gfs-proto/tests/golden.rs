@@ -75,6 +75,16 @@ const PINNED: &[(&str, &[Field])] = &[
       (5, "snapshot_time", ".gfs.v1.Timestamp"),
     ],
   ),
+  ("ListRefsRequest", &[(1, "repository_id", "string")]),
+  (
+    "Ref",
+    &[
+      (1, "name", "string"),
+      (2, "target_oid", "string"),
+      (3, "peeled_oid", "string"),
+    ],
+  ),
+  ("ListRefsResponse", &[(1, "refs", ".gfs.v1.Ref")]),
   (
     "Signature",
     &[
@@ -686,6 +696,7 @@ fn service_methods_are_stable() {
     "SnapshotService/GetCommit(.gfs.v1.GetCommitRequest) -> .gfs.v1.GetCommitResponse",
     "SnapshotService/GetEntry(.gfs.v1.GetEntryRequest) -> .gfs.v1.GetEntryResponse",
     "SnapshotService/ListDirectory(.gfs.v1.ListDirectoryRequest) -> .gfs.v1.ListDirectoryResponse",
+    "SnapshotService/ListRefs(.gfs.v1.ListRefsRequest) -> .gfs.v1.ListRefsResponse",
     "SnapshotService/Log(.gfs.v1.LogRequest) -> .gfs.v1.LogResponse",
     "SnapshotService/PrepareSnapshot(.gfs.v1.PrepareSnapshotRequest) -> .gfs.v1.PrepareSnapshotResponse",
     "SnapshotService/ReleaseMount(.gfs.v1.ReleaseMountRequest) -> .gfs.v1.ReleaseMountResponse",

@@ -29,6 +29,25 @@ pub struct ResolvedRevision {
   pub snapshot_time: Timestamp,
 }
 
+/// One ref a caller may see, with its target peeled if it names a tag object.
+///
+/// The peel is carried rather than left to the reader because the reader is a
+/// workspace whose object database is a network projection: peeling a tag there
+/// costs a pack lookup and a block fetch, and the server has the object open
+/// already. It is what lets a mount write a `fully-peeled` `packed-refs` file,
+/// so `git describe` and `git tag --list` answer without touching the
+/// projection at all.
+#[derive(Clone, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize)]
+pub struct RefTarget {
+  /// The full ref name, `refs/heads/main` or `refs/tags/v1.0`.
+  pub name: String,
+  /// What the ref points at directly — a tag object for an annotated tag.
+  pub target: ObjectId,
+  /// The commit an annotated tag resolves to. `None` for a ref that already
+  /// points at a commit, which is the lightweight-tag and branch case.
+  pub peeled: Option<ObjectId>,
+}
+
 /// A Git identity line.
 ///
 /// `name` and `email` are raw bytes because Git does not constrain them to UTF-8.

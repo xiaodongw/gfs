@@ -264,6 +264,9 @@ impl Mount {
       // Fetched the way the daemon fetches it, so the shim's `log -1` is
       // exercised against real metadata rather than a hand-built value.
       commit_meta: client.get_commit().await.ok(),
+      // Also as the daemon does: the seeded `packed-refs` is part of the
+      // surface the shim and stock Git are tested against.
+      refs: client.list_refs().await.ok(),
       work_ref_root: (!grant.work_ref_root.is_empty()).then(|| grant.work_ref_root.clone()),
     };
 

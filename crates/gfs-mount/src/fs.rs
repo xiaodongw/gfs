@@ -422,7 +422,20 @@ impl Gfs {
   }
 
   fn attr(&self, record: &Record) -> FileAttr {
-    attr_of(record, self.snapshot_time(), self.owner)
+    let mut attr = attr_of(record, self.snapshot_time(), self.owner);
+    // The root is the one directory with no journal row to carry its times (see
+    // `Overlay::touch_root`), so they are applied here instead. Skipping this
+    // is what left a workspace whose root reported the pinned commit's snapshot
+    // time however many files a job created in it — and Git's untracked cache
+    // keys a directory's extent on exactly that stat data.
+    if record.path.is_empty() {
+      if let Some((mtime, ctime)) = self.overlay().root_times() {
+        attr.mtime = crate::attr::to_system_time(mtime);
+        attr.ctime = crate::attr::to_system_time(ctime);
+        attr.atime = attr.mtime;
+      }
+    }
+    attr
   }
 
   fn record(&self, ino: u64) -> Option<Record> {
@@ -2263,8 +2276,14 @@ impl Filesystem for GfsFilesystem {
         let path = record.path.clone();
         let base = base.clone();
         let ino = record.ino;
-        if let Err(e) = Gfs::blocking(move || overlay.set_times(&path, base, ino, requested)).await
-        {
+        // `touch .` on the workspace root: the root keeps its times in meta
+        // rather than in a row, so it cannot go through `set_times`.
+        let outcome = if path.is_empty() {
+          Gfs::blocking(move || overlay.touch_root(requested).map(|_| ())).await
+        } else {
+          Gfs::blocking(move || overlay.set_times(&path, base, ino, requested).map(|_| ())).await
+        };
+        if let Err(e) = outcome {
           return reply.error(errno_of_overlay(&e));
         }
       }
@@ -2726,12 +2745,21 @@ impl Gfs {
   /// two commits leaves the child present with a stale parent time, which is the
   /// same thing every filesystem that does not journal the two together does.
   ///
-  /// The mount root is skipped: it has no base facts to adopt from, and giving
-  /// the empty path an overlay row would create a second spelling of the root for
-  /// every resolver that walks ancestors.
+  /// The mount root goes through [`gfs_overlay::Overlay::touch_root`] rather
+  /// than through a row: it has no base facts to adopt from, and giving the
+  /// empty path an overlay row would create a second spelling of the root for
+  /// every resolver that walks ancestors. Its times live in the journal's meta
+  /// table and [`Gfs::attr`] applies them.
   async fn touch_parent(&self, parent: &Record) {
-    if parent.path.is_empty() || parent.node.is_git() || parent.node.is_odb() {
+    if parent.node.is_git() || parent.node.is_odb() {
       // A real directory's mtime advances by itself; the projection has none.
+      return;
+    }
+    if parent.path.is_empty() {
+      let overlay = self.overlay();
+      if let Err(e) = Self::blocking(move || overlay.touch_root(None)).await {
+        tracing::debug!(error = %e, "could not advance the mount root's timestamps");
+      }
       return;
     }
     let overlay = self.overlay();

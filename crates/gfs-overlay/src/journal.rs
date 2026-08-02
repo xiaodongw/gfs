@@ -34,13 +34,29 @@
 
 use std::path::Path;
 
+use gfs_types::Timestamp;
 use rusqlite::{Connection, OptionalExtension};
 
 use crate::error::{OverlayError, Result};
 use crate::state::{OverlayEntry, Row};
 
 /// The current schema version. Refused, never guessed at, when it is newer.
-pub const SCHEMA_VERSION: i64 = 1;
+pub const SCHEMA_VERSION: i64 = 2;
+
+/// How many vanished paths the journal will remember before it gives up and
+/// tells the fsmonitor hook to ask for a full rescan.
+///
+/// A path is *vanished* when its row was deleted outright — created and then
+/// removed, or renamed away from — leaving nothing for [`crate::Status`] to
+/// report. The fsmonitor hook still has to name it, or Git trusts its cached
+/// answer forever ([`crate::Overlay::vanished`] has the whole argument), so the
+/// journal keeps the names.
+///
+/// The cap is what keeps that bounded. A build that writes and deletes a
+/// million temporaries would otherwise grow this set without limit; past the
+/// cap the set is dropped and the hook answers "rescan everything", which is
+/// slow and correct rather than fast and wrong.
+pub const VANISHED_LIMIT: usize = 4096;
 
 /// The state-file format the overlay directory as a whole speaks.
 pub const OVERLAY_FORMAT_VERSION: u32 = 1;
@@ -52,6 +68,52 @@ pub const OVERLAY_DB_FILE: &str = "overlay.sqlite";
 pub enum Change {
   Put(OverlayEntry),
   Delete(gfs_types::BytePath),
+}
+
+/// What one transaction did to the vanished set, computed from its changes.
+///
+/// Travels with the changes into the same SQLite transaction: a crash that
+/// dropped the row but kept the path out of this set would leave a deletion the
+/// fsmonitor hook can never mention again.
+#[derive(Clone, Debug, Default)]
+pub struct VanishedDelta {
+  /// Paths whose row this transaction removes without leaving a whiteout.
+  pub gone: Vec<Vec<u8>>,
+  /// Paths this transaction gives a row back to. A row is what [`Status`]
+  /// reports from, so the separate record is no longer needed.
+  ///
+  /// [`Status`]: crate::Status
+  pub returned: Vec<Vec<u8>>,
+}
+
+impl VanishedDelta {
+  /// Derive the delta from a change list.
+  ///
+  /// A path that is deleted *and* put in the same transaction — which is what a
+  /// rename onto an existing path looks like — counts as returned: the row
+  /// exists when the transaction ends, so `Status` sees it.
+  pub fn of(changes: &[Change]) -> Self {
+    let mut delta = VanishedDelta::default();
+    for change in changes {
+      match change {
+        Change::Put(entry) => {
+          let path = entry.path.as_bytes().to_vec();
+          delta.gone.retain(|p| p != &path);
+          delta.returned.push(path);
+        }
+        Change::Delete(path) => {
+          let path = path.as_bytes().to_vec();
+          delta.returned.retain(|p| p != &path);
+          delta.gone.push(path);
+        }
+      }
+    }
+    delta
+  }
+
+  pub fn is_empty(&self) -> bool {
+    self.gone.is_empty() && self.returned.is_empty()
+  }
 }
 
 /// Identity the overlay is bound to, checked on every open.
@@ -145,6 +207,12 @@ impl Journal {
     self.conn.execute_batch("BEGIN IMMEDIATE;").map_err(db)?;
     let result = (|| {
       self.conn.execute("DELETE FROM entries", []).map_err(db)?;
+      // A new generation is a full rescan for the fsmonitor hook whatever this
+      // set held, so carrying it across would only make the first answer of the
+      // new pin name paths that belong to the old one.
+      self.conn.execute("DELETE FROM vanished", []).map_err(db)?;
+      self.set_meta("vanished_overflow", "0")?;
+      self.set_meta("root_mtime", "")?;
       self.set_meta("repository_id", &binding.repository_id)?;
       self.set_meta("base_commit", &binding.base_commit)?;
       Ok(())
@@ -195,6 +263,46 @@ impl Journal {
     self.counter("next_content_id", 1)
   }
 
+  /// The mount root's recorded modification and change times.
+  ///
+  /// Meta rather than an entry: the root cannot have a journal row. The empty
+  /// path terminates every ancestor walk in this crate, and giving it a row
+  /// would make the root resolvable two ways. `None` means nothing has changed
+  /// in the root directory yet and the snapshot time still describes it.
+  pub fn root_times(&self) -> Result<Option<(Timestamp, Timestamp)>> {
+    let Some(raw) = self.meta("root_mtime")? else {
+      return Ok(None);
+    };
+    let mtime = parse_time(&raw);
+    let ctime = self.meta("root_ctime")?.as_deref().and_then(parse_time);
+    match (mtime, ctime) {
+      (Some(m), Some(c)) => Ok(Some((m, c))),
+      (Some(m), None) => Ok(Some((m, m))),
+      _ => Ok(None),
+    }
+  }
+
+  pub fn set_root_times(&self, mtime: Timestamp, ctime: Timestamp) -> Result<()> {
+    self.set_meta("root_mtime", &format_time(mtime))?;
+    self.set_meta("root_ctime", &format_time(ctime))
+  }
+
+  /// The remembered vanished paths, and whether the set overflowed its cap.
+  ///
+  /// Overflow is sticky for the generation: once the journal has stopped
+  /// recording names it cannot reconstruct the ones it dropped, so the only
+  /// honest answer left is "rescan".
+  pub fn vanished(&self) -> Result<(Vec<Vec<u8>>, bool)> {
+    let overflow = self.meta("vanished_overflow")?.as_deref() == Some("1");
+    let mut stmt = self.conn.prepare("SELECT path FROM vanished").map_err(db)?;
+    let rows = stmt
+      .query_map([], |r| r.get::<_, Vec<u8>>(0))
+      .map_err(db)?
+      .collect::<std::result::Result<Vec<_>, _>>()
+      .map_err(db)?;
+    Ok((rows, overflow))
+  }
+
   /// Every row, for the in-memory index built at open.
   pub fn load(&self) -> Result<Vec<OverlayEntry>> {
     let mut stmt = self.conn.prepare(SELECT_ALL).map_err(db)?;
@@ -242,7 +350,18 @@ impl Journal {
   /// "the row that uses content id 7 is committed" and "the counter says 8" would
   /// hand id 7 out twice, and the second use would rename a new file over the
   /// bytes the first one is still serving.
-  pub fn apply(&mut self, changes: &[Change], next_ino: u64, next_content_id: u64) -> Result<()> {
+  ///
+  /// `vanished` and `overflow` travel with them for the same reason: the set of
+  /// deletions the fsmonitor hook still has to report is only useful if it
+  /// cannot disagree with the rows.
+  pub fn apply(
+    &mut self,
+    changes: &[Change],
+    vanished: &VanishedDelta,
+    overflow: bool,
+    next_ino: u64,
+    next_content_id: u64,
+  ) -> Result<()> {
     let tx = self.conn.transaction().map_err(db)?;
     for change in changes {
       match change {
@@ -278,6 +397,27 @@ impl Journal {
           tx.execute("DELETE FROM entries WHERE path = ?1", [path.as_bytes()])
             .map_err(db)?;
         }
+      }
+    }
+    if overflow {
+      // Nothing left to say path by path. The flag is the whole answer, and
+      // keeping the names would only cost space for a set that is already
+      // superseded.
+      tx.execute("DELETE FROM vanished", []).map_err(db)?;
+      tx.execute(
+        "INSERT INTO meta (key, value) VALUES ('vanished_overflow', '1')
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        [],
+      )
+      .map_err(db)?;
+    } else {
+      for path in &vanished.returned {
+        tx.execute("DELETE FROM vanished WHERE path = ?1", [path])
+          .map_err(db)?;
+      }
+      for path in &vanished.gone {
+        tx.execute("INSERT OR IGNORE INTO vanished (path) VALUES (?1)", [path])
+          .map_err(db)?;
       }
     }
     tx.execute(
@@ -340,6 +480,9 @@ fn migrate(conn: &Connection) -> Result<()> {
   if current < 1 {
     conn.execute_batch(V1).map_err(db)?;
   }
+  if current < 2 {
+    conn.execute_batch(V2).map_err(db)?;
+  }
   conn
     .execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))
     .map_err(db)?;
@@ -379,6 +522,17 @@ CREATE TABLE entries (
 CREATE INDEX entries_parent ON entries(parent);
 "#;
 
+/// Schema 2: the paths whose rows are gone.
+///
+/// Separate from `entries` because these are exactly the paths that have no
+/// entry. See [`VANISHED_LIMIT`] for why the table is capped and
+/// [`crate::Overlay::vanished`] for what reads it.
+const V2: &str = r#"
+CREATE TABLE vanished (
+  path BLOB PRIMARY KEY
+) STRICT;
+"#;
+
 /// The column order every `Row` encode/decode pair depends on. Written once and
 /// referenced by both statements, so an added column cannot be forgotten in one.
 const SELECT_ALL: &str =
@@ -390,6 +544,16 @@ const INSERT: &str = "INSERT OR REPLACE INTO entries (path, parent, present, kin
    content_kind, content_id, content_oid, symlink_target, size, mtime_secs, mtime_nanos, \
    ctime_secs, ctime_nanos, renamed_from, base_oid, base_mode, base_size) \
    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)";
+
+/// `<secs>.<nanos>`, so the meta table stays human-readable text.
+fn format_time(t: Timestamp) -> String {
+  format!("{}.{}", t.secs, t.nanos)
+}
+
+fn parse_time(raw: &str) -> Option<Timestamp> {
+  let (secs, nanos) = raw.split_once('.')?;
+  Some(Timestamp::new(secs.parse().ok()?, nanos.parse().ok()?))
+}
 
 fn db(e: rusqlite::Error) -> OverlayError {
   OverlayError::io(format!("overlay journal: {e}"))

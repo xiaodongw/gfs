@@ -1005,9 +1005,22 @@ impl Mount {
   /// changes since any token in the generation, and a superset is always safe
   /// because Git re-checks listed paths and trusts only the unlisted ones.
   ///
-  /// The token is `gfs:<generation>`. A repin discards or re-bases the
-  /// overlay, which changes what an unlisted path means, so a token from
-  /// another generation forces the one full rescan that re-grounds Git.
+  /// **Plus the paths whose rows are gone.** `Status` is derived from the
+  /// journal's rows, and a file created and then deleted leaves none, so the
+  /// change set alone silently forgets it. Git's answer to a path it is not
+  /// told about is to trust what it already believed: `?? f.txt` for a file
+  /// that no longer exists, and — worse — a clean report for a staged path
+  /// that was deleted, because the index entry keeps its fsmonitor-valid flag
+  /// and is never `lstat`ed. [`gfs_overlay::Overlay::vanished`] keeps those
+  /// names for exactly this call.
+  ///
+  /// The token is `gfs:<generation>:<sequence>`. Only the generation decides a
+  /// rescan — a repin discards or re-bases the overlay, which changes what an
+  /// *unlisted* path means, so a token from another generation forces the one
+  /// full rescan that re-grounds Git. The sequence carries the overlay's
+  /// committed-change count so that the token advances when the workspace
+  /// changes, which is what the v2 protocol asks of it; it does not narrow the
+  /// answer, which stays cumulative for the generation.
   pub async fn fsmonitor_changes(
     &self,
     caller_token: &str,
@@ -1017,13 +1030,23 @@ impl Mount {
       let current = self.current.lock().expect("current pin");
       (current.commit.clone(), current.epoch)
     };
-    let token = format!("gfs:{generation}");
-    let full_rescan = caller_token != token;
+    let generation_token = format!("gfs:{generation}");
     let algorithm = commit.algorithm();
-    let status = tokio::task::spawn_blocking(move || overlay.status(algorithm))
-      .await
-      .map_err(|e| GfsError::internal(format!("the fsmonitor task failed: {e}")))?
-      .map_err(crate::fs::overlay_as_service_error)?;
+    // One trip to the blocking pool for all three: the overlay's lock is held
+    // across content I/O by a concurrent copy-up, and waiting for it on a
+    // reactor thread would stall every other request on the daemon.
+    let (status, vanished, vanished_overflow, sequence) = tokio::task::spawn_blocking(move || {
+      let status = overlay.status(algorithm);
+      let (vanished, overflow) = overlay.vanished();
+      (status, vanished, overflow, overlay.sequence())
+    })
+    .await
+    .map_err(|e| GfsError::internal(format!("the fsmonitor task failed: {e}")))?;
+    let status = status.map_err(crate::fs::overlay_as_service_error)?;
+    let token = format!("{generation_token}:{sequence}");
+    // The names were dropped at the cap, so no list can be complete any more.
+    let full_rescan =
+      !caller_token.starts_with(&format!("{generation_token}:")) || vanished_overflow;
     let mut paths = Vec::with_capacity(status.changes.len() * 2);
     for change in &status.changes {
       paths.push(String::from_utf8_lossy(change.path.as_bytes()).into_owned());
@@ -1037,6 +1060,9 @@ impl Mount {
       // Git's protocol: a trailing slash marks a directory whose contents all
       // changed.
       paths.push(format!("{}/", String::from_utf8_lossy(dir.as_bytes())));
+    }
+    for path in &vanished {
+      paths.push(String::from_utf8_lossy(path.as_bytes()).into_owned());
     }
     Ok(crate::control::FsMonitorAnswer {
       token,
@@ -1867,6 +1893,20 @@ async fn resolve_pin(config: &MountSpec, selector: &str, epoch: u64) -> Result<R
     }
   };
 
+  // The ref view, also once, also best-effort. A failure costs `git describe`
+  // and `origin/main`; failing the mount for it would be a worse trade, and the
+  // seed leaves the previous view in place rather than emptying it.
+  let refs = match client.list_refs().await {
+    Ok(refs) => Some(refs),
+    Err(e) => {
+      tracing::warn!(
+        error = %e.message,
+        "ref listing unavailable; tags and remote-tracking refs will not be materialized"
+      );
+      None
+    }
+  };
+
   let facts = GitDirFacts {
     repository_id: config.repository_id.clone(),
     commit: commit.clone(),
@@ -1879,6 +1919,7 @@ async fn resolve_pin(config: &MountSpec, selector: &str, epoch: u64) -> Result<R
     http_endpoint: config.http_endpoint.clone(),
     generation: epoch,
     commit_meta,
+    refs,
     work_ref_root: (!grant.work_ref_root.is_empty()).then(|| grant.work_ref_root.clone()),
   };
 

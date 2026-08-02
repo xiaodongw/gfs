@@ -314,8 +314,24 @@ pub trait GitRepository: Send + Sync + std::fmt::Debug {
 
   fn blob_size(&self, blob: &ObjectId) -> Result<u64, GfsError>;
 
-  /// Every ref a caller may see. Excludes the reserved internal namespace.
-  fn visible_refs(&self) -> Result<Vec<(String, ObjectId)>, GfsError>;
+  /// Every ref a caller may see, with annotated tags peeled. Excludes the
+  /// reserved internal namespace.
+  fn visible_ref_targets(&self) -> Result<Vec<gfs_types::RefTarget>, GfsError>;
+
+  /// The same refs as names and direct targets, for the callers that reconcile
+  /// or compare rather than serve.
+  ///
+  /// A default over [`Self::visible_ref_targets`] rather than a second
+  /// implementation, so the reserved-namespace filter has exactly one home.
+  fn visible_refs(&self) -> Result<Vec<(String, ObjectId)>, GfsError> {
+    Ok(
+      self
+        .visible_ref_targets()?
+        .into_iter()
+        .map(|r| (r.name, r.target))
+        .collect(),
+    )
+  }
 
   /// Every ref *inside* the reserved internal namespace.
   ///
@@ -659,6 +675,10 @@ impl AsyncRepository {
 
   pub async fn visible_refs(&self) -> Result<Vec<(String, ObjectId)>, GfsError> {
     self.run(move |r| r.visible_refs()).await
+  }
+
+  pub async fn visible_ref_targets(&self) -> Result<Vec<gfs_types::RefTarget>, GfsError> {
+    self.run(move |r| r.visible_ref_targets()).await
   }
 
   pub async fn is_visible(&self, commit: ObjectId) -> Result<bool, GfsError> {

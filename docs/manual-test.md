@@ -362,6 +362,24 @@ gfs rg -F 'some-symbol' -m 5     # content search, answered by the gateway
 gfs inspect | grep hydration     # still 0 blobs, 0 bytes
 ```
 
+Names include refs. The mount writes the gateway's whole filtered ref set as
+`packed-refs` — tags with their peel lines, branches as
+`refs/remotes/origin/*` — so the questions a version-derived build asks are
+answerable locally:
+
+```sh
+git tag --list | tail -3         # tags exist; `git describe` works, so hatch-vcs does
+git describe --tags
+git branch -r                    # refs/remotes/origin/*, as a clone would have
+git rev-parse origin/main        # resolves; `git log origin/main` walks
+git status -sb                   # `## main...origin/main`, with ahead/behind
+git show-ref | grep refs/gfs/    # empty: the reserved namespace is never shown
+```
+
+Local branches stay yours: nothing upstream is ever packed into `refs/heads/`.
+The view is pinned like the index — `gfs refresh` or a `switch` re-seeds it,
+and a ref that moved upstream in between does not move under you.
+
 With the shims installed you rarely type the `gfs` spellings: `rg`, `find`,
 and recursive `grep` inside a workspace delegate to `gfs rg`/`gfs find`
 automatically, and fall back to the real tool (with a stderr note) when an
@@ -570,12 +588,35 @@ Both were defects found by `spikes/conformance/pjdfstest.sh` and fixed on
 2026-07-27; see [`reports/posix-conformance.md`](reports/posix-conformance.md).
 
 **A directory's timestamps advance when its contents change.** Build systems and
-watchers rely on this.
+watchers rely on this. The workspace root counts as a directory — it was the
+exception until 2026-08-02, and the exception is what let a deleted file keep
+showing as untracked.
 
 ```sh
 mkdir -p dtest
 a=$(stat -c %Y dtest); sleep 1.1; touch dtest/x; b=$(stat -c %Y dtest)
 [ "$b" -gt "$a" ] && echo "advanced" || echo "INERT -- regression"
+
+a=$(stat -c %Y .); sleep 1.1; touch rootprobe; b=$(stat -c %Y .); rm rootprobe
+[ "$b" -gt "$a" ] && echo "advanced" || echo "INERT -- regression"
+```
+
+**A file that is created and then deleted leaves `git status` clean.** The
+intervening `status` is the point: it is what makes Git cache the directory's
+untracked extent, and with `core.fsmonitor` configured Git will not re-`lstat`
+the directory — it only invalidates the extent when the hook names a path
+inside it.
+
+```sh
+git status --porcelain            # clean
+echo x > probe.txt
+git status --porcelain            # ?? probe.txt
+rm probe.txt
+git status --porcelain            # clean again -- a phantom here is a regression
+
+echo y > staged.txt && git add staged.txt && rm staged.txt
+git status --porcelain            # AD staged.txt -- never a bare "A "
+git reset -q staged.txt
 ```
 
 **A too-long path component fails with `ENAMETOOLONG`, not `EIO`.** The limit is

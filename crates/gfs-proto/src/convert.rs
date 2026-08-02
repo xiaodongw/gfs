@@ -326,6 +326,37 @@ impl v1::ResolveRevisionResponse {
 }
 
 // ---------------------------------------------------------------------------
+// Ref listing
+// ---------------------------------------------------------------------------
+
+impl From<gfs_types::RefTarget> for v1::Ref {
+  fn from(r: gfs_types::RefTarget) -> Self {
+    v1::Ref {
+      name: r.name,
+      target_oid: r.target.to_qualified(),
+      // Empty rather than an option: a ref that already points at a commit is
+      // the common case, and "no peel" is not a distinct state from "peels to
+      // itself" for any reader.
+      peeled_oid: r.peeled.map(|o| o.to_qualified()).unwrap_or_default(),
+    }
+  }
+}
+
+impl v1::Ref {
+  pub fn try_into_domain(self, algorithm: HashAlgorithm) -> Result<gfs_types::RefTarget, GfsError> {
+    Ok(gfs_types::RefTarget {
+      target: try_oid(&self.target_oid, algorithm, "target_oid")?,
+      peeled: if self.peeled_oid.is_empty() {
+        None
+      } else {
+        Some(try_oid(&self.peeled_oid, algorithm, "peeled_oid")?)
+      },
+      name: self.name,
+    })
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Diff and blame
 // ---------------------------------------------------------------------------
 

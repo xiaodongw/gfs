@@ -465,6 +465,30 @@ impl SnapshotClient {
     convert::try_oid(&response.commit_oid, self.binding.algorithm, "commit_oid")
   }
 
+  /// Every ref the repository shows this credential, with tags peeled.
+  ///
+  /// One call at pin time; the seed turns the answer into `packed-refs`. Not a
+  /// filesystem path — a workspace's ref view is fixed at the pin, exactly like
+  /// its branch ref and its index, so re-asking mid-generation would only be a
+  /// way to disagree with them.
+  pub async fn list_refs(&self) -> Result<Vec<gfs_types::RefTarget>, GfsError> {
+    let request = self.authed(v1::ListRefsRequest {
+      repository_id: self.binding.repository_id.as_str().to_owned(),
+    })?;
+    let response = self
+      .grpc
+      .clone()
+      .list_refs(request)
+      .await
+      .map_err(|s| convert::from_status(&s))?
+      .into_inner();
+    response
+      .refs
+      .into_iter()
+      .map(|r| r.try_into_domain(self.binding.algorithm))
+      .collect()
+  }
+
   /// What changed between two commits, rendered by the server.
   ///
   /// `from` is `None` for a root commit, which is diffed against the empty tree.

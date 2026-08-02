@@ -24,6 +24,20 @@ service SnapshotService {
   // that must stay readable.
   rpc ResolveRevision(ResolveRevisionRequest) returns (ResolveRevisionResponse);
 
+  // Every ref the caller may see, with annotated tags peeled.
+  //
+  // The same set the Git gateway advertises to the same token, through the same
+  // reserved-namespace filter -- ADR 0002's "one bare repository is one
+  // authorization domain" is why this needs no mount capability and discloses
+  // nothing `git ls-remote` does not.
+  //
+  // A workspace calls it once at mount time and writes `packed-refs`. Without
+  // it the seeded `.git` has one branch and no tags, so `git describe` reports
+  // "No names found", `origin/main` is an unknown revision, and `git status
+  // -sb` has no upstream to count against -- all of which read as a corrupt
+  // repository rather than as a surface that was never materialized.
+  rpc ListRefs(ListRefsRequest) returns (ListRefsResponse);
+
   rpc GetCommit(GetCommitRequest) returns (GetCommitResponse);
 
   // One path. Returns gRPC `NOT_FOUND` when the path does not exist in the
@@ -119,6 +133,31 @@ message ResolveRevisionResponse {
   // was first cataloged. Never the raw committer timestamp, which Git allows to
   // be in the future.
   Timestamp snapshot_time = 5;
+}
+
+// ---------------------------------------------------------------------------
+// Ref listing
+// ---------------------------------------------------------------------------
+
+message ListRefsRequest {
+  string repository_id = 1;
+}
+
+message Ref {
+  // The full name: `refs/heads/main`, `refs/tags/v1.0`.
+  string name = 1;
+  // What the ref points at directly -- a tag object for an annotated tag.
+  string target_oid = 2;
+  // The commit an annotated tag resolves to; empty when `target_oid` is already
+  // one. Peeled by the server because the client's object database is a network
+  // projection and the server has the object open.
+  string peeled_oid = 3;
+}
+
+message ListRefsResponse {
+  // Sorted by name, so two calls against an unchanged repository produce
+  // identical bytes and a `packed-refs` file written from them is stable.
+  repeated Ref refs = 1;
 }
 
 // ---------------------------------------------------------------------------

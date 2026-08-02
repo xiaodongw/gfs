@@ -1411,7 +1411,7 @@ impl GitRepository for Libgit2Repository {
     Ok(size)
   }
 
-  fn visible_refs(&self) -> Result<Vec<(String, ObjectId)>, GfsError> {
+  fn visible_ref_targets(&self) -> Result<Vec<gfs_types::RefTarget>, GfsError> {
     let pooled = self.checkout()?;
     let mut out = Vec::new();
     {
@@ -1443,10 +1443,25 @@ impl GitRepository for Libgit2Repository {
             Err(_) => continue,
           },
         };
-        out.push((name.to_owned(), self.to_oid(target)?));
+        // Peeled here, where the object database is local and open. A tag that
+        // does not peel to a commit (a tag of a blob, which Git allows) is
+        // carried unpeeled rather than dropped: the ref exists, and a caller
+        // that only lists names must still see it.
+        let peeled = match repo.find_tag(target) {
+          Ok(tag) => match tag.peel() {
+            Ok(object) if object.id() != target => Some(self.to_oid(object.id())?),
+            _ => None,
+          },
+          Err(_) => None,
+        };
+        out.push(gfs_types::RefTarget {
+          name: name.to_owned(),
+          target: self.to_oid(target)?,
+          peeled,
+        });
       }
     }
-    out.sort_by(|a, b| a.0.cmp(&b.0));
+    out.sort_by(|a, b| a.name.cmp(&b.name));
     Ok(out)
   }
 

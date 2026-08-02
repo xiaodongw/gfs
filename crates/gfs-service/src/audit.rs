@@ -18,6 +18,7 @@ use gfs_types::{redact, BytePath, MountId, ObjectId, RepositoryId, SubjectId};
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Action {
   ResolveRevision,
+  ListRefs,
   GetCommit,
   GetEntry,
   ListDirectory,
@@ -39,6 +40,7 @@ impl Action {
   pub fn as_str(self) -> &'static str {
     match self {
       Action::ResolveRevision => "resolve_revision",
+      Action::ListRefs => "list_refs",
       Action::GetCommit => "get_commit",
       Action::GetEntry => "get_entry",
       Action::ListDirectory => "list_directory",

@@ -84,6 +84,70 @@ async fn a_fresh_workspace_reads_clean_through_stock_git() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn tags_and_remote_tracking_refs_are_materialized_at_mount() {
+  // Seeding only the pinned branch left `git describe` answering "No names
+  // found", `origin/main` an unknown revision, and `git status -sb` with no
+  // upstream — three messages that read as a corrupt repository. The whole
+  // filtered ref set is now written as `packed-refs` at pin time.
+  let backend = Backend::start("basic").await;
+  let job = Job::start(&backend, "main").await;
+  let ws = job.workspace.clone();
+
+  let (tags, remotes, describe, upstream, branch_status, reserved) = on_fs(move || {
+    (
+      git_in(&ws, &["tag", "--list"]),
+      git_in(&ws, &["branch", "-r"]),
+      // Peeled in `packed-refs`, so this answers without reading a tag object
+      // out of the projection.
+      git_in(&ws, &["describe", "--tags"]),
+      git_in(&ws, &["rev-parse", "origin/main"]),
+      git_in(&ws, &["status", "-sb"]),
+      git_in(&ws, &["show-ref"]),
+    )
+  })
+  .await;
+
+  assert!(tags.0, "{}", tags.1);
+  assert!(
+    tags.1.contains("v1.0") && tags.1.contains("v2.0"),
+    "lightweight and annotated tags both materialize: {}",
+    tags.1
+  );
+  assert!(
+    tags.1.contains("tree-tag"),
+    "a tag that peels to a tree is still a tag: {}",
+    tags.1
+  );
+  assert!(remotes.0, "{}", remotes.1);
+  assert!(
+    remotes.1.contains("origin/main"),
+    "branches arrive as remote-tracking refs: {}",
+    remotes.1
+  );
+  assert!(describe.0, "{}", describe.1);
+  assert!(upstream.0, "`origin/main` must resolve: {}", upstream.1);
+  assert!(
+    branch_status.1.contains("...origin/main"),
+    "the pinned branch has an upstream to count against: {}",
+    branch_status.1
+  );
+  // ADR 0002's boundary: the reserved namespace is filtered out of the listing,
+  // exactly as it is out of the gateway's advertisement.
+  assert!(
+    !reserved.1.contains("refs/gfs/"),
+    "the reserved namespace must never be materialized: {}",
+    reserved.1
+  );
+  // The agent's own branch namespace stays the agent's: an upstream branch
+  // packed into `refs/heads/` would collide with a branch it creates.
+  let packed = std::fs::read_to_string(job.workspace.join(".git/packed-refs")).unwrap();
+  assert!(
+    !packed.contains(" refs/heads/"),
+    "upstream branches must not be packed into refs/heads:\n{packed}"
+  );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_local_commit_pushes_to_the_real_branch_through_the_seeded_remote() {
   // The push half of ADR 0009: `git push origin <branch>` out of the box. The
   // seeded config maps `refs/heads/*` onto the gateway's real branches — the

@@ -285,6 +285,57 @@ impl SnapshotService for SnapshotApi {
     }
   }
 
+  /// Every ref the caller may see, peeled.
+  ///
+  /// Authorized exactly like `resolve_revision` — repository read, no mount
+  /// capability. The set is `visible_refs`', which excludes the reserved
+  /// namespace, so this shows what the Git gateway's advertisement shows the
+  /// same token and nothing more (ADR 0002).
+  async fn list_refs(
+    &self,
+    request: Request<v1::ListRefsRequest>,
+  ) -> Result<Response<v1::ListRefsResponse>, Status> {
+    let ctx = self.begin(&request)?;
+    let req = request.into_inner();
+
+    let result = async {
+      let (id, _) = self.repo_context(&ctx, &req.repository_id).await?;
+      let repo = self.registry.repository(&id)?;
+      let refs = repo.visible_ref_targets().await?;
+      Ok((
+        id,
+        v1::ListRefsResponse {
+          refs: refs.into_iter().map(v1::Ref::from).collect(),
+        },
+      ))
+    }
+    .await;
+
+    match result {
+      Ok((id, response)) => self.finish(
+        Action::ListRefs,
+        &ctx,
+        AuditRecord {
+          subject: Some(&ctx.identity.subject),
+          repository_id: Some(&id),
+          request_id: Some(ctx.request_id.as_str()),
+          ..Default::default()
+        },
+        Ok(response),
+      ),
+      Err(e) => self.finish(
+        Action::ListRefs,
+        &ctx,
+        AuditRecord {
+          subject: Some(&ctx.identity.subject),
+          request_id: Some(ctx.request_id.as_str()),
+          ..Default::default()
+        },
+        Err(e),
+      ),
+    }
+  }
+
   async fn get_commit(
     &self,
     request: Request<v1::GetCommitRequest>,

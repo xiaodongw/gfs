@@ -68,6 +68,18 @@ agent's branches and two agents on one branch collide. Each mount gets a local
 `refs/heads/main` would let it move under a workspace whose index still describes
 the old commit, and Git would report the entire repository as modified.
 
+That view is the *whole* filtered ref set, not just the pinned branch. The
+daemon calls `ListRefs` once per pin — repository-scoped, the same
+reserved-namespace filter the gateway advertisement uses — and writes
+`packed-refs`: tags verbatim with their peel lines, branches mapped to
+`refs/remotes/origin/*`, everything else left out because the seeded fetch
+refspec cannot refresh it. Upstream branches never land in `refs/heads/`, which
+belongs to the agent. Seeding only the pinned branch, as the first
+implementation did, left `git describe` answering "No names found",
+`origin/main` an unknown revision, and `git status -sb` with no upstream to
+count against — three messages that read as a corrupt repository rather than as
+a surface nobody had materialized.
+
 ### What the gateway must ship, per commit
 
 | artifact | why |
@@ -372,3 +384,37 @@ shim then runs the real tool over the mount — unsupported invocations still
 work slowly rather than failing or lying, with the hydration budget pricing
 the sweep as before. `GFS_SHIM_BYPASS` forces pass-through, which is how
 `--hydrate` runs the real tool without the shim delegating straight back.
+
+## Amendment, 2026-08-02: the hook has to name what the journal forgot
+
+The Consequences above flagged the fsmonitor hook's token semantics as
+correctness-critical and only exercised against a static stand-in. The
+correctness gap turned out to be one layer down, in what the hook has to
+*name*.
+
+The answer is derived from `Status`, which is derived from the journal's rows.
+A file created and then deleted leaves no row — `Overlay::remove` drops it
+outright when the base has nothing at that path to whiteout — so the change set
+forgets it ever existed. Git's response to a path fsmonitor does not mention is
+to trust what it already believed, and it believes two things: its untracked
+cache extent (once fsmonitor is configured, `valid_cached_dir` stops `lstat`ing
+directories entirely and trusts the cached `valid` flag until fsmonitor
+invalidates it) and its index entries' `CE_FSMONITOR_VALID` flag (which skips
+the `lstat` that would notice a deletion). Measured against a live mount:
+`git status` printed `?? f.txt` indefinitely for a deleted file, and a
+`git add`ed file that was then removed reported as `A  f.txt` where stock Git
+reports `AD f.txt`.
+
+So the journal now keeps the names of paths whose rows are gone, for the life of
+the generation, capped — past the cap the hook answers "rescan everything",
+which is slow and correct rather than fast and wrong. The token gained a
+sequence (`gfs:<generation>:<count>`) so it advances when the workspace changes,
+as the v2 protocol asks; only the generation still decides a rescan, because the
+answer is deliberately cumulative and a superset is always safe.
+
+The same investigation found the mount root reporting the snapshot time forever:
+`touch_parent` skipped the empty path, since giving the root an overlay row
+would make it resolvable two ways. Its timestamps now live in the journal's meta
+table, which is the same durability without the second spelling. That half
+matters for anything keyed on directory mtime — builds, watchers, and Git's own
+untracked cache when fsmonitor is *not* configured.

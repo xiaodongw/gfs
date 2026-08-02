@@ -793,6 +793,46 @@ async fn a_directorys_timestamps_advance_when_its_contents_change() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_mount_root_is_a_directory_like_any_other_for_timestamps() {
+  // The root was exempt from the fix above, because the overlay row it would
+  // have needed cannot exist: the empty path terminates every ancestor walk.
+  // So it reported the snapshot time however many files a job created in it --
+  // and Git's untracked cache, which keys a directory's extent on exactly that
+  // stat data, kept deleted files listed as untracked. Its timestamps now live
+  // in the journal's meta table.
+  let backend = Backend::start("basic").await;
+  let mount = Mount::new(&backend, "main").await;
+  let root = mount.path.clone();
+
+  on_fs(move || {
+    let mtime = || {
+      std::fs::metadata(&root)
+        .unwrap()
+        .modified()
+        .unwrap()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+    };
+
+    let pinned = mtime();
+    std::fs::write(root.join("a.txt"), b"x").unwrap();
+    let after_create = mtime();
+    assert!(
+      after_create > pinned,
+      "creating a file at the root must advance the root's mtime"
+    );
+
+    std::fs::remove_file(root.join("a.txt")).unwrap();
+    assert!(
+      mtime() > after_create,
+      "and so must removing one — the case that made `git status` \
+       report a phantom untracked file"
+    );
+  })
+  .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn adopting_a_directory_for_its_timestamps_is_not_a_reportable_change() {
   // The cost of the fix above is a journal row for every directory a job writes
   // into. That must stay invisible downstream: `Status` skips directory rows
