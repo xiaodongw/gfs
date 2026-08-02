@@ -619,6 +619,17 @@ plus entry identity. Overlay inodes are allocated persistently. Kernel attribute
 entry TTLs are long because the base commit is immutable; overlay mutations issue
 the necessary invalidations.
 
+The kernel cache alone is not enough to keep a warm metadata walk off the network:
+FUSE does not cache directory listings, and negative dentries expire on a short TTL
+because the overlay can create names. The daemon therefore keeps complete base
+directory listings per pin (bounded LRU). Against an immutable commit one complete
+listing permanently answers a directory's children, their attributes, and the
+absence of every other name, so a warm walk — `git status` on every prompt redraw —
+costs zero server round trips. The cache stores raw tree entries, never assigned
+inode numbers or synthesized attributes, so serving from it is indistinguishable
+from serving from the server; it is swapped out with the pin, so a repin starts
+empty by construction.
+
 Timestamps and inode numbers are load-bearing for build systems, so they are
 specified rather than incidental. A raw Git committer timestamp cannot be used
 directly because Git accepts future-dated commits and job hosts can have clock skew.

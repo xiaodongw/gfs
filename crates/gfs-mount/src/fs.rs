@@ -69,6 +69,7 @@ use crate::attr::{attr_of, errno_of, errno_of_overlay, Ownership};
 use crate::cache::{BlobCache, CacheStats};
 use crate::client::SnapshotClient;
 use crate::inode::{InodeTable, Node, Record, ROOT_INO};
+use crate::listing::Listing;
 use crate::passthrough::{
   errno_io, git_rel, in_object_namespace, odb_rel, GitMeta, GitPassthrough, OdbNode, GIT_DIR_NAME,
 };
@@ -103,6 +104,14 @@ pub struct FsConfig {
   /// daemon's back, and the daemon itself never writes loose objects.
   pub object_negative_ttl: Duration,
   pub directory_page_size: u32,
+  /// How many base directories the daemon keeps complete listings of.
+  ///
+  /// The pinned commit is immutable, so a complete listing answers every
+  /// metadata question about its directory — children, attributes, and
+  /// definitive negatives — for the life of the pin, with zero server round
+  /// trips. Bounded so a monorepo walk cannot pin the whole tree's metadata
+  /// in daemon memory; see [`crate::listing`].
+  pub listing_cache_dirs: usize,
   /// Attempts for a retryable failure, including the first.
   pub attempts: u32,
   /// Bytes a job may hydrate from the server before reads are refused with
@@ -128,6 +137,9 @@ impl Default for FsConfig {
       // ms of local disk on the worst-case repository.
       object_negative_ttl: Duration::from_secs(60),
       directory_page_size: gfs_types::limits::DEFAULT_DIRECTORY_PAGE_SIZE as u32,
+      // ~4096 directories at typical tree fan-out is tens of megabytes at
+      // worst, and a working set far larger than any measured git walk.
+      listing_cache_dirs: 4096,
       attempts: 3,
       // 1 GiB, on by default, which is the point of ADR 0009: a budget that has
       // to be switched on is not enforcement. The number is chosen from
@@ -148,6 +160,8 @@ pub struct FsStats {
   pub negative_lookups: u64,
   pub metadata_requests: u64,
   pub directory_pages: u64,
+  /// Metadata questions answered from a cached base listing, server-free.
+  pub listing_hits: u64,
   pub opens: u64,
   pub reads: u64,
   pub read_bytes: u64,
@@ -208,15 +222,10 @@ struct DirState {
   /// The directory's own path, used to build child paths.
   path: BytePath,
   children: Vec<Child>,
-  next_page_token: Vec<u8>,
-  /// Whether the base listing has been exhausted.
-  base_done: bool,
-  /// Whether the overlay's extra children have been appended. Always after the
-  /// base listing, so a child's offset never moves.
+  /// Whether `children` is the whole merged listing. Filled by the first
+  /// `fill_directory` call; base children always precede overlay extras, so a
+  /// child's offset never moves for the life of the handle.
   complete: bool,
-  /// Names the base listing produced, which is what decides whether an overlay
-  /// child still has to be appended.
-  base_names: HashSet<Vec<u8>>,
   /// A passthrough directory (git-relative path) whose real listing is still
   /// pending. Deferred out of `opendir` so the `read_dir` walk runs on a
   /// blocking worker inside `fill_directory`, never on the event loop.
@@ -271,6 +280,11 @@ pub struct Pinned {
   pub client: Arc<SnapshotClient>,
   pub overlay: Arc<Overlay>,
   pub snapshot_time: Timestamp,
+  /// Complete base listings for this pin. Living *inside* `Pinned` is the
+  /// invalidation strategy: a repin swaps the whole struct, so the cache is
+  /// born empty with the new commit, and a fetch still running against the
+  /// old client can only ever insert into the old generation's cache.
+  pub(crate) listings: crate::listing::ListingCache,
 }
 
 /// The filesystem. Shared behind an `Arc` so a callback can hand it to a worker.
@@ -323,6 +337,7 @@ impl Gfs {
         client,
         overlay,
         snapshot_time,
+        listings: crate::listing::ListingCache::new(config.listing_cache_dirs),
       })),
       git,
       cache,
@@ -355,7 +370,21 @@ impl Gfs {
   /// descriptor obtained before the re-pin goes on reading the bytes it opened,
   /// owing nothing to the old commit's lease. That is what `git switch` leaves
   /// behind too: replacing a file does not reach into a reader's descriptor.
-  pub fn repin(&self, pinned: Pinned, root: TreeEntryInfo) -> Vec<(u64, Vec<u8>)> {
+  pub fn repin(
+    &self,
+    client: Arc<SnapshotClient>,
+    overlay: Arc<Overlay>,
+    snapshot_time: Timestamp,
+    root: TreeEntryInfo,
+  ) -> Vec<(u64, Vec<u8>)> {
+    // Assembled here rather than by the caller so the listing cache is always
+    // born empty and sized from this mount's config.
+    let pinned = Pinned {
+      client,
+      overlay,
+      snapshot_time,
+      listings: crate::listing::ListingCache::new(self.config.listing_cache_dirs),
+    };
     // The inode table first, and under both locks, so no lookup can resolve
     // against the new commit and then be recorded against the old root.
     let mut inodes = self.inodes.lock().expect("inode table");
@@ -498,6 +527,11 @@ impl Gfs {
   }
 
   /// One base lookup, with retries and accounting.
+  ///
+  /// This reaches the server. Metadata questions go through [`Gfs::base_node`]
+  /// and the listing cache instead; what is left here is the root (which has
+  /// no parent listing) and [`Gfs::open_blob`]'s ticket request, because a
+  /// blob ticket is short-lived authorization state, not metadata.
   async fn base_entry(
     &self,
     path: &BytePath,
@@ -507,6 +541,58 @@ impl Gfs {
     self.bump(|s| s.metadata_requests += 1);
     let client = self.client();
     self.retrying(|| client.get_entry(path, want_ticket)).await
+  }
+
+  /// The complete base listing of a directory: cached, or paged to the end
+  /// and then cached.
+  ///
+  /// The pinned commit is immutable, so a complete listing is the permanent
+  /// answer to every metadata question about its directory — children,
+  /// attributes, and definitive negatives. See [`crate::listing`] for the
+  /// lifetime and bounds.
+  async fn base_listing(&self, dir: &BytePath) -> Result<Arc<Listing>, GfsError> {
+    // One `Pinned` for the whole operation: the client that fetches and the
+    // cache that stores must belong to the same generation.
+    let pinned = self.pinned();
+    if let Some(listing) = pinned.listings.get(dir) {
+      self.bump(|s| s.listing_hits += 1);
+      return Ok(listing);
+    }
+    let client = Arc::clone(&pinned.client);
+    let mut entries = Vec::new();
+    let mut token = Vec::new();
+    loop {
+      let page = self
+        .retrying(|| {
+          client.list_directory(dir, token.clone(), self.config.directory_page_size, false)
+        })
+        .await?;
+      self.bump(|s| s.directory_pages += 1);
+      entries.extend(page.entries);
+      if page.next_page_token.is_empty() {
+        break;
+      }
+      token = page.next_page_token;
+    }
+    let listing = Arc::new(Listing::new(entries));
+    pinned.listings.insert(dir, Arc::clone(&listing));
+    Ok(listing)
+  }
+
+  /// One base entry, answered from its parent's cached listing.
+  ///
+  /// A cold deep lookup pays one listing per ancestor — the count the
+  /// kernel's component walk forces anyway — and every later question about
+  /// those directories, including the absence of any name they lack, is
+  /// answered without the server.
+  async fn base_node(&self, path: &BytePath) -> Result<Option<TreeEntryInfo>, GfsError> {
+    path.validate()?;
+    let Some(name) = path.file_name().map(<[u8]>::to_vec) else {
+      // The root has no parent listing; its entry came with the pin.
+      return self.base_entry(path, false).await;
+    };
+    let listing = self.base_listing(&parent_of(path)).await?;
+    Ok(listing.get(&name).cloned())
   }
 
   /// Resolve a path across all three worlds. The single place the order lives.
@@ -528,7 +614,7 @@ impl Gfs {
         base: self.pinned().overlay.get(path).and_then(|entry| entry.base),
       }),
       Resolution::Base => {
-        let entry = self.base_entry(path, false).await?;
+        let entry = self.base_node(path).await?;
         let base = entry.as_ref().and_then(base_facts);
         Ok(Resolved {
           node: entry.map(Node::Base),
@@ -605,32 +691,19 @@ impl Gfs {
     }
   }
 
-  /// Every name the base has in a directory, paged to the end.
+  /// Every name the base has in a directory.
   async fn base_child_names(&self, dir: &BytePath) -> Result<Vec<Vec<u8>>, GfsError> {
     if self.pinned().overlay.masks_base(dir) {
       return Ok(Vec::new());
     }
-    let mut names = Vec::new();
-    let mut token = Vec::new();
-    let client = self.client();
-    loop {
-      let page = self
-        .retrying(|| {
-          client.list_directory(dir, token.clone(), self.config.directory_page_size, false)
-        })
-        .await?;
-      self.bump(|s| s.directory_pages += 1);
-      names.extend(
-        page
-          .entries
-          .iter()
-          .map(|entry| entry.path.file_name().unwrap_or_default().to_vec()),
-      );
-      if page.next_page_token.is_empty() {
-        return Ok(names);
-      }
-      token = page.next_page_token;
-    }
+    let listing = self.base_listing(dir).await?;
+    Ok(
+      listing
+        .entries()
+        .iter()
+        .map(|entry| entry.path.file_name().unwrap_or_default().to_vec())
+        .collect(),
+    )
   }
 
   /// Whether a directory is empty in the merged view.
@@ -657,59 +730,46 @@ impl Gfs {
       } else {
         BytePath::new(join(dir.as_bytes(), relative.as_bytes()))
       };
-      let mut token = Vec::new();
-      let client = self.client();
-      loop {
-        let page = self
-          .retrying(|| {
-            client.list_directory(
-              &absolute,
-              token.clone(),
-              self.config.directory_page_size,
-              false,
-            )
-          })
-          .await?;
-        self.bump(|s| s.directory_pages += 1);
-        for entry in page.entries {
-          let name = entry.path.file_name().unwrap_or_default().to_vec();
-          let child = BytePath::new(if relative.is_empty() {
-            name
-          } else {
-            join(relative.as_bytes(), &name)
-          });
-          if entry.kind == EntryKind::Directory {
-            queue.push(child.clone());
-          }
-          let Some(facts) = base_facts(&entry) else {
-            continue;
-          };
-          out.push(BaseDescendant {
-            relative: child,
-            facts,
-            symlink_target: entry.symlink_target.clone(),
-          });
-          if out.len() > limit {
-            return Err(GfsError::new(
-              ErrorCode::ResourceLimit,
-              format!(
-                "renaming {} would move more than {limit} entries",
-                dir.escaped()
-              ),
-            ));
-          }
+      let listing = self.base_listing(&absolute).await?;
+      for entry in listing.entries() {
+        let name = entry.path.file_name().unwrap_or_default().to_vec();
+        let child = BytePath::new(if relative.is_empty() {
+          name
+        } else {
+          join(relative.as_bytes(), &name)
+        });
+        if entry.kind == EntryKind::Directory {
+          queue.push(child.clone());
         }
-        if page.next_page_token.is_empty() {
-          break;
+        let Some(facts) = base_facts(entry) else {
+          continue;
+        };
+        out.push(BaseDescendant {
+          relative: child,
+          facts,
+          symlink_target: entry.symlink_target.clone(),
+        });
+        if out.len() > limit {
+          return Err(GfsError::new(
+            ErrorCode::ResourceLimit,
+            format!(
+              "renaming {} would move more than {limit} entries",
+              dir.escaped()
+            ),
+          ));
         }
-        token = page.next_page_token;
       }
     }
     Ok(out)
   }
 
-  /// Fetch and merge directory pages until `wanted` children are known.
-  async fn fill_directory(&self, state: &mut DirState, wanted: usize) -> Result<(), GfsError> {
+  /// Resolve a directory's full merged listing into its handle state.
+  ///
+  /// Filled to completion on the first call: the base half is one cached
+  /// listing (see [`Gfs::base_listing`]), so there are no pages left to
+  /// stream, and a complete `children` is what keeps every child's offset
+  /// fixed for the life of the handle.
+  async fn fill_directory(&self, state: &mut DirState) -> Result<(), GfsError> {
     // A passthrough directory lists once, from the real disk, on a blocking
     // worker. `.git` directories are small; there is nothing to page.
     if let Some(rel) = state.git_pending.take() {
@@ -737,48 +797,31 @@ impl Gfs {
       }
       state.complete = true;
     }
-    while !state.complete && state.children.len() < wanted {
-      if state.base_done {
-        // The base listing is exhausted, so anything the overlay holds that the
-        // base never named is appended now. Always last, so a child's offset
-        // cannot move between two `readdir` calls on one handle.
-        for entry in self
-          .pinned()
-          .overlay
-          .extra_children(&state.path, &state.base_names)
-        {
-          state.children.push(Child::Overlay(Box::new(entry)));
-        }
-        state.complete = true;
-        break;
-      }
-      let token = std::mem::take(&mut state.next_page_token);
-      let client = self.client();
-      let page = self
-        .retrying(|| {
-          client.list_directory(
-            &state.path,
-            token.clone(),
-            self.config.directory_page_size,
-            false,
-          )
-        })
-        .await?;
-      self.bump(|s| s.directory_pages += 1);
-      for entry in page.entries {
-        let name = entry.path.file_name().unwrap_or_default().to_vec();
-        state.base_names.insert(name.clone());
-        match self.pinned().overlay.resolve(&state.path.join(&name)) {
-          Resolution::Absent => {}
-          Resolution::Overlay(row) => state.children.push(Child::Overlay(row)),
-          Resolution::Base => state.children.push(Child::Base(entry)),
+    if !state.complete {
+      let mut base_names = HashSet::new();
+      if !self.pinned().overlay.masks_base(&state.path) {
+        let listing = self.base_listing(&state.path).await?;
+        for entry in listing.entries() {
+          let name = entry.path.file_name().unwrap_or_default().to_vec();
+          base_names.insert(name.clone());
+          match self.pinned().overlay.resolve(&state.path.join(&name)) {
+            Resolution::Absent => {}
+            Resolution::Overlay(row) => state.children.push(Child::Overlay(row)),
+            Resolution::Base => state.children.push(Child::Base(entry.clone())),
+          }
         }
       }
-      if page.next_page_token.is_empty() {
-        state.base_done = true;
-      } else {
-        state.next_page_token = page.next_page_token;
+      // Anything the overlay holds that the base never named, appended after
+      // the base children. Always last, so a child's offset cannot move
+      // between two `readdir` calls on one handle.
+      for entry in self
+        .pinned()
+        .overlay
+        .extra_children(&state.path, &base_names)
+      {
+        state.children.push(Child::Overlay(Box::new(entry)));
       }
+      state.complete = true;
     }
     Ok(())
   }
@@ -931,6 +974,15 @@ fn join(prefix: &[u8], suffix: &[u8]) -> Vec<u8> {
   }
   out.extend_from_slice(suffix);
   out
+}
+
+/// The directory a validated path sits in; the root for a top-level name.
+fn parent_of(path: &BytePath) -> BytePath {
+  let bytes = path.as_bytes();
+  match bytes.iter().rposition(|b| *b == b'/') {
+    Some(slash) => BytePath::new(bytes[..slash].to_vec()),
+    None => BytePath::root(),
+  }
 }
 
 /// Where a row's base blob still lives in the pinned commit.
@@ -1840,10 +1892,7 @@ impl Filesystem for GfsFilesystem {
     let mut state = DirState {
       path: record.path.clone(),
       children: Vec::new(),
-      next_page_token: Vec::new(),
-      base_done: false,
       complete: false,
-      base_names: HashSet::new(),
       git_pending: None,
     };
     match &record.node {
@@ -1877,10 +1926,9 @@ impl Filesystem for GfsFilesystem {
           .collect();
         state.complete = true;
       }
-      Node::Overlay(entry) if entry.kind.is_dir() => {
-        // A created directory shadows the base, so there is nothing to page.
-        state.base_done = self.fs.overlay().masks_base(&record.path);
-      }
+      // A created directory shadows the base; `fill_directory` checks the
+      // mask itself before touching the base listing.
+      Node::Overlay(entry) if entry.kind.is_dir() => {}
       Node::Overlay(_) => return reply.error(Errno::ENOTDIR),
       Node::Base(entry) => match entry.kind {
         // A submodule is an empty directory that lists successfully rather than
@@ -1955,8 +2003,7 @@ impl Filesystem for GfsFilesystem {
           index = 2;
           continue;
         }
-        let wanted = (index - 1) as usize;
-        if let Err(e) = fs.fill_directory(&mut state, wanted).await {
+        if let Err(e) = fs.fill_directory(&mut state).await {
           fs.bump(|s| s.errors += 1);
           return reply.error(errno_of(&e));
         }
@@ -2042,8 +2089,7 @@ impl Filesystem for GfsFilesystem {
           index = 2;
           continue;
         }
-        let wanted = (index - 1) as usize;
-        if let Err(e) = fs.fill_directory(&mut state, wanted).await {
+        if let Err(e) = fs.fill_directory(&mut state).await {
           fs.bump(|s| s.errors += 1);
           return reply.error(errno_of(&e));
         }

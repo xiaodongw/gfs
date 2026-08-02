@@ -746,11 +746,9 @@ impl Mount {
       .map_err(crate::fs::overlay_as_service_error)?;
 
     let stale = self.fs.repin(
-      crate::fs::Pinned {
-        client: Arc::clone(&resolved.pin.client),
-        overlay: Arc::clone(&self.overlay),
-        snapshot_time: resolved.pin.snapshot_time,
-      },
+      Arc::clone(&resolved.pin.client),
+      Arc::clone(&self.overlay),
+      resolved.pin.snapshot_time,
       resolved.root,
     );
     let superseded = {

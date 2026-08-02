@@ -139,6 +139,30 @@ one daemon per mount each opened its own cache over the same directory, so the
 bytes doubled and `--cache-quota` silently meant "per mount" rather than per
 host.
 
+### A warm metadata walk is server-silent
+
+The daemon keeps complete base directory listings per pin, so once a directory
+has been listed, every metadata question about it — readdir, stat, and the
+absence of any name — is answered locally. Watch the server's counters across
+two warm `git status` runs (more than a second apart, so the kernel's negative
+dentries have expired and the daemon is genuinely answering):
+
+```sh
+cd ~/.gfs-lab/flask
+git status >/dev/null   # warm the listings
+curl -s 127.0.0.1:8430/metrics | grep -E 'list_directory|get_entry'
+sleep 2; git status >/dev/null
+curl -s 127.0.0.1:8430/metrics | grep -E 'list_directory|get_entry'
+```
+
+The `gfs_requests_total` counters must be identical before and after the second
+status. Before the listing cache each warm status leaked ~15 requests (6
+listings, 9 negative lookups), every prompt redraw, forever.
+
+The client-side view of the same fact is the `metadata` line of `gfs inspect`:
+across warm walks, `server requests` and `directory pages` hold still while
+`listing hits` climbs.
+
 ## The write path, step by step
 
 ### `gfs clone`

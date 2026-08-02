@@ -892,6 +892,12 @@ fn print_report(report: &gfs_mount::control::MountReport) {
     "hydration  {} blobs, {} bytes, {} cache hits",
     report.cache.fetches, report.cache.bytes_fetched, report.cache.hits
   );
+  // The listing-cache line: server requests that stop growing while listing
+  // hits climb is what "a warm metadata walk is server-silent" looks like.
+  println!(
+    "metadata   {} server requests, {} directory pages, {} listing hits",
+    report.stats.metadata_requests, report.stats.directory_pages, report.stats.listing_hits
+  );
   // The budget line names the remedy, because the EDQUOT the job saw could not
   // (a FUSE reply is an errno, with no room for prose -- ADR 0009).
   if report.budget.limit_bytes > 0 {

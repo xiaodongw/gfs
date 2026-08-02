@@ -44,6 +44,7 @@ pub mod gitdir;
 pub mod host;
 pub mod inode;
 pub mod lease;
+pub mod listing;
 pub mod mount;
 pub mod odb;
 pub mod passthrough;
