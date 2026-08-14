@@ -29,30 +29,35 @@ cap at 108 bytes).
 ## The whole loop (second terminal)
 
 ```sh
-export PATH="$PWD/gfs-bundle/bin:$PATH"   # from wherever you unpacked
+# Keep Ubuntu's native Git ahead of Databricks' /usr/bin command shim.
+export PATH="$PWD/gfs-bundle/bin:/usr/lib/git-core:$PATH"
 cd ~/.gfs-lab
 
-gfs clone https://github.com/pallets/flask.git
+git clone https://github.com/pallets/flask.git
 cd flask
-export PATH="$(gfs install-shim):$PATH"
 
 git status
 git log --oneline -10
+find src -name '*.py' | head
+grep -rn "def route" src | head
 git switch -c my-change
 echo "a change" >> README.md
 git commit -am "a change"
-git push                # lands at refs/gfs/work/dev/my-change on the gateway
+git push -u origin my-change
 ```
 
-Apart from the clone and the shim install, that is stock Git. `gfs push
-my-change` would continue outward to the real upstream, but needs a
+The bundle's `bin/` is the pre-configured tool surface: `git`, `grep`,
+`find`, and `rg` are the GFS shims, and they pass through to the real tools
+whenever GFS cannot serve an invocation. `gfs push my-change` would continue
+the gateway branch outward to the real upstream, but needs a
 credential with write access (`GFS_UPSTREAM_CREDENTIAL`) — skip it for a
 repository you cannot write to, or clone a local bare repo instead:
 
 ```sh
 git clone --bare https://github.com/pallets/flask.git ~/.gfs-lab/mine.git
-gfs clone file://$HOME/.gfs-lab/mine.git
-# ...same loop... then the outward push works with no credential:
+git clone file://$HOME/.gfs-lab/mine.git
+# ...same loop, including `git push -u origin my-change`...
+# Then the outward push works with no credential:
 gfs push my-change
 ```
 
@@ -70,27 +75,30 @@ hydrated** — history and metadata come through the object-store projection
 Reading a file hydrates exactly that file. Compare:
 
 ```sh
-gfs rg -F 'ImproperlyConfigured'  # server-side: milliseconds, downloads nothing
-rg -F 'ImproperlyConfigured'      # sweeps the tree: hydrates everything it reads
-gfs inspect | grep hydration      # now look what the second one cost
+rg -F 'ImproperlyConfigured'                    # shim: server-side, no hydration
+GFS_SHIM_BYPASS=1 rg -F 'ImproperlyConfigured'  # real rg: hydrates what it reads
+gfs inspect | grep hydration                    # now look what the second one cost
 ```
 
-**The shims route cost, not correctness.** With the shim PATH installed:
+**The shims route cost, not correctness.** The bundle PATH already has them:
 
 ```sh
 git gc                        # refused, exit 2 (walks the whole object database)
 git blame src/flask/app.py    # runs, after a stderr note naming `gfs blame`
-rg 'pattern'                  # runs, after a stderr note naming `gfs rg`
+find src -name '*.py'         # answered from the local index, no tree walk
+grep -rn 'pattern' src        # translated to server-side `gfs rg`
+rg 'pattern'                  # delegated to server-side `gfs rg`
 ```
 
 **The push landed where it should:**
 
 ```sh
-git -C ~/.gfs-lab/repos/*.git for-each-ref refs/gfs/work
+git -C ~/.gfs-lab/repos/<repo-id>.git show-ref refs/heads/my-change
 ```
 
-Work lives under `refs/gfs/work/dev/`, never `refs/heads/` — the branch
-namespace mirrors upstream and is written only by fetch.
+The gateway is a shared fork: stock `git push` writes the branch you name
+under `refs/heads/`. `gfs push my-change` is the separate step that
+continues that gateway branch outward to the real upstream.
 
 **Server-side review, zero download:**
 
@@ -104,7 +112,7 @@ gfs blame src/flask/cli.py -L 40,80
 
 The same server speaks read-only WebDAV at `/dav/` — no `gfs`, no `git`,
 no FUSE. Any repository the server holds is browsable at
-`/dav/<repo-id>/<branch>/...`, where `<repo-id>` is what `gfs clone`
+`/dav/<repo-id>/<branch>/...`, where `<repo-id>` is what `git clone`
 printed (e.g. `github.com_pallets_flask`). This server runs the no-token
 dev posture, so no credentials anywhere:
 

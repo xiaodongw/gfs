@@ -119,7 +119,6 @@ struct Index {
 pub struct BlobCache {
   root: PathBuf,
   repository_id: RepositoryId,
-  algorithm: HashAlgorithm,
   quota_bytes: u64,
   index: Mutex<Index>,
   inflight: Mutex<HashMap<String, broadcast::Sender<Result<u64, String>>>>,
@@ -164,7 +163,6 @@ impl BlobCache {
     let cache = BlobCache {
       root,
       repository_id: repository_id.clone(),
-      algorithm,
       quota_bytes,
       index: Mutex::new(Index::default()),
       inflight: Mutex::new(HashMap::new()),

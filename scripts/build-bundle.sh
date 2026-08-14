@@ -23,19 +23,30 @@ trap 'rm -rf "$STAGE"' EXIT
 docker run --rm -v "$PWD":/src -w /src \
   -e CARGO_TARGET_DIR=/src/target-focal -e DEBIAN_FRONTEND=noninteractive \
   ubuntu:20.04 bash -c "
-    set -e
-    apt-get update -qq >/dev/null
+    set -euo pipefail
+    fail_bootstrap() {
+      cat /tmp/gfs-bootstrap.log >&2
+      exit 1
+    }
+    apt-get update -qq >/tmp/gfs-bootstrap.log 2>&1 || fail_bootstrap
     apt-get install -y -qq curl build-essential pkg-config zlib1g-dev cmake \
-      ca-certificates >/dev/null
+      ca-certificates >>/tmp/gfs-bootstrap.log 2>&1 || fail_bootstrap
     curl -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain none \
-      --profile minimal >/dev/null
+      --profile minimal >>/tmp/gfs-bootstrap.log 2>&1 || fail_bootstrap
     export PATH=\"/root/.cargo/bin:\$PATH\"
+    # Resolve the pinned override and its components while bootstrap output is
+    # captured. If this fails, replay the log; compiler diagnostics stay live.
+    cargo --version >>/tmp/gfs-bootstrap.log 2>&1 || fail_bootstrap
     cargo build --release -p gfs-cli -p gfs-fuse -p gfs-server
     chown -R $(id -u):$(id -g) /src/target-focal
   "
 
 mkdir -p "$STAGE/gfs-bundle/bin"
-for bin in gfs gfs-server gfs-fuse gfs-git-shim gfs-scan-shim gfs-fsmonitor; do
+for bin in \
+  gfs gfs-server gfs-fuse \
+  gfs-git-shim gfs-scan-shim git grep find rg \
+  gfs-fsmonitor gfs-lfs-filter
+do
   cp "target-focal/release/$bin" "$STAGE/gfs-bundle/bin/"
 done
 cp scripts/bundle/start-server.sh scripts/bundle/TESTING.md "$STAGE/gfs-bundle/"

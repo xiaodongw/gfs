@@ -29,27 +29,26 @@ path = "src/bin/gfs-scan-shim.rs"
 
 # The same two shims again, under the names the shimmed tools answer to, so
 # `target/debug` on PATH *is* the pre-configured environment: `git`, `grep`,
-# `find`, and `rg` resolve to the shims with no `gfs install-shim` step. Both
-# shims dispatch on the name they were invoked as (argv[0]), so each of these
-# is the same source built under another name; cargo warns that the files
-# appear in multiple targets, which is exactly what is happening. Do NOT
-# `cargo install --path` this crate: it would drop binaries named `git` and
-# `rg` into `~/.cargo/bin`, shadowing the real tools everywhere.
+# `find`, and `rg` resolve to the shims with no `gfs install-shim` step. The
+# thin wrapper sources keep each Cargo target distinct while sharing the shim
+# implementation. Do NOT `cargo install --path` this crate: it would drop
+# binaries named `git` and `rg` into `~/.cargo/bin`, shadowing the real tools
+# everywhere.
 [[bin]]
 name = "git"
-path = "src/bin/gfs-git-shim.rs"
+path = "src/bin/git.rs"
 
 [[bin]]
 name = "grep"
-path = "src/bin/gfs-scan-shim.rs"
+path = "src/bin/grep.rs"
 
 [[bin]]
 name = "find"
-path = "src/bin/gfs-scan-shim.rs"
+path = "src/bin/find.rs"
 
 [[bin]]
 name = "rg"
-path = "src/bin/gfs-scan-shim.rs"
+path = "src/bin/rg.rs"
 
 [[bin]]
 name = "gfs-fsmonitor"

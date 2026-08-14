@@ -38,7 +38,7 @@ use std::path::{Path, PathBuf};
 /// reason rather than allowed to run for an hour and fail on quota.
 const REFUSED: &[&str] = &["gc", "repack", "prune", "fsck", "maintenance"];
 
-fn main() {
+pub(crate) fn main() {
   let args: Vec<String> = std::env::args().skip(1).collect();
   let subcommand = args
     .iter()

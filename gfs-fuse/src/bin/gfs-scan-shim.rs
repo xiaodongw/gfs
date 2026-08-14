@@ -42,7 +42,7 @@
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 
-fn main() {
+pub(crate) fn main() {
   let args: Vec<String> = std::env::args().skip(1).collect();
   let invoked_as = std::env::args()
     .next()

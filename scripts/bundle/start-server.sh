@@ -55,7 +55,7 @@ In another terminal:
 
   export PATH="$BIN:\$PATH"
   cd $LAB
-  gfs clone https://github.com/pallets/flask.git
+  git clone https://github.com/pallets/flask.git
 
 Ctrl+C here stops the server and unmounts anything under $LAB.
 
