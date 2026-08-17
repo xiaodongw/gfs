@@ -2,8 +2,8 @@
 #
 # The agent edit workflow, end to end, raw Git against GFS.
 #
-#   acquire a workspace -> read recent history -> start a branch ->
-#   find by name -> grep by content -> edit files -> status -> commit
+#   acquire a workspace -> read recent history -> find by name ->
+#   grep by content -> edit files -> status -> commit
 #
 # `benchmark-clone.sh` measures the *clone*, which is only the first step. This
 # measures the whole task, because the ranking changes once search is in it: the
@@ -13,12 +13,32 @@
 # its time. A faster search that returns a different answer is not a faster
 # search, so the two are never reported apart.
 #
-#   ./spikes/corpus/benchmark-workflow.sh django
+#   ./spikes/corpus/benchmark-workflow.sh vscode
 #
 # Takes repository ids from corpus.conf and hardcodes no repository names.
 # Requires a release build (`scripts/build-release.sh`) and a real ripgrep
 # binary; see the note in benchmarks/baseline.md about `rg` being a shell
 # function in some environments.
+#
+# Both flows run **stock Git inside their own working tree** -- ADR 0009 put a
+# real object database behind the mount, so `log`, `ls-files`, `status` and
+# `commit` are the same commands on both sides. Only content search differs,
+# because search is the one question GFS deliberately answers somewhere else.
+# The earlier version of this harness predates that ADR: it drove `gfs log`,
+# which no longer exists, and measured a sibling `<workspace>.gfs` state
+# directory, which ADR 0011 moved inside the workspace.
+#
+# Three measurements exist because a single number hid something real:
+#
+#   * `status` is timed cold *and* warm. The first one in a fresh workspace
+#     populates the untracked cache, which reads every directory once; on vscode
+#     that is 5 328 uncached listings and 555 s, against 1.75 s warm.
+#   * search is timed twice and its stderr is kept. An index that is not ready
+#     answers SNAPSHOT_BUILDING, and a harness that discards stderr turns that
+#     error into what looks like an empty result.
+#   * disk is measured in allocated blocks, not apparent size: the odb block
+#     cache is sparse, so `du --apparent-size` reports a pack's whole span
+#     rather than the bytes actually fetched.
 
 set -uo pipefail
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -55,14 +75,17 @@ for tool in gfs gfs-fuse gfs-server; do
 done
 
 # Identity and config that must not vary between the flows, or the commits differ
-# for reasons that have nothing to do with what is being measured.
+# for reasons that have nothing to do with what is being measured. `safe.directory`
+# because the mount may be owned by the daemon rather than by the job UID
+# (DESIGN.md section 8.6).
 GITC=(-c user.name=bench -c user.email=bench@example.com
       -c commit.gpgsign=false -c core.autocrlf=false -c gc.auto=0
-      -c protocol.version=2)
+      -c protocol.version=2 -c safe.directory='*')
 
 now() { date +%s.%N; }
 el() { echo "$2 - $1" | bc; }
 mib() { du -sm --apparent-size "$1" 2>/dev/null | cut -f1; }
+allocated() { du -s --block-size=1 "$1" 2>/dev/null | cut -f1; }
 
 # The edit set: one of each change kind the overlay models, applied by the same
 # function in every flow so a difference in the result is a difference in the
@@ -99,6 +122,35 @@ apply_edits() { # $1 = worktree, $2..$5 = the four chosen paths
   return 0
 }
 
+# One raw-git leg: clone with the given flags, then run the task in the clone.
+# Results land in R_* for the caller to snapshot, because bash has no better way
+# to return fifteen values.
+raw_leg() { # $1 = label, $2 = destination, $3.. = clone flags
+  local label="$1" d="$2"; shift 2
+  local t0 t1
+  t0=$(now); git "${GITC[@]}" clone -q "$@" "file://$served" "$d" >/dev/null 2>&1; t1=$(now)
+  R_ACQ=$(el "$t0" "$t1")
+  t0=$(now); R_LOG=$(git -C "$d" "${GITC[@]}" log -10 --oneline | wc -l); t1=$(now)
+  R_LOG_S=$(el "$t0" "$t1")
+  t0=$(now); R_FIND=$(git -C "$d" "${GITC[@]}" ls-files "$find_glob" | wc -l); t1=$(now)
+  R_FIND_S=$(el "$t0" "$t1")
+  t0=$(now); R_GREP=$("$RG" -F "$grep_pat" "$d" 2>/dev/null | wc -l); t1=$(now)
+  R_GREP_S=$(el "$t0" "$t1")
+  t0=$(now); apply_edits "$d" "$m1" "$m2" "$del" "$ren"; t1=$(now)
+  R_EDIT=$(el "$t0" "$t1")
+  t0=$(now); git -C "$d" "${GITC[@]}" status --porcelain >/dev/null; t1=$(now)
+  R_STAT=$(el "$t0" "$t1")
+  t0=$(now); git -C "$d" "${GITC[@]}" status --porcelain >/dev/null; t1=$(now)
+  R_STAT2=$(el "$t0" "$t1")
+  t0=$(now)
+  git -C "$d" "${GITC[@]}" add -A >/dev/null 2>&1
+  git -C "$d" "${GITC[@]}" commit -q -m "bench: agent edit" >/dev/null 2>&1
+  t1=$(now); R_CMT=$(el "$t0" "$t1")
+  R_TREE=$(git -C "$d" rev-parse HEAD^{tree} 2>/dev/null)
+  R_DISK=$(mib "$d")
+  R_TOTAL=$(echo "$R_ACQ+$R_LOG_S+$R_FIND_S+$R_GREP_S+$R_EDIT+$R_STAT+$R_CMT" | bc)
+}
+
 run_one() { # $1 = repository id
   local repo="$1"
   local mirror="$MIRROR_DIR/$repo.git"
@@ -107,10 +159,10 @@ run_one() { # $1 = repository id
     return 1
   fi
 
-  rm -rf "$WORK/$repo"; mkdir -p "$WORK/$repo"
-  local served="$WORK/$repo/served.git"
+  rm -rf "${WORK:?}/$repo"; mkdir -p "$WORK/$repo"
   # Copied, never served in place: the server writes `refs/gfs/*` lease anchors
   # into whatever repository it serves, and the mirror is an input.
+  local served="$WORK/$repo/served.git"
   cp -a "$mirror" "$served"
   local base; base=$(git --git-dir="$served" rev-parse HEAD)
 
@@ -131,34 +183,23 @@ run_one() { # $1 = repository id
 
   echo "## $repo"
   echo "base commit: $base"
+  echo "tip files: $(git --git-dir="$served" ls-tree -r HEAD | wc -l)   refs: $(git --git-dir="$served" for-each-ref | wc -l)   mirror: $(mib "$mirror") MiB"
   echo "find glob: $find_glob   grep pattern: $grep_pat"
   echo "edits: modify $m1, modify $m2, delete $del, rename $ren"
   echo
-  printf '| step | raw git full | raw git --depth 10 | GFS | raw result | GFS result |\n'
-  printf '| --- | ---: | ---: | ---: | --- | --- |\n'
 
-  # ---- raw git ----
-  local d="$WORK/$repo/raw" d10="$WORK/$repo/raw10" t0 t1
-  t0=$(now); git "${GITC[@]}" clone -q "file://$served" "$d" >/dev/null 2>&1; t1=$(now)
-  local a_acq; a_acq=$(el "$t0" "$t1")
-  t0=$(now); git "${GITC[@]}" clone -q --depth 10 "file://$served" "$d10" >/dev/null 2>&1; t1=$(now)
-  local a10_acq; a10_acq=$(el "$t0" "$t1")
+  # ---- raw git, twice: everything, and the cheapest clone that still works ----
+  local a_acq a_log a_log_s a_find a_find_s a_grep a_grep_s a_edit a_stat a_stat2 a_cmt a_total a_disk a_tree
+  raw_leg "full" "$WORK/$repo/raw"
+  a_acq=$R_ACQ a_log=$R_LOG a_log_s=$R_LOG_S a_find=$R_FIND a_find_s=$R_FIND_S
+  a_grep=$R_GREP a_grep_s=$R_GREP_S a_edit=$R_EDIT a_stat=$R_STAT a_stat2=$R_STAT2
+  a_cmt=$R_CMT a_total=$R_TOTAL a_disk=$R_DISK a_tree=$R_TREE
 
-  t0=$(now); local a_log; a_log=$(git -C "$d" log -10 --oneline | wc -l); t1=$(now)
-  local a_log_s; a_log_s=$(el "$t0" "$t1")
-  t0=$(now); local a_find; a_find=$(git -C "$d" ls-files "$find_glob" | wc -l); t1=$(now)
-  local a_find_s; a_find_s=$(el "$t0" "$t1")
-  t0=$(now); local a_grep; a_grep=$("$RG" -F "$grep_pat" "$d" 2>/dev/null | wc -l); t1=$(now)
-  local a_grep_s; a_grep_s=$(el "$t0" "$t1")
-  t0=$(now); apply_edits "$d" "$m1" "$m2" "$del" "$ren"; t1=$(now)
-  local a_edit; a_edit=$(el "$t0" "$t1")
-  t0=$(now); git -C "$d" "${GITC[@]}" status --porcelain >/dev/null; t1=$(now)
-  local a_stat; a_stat=$(el "$t0" "$t1")
-  t0=$(now)
-  git -C "$d" "${GITC[@]}" add -A >/dev/null 2>&1
-  git -C "$d" "${GITC[@]}" commit -q -m "bench: agent edit" >/dev/null 2>&1
-  t1=$(now); local a_cmt; a_cmt=$(el "$t0" "$t1")
-  local a_tree; a_tree=$(git -C "$d" rev-parse HEAD^{tree})
+  local b_acq b_log b_log_s b_find_s b_grep_s b_edit b_stat b_stat2 b_cmt b_total b_disk b_tree
+  raw_leg "shallow+blobless" "$WORK/$repo/raw_sb" --depth 1 --filter=blob:none --no-single-branch
+  b_acq=$R_ACQ b_log=$R_LOG b_log_s=$R_LOG_S b_find_s=$R_FIND_S
+  b_grep_s=$R_GREP_S b_edit=$R_EDIT b_stat=$R_STAT b_stat2=$R_STAT2
+  b_cmt=$R_CMT b_total=$R_TOTAL b_disk=$R_DISK b_tree=$R_TREE
 
   # ---- GFS ----
   local state="$WORK/$repo/server-state"; mkdir -p "$state"
@@ -172,75 +213,113 @@ run_one() { # $1 = repository id
     kill "$server_pid" 2>/dev/null; wait "$server_pid" 2>/dev/null
   }
   trap stop_server RETURN
-  # Generous: the first import reconciles every ref, which on a 29 000-ref
-  # repository is the better part of a minute.
-  local ready=0 i
-  for ((i = 0; i < 6000; i++)); do
+
+  # The server reconciles every ref into its catalog before it binds a listener,
+  # so this is the repository's one-time import cost and belongs in the report.
+  local ready=0 i t0 t1
+  t0=$(now)
+  for ((i = 0; i < 12000; i++)); do
     if curl -fsS "http://$HTTP_ADDR/readyz" >/dev/null 2>&1; then ready=1; break; fi
     sleep 0.1
   done
+  t1=$(now)
   if [ "$ready" -eq 0 ]; then echo "[$repo] server did not become ready" >&2; return 1; fi
+  local import_s; import_s=$(el "$t0" "$t1")
 
   export GFS_ENDPOINT="http://$GRPC_ADDR" GFS_HTTP_ENDPOINT="http://$HTTP_ADDR" GFS_TOKEN="$TOKEN"
-  local ws="$WORK/$repo/ws"
+  local ws="$WORK/$repo/ws" cache="$WORK/$repo/cache"
+
   t0=$(now); "$BIN/gfs" mount --repo "$repo" --rev HEAD --workspace "$ws" \
-    --cache-dir "$WORK/$repo/cache" >/dev/null 2>&1; t1=$(now)
+    --cache-dir "$cache" >"$WORK/$repo/mount.log" 2>&1; t1=$(now)
   local c_acq; c_acq=$(el "$t0" "$t1")
 
-  t0=$(now); local c_log; c_log=$(cd "$ws" && "$BIN/gfs" log -10 --oneline 2>/dev/null | wc -l); t1=$(now)
-  local c_log_s; c_log_s=$(el "$t0" "$t1")
-  t0=$(now); local c_find; c_find=$(cd "$ws" && "$BIN/gfs" find "$find_glob" --max-results "$max_results" 2>/dev/null | wc -l); t1=$(now)
-  local c_find_s; c_find_s=$(el "$t0" "$t1")
-  t0=$(now); local c_grep; c_grep=$(cd "$ws" && "$BIN/gfs" rg -F "$grep_pat" -m "$max_results" 2>/dev/null | wc -l); t1=$(now)
-  local c_grep_s; c_grep_s=$(el "$t0" "$t1")
-  t0=$(now); apply_edits "$ws" "$m1" "$m2" "$del" "$ren"; t1=$(now)
-  local c_edit; c_edit=$(el "$t0" "$t1")
-  t0=$(now); "$BIN/gfs" status --workspace "$ws" >/dev/null 2>&1; t1=$(now)
-  local c_stat; c_stat=$(el "$t0" "$t1")
+  local c_log c_log_s c_find c_find_s
+  t0=$(now); c_log=$(git -C "$ws" "${GITC[@]}" log -10 --oneline | wc -l); t1=$(now)
+  c_log_s=$(el "$t0" "$t1")
+  t0=$(now); c_find=$(git -C "$ws" "${GITC[@]}" ls-files "$find_glob" | wc -l); t1=$(now)
+  c_find_s=$(el "$t0" "$t1")
 
-  t0=$(now); "$BIN/gfs" export --workspace "$ws" --bundle "$WORK/$repo/bundle" >/dev/null 2>&1; t1=$(now)
-  local c_exp; c_exp=$(el "$t0" "$t1")
-  # The commit lands where the objects are. No worktree: a temporary index and
-  # `commit-tree` is what a server would do, and it is the honest cost -- an
-  # earlier harness cloned the repository here and charged GFS for it.
+  # Hydration around the search, which is the claim worth proving: a
+  # repository-wide content search must move no file bytes to the client.
+  "$BIN/gfs" inspect --workspace "$ws" >"$WORK/$repo/inspect-before-search.txt" 2>&1
+  local c_grep c_grep_s c_grep_rc c_grep2 c_grep2_s
   t0=$(now)
-  local idx="$WORK/$repo/index"
-  GIT_INDEX_FILE="$idx" git --git-dir="$served" "${GITC[@]}" read-tree "$base"
-  GIT_INDEX_FILE="$idx" git --git-dir="$served" "${GITC[@]}" apply --cached \
-    --whitespace=nowarn "$WORK/$repo/bundle/changes.patch"
-  local c_tree
-  c_tree=$(GIT_INDEX_FILE="$idx" git --git-dir="$served" "${GITC[@]}" write-tree)
-  t1=$(now); local c_cmt; c_cmt=$(el "$t0" "$t1")
+  ( cd "$ws" && "$BIN/gfs" rg -F "$grep_pat" -m "$max_results" \
+      >"$WORK/$repo/search-cold.out" 2>"$WORK/$repo/search-cold.err" )
+  c_grep_rc=$?; t1=$(now)
+  c_grep_s=$(el "$t0" "$t1"); c_grep=$(wc -l <"$WORK/$repo/search-cold.out")
+  t0=$(now)
+  ( cd "$ws" && "$BIN/gfs" rg -F "$grep_pat" -m "$max_results" \
+      >"$WORK/$repo/search-warm.out" 2>"$WORK/$repo/search-warm.err" )
+  t1=$(now)
+  c_grep2_s=$(el "$t0" "$t1"); c_grep2=$(wc -l <"$WORK/$repo/search-warm.out")
+  "$BIN/gfs" inspect --workspace "$ws" >"$WORK/$repo/inspect-after-search.txt" 2>&1
 
-  local hydration
-  hydration=$("$BIN/gfs" inspect --workspace "$ws" | grep hydration | sed 's/^hydration *//')
+  local c_edit c_stat c_stat2 c_gfsstat c_cmt c_tree
+  t0=$(now); apply_edits "$ws" "$m1" "$m2" "$del" "$ren"; t1=$(now)
+  c_edit=$(el "$t0" "$t1")
+  t0=$(now); git -C "$ws" "${GITC[@]}" status --porcelain >/dev/null; t1=$(now)
+  c_stat=$(el "$t0" "$t1")
+  t0=$(now); git -C "$ws" "${GITC[@]}" status --porcelain >/dev/null; t1=$(now)
+  c_stat2=$(el "$t0" "$t1")
+  t0=$(now); "$BIN/gfs" status --workspace "$ws" >/dev/null 2>&1; t1=$(now)
+  c_gfsstat=$(el "$t0" "$t1")
+  t0=$(now)
+  git -C "$ws" "${GITC[@]}" add -A >/dev/null 2>&1
+  git -C "$ws" "${GITC[@]}" commit -q -m "bench: agent edit" >/dev/null 2>&1
+  t1=$(now); c_cmt=$(el "$t0" "$t1")
+  c_tree=$(git -C "$ws" "${GITC[@]}" rev-parse HEAD^{tree} 2>/dev/null)
 
-  printf '| acquire | %.3f s | %.3f s | %.3f s | clone | mount |\n' "$a_acq" "$a10_acq" "$c_acq"
+  "$BIN/gfs" inspect --workspace "$ws" >"$WORK/$repo/inspect-final.txt" 2>&1
+  local hydration odb
+  hydration=$(grep -E '^hydration' "$WORK/$repo/inspect-final.txt" | sed 's/^hydration *//')
+  odb=$(grep -E '^odb' "$WORK/$repo/inspect-final.txt" | sed 's/^odb *//')
+
+  local c_total; c_total=$(echo "$c_acq+$c_log_s+$c_find_s+$c_grep2_s+$c_edit+$c_stat+$c_cmt" | bc)
+
+  # Disk after unmount: while mounted the odb projection advertises pack sizes it
+  # does not hold, so measuring the live mount reports bytes nobody stored.
+  "$BIN/gfs" unmount --workspace "$ws" >/dev/null 2>&1
+  local c_state c_cache
+  c_state=$(allocated "$ws"); c_cache=$(allocated "$cache")
+
+  printf '| step | raw git full | raw git shallow+blobless | GFS | raw result | GFS result |\n'
+  printf '| --- | ---: | ---: | ---: | --- | --- |\n'
+  printf '| acquire | %.3f s | %.3f s | %.3f s | clone | mount |\n' "$a_acq" "$b_acq" "$c_acq"
   printf '| `log -10` | %.3f s | %.3f s | %.3f s | %s commits | %s commits |\n' \
-    "$a_log_s" "$a_log_s" "$c_log_s" "$a_log" "$c_log"
-  printf '| find | %.3f s | %.3f s | %.3f s | %s files | %s files |\n' \
-    "$a_find_s" "$a_find_s" "$c_find_s" "$a_find" "$c_find"
-  printf '| grep | %.3f s | %.3f s | %.3f s | %s lines | %s lines |\n' \
-    "$a_grep_s" "$a_grep_s" "$c_grep_s" "$a_grep" "$c_grep"
-  printf '| edit | %.3f s | %.3f s | %.3f s | | |\n' "$a_edit" "$a_edit" "$c_edit"
-  printf '| status | %.3f s | %.3f s | %.3f s | | |\n' "$a_stat" "$a_stat" "$c_stat"
-  printf '| commit | %.3f s | %.3f s | %.3f s | | export + apply |\n' \
-    "$a_cmt" "$a_cmt" "$(echo "$c_exp + $c_cmt" | bc)"
-  printf '| **total** | **%.3f s** | **%.3f s** | **%.3f s** | | |\n' \
-    "$(echo "$a_acq+$a_log_s+$a_find_s+$a_grep_s+$a_edit+$a_stat+$a_cmt" | bc)" \
-    "$(echo "$a10_acq+$a_log_s+$a_find_s+$a_grep_s+$a_edit+$a_stat+$a_cmt" | bc)" \
-    "$(echo "$c_acq+$c_log_s+$c_find_s+$c_grep_s+$c_edit+$c_stat+$c_exp+$c_cmt" | bc)"
+    "$a_log_s" "$b_log_s" "$c_log_s" "$a_log" "$c_log"
+  printf '| `ls-files` | %.3f s | %.3f s | %.3f s | %s files | %s files |\n' \
+    "$a_find_s" "$b_find_s" "$c_find_s" "$a_find" "$c_find"
+  printf '| grep, cold index | %.3f s | %.3f s | %.3f s | %s lines | %s lines (exit %s) |\n' \
+    "$a_grep_s" "$b_grep_s" "$c_grep_s" "$a_grep" "$c_grep" "$c_grep_rc"
+  printf '| grep, warm | %.3f s | %.3f s | %.3f s | %s lines | %s lines |\n' \
+    "$a_grep_s" "$b_grep_s" "$c_grep2_s" "$a_grep" "$c_grep2"
+  printf '| edit | %.3f s | %.3f s | %.3f s | | |\n' "$a_edit" "$b_edit" "$c_edit"
+  printf '| `git status`, cold | %.3f s | %.3f s | %.3f s | | |\n' "$a_stat" "$b_stat" "$c_stat"
+  printf '| `git status`, warm | %.3f s | %.3f s | %.3f s | | |\n' "$a_stat2" "$b_stat2" "$c_stat2"
+  printf '| `gfs status` | – | – | %.3f s | | journal |\n' "$c_gfsstat"
+  printf '| commit | %.3f s | %.3f s | %.3f s | | |\n' "$a_cmt" "$b_cmt" "$c_cmt"
+  printf '| **total** | **%.3f s** | **%.3f s** | **%.3f s** | | |\n' "$a_total" "$b_total" "$c_total"
   echo
-  printf 'disk: raw full %s MiB, raw --depth 10 %s MiB, GFS %s bytes state + %s bytes cache\n' \
-    "$(mib "$d")" "$(mib "$d10")" \
-    "$(du -sb --exclude=generations "$ws.gfs" | cut -f1)" \
-    "$(du -sb "$WORK/$repo/cache" | cut -f1)"
-  printf 'hydration: %s\n' "$hydration"
-  printf 'tree(raw)  %s\ntree(GFS) %s\n' "$a_tree" "$c_tree"
+  printf 'server import (one time, blocks the listeners): %.3f s\n' "$import_s"
+  printf 'disk: raw full %s MiB, raw shallow+blobless %s MiB, GFS %s bytes workspace + %s bytes host cache (allocated)\n' \
+    "$a_disk" "$b_disk" "$c_state" "$c_cache"
+  printf 'hydration: %s\nodb: %s\n' "$hydration" "$odb"
+  printf 'search coverage: %s\n' "$(head -c 300 "$WORK/$repo/search-warm.err")"
+  printf 'tree(raw full) %s\ntree(raw s+b)  %s\ntree(GFS)      %s\n' "$a_tree" "$b_tree" "$c_tree"
+  # The clone is not automatically the reference answer: where a repository uses
+  # LFS and no LFS endpoint is reachable, the smudge filter leaves files missing
+  # and `git add -A` commits them as deletions. Print both diffs against the base
+  # so a disagreement says which side wandered rather than only that one did.
   if [ "$a_tree" = "$c_tree" ]; then
     printf 'COMMIT CORRECTNESS: PASS -- the two flows produced the same tree\n\n'
   else
-    printf 'COMMIT CORRECTNESS: **FAIL** -- the two flows disagree\n\n'
+    printf 'COMMIT CORRECTNESS: **FAIL** -- the two flows disagree\n'
+    printf 'raw changed %s paths, GFS changed %s paths, against base tree %s\n\n' \
+      "$(git -C "$WORK/$repo/raw" diff --name-status "$base^{tree}" "$a_tree" | wc -l)" \
+      "$(GIT_ALTERNATE_OBJECT_DIRECTORIES="$ws/.git/objects" git --git-dir="$served" \
+           diff --name-status "$base^{tree}" "$c_tree" 2>/dev/null | wc -l)" \
+      "$(git --git-dir="$served" rev-parse "$base^{tree}")"
   fi
 }
 

@@ -6,6 +6,7 @@
 **CRITICAL** Don't worry about backwards compatibility or breaking changes, we are in early development.
 **CRITICAL** Build the project after code change to make sure it compiles.
 **CRITICAL** This project is still a prototype, write only high-level smoke tests for major entry points, skipping unit tests for internal logic until architecture stabilizes.
+**CRITICAL** Commit directly on `main`. The project is early stage with a single author, so no feature branch or PR is needed unless I ask for one.
 
 ## Plan
 In plan mode, each feature should have a plan file in plans/yyyymmdd-hhMM-<name>.md with few sections: 

@@ -1,18 +1,25 @@
 # The agent edit workflow, raw Git against GFS
 
-Date: 2026-07-27
-Reproduce: `./spikes/corpus/benchmark-workflow.sh django`
+Date: 2026-08-17
+Reproduce: `./spikes/corpus/benchmark-workflow.sh vscode django`
 
 [`baseline.md`](baseline.md) measures the **clone**, which is the first step of a
 task and the one GFS wins by the widest margin. This measures the **whole
-task**, because the ranking changes once search is in it:
+task**, because the ranking changes once everything Git does afterwards is in
+it:
 
 ```
-acquire a workspace -> git log -10 -> start a branch ->
-find by name -> grep by content -> edit files -> status -> commit
+acquire a workspace -> git log -10 -> find by name ->
+grep by content -> edit files -> status -> commit
 ```
 
-The clone is where GFS wins. Search is where it can give all of it back.
+Since [ADR 0009](../docs/adr/0009-raw-git-over-a-projected-object-store.md) the
+mount carries a real object database, so **both flows run stock Git in their own
+working tree** — `log`, `ls-files`, `status` and `commit` are the same commands
+on both sides. Only content search differs, because search is the one question
+GFS deliberately answers somewhere else. An earlier revision of this report
+measured `gfs log` and `gfs find`, which ADR 0009 deleted, and an
+export-and-apply commit path that `git commit` replaced.
 
 ## Machine and corpus
 
@@ -21,103 +28,112 @@ The clone is where GFS wins. Search is where it can give all of it back.
 | Host | WSL2, Linux 6.18.33.2-microsoft-standard-WSL2, 32 cores, 46 GiB |
 | Git | 2.53.0 |
 | ripgrep | 15.2.0 (a real binary; see `baseline.md`'s note on `rg` as a shell function) |
-| Repository | `django`, 788 MiB mirror, 34 814 commits, **29 298 refs**, 7 077 files at tip |
-| Base commit | `c2517faff335f683e1cbe55d9844910b3fb40670` |
+| Primary repository | `vscode`, 2 485 MiB mirror, **17 926 files**, **73 989 refs**, base `fc62850c022bbba2c93b0202dd24f42d1e0b3882` |
+| Secondary repository | `django`, 803 MiB mirror, 7 078 files, 29 310 refs, base `274a1d494d11d87a1b767340d1f398f197810f93` |
 
 Clones run over `file://` against a local bare copy, so no step carries internet
 variance. Both flows apply the same five-change edit set — two modifies, one
 add, one delete, one rename — to the **same four paths**, chosen once from
 `git ls-tree` and passed to both.
 
-## Results
+## Results: vscode
 
-Every step's *result* is recorded next to its time. A faster search that returns
-a different answer is not a faster search.
-
-| step | raw git full | raw git `--depth 10` | GFS | raw result | GFS result |
+| step | raw git full | raw git shallow+blobless | GFS | raw result | GFS result |
 | --- | ---: | ---: | ---: | --- | --- |
-| acquire | 12.367 s | 1.836 s | **0.211 s** | clone | mount |
-| `log -10` | 0.006 s | 0.006 s | 0.554 s | 10 commits | 10 commits |
-| find (`*test*`) | 0.007 s | 0.007 s | 0.192 s | 2 621 files | 2 621 files |
-| grep (`TODO`) | 0.017 s | 0.017 s | 1.042 s | 35 lines | 35 lines |
-| edit 5 files | 0.005 s | 0.005 s | 0.559 s | | |
-| `status` | 0.116 s | 0.116 s | **0.009 s** | | |
-| commit | 0.054 s | 0.054 s | 0.078 s | | export + apply |
-| **total** | **12.572 s** | **2.041 s** | **2.644 s** | | |
+| acquire | 55.803 s | 9.960 s | **0.300 s** | clone | mount |
+| `log -10` | 0.006 s | 0.007 s | 1.503 s | 10 commits | 10 commits |
+| `ls-files '*test*'` | 0.013 s | 0.013 s | 0.021 s | 6 146 files | 6 245 files |
+| grep `TODO`, cold index | 0.039 s | 0.040 s | 6.426 s | 1 683 lines | error, see below |
+| grep `TODO`, warm | 0.039 s | 0.040 s | 0.283 s | 1 683 lines | 1 574 lines |
+| edit 5 files | 0.005 s | 0.005 s | 2.908 s | | |
+| `git status`, cold | 0.032 s | 0.032 s | **555 s** | | |
+| `git status`, warm | 0.033 s | 0.034 s | 1.753 s | | |
+| `gfs status` | – | – | **0.0097 s** | | journal |
+| commit | 0.937 s | 0.934 s | 1 448 s | | |
+| **local disk** | 1 648 MiB | 363 MiB | **21 MB** + 145 MB host cache | | |
 
-| | raw git full | raw git `--depth 10` | GFS |
+## Results: django
+
+| step | raw git full | raw git shallow+blobless | GFS |
 | --- | ---: | ---: | ---: |
-| local disk | 338 MiB | 58 MiB | **266 KiB** state + 9 KiB cache |
-| bytes fetched | ~294 MiB | ~14 MiB | **8 828 bytes, 4 blobs** |
+| acquire | 10.987 s | 2.560 s | **0.180 s** |
+| `log -10` | 0.006 s | 0.006 s | 0.241 s |
+| `ls-files '*test*'` | 0.007 s | 0.008 s | 0.019 s (2 621 files, both) |
+| grep `TODO`, cold index | 0.019 s | 0.018 s | 1.461 s (35 lines, both) |
+| grep `TODO`, warm | 0.019 s | 0.018 s | 0.217 s |
+| edit 5 files | 0.006 s | 0.005 s | 0.482 s |
+| `git status`, cold | 0.128 s | 0.127 s | 7.229 s |
+| `git status`, warm | 0.035 s | 0.124 s | 0.116 s |
+| `gfs status` | – | – | **0.011 s** |
+| commit | 0.053 s | 0.055 s | 9.811 s |
+| **local disk** | 338 MiB | 68 MiB | **15.6 MB** + 46.7 MB host cache |
 
-**Correctness: the two flows produce the identical tree**,
-`d9416486b601990add98ac423b64c3f5dc21c926`, including the rename. Each search
-step returns the same count as the tool it replaces.
-
-### Warm numbers
-
-The table above is one cold run: a server that has just imported the repository,
-an unbuilt search index, and a first gRPC connection. That is the honest cost of
-the *first* job. A second job on the same server pays none of it:
-
-| | cold (table above) | warm, median of 3 |
-| --- | ---: | ---: |
-| mount | 0.211 s | 0.211 s |
-| `gfs log -10` | 0.554 s | **0.069 s** |
-| `gfs find '*test*'` | 0.192 s | **0.029 s** |
-| `gfs rg -F TODO` | 1.042 s | **0.043 s** |
-
-Warm hydration is **0 blobs, 0 bytes**: none of the three tools reads the mount.
+Commit correctness: **PASS**, both flows produced tree
+`c297292656bb794d6e231778d3f9272d22a52c03`.
 
 ## What the numbers say
 
-**GFS wins the task, not just the clone.** 2.6 s cold and well under 1 s warm,
-against 12.6 s for a full clone and 2.0 s for the cheapest raw-git option that
-can still answer `git log -10`. Disk is the larger margin: 266 KiB against
-338 MiB, because nothing is materialized that the task did not read.
+**The workspace is effectively free; the first full-tree walk is not.** 0.300 s
+against 55.8 s to acquire, and 21 MB against 1 648 MiB on disk. But the first
+`git status` in a fresh vscode workspace costs 555 s, and the first `commit`
+1 448 s, because both walk every directory once to populate the untracked cache.
+That is **5 328 uncached listings, serialized**. One listing measures 38–126 ms,
+inside DESIGN.md section 11's 250 ms target — the target is per call, and a
+monorepo's first walk multiplies it by several thousand. Warm, the same command
+is 1.75 s. Prefetching that walk is the open item this benchmark argues for.
 
-**`--depth 1` is not a competitor for this workflow.** It clones in 1.8 s but
-`git log -10` returns **one** commit. `--depth 10` is the honest comparison and
-costs 2.0 s.
+**A repository-wide search moves no file bytes.** The hydration counters are
+byte-identical either side of searching all 17 926 files:
 
-**`status` is the one step GFS wins outright on a warm clone** — 0.009 s against
-0.116 s — because it is derived from the overlay journal and touches no base
-metadata, where Git stats every index entry.
+| after | working tree | object store |
+| --- | ---: | ---: |
+| mount | 0 B | 0 B |
+| `log -10` + `ls-files` | 122 B | 7.96 MB |
+| grep `TODO` over the whole repository | 122 B | 7.96 MB |
 
-**The searches are slower per call and that is the correct trade.** `rg` over a
-materialized tree is 0.017 s; `gfs rg` is 0.043 s warm. The comparison is not
-0.017 against 0.043, it is 0.017 **plus 12.4 s of clone and 338 MiB** against
-0.043 plus 0.2 s and 266 KiB.
+**Search says what it did not read.** `gfs rg` returned 1 574 lines against
+ripgrep's 1 683 and reported the difference itself, on stderr:
+`412 of 17925 paths in scope were not searched: 312 binary, 98 lfs, 2 oversized`.
 
-**The server's first import is a real cost and is not in the table.** Importing
-django took ~50 s, almost all of it reconciling 29 298 refs. It is one-time and
-amortized across every job on that repository — a restart against warm state is
-0.23 s — but it scales with ref count, and django is a high-ref repository for
-its size.
+**An unready index is an error, not an empty result.** The first search of the
+vscode run returned nothing, and the audit log records why:
+`outcome="error" error_code="SNAPSHOT_BUILDING"`. This is the property section
+7.5 exists to guarantee, and it survives only because the harness now keeps
+stderr and the exit code — an earlier version discarded both and the run looked
+like a silent empty answer.
 
-## History
+**The clone is not automatically the reference answer.** On vscode the two flows
+disagreed, and the GFS side was right: diffed against the base tree, the GFS
+commit contains exactly the five intended changes; the clone's contains **105**
+— the five, one renormalized YAML file, and **100 deleted**
+`extensions/copilot/test/simulation/cache/*.sqlite` paths. Those are LFS
+pointers; git-lfs is installed on the host, its smudge filter could not reach an
+LFS endpoint through the `file://` mirror, and it left the files missing, which
+`git add -A` recorded as deletions. The mount never runs a smudge filter, so it
+had nothing to lose (ADR 0012).
 
-An earlier revision of this workflow, before `gfs find` and `gfs log` existed
-and while `gfs rg` could not find its own workspace, measured **~53 s** for the
-GFS column: the filename step went through the `git` shim's `ls-files`, which
-issued one snapshot-API round trip per directory (28.9–53.7 s for 7 077 files),
-and the content step returned nothing at all. The three tools were introduced to
-delegate those questions to the server; see
-[`docs/agent-search.md`](../docs/agent-search.md).
+**The server's first import used to dominate and no longer does.** Reconciling
+vscode's 73 989 refs took **311.8 s** before the listeners bound, all of it
+catalog bookkeeping — quadratic, because each observation scanned for its
+repository's `MAX(ref_version)` against a table that did not index it. With
+schema v2's `repository_refs_by_version` and a batched reconcile it is
+**1.78 s**; django's is 0.679 s, from ~50 s.
 
 ## Caveats
 
-- One run per configuration except where "median of 3" is stated. Clone times in
-  `baseline.md` varied under 1 %; the sub-second steps here vary more.
-- Clone times exclude network transfer. Over a real network the 294 MiB against
-  8 828 bytes gap widens well past the wall-clock ratio.
-- The edit step is slower on GFS (0.559 s cold against 0.005 s) because five
-  writes go through FUSE. That is a per-file cost this edit set is too small to
-  characterize.
+- One run per configuration. Clone times in `baseline.md` varied under 1 %; the
+  sub-second steps here vary more.
+- The vscode step timings were taken with the pre-fix binary. Only the server
+  import changed; it was re-measured against the same mirror afterwards.
+- `ls-files` reports 6 146 for the clone against 6 245 in the mount **after**
+  each side committed: the clone had already lost 99 matching LFS paths to the
+  smudge failure above.
+- Clone times exclude network transfer. Over a real network the gap widens well
+  past the wall-clock ratio.
+- The edit step is slower on GFS (2.9 s against 0.005 s on vscode) because five
+  writes go through FUSE with copy-up.
 - **The corpus is still the public stand-in set.** Every number moves when
   `spikes/corpus/corpus.conf` points at the real monorepos. Open since M0.1.
 - The harness selects text files for the edit set. An earlier run picked `.mo`
-  locale catalogs and the export failed: `git apply` cannot apply a binary patch
-  without a full index line, which the M3 completion report already records as a
-  known limitation of the bundle's patch half. The bundle's `content/` files
-  carry those bytes exactly; only the patch representation is affected.
+  locale catalogs and `git apply` could not apply a binary patch without a full
+  index line.

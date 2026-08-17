@@ -944,7 +944,9 @@ maintenance.auto   = false</pre>
         </p>
         <p>
           Run on WSL2, 32 cores, Git 2.53.0, ripgrep 15.2.0, against a local mirror over
-          <code>file://</code> so no step carries internet variance.
+          <code>file://</code> so no step carries internet variance. Reproduce with
+          <code>./spikes/corpus/benchmark-workflow.sh vscode</code>; the full report, including the
+          django run, is <code>benchmarks/agent-workflow.md</code>.
         </p>
       </div>
     </div>
