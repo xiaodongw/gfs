@@ -14,7 +14,7 @@ use rusqlite::Connection;
 /// Checked on open. A database from a newer version is refused rather than read,
 /// because reading a schema you do not understand is how a control plane
 /// corrupts a lease -- and a corrupted lease is a mount that dies mid-job.
-pub const SCHEMA_VERSION: i64 = 1;
+pub const SCHEMA_VERSION: i64 = 2;
 
 pub fn open(path: &std::path::Path) -> Result<Connection, GfsError> {
   if let Some(parent) = path.parent() {
@@ -76,6 +76,9 @@ fn migrate(conn: &Connection) -> Result<(), GfsError> {
 
   if current < 1 {
     conn.execute_batch(V1).map_err(db_error)?;
+  }
+  if current < 2 {
+    conn.execute_batch(V2).map_err(db_error)?;
   }
 
   conn
@@ -180,6 +183,17 @@ CREATE INDEX leases_by_expiry ON leases (state, expires_at);
 CREATE INDEX leases_by_commit ON leases (repository_id, commit_oid, state);
 "#;
 
+/// The per-repository ref-version high-water mark, as an index.
+///
+/// Every ref observation asks for `MAX(ref_version)` within its repository.
+/// `repository_refs` is keyed by `(repository_id, ref_name)`, so without this
+/// index that question is a scan of the repository's rows, and reconciling a
+/// whole repository is quadratic in its ref count: a 73 989-ref import spent
+/// 312 s here, of which ~203 s was this one query.
+const V2: &str = r#"
+CREATE INDEX repository_refs_by_version ON repository_refs (repository_id, ref_version);
+"#;
+
 pub fn db_error(e: rusqlite::Error) -> GfsError {
   // The message may contain SQL but never repository content, so it is safe to
   // surface and to log. A busy database is reported as retryable rather than
@@ -220,6 +234,59 @@ mod tests {
       .query_row("SELECT count(*) FROM repositories", [], |r| r.get(0))
       .unwrap();
     assert_eq!(repos, 0);
+  }
+
+  #[test]
+  fn ref_observation_reaches_its_version_high_water_mark_by_index() {
+    // Not a style preference: without this index `MAX(ref_version)` scans the
+    // repository's rows on every observation, which makes reconciling a
+    // repository quadratic in its ref count. A 73 989-ref import cost 312 s.
+    let conn = open_in_memory().unwrap();
+    conn
+      .execute(
+        "INSERT INTO repositories (repository_id, display_name, repo_path, state,
+           algorithm, created_at, updated_at)
+         VALUES ('r1', 'r', '/tmp/r', 'ACTIVE', 'sha1', 0, 0)",
+        [],
+      )
+      .unwrap();
+    let plan: String = conn
+      .query_row(
+        "EXPLAIN QUERY PLAN
+         SELECT COALESCE(MAX(ref_version), 0) + 1 FROM repository_refs
+         WHERE repository_id = 'r1'",
+        [],
+        |r| r.get(3),
+      )
+      .unwrap();
+    assert!(
+      plan.contains("repository_refs_by_version"),
+      "the high-water-mark query must use the index, not scan: {plan}"
+    );
+  }
+
+  #[test]
+  fn an_existing_v1_catalog_gains_the_ref_version_index() {
+    // The upgrade path, not just the fresh one: a server that already imported a
+    // repository must get the index on its next start.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("catalog.sqlite");
+    {
+      let conn = Connection::open(&path).unwrap();
+      configure(&conn).unwrap();
+      conn.execute_batch(V1).unwrap();
+      conn.execute_batch("PRAGMA user_version = 1").unwrap();
+    }
+    let conn = open(&path).unwrap();
+    let indexes: i64 = conn
+      .query_row(
+        "SELECT count(*) FROM sqlite_master
+         WHERE type = 'index' AND name = 'repository_refs_by_version'",
+        [],
+        |r| r.get(0),
+      )
+      .unwrap();
+    assert_eq!(indexes, 1);
   }
 
   #[test]

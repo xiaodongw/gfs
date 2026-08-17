@@ -1,0 +1,1291 @@
+<title>Inside GFS</title>
+<style>
+
+:root {
+  color-scheme: light;
+  --ground: #EDEFF2;
+  --surface: #FBFCFD;
+  --surface-2: #E4E8ED;
+  --ink: #0F1519;
+  --ink-2: #4D5B67;
+  --ink-3: #6C7A86;
+  --line: #CCD4DC;
+  --line-strong: #A9B5C0;
+  --client: #A94C1B;
+  --client-soft: #F3E2D8;
+  --server: #0E6570;
+  --server-soft: #D9EAEC;
+  --limit: #7E5A05;
+  --limit-soft: #F0E6CC;
+  --grid: rgba(15, 21, 25, 0.055);
+  --shadow: 0 1px 0 rgba(15, 21, 25, .04), 0 12px 28px -22px rgba(15, 21, 25, .5);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    color-scheme: dark;
+    --ground: #0C1114;
+    --surface: #141B20;
+    --surface-2: #1A232A;
+    --ink: #E7EDF2;
+    --ink-2: #9CABB7;
+    --ink-3: #7C8B97;
+    --line: #26323A;
+    --line-strong: #3A4954;
+    --client: #E8905B;
+    --client-soft: #2C1F16;
+    --server: #57BAC4;
+    --server-soft: #12262A;
+    --limit: #D3A855;
+    --limit-soft: #262015;
+    --grid: rgba(231, 237, 242, 0.05);
+    --shadow: 0 1px 0 rgba(0,0,0,.3), 0 14px 30px -24px rgba(0, 0, 0, .9);
+  }
+}
+
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --ground: #0C1114;
+  --surface: #141B20;
+  --surface-2: #1A232A;
+  --ink: #E7EDF2;
+  --ink-2: #9CABB7;
+  --ink-3: #7C8B97;
+  --line: #26323A;
+  --line-strong: #3A4954;
+  --client: #E8905B;
+  --client-soft: #2C1F16;
+  --server: #57BAC4;
+  --server-soft: #12262A;
+  --limit: #D3A855;
+  --limit-soft: #262015;
+  --grid: rgba(231, 237, 242, 0.05);
+  --shadow: 0 1px 0 rgba(0,0,0,.3), 0 14px 30px -24px rgba(0, 0, 0, .9);
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  background: var(--ground);
+  color: var(--ink);
+  font-family: "Ubuntu", system-ui, -apple-system, "Segoe UI", sans-serif;
+  font-size: 17px;
+  line-height: 1.62;
+  -webkit-font-smoothing: antialiased;
+}
+
+code, kbd, pre, .mono, .eyebrow, .stat-num, table td.num, table th.num {
+  font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-feature-settings: "tnum" 1;
+}
+
+a { color: inherit; text-decoration-color: var(--line-strong); text-underline-offset: 3px; }
+a:hover { text-decoration-color: currentColor; }
+:focus-visible { outline: 2px solid var(--client); outline-offset: 3px; border-radius: 2px; }
+
+/* ---------- shell ---------- */
+
+.rail {
+  position: sticky; top: 0; z-index: 10;
+  background: color-mix(in srgb, var(--ground) 88%, transparent);
+  backdrop-filter: blur(8px);
+  border-bottom: 1px solid var(--line);
+}
+.rail-in {
+  max-width: 76rem; margin: 0 auto; padding: 9px 28px;
+  display: flex; align-items: center; gap: 22px;
+  font-family: "JetBrains Mono", ui-monospace, monospace;
+  font-size: 11.5px; letter-spacing: .09em; text-transform: uppercase;
+}
+.rail-mark { font-weight: 700; letter-spacing: .16em; color: var(--ink); }
+.rail nav { display: flex; gap: 18px; flex-wrap: wrap; }
+.rail nav a { color: var(--ink-3); text-decoration: none; }
+.rail nav a:hover { color: var(--ink); }
+.rail-tag { margin-left: auto; color: var(--ink-3); }
+
+.wrap { max-width: 76rem; margin: 0 auto; padding: 0 28px; }
+.prose { max-width: 68ch; }
+.prose p { margin: 0 0 1.05em; color: var(--ink-2); }
+.prose p strong { color: var(--ink); font-weight: 500; }
+.prose ul { margin: 0 0 1.15em; padding-left: 1.15em; color: var(--ink-2); }
+.prose li { margin-bottom: .5em; }
+.prose li strong { color: var(--ink); font-weight: 500; }
+
+h1, h2, h3 { text-wrap: balance; margin: 0; font-weight: 500; letter-spacing: -.015em; }
+h1 { font-size: clamp(2.5rem, 6vw, 4.1rem); line-height: 1.02; letter-spacing: -.033em; font-weight: 700; }
+h2 { font-size: clamp(1.6rem, 3vw, 2.05rem); line-height: 1.14; letter-spacing: -.024em; }
+h3 { font-size: 1.06rem; line-height: 1.35; letter-spacing: -.005em; font-weight: 700; }
+
+.eyebrow {
+  font-size: 11.5px; letter-spacing: .13em; text-transform: uppercase;
+  color: var(--ink-3); margin: 0 0 14px;
+}
+.eyebrow b { color: var(--client); font-weight: 700; }
+.eyebrow.srv b { color: var(--server); }
+
+section { padding: 74px 0 4px; }
+section + section { border-top: 1px solid var(--line); }
+.sec-head { display: grid; gap: 18px; margin-bottom: 34px; }
+.sec-head .prose { max-width: 66ch; }
+.sec-head .prose p:last-child { margin-bottom: 0; }
+
+/* ---------- hero ---------- */
+
+.hero {
+  border-bottom: 1px solid var(--line);
+  background:
+    linear-gradient(to bottom, color-mix(in srgb, var(--surface) 60%, transparent), transparent 62%),
+    repeating-linear-gradient(to right, var(--grid) 0 1px, transparent 1px 46px),
+    repeating-linear-gradient(to bottom, var(--grid) 0 1px, transparent 1px 46px);
+  padding: 58px 0 62px;
+}
+.hero h1 { max-width: 15ch; }
+.hero-lede {
+  margin: 24px 0 0; max-width: 60ch; font-size: 1.16rem; line-height: 1.55; color: var(--ink-2);
+}
+.hero-lede b { color: var(--ink); font-weight: 500; }
+.hero-meta {
+  margin-top: 30px; display: flex; flex-wrap: wrap; gap: 8px;
+}
+.chip {
+  font-family: "JetBrains Mono", ui-monospace, monospace; font-size: 11.5px; letter-spacing: .05em;
+  border: 1px solid var(--line); border-radius: 999px; padding: 4px 11px; color: var(--ink-2);
+  background: var(--surface);
+}
+.chip.c { border-color: color-mix(in srgb, var(--client) 45%, var(--line)); color: var(--client); background: var(--client-soft); }
+.chip.s { border-color: color-mix(in srgb, var(--server) 45%, var(--line)); color: var(--server); background: var(--server-soft); }
+
+.stats {
+  margin-top: 46px; display: grid; gap: 1px; background: var(--line);
+  border: 1px solid var(--line); border-radius: 3px; overflow: hidden;
+  grid-template-columns: repeat(auto-fit, minmax(215px, 1fr));
+}
+.stat { background: var(--surface); padding: 20px 22px 18px; }
+.stat-num { font-size: 2.05rem; line-height: 1; font-weight: 700; letter-spacing: -.03em; }
+.stat-num span { font-size: .95rem; font-weight: 400; letter-spacing: 0; color: var(--ink-3); margin-left: 3px; }
+.stat-label { margin-top: 9px; font-size: .87rem; color: var(--ink-2); line-height: 1.4; }
+.stat-sub {
+  margin-top: 7px; font-family: "JetBrains Mono", ui-monospace, monospace;
+  font-size: 11px; letter-spacing: .04em; color: var(--ink-3); text-transform: uppercase;
+}
+
+/* ---------- generic blocks ---------- */
+
+.cards { display: grid; gap: 18px; grid-template-columns: repeat(auto-fit, minmax(275px, 1fr)); }
+.card {
+  background: var(--surface); border: 1px solid var(--line); border-radius: 4px;
+  padding: 22px 22px 20px; box-shadow: var(--shadow);
+}
+.card h3 { margin-bottom: 4px; }
+.card .role {
+  font-family: "JetBrains Mono", ui-monospace, monospace; font-size: 11px; text-transform: uppercase;
+  letter-spacing: .1em; color: var(--ink-3); margin-bottom: 12px;
+}
+.card p { margin: 0 0 12px; font-size: .95rem; color: var(--ink-2); }
+.card p:last-child { margin-bottom: 0; }
+.card.client { border-top: 2px solid var(--client); }
+.card.server { border-top: 2px solid var(--server); }
+
+.cmds { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 4px; }
+.cmds code {
+  font-size: 11.5px; padding: 2px 7px; border-radius: 3px;
+  background: var(--surface-2); color: var(--ink-2); border: 1px solid transparent;
+}
+
+pre, .term {
+  background: var(--surface); border: 1px solid var(--line); border-radius: 4px;
+  padding: 18px 20px; overflow-x: auto; margin: 0;
+  font-size: 13.2px; line-height: 1.62; color: var(--ink-2);
+}
+pre b { color: var(--ink); font-weight: 700; }
+pre .c { color: var(--client); }
+pre .s { color: var(--server); }
+pre .dim { color: var(--ink-3); }
+p code, li code, td code, .note code {
+  font-size: .88em; background: var(--surface-2); padding: 1px 5px; border-radius: 3px;
+}
+
+.figure { margin: 0 0 34px; }
+.figure .frame {
+  background: var(--surface); border: 1px solid var(--line); border-radius: 4px;
+  padding: 22px; overflow-x: auto; box-shadow: var(--shadow);
+}
+.figure svg { display: block; width: 100%; min-width: 760px; height: auto; }
+figcaption {
+  margin-top: 11px; font-size: .85rem; color: var(--ink-3); max-width: 74ch;
+}
+
+.tablewrap { overflow-x: auto; border: 1px solid var(--line); border-radius: 4px; background: var(--surface); }
+table { border-collapse: collapse; width: 100%; min-width: 560px; font-size: .92rem; }
+th, td { text-align: left; padding: 11px 16px; border-bottom: 1px solid var(--line); vertical-align: top; }
+thead th {
+  font-family: "JetBrains Mono", ui-monospace, monospace; font-size: 11px; letter-spacing: .1em;
+  text-transform: uppercase; color: var(--ink-3); font-weight: 400; background: var(--surface-2);
+}
+tbody tr:last-child td { border-bottom: 0; }
+td { color: var(--ink-2); }
+td:first-child { color: var(--ink); }
+.num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+tr.win td { background: color-mix(in srgb, var(--client-soft) 55%, transparent); }
+tr.win td:first-child { color: var(--client); }
+
+.note {
+  border-left: 2px solid var(--limit); background: var(--limit-soft);
+  padding: 14px 18px; border-radius: 0 3px 3px 0; font-size: .93rem; color: var(--ink-2);
+  max-width: 72ch;
+}
+.note b { color: var(--ink); font-weight: 500; }
+
+/* ---------- lifecycle ladder ---------- */
+
+.ladder { list-style: none; margin: 0; padding: 0; display: grid; gap: 0; max-width: 74ch; }
+.ladder li {
+  display: grid; grid-template-columns: 3.2rem 1fr; gap: 20px;
+  padding: 20px 0; border-top: 1px solid var(--line);
+}
+.ladder li:last-child { border-bottom: 1px solid var(--line); }
+.step {
+  font-family: "JetBrains Mono", ui-monospace, monospace; font-size: 12px; letter-spacing: .06em;
+  color: var(--ink-3); padding-top: 3px;
+}
+.ladder h3 { margin-bottom: 6px; }
+.ladder p { margin: 0; font-size: .95rem; color: var(--ink-2); }
+.ladder p + p { margin-top: 8px; }
+
+/* ---------- mechanism grid ---------- */
+
+.mech { display: grid; gap: 22px; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); }
+.mech article {
+  border: 1px solid var(--line); border-radius: 4px; background: var(--surface);
+  padding: 24px; box-shadow: var(--shadow); display: flex; flex-direction: column; gap: 12px;
+}
+.mech h3 { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; }
+.tag {
+  font-family: "JetBrains Mono", ui-monospace, monospace; font-size: 10.5px; letter-spacing: .1em;
+  text-transform: uppercase; padding: 2px 7px; border-radius: 2px; font-weight: 400;
+  background: var(--surface-2); color: var(--ink-3);
+}
+.tag.c { background: var(--client-soft); color: var(--client); }
+.tag.s { background: var(--server-soft); color: var(--server); }
+.tag.l { background: var(--limit-soft); color: var(--limit); }
+.mech p { margin: 0; font-size: .95rem; color: var(--ink-2); }
+.mech ul { margin: 0; padding-left: 1.1em; font-size: .93rem; color: var(--ink-2); }
+.mech li { margin-bottom: .35em; }
+.mech pre { font-size: 12.4px; padding: 14px 16px; background: var(--surface-2); }
+
+.legend { display: flex; flex-wrap: wrap; gap: 18px; margin: 0 0 18px; font-size: .84rem; color: var(--ink-2); }
+.legend span { display: inline-flex; align-items: center; gap: 7px; }
+.swatch { width: 11px; height: 11px; border-radius: 2px; border: 1px solid var(--line-strong); }
+.swatch.c { background: var(--client-soft); border-color: var(--client); }
+.swatch.s { background: var(--server-soft); border-color: var(--server); }
+.swatch.n { background: var(--surface-2); }
+
+footer {
+  border-top: 1px solid var(--line); margin-top: 74px; padding: 34px 0 60px;
+  font-size: .88rem; color: var(--ink-3);
+}
+footer .wrap { display: flex; flex-wrap: wrap; gap: 26px; align-items: baseline; }
+footer .mono { font-size: 12px; letter-spacing: .04em; }
+
+@media (max-width: 640px) {
+  body { font-size: 16px; }
+  .wrap { padding: 0 18px; }
+  .rail-in { padding: 9px 18px; }
+  .rail nav { display: none; }
+  section { padding: 52px 0 4px; }
+  .ladder li { grid-template-columns: 1fr; gap: 6px; }
+}
+@media (prefers-reduced-motion: reduce) {
+  * { animation: none !important; transition: none !important; }
+}
+</style>
+
+<div class="rail">
+  <div class="rail-in">
+    <span class="rail-mark">GFS</span>
+    <nav>
+      <a href="#what">What it is</a>
+      <a href="#life">Workspace</a>
+      <a href="#arch">Architecture</a>
+      <a href="#mech">Mechanisms</a>
+      <a href="#numbers">Numbers</a>
+      <a href="#edges">Edges</a>
+    </nav>
+    <span class="rail-tag">Rust &middot; FUSE3 &middot; Git 2.53</span>
+  </div>
+</div>
+
+<header class="hero">
+  <div class="wrap">
+    <p class="eyebrow"><b>Agent-oriented virtual Git workspace</b></p>
+    <h1>Mount the commit. Don't clone the repository.</h1>
+    <p class="hero-lede">
+      GFS is a Git-compatible repository service plus a Rust FUSE client, built for short-lived
+      coding-agent jobs. A job <b>mounts an immutable Git snapshot</b>, sees an ordinary directory
+      tree, and downloads file data only when a process actually opens a file. Writes land in a
+      local copy-on-write overlay. Code discovery goes through a revision-aware server search API,
+      so searching a monorepo hydrates <b>nothing</b>.
+    </p>
+    <div class="hero-meta">
+      <span class="chip s">gfs-server</span>
+      <span class="chip c">gfs-fuse</span>
+      <span class="chip c">gfs</span>
+      <span class="chip">libgit2 &middot; git2-rs</span>
+      <span class="chip">Tonic &middot; Axum</span>
+      <span class="chip">Tantivy &middot; roaring</span>
+      <span class="chip">fuser</span>
+    </div>
+
+    <div class="stats">
+      <div class="stat">
+        <div class="stat-num">0.30<span>s</span></div>
+        <div class="stat-label">To acquire a vscode workspace, against 55.8&nbsp;s for a full clone of the same commit.</div>
+        <div class="stat-sub">microsoft/vscode &middot; 2 485 MiB mirror</div>
+      </div>
+      <div class="stat">
+        <div class="stat-num">21<span>MB</span></div>
+        <div class="stat-label">Local disk for that workspace, against 1 648&nbsp;MiB for the clone it replaces.</div>
+        <div class="stat-sub">+ 145 MB host cache, shared per repo</div>
+      </div>
+      <div class="stat">
+        <div class="stat-num">0<span>bytes</span></div>
+        <div class="stat-label">Client hydration caused by searching all 17 926 files for <code>TODO</code>.</div>
+        <div class="stat-sub">measured before and after</div>
+      </div>
+      <div class="stat">
+        <div class="stat-num">9.7<span>ms</span></div>
+        <div class="stat-label"><code>gfs status</code> after five edits, derived from the journal without touching the tree.</div>
+        <div class="stat-sub">stock git in the mount: 1.75 s</div>
+      </div>
+    </div>
+  </div>
+</header>
+
+<main>
+
+<section id="what">
+  <div class="wrap">
+    <div class="sec-head">
+      <p class="eyebrow">The problem &middot; and the shape of the answer</p>
+      <div class="prose">
+        <h2>A clone is the wrong unit of work for a job that touches twenty files</h2>
+        <p>
+          A hosted coding agent starts, reads a handful of files, greps for a symbol, edits four
+          paths, and exits. Git's startup cost is sized for a human who will keep the checkout for
+          months. Cloning <b>microsoft/vscode</b> costs <b>55.8&nbsp;s and 1&nbsp;648&nbsp;MiB</b>
+          before the agent reads its first line; shallow plus blobless — the best existing
+          combination — still costs <b>10.0&nbsp;s and 363&nbsp;MiB</b>, because the working tree
+          is checked out in full either way. On the Linux kernel the same two numbers are
+          <b>383&nbsp;s / 8&nbsp;087&nbsp;MiB</b> and <b>19.5&nbsp;s / 1&nbsp;839&nbsp;MiB</b>.
+        </p>
+        <p>
+          Partial clone fetches missing blobs one at a time; sparse checkout needs the paths known
+          in advance, which is exactly what an agent does not know before it searches. GFS keeps
+          Git as the source of truth and changes only <b>how a job consumes it</b>: a pinned
+          snapshot, lazy blobs, a copy-on-write overlay, remote revision-correct search, and
+          hydration accounting that is enforced at the filesystem.
+        </p>
+      </div>
+    </div>
+
+    <div class="cards">
+      <div class="card server">
+        <div class="role">Repository service</div>
+        <h3>gfs-server</h3>
+        <p>
+          Imports bare Git repositories, resolves revisions, serves trees and blobs over
+          HTTP/gRPC, answers search and history queries, resolves Git LFS pointers server-side
+          out of its own LFS store, and runs a Git smart-HTTP gateway so stock
+          <code>git clone</code>/<code>fetch</code> work against it. A read-only WebDAV surface
+          lets a machine with no FUSE — Finder, Explorer — browse a branch tip with no client
+          software.
+        </p>
+        <div class="cmds">
+          <code>ResolveRevision</code><code>CreateMount</code><code>GetEntry</code><code>ListDirectory</code><code>Search</code><code>/dav/</code><code>upload-pack</code>
+        </div>
+      </div>
+      <div class="card client">
+        <div class="role">Host mount daemon</div>
+        <h3>gfs-fuse</h3>
+        <p>
+          Mounts a pinned commit as a read-only base with a writable overlay, fetching blobs
+          lazily and caching them per host. One host process serves many workspaces and shares one
+          blob cache per repository. The workspace's <code>.git</code> is a real directory passed
+          through the mount, over a projected object store, so stock Git answers truthfully.
+        </p>
+        <div class="cmds">
+          <code>CreateMount</code><code>ListMounts</code><code>DestroyMount</code><code>lease heartbeat</code><code>control.sock</code>
+        </div>
+      </div>
+      <div class="card client">
+        <div class="role">Agent-facing CLI</div>
+        <h3>gfs</h3>
+        <p>
+          Reading: <code>resolve</code>, <code>ls</code>, <code>cat</code>, <code>search</code>
+          (with an <code>rg</code>-flag-compatible spelling), <code>find</code>, <code>diff</code>,
+          <code>show</code>, <code>blame</code>. Lifecycle: <code>clone</code>, <code>mount</code>,
+          <code>switch</code>, <code>refresh</code>, <code>unmount</code>, <code>status</code>,
+          <code>daemon</code>, <code>lease</code>. Writing back: <code>commit</code>,
+          <code>push</code>, <code>export</code>.
+        </p>
+        <div class="cmds">
+          <code>gfs clone &lt;url&gt;</code><code>gfs rg</code><code>gfs blame</code><code>gfs push</code>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section id="life">
+  <div class="wrap">
+    <div class="sec-head">
+      <p class="eyebrow"><b>Lifecycle</b> &middot; one command, then ordinary tools</p>
+      <div class="prose">
+        <h2>What happens when a workspace comes up</h2>
+        <p>
+          The steps below are a real sequence: each one depends on the previous, and the ordering
+          is what makes the result safe to hand to an agent that will run whatever it likes inside
+          it.
+        </p>
+      </div>
+    </div>
+
+    <ol class="ladder">
+      <li>
+        <div class="step">01</div>
+        <div>
+          <h3>Resolve the selector, pin the commit</h3>
+          <p>
+            A branch name is only a selector. <code>ResolveRevision</code> or
+            <code>CreateMount</code> returns a commit OID, and every later tree, blob, and search
+            request names that OID. The mount does not move when the branch advances, so metadata
+            from one generation can never be combined with file content from another.
+          </p>
+        </div>
+      </li>
+      <li>
+        <div class="step">02</div>
+        <div>
+          <h3>Take a retention lease before returning the handle</h3>
+          <p>
+            Under the repository's ref lock the server writes a durable <code>PREPARING</code>
+            lease, creates a reachability anchor at <code>refs/gfs/mounts/{id}</code>, marks the
+            lease <code>ACTIVE</code>, and only then hands back the mount capability. A force push
+            or a branch deletion upstream can no longer let <code>git gc</code> prune objects out
+            from under a running job. The daemon heartbeats to renew; expiry is the crash
+            fallback, with a grace interval before pruning.
+          </p>
+        </div>
+      </li>
+      <li>
+        <div class="step">03</div>
+        <div>
+          <h3>Mount over the workspace folder</h3>
+          <p>
+            The daemon creates the folder with a real <code>.git</code> inside it, opens directory
+            handles to that <code>.git</code>, then mounts the filesystem <b>over</b> the folder.
+            The on-disk contents are now shadowed and reachable only through the daemon's retained
+            handles. One folder holds everything; unmount leaves a plain working tree behind.
+          </p>
+        </div>
+      </li>
+      <li>
+        <div class="step">04</div>
+        <div>
+          <h3>Seed the Git surface so stock Git tells the truth</h3>
+          <p>
+            The daemon writes a <code>packed-refs</code> carrying the repository's whole visible
+            ref set — tags peeled, branches as <code>refs/remotes/origin/*</code> — plus an index
+            stamped with the commit's deterministic snapshot time, a <code>filter.lfs</code>
+            configuration, an fsmonitor hook, and <code>objects/info/alternates</code> pointing at
+            the projected object store. <code>git describe</code>, <code>git log origin/main</code>
+            and <code>git status -sb</code>'s ahead/behind all answer without a fetch.
+          </p>
+        </div>
+      </li>
+      <li>
+        <div class="step">05</div>
+        <div>
+          <h3>The agent works with the tools it already knows</h3>
+          <p>
+            Opening a file fetches one blob and caches it. Searching goes to the server index and
+            fetches nothing. Writes copy up into the overlay. <code>git status</code>,
+            <code>git log</code>, <code>git diff</code>, <code>git commit</code> and
+            <code>git rebase</code> are stock Git over the projection — no forked Git, no
+            synthesized index.
+          </p>
+        </div>
+      </li>
+      <li>
+        <div class="step">06</div>
+        <div>
+          <h3>Hand the work back</h3>
+          <p>
+            <code>gfs commit</code> commits to the gateway's fork of the upstream,
+            <code>gfs push</code> pushes upstream with the caller's own credential, and
+            <code>gfs export</code> writes a bundle with a <code>git apply</code>-compatible patch
+            and the base commit, so a downstream applier can reject or three-way merge stale work.
+            Unmount never discards an overlay; cleanup is a separate, auditable action.
+          </p>
+        </div>
+      </li>
+    </ol>
+
+    <figure class="figure" style="margin-top:38px">
+      <div class="frame">
+<pre><b>vscode/</b>                        <span class="dim">&larr; the FUSE mount, one self-contained folder</span>
+&#9500;&#9472; src/ ...                    <span class="c">projected working tree, blobs fetched on open()</span>
+&#9500;&#9472; README.md                   <span class="c">read: overlay first, then pinned base</span>
+&#9492;&#9472; <b>.git/</b>                      <span class="dim">passthrough &rarr; the real directory under the mount</span>
+   &#9500;&#9472; HEAD  config  index      <span class="dim">local, writable, fast &mdash; never in the overlay</span>
+   &#9500;&#9472; refs/  packed-refs       <span class="dim">pinned ref view, captured once per pin</span>
+   &#9500;&#9472; objects/                 <span class="dim">loose objects and fetched packs land here, untouched</span>
+   &#9474;  &#9492;&#9472; info/alternates    <span class="dim">&rarr; ../gfs/objects  (relative: the folder can move)</span>
+   &#9492;&#9472; gfs/
+      &#9500;&#9472; <span class="s">objects/</span>             <span class="s">projection of the gateway's object database</span>
+      &#9500;&#9472; overlay.sqlite       <span class="c">journal: path state, renames, whiteouts</span>
+      &#9492;&#9472; files/               <span class="c">created and copied-up file data</span></pre>
+      </div>
+      <figcaption>
+        Two subtree behaviours and no merged namespace: pure passthrough under <code>.git</code>,
+        pure projection under <code>.git/gfs/objects</code>. The one-line
+        <code>alternates</code> file — a stock Git mechanism — is what removes the need to union
+        the projection into <code>objects/pack/</code>, which would have been the riskiest FUSE
+        logic in the design.
+      </figcaption>
+    </figure>
+  </div>
+</section>
+
+<section id="arch">
+  <div class="wrap">
+    <div class="sec-head">
+      <p class="eyebrow srv"><b>Architecture</b> &middot; three processes, one object database</p>
+      <div class="prose">
+        <h2>Where the bytes live and who is allowed to move them</h2>
+        <p>
+          The Git object database is authoritative. Search indexes, decoded-blob caches, snapshot
+          manifests, and every client cache are derived and can be rebuilt from it. FUSE privilege
+          stays in a trusted host component; the agent container gets a bind-mounted workspace and
+          a scoped socket, not a credential.
+        </p>
+      </div>
+    </div>
+
+    <div class="legend">
+      <span><i class="swatch c"></i> Job host &mdash; gfs-fuse, caches, overlay</span>
+      <span><i class="swatch s"></i> gfs-server &mdash; snapshot, search, gateway</span>
+      <span><i class="swatch n"></i> Unmodified software</span>
+    </div>
+
+    <figure class="figure">
+      <div class="frame">
+        <svg viewBox="0 0 1020 560" role="img" aria-label="GFS system architecture: agent process and kernel FUSE on the job host, the gfs-fuse daemon with its caches and overlay, and gfs-server with its snapshot, search, LFS, gateway and WebDAV surfaces over the bare repositories.">
+          <defs>
+            <marker id="ar" markerWidth="9" markerHeight="9" refX="8" refY="4.5" orient="auto">
+              <path d="M0,1 L8,4.5 L0,8 z" fill="var(--line-strong)"/>
+            </marker>
+            <marker id="arc" markerWidth="9" markerHeight="9" refX="8" refY="4.5" orient="auto">
+              <path d="M0,1 L8,4.5 L0,8 z" fill="var(--client)"/>
+            </marker>
+            <marker id="ars" markerWidth="9" markerHeight="9" refX="8" refY="4.5" orient="auto">
+              <path d="M0,1 L8,4.5 L0,8 z" fill="var(--server)"/>
+            </marker>
+          </defs>
+          <g font-family="JetBrains Mono, ui-monospace, monospace">
+
+            <!-- lane frames -->
+            <rect x="8" y="46" width="276" height="470" rx="6" fill="none" stroke="var(--line)" stroke-dasharray="3 4"/>
+            <rect x="316" y="46" width="330" height="470" rx="6" fill="none" stroke="var(--client)" stroke-dasharray="3 4" opacity=".65"/>
+            <rect x="678" y="46" width="334" height="470" rx="6" fill="none" stroke="var(--server)" stroke-dasharray="3 4" opacity=".65"/>
+            <text x="20" y="34" font-size="12" letter-spacing="1.6" fill="var(--ink-3)">AGENT CONTAINER</text>
+            <text x="328" y="34" font-size="12" letter-spacing="1.6" fill="var(--client)">TRUSTED HOST</text>
+            <text x="690" y="34" font-size="12" letter-spacing="1.6" fill="var(--server)">GFS-SERVER</text>
+
+            <!-- agent lane -->
+            <rect x="30" y="70" width="232" height="66" rx="4" fill="var(--surface-2)" stroke="var(--line)"/>
+            <text x="46" y="96" font-size="14" fill="var(--ink)">agent process</text>
+            <text x="46" y="118" font-size="12" fill="var(--ink-3)">git &middot; rg &middot; cc &middot; editors &middot; LSP</text>
+
+            <rect x="30" y="156" width="232" height="60" rx="4" fill="var(--client-soft)" stroke="var(--client)"/>
+            <text x="46" y="181" font-size="14" fill="var(--client)">PATH shims</text>
+            <text x="46" y="201" font-size="12" fill="var(--ink-3)">git &middot; grep &middot; find &middot; rg &rarr; cheap route</text>
+
+            <rect x="30" y="238" width="232" height="60" rx="4" fill="var(--surface-2)" stroke="var(--line)"/>
+            <text x="46" y="263" font-size="14" fill="var(--ink)">kernel FUSE</text>
+            <text x="46" y="283" font-size="12" fill="var(--ink-3)">/dev/fuse &middot; dentry + attr cache</text>
+
+            <rect x="30" y="330" width="232" height="60" rx="4" fill="var(--surface-2)" stroke="var(--line)"/>
+            <text x="46" y="355" font-size="14" fill="var(--ink)">stock git client</text>
+            <text x="46" y="375" font-size="12" fill="var(--ink-3)">clone / fetch / push</text>
+
+            <rect x="30" y="412" width="232" height="60" rx="4" fill="var(--surface-2)" stroke="var(--line)"/>
+            <text x="46" y="437" font-size="14" fill="var(--ink)">Finder / Explorer</text>
+            <text x="46" y="457" font-size="12" fill="var(--ink-3)">no client software</text>
+
+            <!-- host lane -->
+            <rect x="338" y="70" width="286" height="76" rx="4" fill="var(--client-soft)" stroke="var(--client)"/>
+            <text x="356" y="96" font-size="14" fill="var(--client)">workspace mount</text>
+            <text x="356" y="117" font-size="12" fill="var(--ink-3)">projected tree + passthrough .git</text>
+            <text x="356" y="135" font-size="12" fill="var(--ink-3)">bind-mounted into the job</text>
+
+            <rect x="338" y="166" width="286" height="150" rx="4" fill="var(--surface)" stroke="var(--client)"/>
+            <text x="356" y="192" font-size="14" fill="var(--client)">gfs-fuse host daemon</text>
+            <rect x="352" y="206" width="128" height="44" rx="3" fill="var(--surface-2)" stroke="var(--line)"/>
+            <text x="364" y="224" font-size="11.5" fill="var(--ink)">blob cache</text>
+            <text x="364" y="240" font-size="11" fill="var(--ink-3)">per repo, shared</text>
+            <rect x="490" y="206" width="120" height="44" rx="3" fill="var(--surface-2)" stroke="var(--line)"/>
+            <text x="502" y="224" font-size="11.5" fill="var(--ink)">listing cache</text>
+            <text x="502" y="240" font-size="11" fill="var(--ink-3)">per pin, LRU</text>
+            <rect x="352" y="258" width="128" height="44" rx="3" fill="var(--surface-2)" stroke="var(--line)"/>
+            <text x="364" y="276" font-size="11.5" fill="var(--ink)">block cache</text>
+            <text x="364" y="292" font-size="11" fill="var(--ink-3)">64 KiB, pack-keyed</text>
+            <rect x="490" y="258" width="120" height="44" rx="3" fill="var(--surface-2)" stroke="var(--line)"/>
+            <text x="502" y="276" font-size="11.5" fill="var(--ink)">budget</text>
+            <text x="502" y="292" font-size="11" fill="var(--ink-3)">EDQUOT at open</text>
+
+            <rect x="338" y="336" width="286" height="66" rx="4" fill="var(--surface)" stroke="var(--client)"/>
+            <text x="356" y="362" font-size="14" fill="var(--client)">overlay + journal</text>
+            <text x="356" y="383" font-size="12" fill="var(--ink-3)">copy-on-write, whiteouts, renames</text>
+
+            <rect x="338" y="422" width="286" height="66" rx="4" fill="var(--surface)" stroke="var(--client)"/>
+            <text x="356" y="448" font-size="14" fill="var(--client)">lease heartbeat</text>
+            <text x="356" y="469" font-size="12" fill="var(--ink-3)">keeps the pinned commit reachable</text>
+
+            <!-- server lane -->
+            <rect x="700" y="70" width="290" height="66" rx="4" fill="var(--server-soft)" stroke="var(--server)"/>
+            <text x="718" y="96" font-size="14" fill="var(--server)">snapshot service</text>
+            <text x="718" y="117" font-size="12" fill="var(--ink-3)">GetEntry &middot; ListDirectory &middot; blobs</text>
+
+            <rect x="700" y="150" width="290" height="66" rx="4" fill="var(--server-soft)" stroke="var(--server)"/>
+            <text x="718" y="176" font-size="14" fill="var(--server)">search service</text>
+            <text x="718" y="197" font-size="12" fill="var(--ink-3)">trigrams &middot; roaring &middot; Tantivy</text>
+
+            <rect x="700" y="230" width="290" height="66" rx="4" fill="var(--server-soft)" stroke="var(--server)"/>
+            <text x="718" y="256" font-size="14" fill="var(--server)">LFS store</text>
+            <text x="718" y="277" font-size="12" fill="var(--ink-3)">lfs-sha256:{oid} served expanded</text>
+
+            <rect x="700" y="310" width="290" height="66" rx="4" fill="var(--server-soft)" stroke="var(--server)"/>
+            <text x="718" y="336" font-size="14" fill="var(--server)">smart-HTTP gateway</text>
+            <text x="718" y="357" font-size="12" fill="var(--ink-3)">sandboxed git upload-pack</text>
+
+            <rect x="700" y="390" width="290" height="52" rx="4" fill="var(--server-soft)" stroke="var(--server)"/>
+            <text x="718" y="421" font-size="14" fill="var(--server)">WebDAV, read-only</text>
+
+            <rect x="700" y="456" width="290" height="52" rx="4" fill="var(--surface-2)" stroke="var(--line-strong)"/>
+            <text x="718" y="480" font-size="14" fill="var(--ink)">bare repositories</text>
+            <text x="718" y="498" font-size="11.5" fill="var(--ink-3)">the source of truth</text>
+
+            <!-- arrows: agent -> mount -->
+            <path d="M262 100 L338 100" stroke="var(--line-strong)" fill="none" marker-end="url(#ar)"/>
+            <text x="268" y="92" font-size="11" fill="var(--ink-3)">POSIX I/O</text>
+            <path d="M262 186 L300 186 L300 268 L262 268" stroke="var(--client)" fill="none" marker-end="url(#arc)" opacity=".8"/>
+            <path d="M262 268 L338 268" stroke="var(--line-strong)" fill="none" marker-end="url(#ar)" stroke-dasharray="4 3"/>
+            <text x="268" y="260" font-size="11" fill="var(--ink-3)">/dev/fuse</text>
+            <path d="M262 360 L700 336" stroke="var(--line-strong)" fill="none" marker-end="url(#ar)"/>
+            <text x="430" y="356" font-size="11" fill="var(--ink-3)">git smart HTTP v2</text>
+            <path d="M262 442 L700 416" stroke="var(--line-strong)" fill="none" marker-end="url(#ar)"/>
+            <text x="430" y="440" font-size="11" fill="var(--ink-3)">PROPFIND / GET</text>
+
+            <!-- daemon -> server -->
+            <path d="M624 200 L700 108" stroke="var(--server)" fill="none" marker-end="url(#ars)"/>
+            <text x="628" y="152" font-size="11" fill="var(--server)">gRPC</text>
+            <path d="M624 232 L700 184" stroke="var(--server)" fill="none" marker-end="url(#ars)"/>
+            <path d="M624 280 L700 268" stroke="var(--server)" fill="none" marker-end="url(#ars)"/>
+            <text x="628" y="300" font-size="11" fill="var(--server)">blob + block fetch</text>
+            <path d="M624 455 L700 470" stroke="var(--server)" fill="none" marker-end="url(#ars)"/>
+
+            <!-- server internals -->
+            <path d="M845 136 L845 150" stroke="var(--line-strong)" fill="none" marker-end="url(#ar)"/>
+            <path d="M845 216 L845 230" stroke="var(--line-strong)" fill="none" marker-end="url(#ar)"/>
+            <path d="M845 296 L845 310" stroke="var(--line-strong)" fill="none" marker-end="url(#ar)"/>
+            <path d="M845 376 L845 390" stroke="var(--line-strong)" fill="none" marker-end="url(#ar)"/>
+            <path d="M845 442 L845 456" stroke="var(--line-strong)" fill="none" marker-end="url(#ar)"/>
+          </g>
+        </svg>
+      </div>
+      <figcaption>
+        Every surface is a gateway onto the same internal services, never a second implementation.
+        The snapshot and blob paths never invoke <code>upload-pack</code>: they use libgit2 to walk
+        the pinned tree and return decoded bytes, so a one-file read costs no pack negotiation.
+      </figcaption>
+    </figure>
+  </div>
+</section>
+
+<section id="mech">
+  <div class="wrap">
+    <div class="sec-head">
+      <p class="eyebrow"><b>Mechanisms</b> &middot; the parts that carry the design</p>
+      <div class="prose">
+        <h2>How it actually works</h2>
+        <p>
+          Each of these exists because a simpler version was measured and found wanting. The
+          reasoning is recorded in twelve architecture decision records; what follows is the
+          working version of each.
+        </p>
+      </div>
+    </div>
+
+    <div class="mech">
+
+      <article>
+        <h3>Lazy hydration <span class="tag c">client</span></h3>
+        <p>
+          <code>lookup</code> and <code>getattr</code> check the overlay, then the cached entry,
+          then the server. <code>open</code> and <code>read</code> serve the overlay file or the
+          immutable blob cache and fetch once on a miss. Cache entries are written to a temp file,
+          hashed as a canonical Git blob, and atomically renamed, so a cache hit is
+          cryptographically the same object as a server fetch.
+        </p>
+        <p>
+          The kernel cache is not enough on its own — FUSE does not cache directory listings and
+          negative dentries expire quickly — so the daemon keeps complete base directory listings
+          per pin. Against an immutable commit, one listing permanently answers a directory's
+          children <b>and the absence of every other name</b>, which is what makes a warm
+          <code>git status</code> cost zero round trips.
+        </p>
+      </article>
+
+      <article>
+        <h3>Copy-on-write overlay <span class="tag c">client</span></h3>
+        <p>
+          The mounted base is immutable; every mutation is journaled. A whiteout represents a
+          deleted base path, a rename is one atomic journal transaction, and the executable bit and
+          symlink target are preserved. The first write to an existing file copies its blob up —
+          unless <code>O_TRUNC</code> says the caller is replacing the whole file, in which case
+          the old content is never downloaded.
+        </p>
+        <p>
+          Because the journal <i>is</i> the change set, <code>status</code> and <code>diff</code>
+          are derived rather than scanned. On vscode, after five edits, <code>gfs status</code>
+          answers in <b>9.7&nbsp;ms</b> without touching the tree; stock Git in the same workspace
+          takes 1.75&nbsp;s, and 555&nbsp;s the very first time, because it insists on walking
+          every directory once.
+        </p>
+      </article>
+
+      <article>
+        <h3>Raw Git over a projected object store <span class="tag c">ADR 0009</span></h3>
+        <p>
+          The earlier design synthesized a <code>.git</code> and shimmed a frozen grammar of Git
+          subcommands. That grammar had to grow for every tool that exists — and an agent late in a
+          session reverts to its strongest prior, which is <code>git</code>. So the gateway's real
+          object database is projected into the mount instead, and stock Git answers for itself.
+        </p>
+        <pre>core.checkStat     = minimal
+core.trustctime    = false
+core.untrackedCache = true
+core.fsmonitor     = &lt;journal-backed hook&gt;
+gc.auto            = 0
+maintenance.auto   = false</pre>
+        <p>
+          None of that is enforceable — <code>git -c core.checkStat=default status</code> overrides
+          it and costs 1&nbsp;615&nbsp;MiB — which is why the budget below is a prerequisite rather
+          than a companion.
+        </p>
+      </article>
+
+      <article>
+        <h3>The hydration budget <span class="tag l">enforcement</span></h3>
+        <p>
+          Mandatory and default-on, because it is the only limit a renamed binary or a
+          <code>git -c</code> override cannot bypass. Byte counting discriminates without a deny
+          list: a configured <code>git status</code> touches zero tree bytes, while
+          <code>grep -r</code> trips the limit inside 2&nbsp;MB.
+        </p>
+        <ul>
+          <li><b>EDQUOT</b>, chosen for its <code>strerror</code>: every tool prints "Disk quota exceeded" with the path. <code>EIO</code> would read as a corrupt filesystem.</li>
+          <li><b>Refuse at <code>open</code> and <code>opendir</code></b>, not at <code>read</code>, so a sweeping tool aborts instead of emitting one error per file.</li>
+          <li><b>Count unique blocks</b>, so a re-read of an evicted block is free.</li>
+          <li><b>Separate counters</b> for the working tree and the object store, so a legitimate <code>blame</code> cannot starve ordinary reads.</li>
+        </ul>
+        <p>
+          A mutually exclusive alternative — a cache residency budget that evicts and re-fetches
+          instead of refusing — exists for hosts that would rather be slow than fail. It reports
+          re-fetched over unique bytes, and its cache is scan-resistant.
+        </p>
+      </article>
+
+      <article>
+        <h3>64 KiB blocks, keyed by pack <span class="tag c">projection</span></h3>
+        <p>
+          Locating an object is a binary search and reconstructing one walks a delta chain, so
+          object-store access is sparse and random — exactly what large chunks punish. The block
+          size was measured, not chosen, and it matches FUSE's 128&nbsp;KiB maximum read, so there
+          is nothing to tune.
+        </p>
+        <div class="tablewrap">
+          <table style="min-width:0">
+            <thead><tr><th>Chunk</th><th class="num">log --oneline -20</th><th class="num">blame</th></tr></thead>
+            <tbody>
+              <tr class="win"><td>64 KiB</td><td class="num">0.3 MiB</td><td class="num">274 MiB</td></tr>
+              <tr><td>1 MiB</td><td class="num">2 MiB</td><td class="num">1 004 MiB</td></tr>
+              <tr><td>8 MiB</td><td class="num">16 MiB</td><td class="num">2 320 MiB</td></tr>
+              <tr><td>32 MiB</td><td class="num">64 MiB</td><td class="num">3 648 MiB</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>
+          Blocks are keyed by <code>(pack name, offset)</code>. A pack's filename is its own
+          checksum, so those bytes are fixed forever and a cached block <b>cannot</b> go stale.
+        </p>
+      </article>
+
+      <article>
+        <h3>Revision-aware search <span class="tag s">server</span></h3>
+        <p>
+          Indexing every path and content pair per commit would multiply storage, so each unique
+          searchable blob gets a stable numeric <code>blob_key</code> and is indexed once. A
+          snapshot manifest supplies the sorted <code>path &rarr; (mode, oid, blob_key)</code>
+          table, its reverse, and a Roaring bitmap of the keys reachable from that snapshot.
+        </p>
+        <p>
+          Literal search intersects trigram posting lists with the snapshot bitmap and then
+          verifies candidate bytes for exact line, column, and snippet. Regex extracts required
+          literals and verifies with <code>regex-automata</code> under scan and time budgets.
+          Tantivy adds optional ranked token search over the same keys.
+        </p>
+        <p>
+          <b>Silence is never ambiguous.</b> Execution status (complete or truncated) and corpus
+          coverage (binary, oversized, LFS, ignored — grouped by reason and scoped to the query's
+          globs) are separate fields, and a successful search always ends with exactly one
+          completion message. A missing terminal message is an error, never an empty result.
+        </p>
+      </article>
+
+      <article>
+        <h3>Server-side LFS expansion <span class="tag s">ADR 0012</span></h3>
+        <p>
+          An entry is an LFS entry when its path carries <code>filter=lfs</code> in
+          <code>.gitattributes</code> at that revision and its blob parses as a v1 pointer. For
+          those entries the metadata APIs report the <i>expanded</i> size and the content key
+          <code>lfs-sha256:{oid}</code>, which the immutable blob endpoint serves from the LFS
+          store. The mount, <code>gfs cat</code>, and WebDAV expand without knowing they did.
+        </p>
+        <p>
+          Shipping git-lfs in the image instead would have smudged gigabytes into the
+          copy-on-write overlay, where the journal cannot tell a smudge from an edit — making an
+          innocent <code>gfs commit</code> a corruption vector. Expansion is per entry: an object
+          the store cannot fetch degrades that one file to its pointer, and nothing else.
+        </p>
+      </article>
+
+      <article>
+        <h3>The Git compatibility gateway <span class="tag s">server</span></h3>
+        <p>
+          A Rust gateway authenticates, authorizes, limits, and streams to a sandboxed stock
+          <code>git upload-pack</code> child process — no shell, fixed argv and environment,
+          read-only repository access. Protocol v2 <code>ls-refs</code> and <code>fetch</code>,
+          shallow clone, and an explicitly configured partial-clone filter subset work; the
+          <code>refs/gfs/</code> lease namespace is hidden from advertisement and fetch.
+        </p>
+        <p>
+          Partial clone is controlled configuration, not merely a property of the Git binary: the
+          gateway validates the exact requested filter before starting the subprocess, because
+          Git's own per-filter settings can allow a family more broadly than GFS intends.
+        </p>
+      </article>
+
+      <article>
+        <h3>Time and inodes, specified <span class="tag c">client</span></h3>
+        <p>
+          Build systems depend on these, so they are not incidental. A raw committer timestamp is
+          unusable — Git accepts future-dated commits — so the server records a sanitized
+          <code>snapshot_time</code> once, clamped below its own first-seen time, and every base
+          entry reports it. Overlay writes advance on a logical clock:
+        </p>
+        <pre>new_time = max(host_wall_clock,
+               snapshot_time + one_tick,
+               prior_entry_time + one_tick)</pre>
+        <p>
+          So an acknowledged local mutation is always newer, even on a skewed host, and one index
+          shipped with the commit is valid on every machine that mounts it.
+        </p>
+      </article>
+
+      <article>
+        <h3>Shims: a hint layer, not a boundary <span class="tag c">ADR 0007</span></h3>
+        <p>
+          <code>gfs install-shim</code> symlinks <code>git</code>, <code>grep</code>,
+          <code>find</code>, and <code>rg</code> into a directory early on <code>PATH</code>.
+          <code>rg</code> and <code>find</code> become their <code>gfs</code> equivalents with the
+          same argv; recursive <code>grep</code> is translated conservatively; an unimplemented
+          flag is refused <i>by name at parse time</i>, before any output exists, and the real tool
+          runs over the mount instead — slow rather than wrong.
+        </p>
+        <p>
+          The <code>git</code> shim passes through by default. It routes <code>blame</code> and
+          path-scoped history to the server, refuses <code>gc</code>, <code>repack</code>,
+          <code>prune</code>, <code>fsck</code>, and <code>maintenance</code> with the reason, and
+          delegates <code>git clone</code> to <code>gfs clone</code>. Outside a GFS workspace every
+          shim is silent, which is what makes a PATH-wide install safe.
+        </p>
+      </article>
+
+    </div>
+  </div>
+</section>
+
+<section id="numbers">
+  <div class="wrap">
+    <div class="sec-head">
+      <p class="eyebrow"><b>Measurements</b> &middot; microsoft/vscode at <code>fc62850</code> &middot; 17 926 files, 73 989 refs, 2 485 MiB mirror</p>
+      <div class="prose">
+        <h2>What it costs, next to what it replaces</h2>
+        <p>
+          The clone is where GFS wins by the widest margin; everything Git does afterwards is where
+          a naive design could give it all back. So the benchmark runs the whole task — acquire,
+          history, find by name, grep by content, edit, status, commit — on the same commit, with
+          the same five edits, and records each step's <i>result</i> beside its time. Both sides run
+          stock Git inside their working tree; only the content search differs, because search is
+          the one thing GFS deliberately answers somewhere else.
+        </p>
+        <p>
+          Run on WSL2, 32 cores, Git 2.53.0, ripgrep 15.2.0, against a local mirror over
+          <code>file://</code> so no step carries internet variance.
+        </p>
+      </div>
+    </div>
+
+    <div class="tablewrap" style="margin-bottom:14px">
+      <table>
+        <thead>
+          <tr>
+            <th>Step</th>
+            <th class="num">git, full clone</th>
+            <th class="num">git, shallow+blobless</th>
+            <th class="num">GFS</th>
+            <th>Result</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr class="win"><td>acquire a workspace</td><td class="num">55.803 s</td><td class="num">9.960 s</td><td class="num">0.300 s</td><td>clone vs. mount</td></tr>
+          <tr><td><code>log -10</code></td><td class="num">0.006 s</td><td class="num">0.007 s</td><td class="num">1.503 s</td><td>10 commits both</td></tr>
+          <tr><td><code>ls-files '*test*'</code></td><td class="num">0.013 s</td><td class="num">0.013 s</td><td class="num">0.021 s</td><td>6 146 vs. 6 245 files</td></tr>
+          <tr><td>grep <code>TODO</code></td><td class="num">0.039 s</td><td class="num">0.040 s</td><td class="num">0.283 s</td><td>1 683 vs. 1 574 lines</td></tr>
+          <tr><td>edit 5 files</td><td class="num">0.005 s</td><td class="num">0.005 s</td><td class="num">2.908 s</td><td>copy-up through FUSE</td></tr>
+          <tr><td><code>git status</code>, first ever</td><td class="num">0.032 s</td><td class="num">0.032 s</td><td class="num">555 s</td><td>one full directory walk</td></tr>
+          <tr><td><code>git status</code>, warm</td><td class="num">0.033 s</td><td class="num">0.034 s</td><td class="num">1.753 s</td><td>fsmonitor + untracked cache</td></tr>
+          <tr class="win"><td><code>gfs status</code></td><td class="num">&mdash;</td><td class="num">&mdash;</td><td class="num">0.0097 s</td><td>read from the journal</td></tr>
+          <tr class="win"><td><b>local disk</b></td><td class="num">1 648 MiB</td><td class="num">363 MiB</td><td class="num">21 MB</td><td>+145 MB cache, shared per repo</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="cards" style="margin-top:26px">
+      <div class="card">
+        <div class="role">The hydration ledger, read off the daemon</div>
+        <h3>A repository-wide search moves nothing</h3>
+        <div class="tablewrap" style="border:0">
+          <table style="min-width:0">
+            <thead><tr><th>After</th><th class="num">working tree</th><th class="num">object store</th></tr></thead>
+            <tbody>
+              <tr><td>mount</td><td class="num">0 B</td><td class="num">0 B</td></tr>
+              <tr><td><code>log -10</code> + <code>ls-files</code></td><td class="num">122 B</td><td class="num">7.96 MB</td></tr>
+              <tr class="win"><td>grep TODO, all 17 926 files</td><td class="num">122 B</td><td class="num">7.96 MB</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p style="margin-top:12px">
+          Byte for byte identical across the search: the answer came from the server's index, so the
+          client hydrated nothing. Ripgrep needed the 1 648 MiB clone to exist first.
+        </p>
+      </div>
+      <div class="card">
+        <div class="role">Search parity, stated rather than assumed</div>
+        <h3>1 574 lines, and why not 1 683</h3>
+        <p>
+          <code>gfs rg</code> returned 109 fewer lines than ripgrep — and said so on stderr, in the
+          same breath as the results:
+        </p>
+        <pre style="font-size:12px">gfs search: 412 of 17925 paths in scope
+were not searched: 312 binary, 98 lfs,
+2 oversized</pre>
+        <p>
+          The first search of the run returned no results at all, and the server audit records why:
+          <code>outcome="error" error_code="SNAPSHOT_BUILDING"</code>. An index that is not ready
+          yet is an error, never an empty answer — which is the property the whole search contract
+          exists to guarantee.
+        </p>
+      </div>
+      <div class="card">
+        <div class="role">Commit correctness</div>
+        <h3>The clone committed 105 changes; GFS committed 5</h3>
+        <p>
+          Both sides applied the same edit set — two modifications, one addition, one deletion, one
+          rename — and committed with stock Git. Diffed against the base tree, the GFS commit
+          contains exactly those five changes. The clone's contains <b>105</b>: the five, one
+          spuriously renormalized YAML file, and <b>100 deleted</b>
+          <code>extensions/copilot/test/simulation/cache/*.sqlite</code> paths.
+        </p>
+        <p>
+          Those hundred are Git LFS pointers. git-lfs is installed on this host, its smudge filter
+          could not reach an LFS endpoint through the <code>file://</code> mirror, and it left the
+          files missing — which <code>git add -A</code> then recorded as deletions. The GFS
+          workspace never ran a smudge filter: LFS is the server's job, and an object the store
+          cannot fetch degrades to its pointer rather than to a hole.
+        </p>
+      </div>
+    </div>
+
+    <div class="sec-head" style="margin-top:52px">
+      <p class="eyebrow"><b>The other direction</b> &middot; what this run cost</p>
+      <div class="prose">
+        <h2>Where a mount is still the expensive answer</h2>
+        <p>
+          Two numbers in this run were minutes long. One turned out to be a defect and is now
+          fixed; the other is the genuine price of a working tree that lives on the far side of a
+          network.
+        </p>
+      </div>
+    </div>
+
+    <div class="cards" style="margin-bottom:34px">
+      <div class="card">
+        <div class="role">First full-tree walk</div>
+        <h3>555 s, one directory at a time</h3>
+        <p>
+          The first <code>git status</code> in a fresh workspace is not re-hashing content — the
+          budget recorded <b>28 blobs, 3 672 bytes</b> for the whole run. It is populating the
+          untracked cache, which means reading every directory once: <b>5 328 listings</b>,
+          uncached, serialized by a single-threaded walk.
+        </p>
+        <p>
+          Measured on its own, one uncached listing costs 38–126 ms — inside the design's
+          250&nbsp;ms target. The target is per call; a monorepo's first walk multiplies it by
+          several thousand. Warm, the same command is 1.75 s, and the listing cache serves 22 996
+          hits against 5 340 fetched pages. Prefetching that walk is the obvious missing piece.
+        </p>
+      </div>
+      <div class="card">
+        <div class="role">Server-side, once per repository &middot; fixed</div>
+        <h3>312 s to import 73 989 refs, now 1.8 s</h3>
+        <p>
+          Before the first mount the server reconciles every ref into its catalog, and until that
+          finishes it does not bind its listeners. No Git data is fetched — the bare repository is
+          already on disk — so this was pure bookkeeping, and it was <b>quadratic</b>: one
+          transaction per ref, each running <code>SELECT MAX(ref_version) WHERE repository_id = ?</code>
+          against a table indexed only by <code>(repository_id, ref_name)</code>, so every
+          observation scanned every row written before it.
+        </p>
+        <p>
+          Two changes: an index on <code>(repository_id, ref_version)</code>, which turns the
+          high-water-mark query into a lookup, and a reconcile that runs all 73 989 observations in
+          <b>one</b> transaction — also the more correct shape, since a crash halfway through now
+          leaves the catalog on the state it was reconciling from rather than on a prefix of it.
+        </p>
+        <div class="tablewrap" style="border:0">
+          <table style="min-width:0">
+            <tbody>
+              <tr><td>before</td><td class="num">311.8 s</td></tr>
+              <tr class="win"><td>after</td><td class="num">1.78 s</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+      <div class="card">
+        <div class="role">History through the projection</div>
+        <h3>1.5 s for <code>log -10</code></h3>
+        <p>
+          Stock Git reading ten commits through the object-store projection fetched
+          <b>7.96 MB</b> of 64 KiB pack blocks. Against 0.006 s in a local clone this looks bad in
+          isolation; against a 55.8 s clone it is 250× cheaper to get to the same answer, and the
+          blocks stay cached for every command after it.
+        </p>
+      </div>
+    </div>
+
+    <div class="cards" style="margin-top:26px">
+      <div class="card">
+        <div class="role">Worst case &middot; linux, 94 850 files at tip</div>
+        <h3>Cold start against a real monorepo</h3>
+        <div class="tablewrap" style="border:0">
+          <table style="min-width:0">
+            <tbody>
+              <tr><td>full clone</td><td class="num">383 s</td><td class="num">8 087 MiB</td></tr>
+              <tr><td>shallow + blobless</td><td class="num">19.5 s</td><td class="num">1 839 MiB</td></tr>
+              <tr class="win"><td>GFS target</td><td class="num">&lt; 2 s</td><td class="num">&lt; 10 MiB</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p style="margin-top:12px">
+          Sparse checkout narrows the tree but not the wait: cutting to <code>drivers/net</code>
+          took the working tree from 1 540 MiB to 145 MiB and cost 168 s to get there.
+        </p>
+      </div>
+      <div class="card">
+        <div class="role">The measurement that changed the design &middot; spike m05b, warm</div>
+        <h3>git status on the kernel, through the mount</h3>
+        <div class="tablewrap" style="border:0">
+          <table style="min-width:0">
+            <tbody>
+              <tr><td>Git defaults</td><td class="num">18.8 s</td><td class="num">108 445 lookups</td></tr>
+              <tr class="win"><td>fsmonitor + untracked cache</td><td class="num">49 ms</td><td class="num">170 lookups</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p style="margin-top:12px">
+          The earlier ADR ruled out a real <code>.git</code> on the strength of the first row,
+          noting that <code>core.fsmonitor</code> "is not available through a FUSE mount without
+          further work." The overlay journal is exactly the modified-path set that hook asks for —
+          and a better source than a watcher, because the FUSE server sees every mutation by
+          construction. Both rows are the <i>warm</i> state; the vscode run above is what reaching
+          it costs the first time.
+        </p>
+      </div>
+      <div class="card">
+        <div class="role">Prototype acceptance targets</div>
+        <h3>What the system holds itself to</h3>
+        <div class="tablewrap" style="border:0">
+          <table style="min-width:0">
+            <tbody>
+              <tr><td>cold mount to usable root</td><td class="num">&lt; 2 s</td></tr>
+              <tr><td>cached <code>getattr</code></td><td class="num">p95 &lt; 1 ms</td></tr>
+              <tr><td>uncached <code>readdirplus</code></td><td class="num">p95 &lt; 250 ms</td></tr>
+              <tr><td>uncached first byte</td><td class="num">p95 &lt; 250 ms</td></tr>
+              <tr><td>warm literal search</td><td class="num">p95 &lt; 2 s</td></tr>
+              <tr class="win"><td>search-induced hydration</td><td class="num">0 bytes</td></tr>
+              <tr><td>crash recovery</td><td class="num">no lost mutation</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section id="edges">
+  <div class="wrap">
+    <div class="sec-head">
+      <p class="eyebrow"><b>Boundaries</b> &middot; stated, because they are invisible from inside</p>
+      <div class="prose">
+        <h2>Where a GFS workspace is deliberately not a checkout</h2>
+        <p>
+          GFS is not a Git replacement — the server stores real Git repositories and speaks the
+          real Git protocol. But a projected tree differs from <code>git checkout</code> in ways an
+          agent cannot see unless they are written down.
+        </p>
+      </div>
+    </div>
+
+    <div class="tablewrap" style="margin-bottom:28px">
+      <table>
+        <thead><tr><th>Concern</th><th>Raw Git</th><th>GFS</th></tr></thead>
+        <tbody>
+          <tr>
+            <td>Getting started</td>
+            <td>clone downloads history and checks out every file</td>
+            <td>mount a pinned commit; blobs fetched on first open</td>
+          </tr>
+          <tr>
+            <td>Large monorepos</td>
+            <td>partial clone fetches blobs one at a time; sparse checkout needs paths known in advance</td>
+            <td>whole tree visible immediately; only touched files hydrate, with accounting</td>
+          </tr>
+          <tr>
+            <td>Code search</td>
+            <td><code>git grep</code> needs a local checkout</td>
+            <td>server-side revision-aware search; zero client hydration</td>
+          </tr>
+          <tr>
+            <td>Edits</td>
+            <td>the working tree is the checkout</td>
+            <td>copy-on-write overlay over an immutable base</td>
+          </tr>
+          <tr>
+            <td>Large files</td>
+            <td><code>git lfs pull</code> smudges every object into each checkout</td>
+            <td>server resolves LFS; the tree is born expanded, objects shared per host</td>
+          </tr>
+          <tr>
+            <td>Protocol</td>
+            <td>&mdash;</td>
+            <td>smart-HTTP gateway: stock clone and fetch work unchanged</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="cards">
+      <div class="card">
+        <h3>No content filters except LFS</h3>
+        <p>
+          The mount serves raw blob bytes. <code>.gitattributes</code> <code>text</code>/<code>eol</code>
+          conversion, <code>core.autocrlf</code>, and custom clean/smudge filters are not applied,
+          so a repository that relies on them presents different bytes than
+          <code>git checkout</code> would. LFS is the single exception, and it is resolved on the
+          server rather than by the mount running a filter.
+        </p>
+      </div>
+      <div class="card">
+        <h3>Repository formats are validated, not degraded</h3>
+        <p>
+          SHA-1 repositories with the <code>files</code> ref backend only. libgit2 cannot read
+          <code>reftable</code> and its SHA-256 support is experimental, so the catalog
+          <b>rejects</b> a mirror it cannot fully open rather than serving a partial view of it.
+        </p>
+      </div>
+      <div class="card">
+        <h3>Platform and I/O shape</h3>
+        <p>
+          Linux and FUSE3 only, case-sensitive paths, whole-blob fetch, single-node server storage.
+          Hard links return <code>EPERM</code>; xattrs and device nodes return a documented
+          unsupported error; a gitlink appears as an empty read-only directory. The first open of a
+          large LFS file blocks for a whole-object fetch and verify.
+        </p>
+      </div>
+      <div class="card">
+        <h3>Honest about what FUSE cannot promise</h3>
+        <p>
+          Shims and search are cost measures, not security boundaries: a program that calls a
+          binary by absolute path and opens every file will still hydrate every file — the budget,
+          not the shim, is what stops it. FUSE sees file opens, not the intent behind them.
+        </p>
+      </div>
+    </div>
+
+    <div class="note" style="margin-top:26px">
+      <b>Status.</b> Milestones M0–M5 are complete: spikes, the repository and snapshot API, the
+      read-only mount, the writable overlay, revision-aware search, and Git smart-HTTP
+      compatibility. The single-mount workspace (ADR 0011) and server-side LFS expansion
+      (ADR 0012) are implemented. The hosted-agent pilot, production hardening, and multi-node
+      storage remain open.
+    </div>
+  </div>
+</section>
+
+<section id="map">
+  <div class="wrap">
+    <div class="sec-head">
+      <p class="eyebrow">Repository map</p>
+      <div class="prose">
+        <h2>Where the code is</h2>
+      </div>
+    </div>
+    <div class="tablewrap">
+      <table>
+        <thead><tr><th>Crate</th><th>Owns</th></tr></thead>
+        <tbody>
+          <tr><td><code>gfs-git</code></td><td>libgit2 behind a <code>GitRepository</code> trait — objects, trees, refs, the index, attributes, worker pools</td></tr>
+          <tr><td><code>gfs-service</code></td><td>server internals: catalog, auth, mirror, ingest, LFS, search services, the smart-HTTP gateway, mounts and leases, audit</td></tr>
+          <tr><td><code>gfs-search</code></td><td>trigram postings, snapshot manifests, blob registry, text classification, local overlay search</td></tr>
+          <tr><td><code>gfs-mount</code></td><td>the FUSE filesystem: inodes, attributes, listings, blob and block caches, budget, the gitdir passthrough and ODB projection, host and control sockets</td></tr>
+          <tr><td><code>gfs-overlay</code></td><td>the journal, copy-up store, status, diff, export, merge, and fault injection</td></tr>
+          <tr><td><code>gfs-types</code> / <code>gfs-proto</code></td><td>byte paths, OIDs with their algorithm, revisions, limits, redaction; the protobuf surface and conversions</td></tr>
+          <tr><td><code>gfs-test</code></td><td>fixtures, mount harness, a million-entry big-tree corpus, and a real-Git oracle</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+</section>
+
+</main>
+
+<footer>
+  <div class="wrap">
+    <span class="mono">docs/DESIGN.md &middot; docs/adr/0001–0012 &middot; docs/manual-test.md &middot; benchmarks/</span>
+    <span class="mono">Apache-2.0 &middot; vendored libgit2 is GPL-2.0-only with a linking exception</span>
+  </div>
+</footer>
