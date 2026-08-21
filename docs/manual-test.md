@@ -163,6 +163,42 @@ The client-side view of the same fact is the `metadata` line of `gfs inspect`:
 across warm walks, `server requests` and `directory pages` hold still while
 `listing hits` climbs.
 
+### A cold walk is one request, not thousands
+
+The listing cache answers the *second* walk. The first one is what used to cost
+5 328 serialized round trips on vscode, and the daemon now recognizes it: a few
+listing misses descending from a common root make it fetch that subtree with one
+`ListTree`, and the rest of the walk waits on that instead of asking directory
+by directory.
+
+```sh
+cd ~/.gfs-lab/flask
+gfs unmount && gfs mount --repo flask --rev main   # a cold pin
+time find . -path ./.git -prune -o -type d -print >/dev/null
+gfs inspect | grep -E 'metadata|prefetch'
+curl -s 127.0.0.1:8430/metrics | grep -E 'list_directory|list_tree' | grep _count
+```
+
+`directory pages` should be a handful — the misses before the detector fired —
+and `prefetch` should report one walk whose `listings` count is the repository's
+directory count. On the corpus a cold `find` over vscode went from **1 131 s**
+(4 318 `ListDirectory` calls) to **1.7 s** (4 calls plus 3 `ListTree` pages).
+
+The reading-ahead half shows on the same line. Read three files out of one
+directory and the rest of that directory arrives without being asked for:
+
+```sh
+head -c1 src/flask/app.py src/flask/cli.py src/flask/config.py >/dev/null
+sleep 1
+gfs inspect | grep -E 'prefetch|hydration'
+```
+
+`directories read ahead` goes to 1 and the blob count climbs past the three
+files actually read; a subsequent `cat` of another file in that directory adds
+no `hydration` fetches. Files above the per-file bound (8 MiB by default) are
+deliberately left alone, and prefetching stops before the last quarter of the
+job's hydration budget so a wrong guess can never be why a real read is refused.
+
 ## The write path, step by step
 
 ### `gfs clone`

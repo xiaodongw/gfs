@@ -112,6 +112,27 @@ pub struct FsConfig {
   /// trips. Bounded so a monorepo walk cannot pin the whole tree's metadata
   /// in daemon memory; see [`crate::listing`].
   pub listing_cache_dirs: usize,
+  /// How many *entries* those listings may hold in total. The bound that
+  /// actually describes memory, since one directory can carry thousands.
+  pub listing_cache_entries: usize,
+  /// Listing misses inside a two-second window that make the daemon call a
+  /// walk a walk and fetch the subtree in one request. Zero disables it.
+  pub walk_prefetch_threshold: usize,
+  /// Entries per `ListTree` page.
+  pub tree_page_entries: u32,
+  /// Entries one recognized walk may prefetch before it stops.
+  pub tree_prefetch_max_entries: usize,
+  /// Distinct files read from one directory that make the daemon fetch the
+  /// rest of that directory's content. Zero disables it.
+  pub read_prefetch_threshold: usize,
+  /// Bytes one directory's content prefetch may move.
+  pub read_prefetch_max_bytes: u64,
+  /// The largest file a content prefetch will speculate on.
+  pub read_prefetch_max_file_bytes: u64,
+  /// Blob fetches in flight during a content prefetch.
+  pub read_prefetch_concurrency: usize,
+  /// The percentage of the hydration budget prefetching will not spend.
+  pub prefetch_budget_reserve_percent: u64,
   /// Attempts for a retryable failure, including the first.
   pub attempts: u32,
   /// Bytes a job may hydrate from the server before reads are refused with
@@ -137,9 +158,30 @@ impl Default for FsConfig {
       // ms of local disk on the worst-case repository.
       object_negative_ttl: Duration::from_secs(60),
       directory_page_size: gfs_types::limits::DEFAULT_DIRECTORY_PAGE_SIZE as u32,
-      // ~4096 directories at typical tree fan-out is tens of megabytes at
-      // worst, and a working set far larger than any measured git walk.
-      listing_cache_dirs: 4096,
+      // Sized to hold a monorepo's whole directory structure, because that is
+      // now a thing that happens in one operation: vscode is 4 318 directories
+      // and 22 243 entries, and a walk prefetch fills all of them at once. The
+      // entry bound is what caps memory — 150 000 entries is ~25 MB of paths
+      // and object IDs, well past every measured corpus and still far from
+      // pinning a million-entry tree, which is what ADR 0009 refused.
+      listing_cache_dirs: 32_768,
+      listing_cache_entries: 150_000,
+      // Four misses inside two seconds. A job opening a handful of known files
+      // never reaches it; a `git status` reaches it in the first few
+      // directories and pays one `ListTree` for the rest of the tree.
+      walk_prefetch_threshold: 4,
+      tree_page_entries: gfs_types::limits::DEFAULT_TREE_PAGE_ENTRIES as u32,
+      // Above every corpus measured (vscode 22 243, linux ~90 000) so a walk is
+      // one prefetch, and far enough below a pathological tree that the daemon
+      // stops rather than streaming a million entries into memory.
+      tree_prefetch_max_entries: 200_000,
+      // Three distinct files out of one directory is a read-through; two is a
+      // build reading a header and its source.
+      read_prefetch_threshold: 3,
+      read_prefetch_max_bytes: 32 << 20,
+      read_prefetch_max_file_bytes: 8 << 20,
+      read_prefetch_concurrency: 4,
+      prefetch_budget_reserve_percent: 25,
       attempts: 3,
       // 1 GiB, on by default, which is the point of ADR 0009: a budget that has
       // to be switched on is not enforcement. The number is chosen from
@@ -162,6 +204,16 @@ pub struct FsStats {
   pub directory_pages: u64,
   /// Metadata questions answered from a cached base listing, server-free.
   pub listing_hits: u64,
+  /// Recognized walks that were answered by a recursive subtree fetch.
+  pub tree_prefetches: u64,
+  /// `ListTree` pages received.
+  pub tree_pages: u64,
+  /// Directory listings filled by those pages, rather than one call each.
+  pub prefetched_listings: u64,
+  /// Directories whose remaining content was fetched on a read-through.
+  pub content_prefetches: u64,
+  pub prefetched_blobs: u64,
+  pub prefetched_bytes: u64,
   pub opens: u64,
   pub reads: u64,
   pub read_bytes: u64,
@@ -285,6 +337,9 @@ pub struct Pinned {
   /// born empty with the new commit, and a fetch still running against the
   /// old client can only ever insert into the old generation's cache.
   pub(crate) listings: crate::listing::ListingCache,
+  /// Access-pattern detectors and the subtree fetches they started, for the
+  /// same generation and for the same reason.
+  pub(crate) prefetch: crate::prefetch::Prefetcher,
 }
 
 /// The filesystem. Shared behind an `Arc` so a callback can hand it to a worker.
@@ -303,10 +358,12 @@ pub struct Gfs {
   dirs: Mutex<HashMap<u64, Arc<tokio::sync::Mutex<DirState>>>>,
   files: Mutex<HashMap<u64, Arc<FileState>>>,
   next_handle: AtomicU64,
-  stats: Mutex<FsStats>,
+  /// Shared rather than owned: a prefetch runs after the call that triggered it
+  /// has returned, and what it fetched still belongs in this mount's counters.
+  stats: Arc<Mutex<FsStats>>,
   /// Deliberately not inside [`Pinned`]: a re-pin changes which commit the job is
   /// looking at and does not refund what it has already spent.
-  budget: crate::budget::HydrationBudget,
+  budget: Arc<crate::budget::HydrationBudget>,
 }
 
 impl std::fmt::Debug for Gfs {
@@ -337,7 +394,11 @@ impl Gfs {
         client,
         overlay,
         snapshot_time,
-        listings: crate::listing::ListingCache::new(config.listing_cache_dirs),
+        listings: crate::listing::ListingCache::new(
+          config.listing_cache_dirs,
+          config.listing_cache_entries,
+        ),
+        prefetch: crate::prefetch::Prefetcher::new(config.walk_prefetch_threshold),
       })),
       git,
       cache,
@@ -347,8 +408,8 @@ impl Gfs {
       dirs: Mutex::new(HashMap::new()),
       files: Mutex::new(HashMap::new()),
       next_handle: AtomicU64::new(1),
-      stats: Mutex::new(FsStats::default()),
-      budget,
+      stats: Arc::new(Mutex::new(FsStats::default())),
+      budget: Arc::new(budget),
     })
   }
 
@@ -383,7 +444,11 @@ impl Gfs {
       client,
       overlay,
       snapshot_time,
-      listings: crate::listing::ListingCache::new(self.config.listing_cache_dirs),
+      listings: crate::listing::ListingCache::new(
+        self.config.listing_cache_dirs,
+        self.config.listing_cache_entries,
+      ),
+      prefetch: crate::prefetch::Prefetcher::new(self.config.walk_prefetch_threshold),
     };
     // The inode table first, and under both locks, so no lookup can resolve
     // against the new commit and then be recorded against the old root.
@@ -558,6 +623,27 @@ impl Gfs {
       self.bump(|s| s.listing_hits += 1);
       return Ok(listing);
     }
+
+    // A recursive fetch may already be on its way to this directory. Waiting for
+    // it is the whole point: the walk that missed here will ask for thousands
+    // more directories, and one traversal answers all of them.
+    if let Some(listing) = crate::prefetch::await_subtree(&pinned, dir).await {
+      self.bump(|s| s.listing_hits += 1);
+      return Ok(listing);
+    }
+
+    // Not covered, so this miss is evidence in its own right.
+    if self.config.walk_prefetch_threshold > 0 {
+      if let Some(root) = pinned.prefetch.note_listing_miss(dir) {
+        crate::prefetch::spawn_subtree(
+          Arc::clone(&pinned),
+          root,
+          self.prefetch_limits(),
+          Arc::clone(&self.stats),
+        );
+      }
+    }
+
     let client = Arc::clone(&pinned.client);
     let mut entries = Vec::new();
     let mut token = Vec::new();
@@ -826,6 +912,41 @@ impl Gfs {
     Ok(())
   }
 
+  /// The bounds every prefetch runs inside, from this mount's configuration.
+  fn prefetch_limits(&self) -> crate::prefetch::PrefetchLimits {
+    crate::prefetch::PrefetchLimits {
+      tree_page_entries: self.config.tree_page_entries,
+      tree_max_entries: self.config.tree_prefetch_max_entries,
+      content_max_bytes: self.config.read_prefetch_max_bytes,
+      content_max_file_bytes: self.config.read_prefetch_max_file_bytes,
+      content_concurrency: self.config.read_prefetch_concurrency,
+      budget_reserve_percent: self.config.prefetch_budget_reserve_percent,
+    }
+  }
+
+  /// Note that a base file was read, and fetch the rest of its directory once
+  /// enough of them have been.
+  fn note_read(&self, path: &BytePath) {
+    if self.config.read_prefetch_threshold == 0 {
+      return;
+    }
+    let pinned = self.pinned();
+    let Some(dir) = pinned
+      .prefetch
+      .note_read(path, self.config.read_prefetch_threshold)
+    else {
+      return;
+    };
+    crate::prefetch::spawn_content(
+      Arc::clone(&pinned),
+      dir,
+      self.prefetch_limits(),
+      Arc::clone(&self.cache),
+      Arc::clone(&self.budget),
+      Arc::clone(&self.stats),
+    );
+  }
+
   /// Open a base blob for reading, fetching and verifying it if the cache lacks
   /// it.
   ///
@@ -835,6 +956,10 @@ impl Gfs {
   /// the blob is already cached, no ticket -- and no round trip -- is needed at
   /// all, which is what makes a warm reopen free.
   async fn open_blob(&self, path: &BytePath, oid: &ObjectId) -> Result<std::fs::File, GfsError> {
+    // Evidence for the read detector, taken whether or not the blob is cached:
+    // what makes a directory look read-through is which files a job asked for,
+    // not which of them happened to be local already.
+    self.note_read(path);
     if !self.cache.contains(oid) {
       let fresh = self
         .base_entry(path, true)

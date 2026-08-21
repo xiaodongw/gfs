@@ -73,23 +73,33 @@ struct Slot {
 }
 
 /// Complete listings of base directories, keyed by directory path.
+///
+/// Bounded twice, because one bound does not describe the cost: a monorepo has
+/// thousands of directories, and a *single* directory can have thousands of
+/// entries. The directory bound keeps the map small; the entry bound is what
+/// actually caps memory, since an entry carries its full path and object ID.
 #[derive(Debug)]
 pub struct ListingCache {
   slots: Mutex<Slots>,
-  capacity: usize,
+  capacity_dirs: usize,
+  capacity_entries: usize,
 }
 
 #[derive(Debug, Default)]
 struct Slots {
   dirs: HashMap<Vec<u8>, Slot>,
+  /// Entries across every slot, kept incrementally so a bulk fill does not
+  /// re-count the cache per directory.
+  entries: usize,
   clock: u64,
 }
 
 impl ListingCache {
-  pub fn new(capacity: usize) -> ListingCache {
+  pub fn new(capacity_dirs: usize, capacity_entries: usize) -> ListingCache {
     ListingCache {
       slots: Mutex::new(Slots::default()),
-      capacity: capacity.max(1),
+      capacity_dirs: capacity_dirs.max(1),
+      capacity_entries: capacity_entries.max(1),
     }
   }
 
@@ -106,23 +116,52 @@ impl ListingCache {
     let mut slots = self.slots.lock().expect("listing cache");
     slots.clock += 1;
     let clock = slots.clock;
-    if !slots.dirs.contains_key(dir.as_bytes()) && slots.dirs.len() >= self.capacity {
-      if let Some(coldest) = slots
-        .dirs
-        .iter()
-        .min_by_key(|(_, slot)| slot.used)
-        .map(|(path, _)| path.clone())
-      {
-        slots.dirs.remove(&coldest);
-      }
-    }
-    slots.dirs.insert(
+    let added = listing.entries().len();
+    if let Some(replaced) = slots.dirs.insert(
       dir.as_bytes().to_vec(),
       Slot {
         listing,
         used: clock,
       },
-    );
+    ) {
+      slots.entries -= replaced.listing.entries().len();
+    }
+    slots.entries += added;
+    if slots.dirs.len() > self.capacity_dirs || slots.entries > self.capacity_entries {
+      self.trim(&mut slots);
+    }
+  }
+
+  /// How many directories and entries are held.
+  pub fn size(&self) -> (usize, usize) {
+    let slots = self.slots.lock().expect("listing cache");
+    (slots.dirs.len(), slots.entries)
+  }
+
+  /// Drop the coldest slots until both bounds have headroom again.
+  ///
+  /// In one pass down a sorted-by-use list rather than one scan per eviction:
+  /// a recursive prefetch inserts thousands of directories back to back, and a
+  /// per-eviction scan of the whole map would make that quadratic. Trimming to
+  /// below the bound rather than exactly to it is what keeps the sort from
+  /// running on every subsequent insert.
+  fn trim(&self, slots: &mut Slots) {
+    let target_dirs = self.capacity_dirs * 9 / 10;
+    let target_entries = self.capacity_entries * 9 / 10;
+    let mut by_age: Vec<(u64, Vec<u8>)> = slots
+      .dirs
+      .iter()
+      .map(|(path, slot)| (slot.used, path.clone()))
+      .collect();
+    by_age.sort_unstable_by_key(|(used, _)| *used);
+    for (_, path) in by_age {
+      if slots.dirs.len() <= target_dirs && slots.entries <= target_entries {
+        break;
+      }
+      if let Some(slot) = slots.dirs.remove(&path) {
+        slots.entries -= slot.listing.entries().len();
+      }
+    }
   }
 }
 
@@ -153,17 +192,43 @@ mod tests {
 
   #[test]
   fn the_coldest_directory_is_evicted_at_capacity() {
-    let cache = ListingCache::new(2);
+    let cache = ListingCache::new(10, 1_000);
+    let dir = |n: u8| BytePath::new(vec![b'a' + n]);
+    for n in 0..10 {
+      cache.insert(&dir(n), std::sync::Arc::new(Listing::new(Vec::new())));
+    }
+    // Touch the oldest so the *second* oldest is now the coldest.
+    assert!(cache.get(&dir(0)).is_some());
+    cache.insert(&dir(10), std::sync::Arc::new(Listing::new(Vec::new())));
+
+    assert!(
+      cache.get(&dir(0)).is_some(),
+      "a touched listing must survive"
+    );
+    assert!(cache.get(&dir(1)).is_none(), "the coldest listing must go");
+    assert!(cache.get(&dir(10)).is_some());
+    assert!(cache.size().0 <= 10);
+  }
+
+  #[test]
+  fn the_entry_bound_evicts_even_when_directories_would_fit() {
+    // Two directories is well inside the directory bound; four entries is not
+    // inside the entry bound, which is the bound that describes memory.
+    let cache = ListingCache::new(1_000, 3);
     let a = BytePath::new(b"a".to_vec());
     let b = BytePath::new(b"b".to_vec());
-    let c = BytePath::new(b"c".to_vec());
-    cache.insert(&a, std::sync::Arc::new(Listing::new(Vec::new())));
-    cache.insert(&b, std::sync::Arc::new(Listing::new(Vec::new())));
-    // Touch `a` so `b` is the coldest when `c` arrives.
-    assert!(cache.get(&a).is_some());
-    cache.insert(&c, std::sync::Arc::new(Listing::new(Vec::new())));
-    assert!(cache.get(&a).is_some());
-    assert!(cache.get(&b).is_none());
-    assert!(cache.get(&c).is_some());
+    cache.insert(
+      &a,
+      std::sync::Arc::new(Listing::new(vec![entry("a/1"), entry("a/2")])),
+    );
+    cache.insert(
+      &b,
+      std::sync::Arc::new(Listing::new(vec![entry("b/1"), entry("b/2")])),
+    );
+    let (dirs, entries) = cache.size();
+    assert_eq!(dirs, 1, "the coldest listing must go when entries overflow");
+    assert_eq!(entries, 2);
+    assert!(cache.get(&a).is_none());
+    assert!(cache.get(&b).is_some());
   }
 }

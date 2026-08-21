@@ -190,7 +190,13 @@ async fn main() -> anyhow::Result<()> {
   let mut grpc_shutdown = shutdown_rx.clone();
   let grpc_task = tokio::spawn(
     tonic::transport::Server::builder()
-      .add_service(gfs_proto::SnapshotServiceServer::new(server.snapshot_api()))
+      // Encoding ceiling raised from tonic's 4 MiB default for `ListTree`,
+      // whose page is a whole subtree's metadata; the client raises its decode
+      // ceiling to the same `MAX_RESPONSE_BYTES`.
+      .add_service(
+        gfs_proto::SnapshotServiceServer::new(server.snapshot_api())
+          .max_encoding_message_size(gfs_types::limits::MAX_RESPONSE_BYTES),
+      )
       .add_service(gfs_proto::SearchServiceServer::new(server.search_api()))
       .add_service(gfs_proto::RepositoryServiceServer::new(
         server.repository_api(),

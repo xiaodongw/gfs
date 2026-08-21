@@ -52,6 +52,20 @@ struct Args {
   /// to refusal.
   #[arg(long, env = "GFS_ODB_RESIDENCY_BUDGET", default_value_t = 0)]
   odb_residency_budget: u64,
+
+  /// Listing misses inside a two-second window that make the daemon treat a
+  /// descent as a tree walk and fetch the subtree in one request. 0 turns
+  /// metadata prefetching off, which costs a cold walk one round trip per
+  /// directory — 5 328 of them for a first `git status` on vscode.
+  #[arg(long, env = "GFS_WALK_PREFETCH_THRESHOLD", default_value_t = FsConfig::default().walk_prefetch_threshold)]
+  walk_prefetch_threshold: usize,
+
+  /// Distinct files read from one directory that make the daemon fetch the
+  /// rest of that directory's content in the background. 0 turns content
+  /// prefetching off; unlike the metadata half, this one moves speculative
+  /// bytes, so a metered link is a reason to disable it.
+  #[arg(long, env = "GFS_READ_PREFETCH_THRESHOLD", default_value_t = FsConfig::default().read_prefetch_threshold)]
+  read_prefetch_threshold: usize,
 }
 
 #[tokio::main]
@@ -72,6 +86,8 @@ async fn main() -> Result<()> {
     lease_policy: LeasePolicy::adr_0006(),
     fs: FsConfig {
       hydration_budget_bytes: args.hydration_budget,
+      walk_prefetch_threshold: args.walk_prefetch_threshold,
+      read_prefetch_threshold: args.read_prefetch_threshold,
       ..FsConfig::default()
     },
     odb_residency_bytes: args.odb_residency_budget,

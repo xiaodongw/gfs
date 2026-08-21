@@ -11,10 +11,12 @@ pub mod refs;
 pub mod repositories;
 pub mod schema;
 
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Mutex;
 
 use gfs_types::error::GfsError;
+use gfs_types::RepositoryId;
 use rusqlite::Connection;
 
 pub use leases::{Lease, LeaseSweepOutcome};
@@ -29,6 +31,16 @@ pub use repositories::{RepositoryRecord, RepositoryState};
 /// and a real pool.
 pub struct Catalog {
   conn: Mutex<Connection>,
+  /// An in-process counter per repository, bumped by every ref observation that
+  /// changed something. Read by caches that must not outlive the ref state they
+  /// were computed against -- see [`crate::auth::VisibilityCache`].
+  ///
+  /// Deliberately *not* `MAX(ref_version)` from the table. That value is not
+  /// monotonic: deleting the highest-versioned ref removes its row, so the
+  /// maximum drops back and a later observation reuses the number. A counter
+  /// that can return to a value it already had is not a generation. It is also
+  /// free to read, where the query is one statement per authorization.
+  ref_generations: Mutex<HashMap<RepositoryId, u64>>,
 }
 
 impl std::fmt::Debug for Catalog {
@@ -41,12 +53,14 @@ impl Catalog {
   pub fn open(path: &Path) -> Result<Self, GfsError> {
     Ok(Catalog {
       conn: Mutex::new(schema::open(path)?),
+      ref_generations: Mutex::new(HashMap::new()),
     })
   }
 
   pub fn open_in_memory() -> Result<Self, GfsError> {
     Ok(Catalog {
       conn: Mutex::new(schema::open_in_memory()?),
+      ref_generations: Mutex::new(HashMap::new()),
     })
   }
 
@@ -75,6 +89,31 @@ impl Catalog {
     let out = f(&tx)?;
     tx.commit().map_err(schema::db_error)?;
     Ok(out)
+  }
+
+  /// The repository's current ref generation.
+  ///
+  /// In-memory and meaningful only within this process, which is all a
+  /// process-local cache needs: it dies with the value it keys on.
+  pub fn ref_generation(&self, repository_id: &RepositoryId) -> u64 {
+    self
+      .ref_generations
+      .lock()
+      .unwrap_or_else(|e| e.into_inner())
+      .get(repository_id)
+      .copied()
+      .unwrap_or(0)
+  }
+
+  /// Advance the repository's ref generation. Called by every path that records
+  /// a real ref change, so a memoized reachability verdict is invalidated by the
+  /// same write that made it wrong.
+  pub(crate) fn bump_ref_generation(&self, repository_id: &RepositoryId) {
+    let mut generations = self
+      .ref_generations
+      .lock()
+      .unwrap_or_else(|e| e.into_inner());
+    *generations.entry(repository_id.clone()).or_insert(0) += 1;
   }
 }
 

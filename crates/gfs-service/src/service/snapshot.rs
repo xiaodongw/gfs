@@ -523,6 +523,90 @@ impl SnapshotService for SnapshotApi {
     }
   }
 
+  async fn list_tree(
+    &self,
+    request: Request<v1::ListTreeRequest>,
+  ) -> Result<Response<v1::ListTreeResponse>, Status> {
+    let ctx = self.begin(&request)?;
+    let req = request.into_inner();
+    let path = BytePath::new(req.path.clone());
+
+    let result = async {
+      let (access, _) = self
+        .commit_context(&ctx, &req.repository_id, &req.commit_oid, req.authorization)
+        .await?;
+      let root = convert::try_path(req.path)?;
+      // Clamped rather than rejected, as `list_directory` clamps its page size:
+      // a client asking for too much gets a smaller page and a continuation
+      // token, which is a better outcome than an error it has to handle.
+      let max_entries = if req.max_entries == 0 {
+        limits::DEFAULT_TREE_PAGE_ENTRIES
+      } else {
+        (req.max_entries as usize).min(limits::MAX_TREE_PAGE_ENTRIES)
+      };
+      let after = (!req.page_token.is_empty()).then_some(req.page_token);
+
+      let repo = self.registry.repository(&access.repository_id)?;
+      let page = repo
+        .list_tree(access.commit.clone(), root, after, max_entries)
+        .await?;
+      // No blob tickets. This call exists to fill a metadata cache; a ticket
+      // expires in minutes and one per entry would be thousands of authorizations
+      // minted for reads that may never happen.
+      let entries = page
+        .entries
+        .into_iter()
+        .map(|e| self.attach_ticket(&access, e, false))
+        .map(v1::TreeEntry::from)
+        .collect();
+      Ok((
+        access,
+        v1::ListTreeResponse {
+          entries,
+          directories: page
+            .directories
+            .into_iter()
+            .map(|d| d.as_bytes().to_vec())
+            .collect(),
+          next_page_token: page.next_page_token.unwrap_or_default(),
+          commit_oid: String::new(),
+        },
+      ))
+    }
+    .await;
+
+    match result {
+      Ok((access, mut response)) => {
+        response.commit_oid = access.commit.to_qualified();
+        self.finish(
+          Action::ListTree,
+          &ctx,
+          AuditRecord {
+            subject: Some(&access.subject),
+            repository_id: Some(&access.repository_id),
+            commit: Some(&access.commit),
+            path: Some(&path),
+            via_capability: access.via_capability,
+            request_id: Some(ctx.request_id.as_str()),
+            ..Default::default()
+          },
+          Ok(response),
+        )
+      }
+      Err(e) => self.finish(
+        Action::ListTree,
+        &ctx,
+        AuditRecord {
+          subject: Some(&ctx.identity.subject),
+          path: Some(&path),
+          request_id: Some(ctx.request_id.as_str()),
+          ..Default::default()
+        },
+        Err(e),
+      ),
+    }
+  }
+
   async fn batch_get_entry(
     &self,
     request: Request<v1::BatchGetEntryRequest>,

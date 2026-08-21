@@ -48,6 +48,19 @@ service SnapshotService {
 
   rpc ListDirectory(ListDirectoryRequest) returns (ListDirectoryResponse);
 
+  // A whole subtree's directories in one round trip.
+  //
+  // `ListDirectory` answers one directory, and a client walking a tree asks it
+  // once per directory: 5 328 serialized round trips for the first `git status`
+  // in a vscode workspace. This answers all of them from one traversal, so a
+  // client that recognizes a walk pays one call instead of thousands.
+  //
+  // Pages break **between** directories, never inside one, and the response
+  // names the directories it described. That is what lets a client cache each
+  // one as a *complete* listing -- the property that makes a cached listing able
+  // to answer the absence of a name, not only its presence.
+  rpc ListTree(ListTreeRequest) returns (ListTreeResponse);
+
   // The pinned commit's ancestry, newest first.
   //
   // A revwalk rather than a tree query, and the reason `git log` is answerable
@@ -403,6 +416,37 @@ message ListDirectoryResponse {
   // Empty when this is the last page.
   bytes next_page_token = 2;
   string commit_oid = 3;
+}
+
+message ListTreeRequest {
+  string repository_id = 1;
+  string commit_oid = 2;
+  // The subtree root. Empty means the whole snapshot.
+  bytes path = 3;
+  SnapshotAuthorization authorization = 4;
+  // Soft ceiling on entries in one response. Zero takes the server default, and
+  // the server caps it. Soft because a directory is never split across
+  // responses: a page may exceed this by the size of its last directory, which
+  // is the price of every returned directory being complete.
+  uint32 max_entries = 5;
+  // Opaque continuation from a previous response.
+  bytes page_token = 6;
+}
+
+message ListTreeResponse {
+  // Every entry of every directory in `directories`, in walk order: a
+  // directory's own entry precedes its children's.
+  repeated TreeEntry entries = 1;
+  // The directories this response describes completely, including the walk
+  // root. Carried separately because an empty directory contributes no entries,
+  // and a client must be able to tell "listed, and empty" from "not listed" --
+  // it caches the first as a complete listing and the second not at all. A
+  // submodule appears here with no entries, matching `ListDirectory`'s empty
+  // page for a gitlink.
+  repeated bytes directories = 2;
+  // Empty when the walk reached the end of the subtree.
+  bytes next_page_token = 3;
+  string commit_oid = 4;
 }
 
 message BatchGetEntryRequest {

@@ -22,7 +22,7 @@ use crate::lfs::{self, LfsPointer};
 use crate::pool::{PooledRepo, RepoPool};
 use crate::repository::{
   BlameOutput, CommitSignature, DiffOutput, DiffRequest, DirectoryPage, EntryLookup, GitRepository,
-  LfsEntry, LogOptions, TreeChange, TreeChangeKind, TreeDelta, WalkEntry,
+  LfsEntry, LogOptions, TreeChange, TreeChangeKind, TreeDelta, TreePage, WalkEntry,
 };
 
 use crate::tree::{DecodedEntry, DecodedTree, TreeCache, TreeCacheStats};
@@ -268,6 +268,39 @@ impl Libgit2Repository {
     Ok(lfs::parse_pointer(blob.content()))
   }
 
+  /// The decoded tree a directory path names, or `None` for a gitlink.
+  ///
+  /// DESIGN.md section 8.2 presents a submodule as an empty read-only
+  /// directory, and GFS genuinely has nothing to list for one: its contents are
+  /// in another repository. Keeping that rule here means `list_directory` and
+  /// `list_tree` cannot disagree about it.
+  fn directory_tree(
+    &self,
+    repo: &git2::Repository,
+    commit: &ObjectId,
+    path: &BytePath,
+  ) -> Result<Option<Arc<DecodedTree>>, GfsError> {
+    if path.is_empty() {
+      let commit_oid = self.git_oid(commit)?;
+      let root = self.find_commit(repo, commit_oid)?.tree_id();
+      return Ok(Some(self.decoded_tree(repo, root)?));
+    }
+    let Some((parent, name)) = self.walk_to_parent(repo, commit, path)? else {
+      return Err(GfsError::not_found("no such directory"));
+    };
+    let Some(entry) = parent.get(&name) else {
+      return Err(GfsError::not_found("no such directory"));
+    };
+    match entry.mode {
+      mode::DIRECTORY => {
+        let child = self.git_oid(&entry.oid)?;
+        Ok(Some(self.decoded_tree(repo, child)?))
+      }
+      mode::GITLINK => Ok(None),
+      _ => Err(GfsError::new(ErrorCode::InvalidArgument, "not a directory")),
+    }
+  }
+
   /// Build the API-level entry for one decoded tree entry.
   ///
   /// This is where ADR 0012 expansion happens: an LFS entry whose object the
@@ -357,7 +390,12 @@ impl Libgit2Repository {
     let Some(decoded) = tree.get(&name) else {
       return Ok(None);
     };
-    Ok(Some(self.entry_info(repo, commit, path.clone(), decoded)?))
+    Ok(Some(self.entry_info(
+      repo,
+      commit,
+      path.clone(),
+      decoded,
+    )?))
   }
 
   fn find_commit<'r>(
@@ -750,36 +788,11 @@ impl GitRepository for Libgit2Repository {
     let pooled = self.checkout()?;
     let page = {
       let repo: &git2::Repository = &pooled;
-      let commit_oid = self.git_oid(commit)?;
-
-      let tree = if path.is_empty() {
-        let root = self.find_commit(repo, commit_oid)?.tree_id();
-        self.decoded_tree(repo, root)?
-      } else {
-        let Some((parent, name)) = self.walk_to_parent(repo, commit, path)? else {
-          return Err(GfsError::not_found("no such directory"));
-        };
-        let Some(entry) = parent.get(&name) else {
-          return Err(GfsError::not_found("no such directory"));
-        };
-        match entry.mode {
-          mode::DIRECTORY => {
-            let child = self.git_oid(&entry.oid)?;
-            self.decoded_tree(repo, child)?
-          }
-          // DESIGN.md section 8.2 presents a gitlink as an empty read-only
-          // directory. Returning an empty page keeps that rule in one place
-          // instead of making every caller special-case it, and GFS genuinely
-          // has nothing to list: a submodule's contents live in another
-          // repository.
-          mode::GITLINK => {
-            return Ok(DirectoryPage {
-              entries: Vec::new(),
-              next_page_token: None,
-            })
-          }
-          _ => return Err(GfsError::new(ErrorCode::InvalidArgument, "not a directory")),
-        }
+      let Some(tree) = self.directory_tree(repo, commit, path)? else {
+        return Ok(DirectoryPage {
+          entries: Vec::new(),
+          next_page_token: None,
+        });
       };
 
       let (page, next_page_token) = tree.page(after, limit);
@@ -793,6 +806,76 @@ impl GitRepository for Libgit2Repository {
       }
     };
     Ok(page)
+  }
+
+  fn list_tree(
+    &self,
+    commit: &ObjectId,
+    root: &BytePath,
+    after: Option<&[u8]>,
+    max_entries: usize,
+  ) -> Result<TreePage, GfsError> {
+    let max_entries = max_entries.clamp(1, limits::MAX_TREE_PAGE_ENTRIES);
+    let pooled = self.checkout()?;
+    let repo: &git2::Repository = &pooled;
+
+    let mut entries: Vec<TreeEntryInfo> = Vec::new();
+    let mut directories: Vec<BytePath> = Vec::new();
+    let mut next_page_token = None;
+
+    // Depth-first, parents before children, siblings in Git's tree order --
+    // children are pushed reversed so the stack pops them in order. The walk is
+    // a pure function of the commit, so `after` can name a directory and a
+    // resumed walk arrives at the same place by replaying the same traversal.
+    // Replaying is cheap: the skipped prefix costs tree decodes, which the tree
+    // cache mostly answers, and no object-header reads at all.
+    let mut stack = vec![root.clone()];
+    let mut emitting = after.is_none();
+    while let Some(dir) = stack.pop() {
+      if !emitting && Some(dir.as_bytes()) == after {
+        emitting = true;
+      }
+      // The soft cap, checked before a directory is expanded rather than in the
+      // middle of one: a client's cached listing is only usable if it is
+      // complete. The first directory of a page is always emitted, so a
+      // directory larger than the cap makes progress instead of looping.
+      if emitting && !entries.is_empty() && entries.len() >= max_entries {
+        next_page_token = Some(dir.as_bytes().to_vec());
+        break;
+      }
+
+      let Some(tree) = self.directory_tree(repo, commit, &dir)? else {
+        // A gitlink. Named as a listed directory with no children, so a client
+        // records "empty" rather than "not yet fetched".
+        if emitting {
+          directories.push(dir);
+        }
+        continue;
+      };
+
+      let mut children = Vec::new();
+      for decoded in tree.entries() {
+        let path = dir.join(&decoded.name);
+        if matches!(decoded.mode, mode::DIRECTORY | mode::GITLINK) {
+          children.push(path.clone());
+        }
+        if emitting {
+          entries.push(self.entry_info(repo, commit, path, decoded)?);
+        }
+      }
+      if emitting {
+        directories.push(dir);
+      }
+      for child in children.into_iter().rev() {
+        stack.push(child);
+      }
+    }
+
+    Ok(TreePage {
+      entries,
+      directories,
+      next_page_token,
+    })
   }
 
   fn walk_tree(
@@ -1251,7 +1334,15 @@ impl GitRepository for Libgit2Repository {
       for entry in tree.entries() {
         let path = prefix.join(&entry.name);
         if entry.mode == mode::DIRECTORY {
-          descend(this, repo, commit, odb, this.git_oid(&entry.oid)?, &path, out)?;
+          descend(
+            this,
+            repo,
+            commit,
+            odb,
+            this.git_oid(&entry.oid)?,
+            &path,
+            out,
+          )?;
           continue;
         }
         // A gitlink names a commit in *another* repository; reading its header

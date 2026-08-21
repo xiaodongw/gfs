@@ -67,6 +67,17 @@ pub const MIN_ABBREV_HEX: usize = 7;
 pub const DEFAULT_DIRECTORY_PAGE_SIZE: usize = 1000;
 pub const MAX_DIRECTORY_PAGE_SIZE: usize = 10_000;
 
+/// Default and maximum entries per `ListTree` page.
+///
+/// `ListTree` answers a whole subtree, so its page is sized by what a response
+/// can carry rather than by what a directory holds: at the ~110 bytes an entry
+/// encodes to, the default is ~1 MB and the ceiling ~11 MB, against the 32 MB
+/// `MAX_RESPONSE_BYTES` allows. The cap is a *soft* one — a page never splits a
+/// directory, so a response may exceed it by the size of its last directory,
+/// which is what lets a client treat every directory it receives as complete.
+pub const DEFAULT_TREE_PAGE_ENTRIES: usize = 10_000;
+pub const MAX_TREE_PAGE_ENTRIES: usize = 100_000;
+
 /// Maximum paths in one `BatchGetEntry`. Each one is an independent tree walk.
 pub const MAX_BATCH_ENTRIES: usize = 1000;
 

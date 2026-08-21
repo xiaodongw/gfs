@@ -36,6 +36,29 @@ pub struct DirectoryPage {
   pub next_page_token: Option<Vec<u8>>,
 }
 
+/// One page of a recursive listing: whole directories, never a partial one.
+///
+/// The completeness rule is the point. A client caches a directory listing to
+/// answer *every* later question about that directory — including the definitive
+/// absence of a name — so a listing it cannot know is complete is worthless to
+/// it. Paging therefore breaks between directories, and `max_entries` is a soft
+/// ceiling the last directory may cross.
+#[derive(Debug, Clone)]
+pub struct TreePage {
+  /// Every entry of every directory named in `directories`, in walk order:
+  /// a directory's own entry precedes its children's.
+  pub entries: Vec<gfs_types::TreeEntryInfo>,
+  /// The directories this page describes completely, including the walk root.
+  ///
+  /// Carried separately because an *empty* directory contributes no entries, and
+  /// without this a client could not tell "listed, and it has nothing in it"
+  /// from "never listed". A gitlink appears here too: DESIGN.md section 8.2
+  /// presents a submodule as an empty read-only directory.
+  pub directories: Vec<BytePath>,
+  /// `None` when the walk reached the end of the subtree.
+  pub next_page_token: Option<Vec<u8>>,
+}
+
 /// One file a recursive tree walk found.
 ///
 /// Only regular and executable files appear. That is the searchable corpus, and
@@ -222,6 +245,25 @@ pub trait GitRepository: Send + Sync + std::fmt::Debug {
     after: Option<&[u8]>,
     limit: usize,
   ) -> Result<DirectoryPage, GfsError>;
+
+  /// Every directory under `root`, recursively, in one pass.
+  ///
+  /// The recursive answer to the question [`GitRepository::list_directory`]
+  /// answers one directory at a time. A client walking a monorepo asks it
+  /// thousands of times — 5 328 for one `git status` over vscode — and each ask
+  /// is a round trip; this collapses them into one traversal whose cost is the
+  /// tree decode plus one object-header read per file.
+  ///
+  /// `after` resumes a previous page: it is the path of the next directory to
+  /// visit, and the walk is deterministic, so resuming re-walks the skipped
+  /// prefix's trees (cheap, and they are cached) and emits from there.
+  fn list_tree(
+    &self,
+    commit: &ObjectId,
+    root: &BytePath,
+    after: Option<&[u8]>,
+    max_entries: usize,
+  ) -> Result<TreePage, GfsError>;
 
   /// Walk every searchable file under `root`, recursively.
   ///
@@ -624,6 +666,18 @@ impl AsyncRepository {
   ) -> Result<DirectoryPage, GfsError> {
     self
       .run(move |r| r.list_directory(&commit, &path, after.as_deref(), limit))
+      .await
+  }
+
+  pub async fn list_tree(
+    &self,
+    commit: ObjectId,
+    root: BytePath,
+    after: Option<Vec<u8>>,
+    max_entries: usize,
+  ) -> Result<TreePage, GfsError> {
+    self
+      .run(move |r| r.list_tree(&commit, &root, after.as_deref(), max_entries))
       .await
   }
 

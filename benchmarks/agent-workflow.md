@@ -1,6 +1,6 @@
 # The agent edit workflow, raw Git against GFS
 
-Date: 2026-08-17
+Date: 2026-08-21
 Reproduce: `./spikes/corpus/benchmark-workflow.sh vscode django`
 
 [`baseline.md`](baseline.md) measures the **clone**, which is the first step of a
@@ -38,49 +38,69 @@ add, one delete, one rename — to the **same four paths**, chosen once from
 
 ## Results: vscode
 
-| step | raw git full | raw git shallow+blobless | GFS | raw result | GFS result |
-| --- | ---: | ---: | ---: | --- | --- |
-| acquire | 55.803 s | 9.960 s | **0.300 s** | clone | mount |
-| `log -10` | 0.006 s | 0.007 s | 1.503 s | 10 commits | 10 commits |
-| `ls-files '*test*'` | 0.013 s | 0.013 s | 0.021 s | 6 146 files | 6 245 files |
-| grep `TODO`, cold index | 0.039 s | 0.040 s | 6.426 s | 1 683 lines | error, see below |
-| grep `TODO`, warm | 0.039 s | 0.040 s | 0.283 s | 1 683 lines | 1 574 lines |
-| edit 5 files | 0.005 s | 0.005 s | 2.908 s | | |
-| `git status`, cold | 0.032 s | 0.032 s | **555 s** | | |
-| `git status`, warm | 0.033 s | 0.034 s | 1.753 s | | |
-| `gfs status` | – | – | **0.0097 s** | | journal |
-| commit | 0.937 s | 0.934 s | 1 448 s | | |
-| **local disk** | 1 648 MiB | 363 MiB | **21 MB** + 145 MB host cache | | |
+| step | raw git full | raw git shallow+blobless | GFS | GFS on 2026-08-17 | raw result | GFS result |
+| --- | ---: | ---: | ---: | ---: | --- | --- |
+| acquire | 56.174 s | 9.856 s | **0.246 s** | 0.300 s | clone | mount |
+| `log -10` | 0.006 s | 0.006 s | 0.053 s | 1.503 s | 10 commits | 10 commits |
+| `ls-files '*test*'` | 0.007 s | 0.005 s | 0.020 s | 0.021 s | 0 files, see below | 6 245 files |
+| grep `TODO`, cold index | 0.041 s | 0.038 s | 5.786 s | 6.426 s | 1 683 lines | error, see below |
+| grep `TODO`, warm | 0.041 s | 0.038 s | 0.248 s | 0.283 s | 1 683 lines | 1 574 lines |
+| edit 5 files | 0.006 s | 0.005 s | 0.070 s | 2.908 s | | |
+| `git status`, cold | 0.037 s | 0.029 s | **2.344 s** | 555 s | | |
+| `git status`, warm | 0.035 s | 0.029 s | 0.297 s | 1.753 s | | |
+| `gfs status` | – | – | **0.010 s** | 0.0097 s | | journal |
+| commit | 1.002 s | 0.908 s | **14.501 s** | 1 448 s | | |
+| **total** | **57.272 s** | **10.849 s** | **17.482 s** | ~1 521 s | | |
+| **local disk** | 1 648 MiB | 363 MiB | **22 MB** + 147 MB host cache | 21 MB + 145 MB | | |
 
 ## Results: django
 
-| step | raw git full | raw git shallow+blobless | GFS |
-| --- | ---: | ---: | ---: |
-| acquire | 10.987 s | 2.560 s | **0.180 s** |
-| `log -10` | 0.006 s | 0.006 s | 0.241 s |
-| `ls-files '*test*'` | 0.007 s | 0.008 s | 0.019 s (2 621 files, both) |
-| grep `TODO`, cold index | 0.019 s | 0.018 s | 1.461 s (35 lines, both) |
-| grep `TODO`, warm | 0.019 s | 0.018 s | 0.217 s |
-| edit 5 files | 0.006 s | 0.005 s | 0.482 s |
-| `git status`, cold | 0.128 s | 0.127 s | 7.229 s |
-| `git status`, warm | 0.035 s | 0.124 s | 0.116 s |
-| `gfs status` | – | – | **0.011 s** |
-| commit | 0.053 s | 0.055 s | 9.811 s |
-| **local disk** | 338 MiB | 68 MiB | **15.6 MB** + 46.7 MB host cache |
+| step | raw git full | raw git shallow+blobless | GFS | GFS on 2026-08-17 |
+| --- | ---: | ---: | ---: | ---: |
+| acquire | 11.187 s | 2.583 s | **0.108 s** | 0.180 s |
+| `log -10` | 0.006 s | 0.006 s | 0.046 s | 0.241 s |
+| `ls-files '*test*'` | 0.007 s | 0.007 s | 0.014 s (2 621 files, both) | 0.019 s |
+| grep `TODO`, cold index | 0.019 s | 0.019 s | 1.546 s (35 lines, both) | 1.461 s |
+| grep `TODO`, warm | 0.019 s | 0.019 s | 0.035 s | 0.217 s |
+| edit 5 files | 0.005 s | 0.005 s | 0.055 s | 0.482 s |
+| `git status`, cold | 0.130 s | 0.127 s | **1.436 s** | 7.229 s |
+| `git status`, warm | 0.037 s | 0.126 s | 0.119 s | 0.116 s |
+| `gfs status` | – | – | **0.010 s** | 0.011 s |
+| commit | 0.054 s | 0.054 s | 9.705 s | 9.811 s |
+| **local disk** | 338 MiB | 68 MiB | **15.6 MB** + 46.9 MB host cache | same |
 
 Commit correctness: **PASS**, both flows produced tree
 `c297292656bb794d6e231778d3f9272d22a52c03`.
 
 ## What the numbers say
 
-**The workspace is effectively free; the first full-tree walk is not.** 0.300 s
-against 55.8 s to acquire, and 21 MB against 1 648 MiB on disk. But the first
-`git status` in a fresh vscode workspace costs 555 s, and the first `commit`
-1 448 s, because both walk every directory once to populate the untracked cache.
-That is **5 328 uncached listings, serialized**. One listing measures 38–126 ms,
-inside DESIGN.md section 11's 250 ms target — the target is per call, and a
-monorepo's first walk multiplies it by several thousand. Warm, the same command
-is 1.75 s. Prefetching that walk is the open item this benchmark argues for.
+**The first full-tree walk was the whole cost, and it is gone.** The first
+`git status` in a fresh vscode workspace used to take **555 s** and the first
+`commit` **1 448 s**, because each walks every directory once to populate the
+untracked cache — 5 328 uncached listings, serialized, at 38–126 ms apiece. Both
+numbers were a *server* cost that had nothing to do with reading trees:
+every snapshot request re-decided object authorization by enumerating and
+peeling all 73 989 refs (24–28 ms), around a directory read that costs ~2.5 µs.
+Deciding that once per ref generation, and answering a recognized walk with one
+recursive `ListTree` instead of one call per directory, leaves cold `status` at
+**2.344 s** and commit at **14.501 s**. `gfs inspect` shows the mechanism at the
+end of the vscode run:
+
+```
+metadata   32 server requests, 5 directory pages, 34225 listing hits
+prefetch   1 walks in 3 pages filling 4318 listings, 1 directories read ahead
+```
+
+Five per-directory listings for a repository with 4 318 directories: the walk
+detector fired after four misses and the rest arrived in three pages.
+
+**Cold is now within a rounding error of warm.** Measured on its own — a `find`
+over every directory, nothing else running — the cold walk is **1.71 s** against
+1.41 s warm on vscode, and **1.27 s** against 1.06 s on django, down from
+1 131 s and 33.0 s. What is left is FUSE and the walker, not the network. The
+old listing cache was also too small to hold a monorepo: bounded at 4 096
+directories against vscode's 4 318, the baseline walk re-fetched what it had
+already listed, 7 283 listings for 4 318 directories.
 
 **A repository-wide search moves no file bytes.** The hydration counters are
 byte-identical either side of searching all 17 926 files:
@@ -123,15 +143,28 @@ schema v2's `repository_refs_by_version` and a batched reconcile it is
 
 - One run per configuration. Clone times in `baseline.md` varied under 1 %; the
   sub-second steps here vary more.
-- The vscode step timings were taken with the pre-fix binary. Only the server
-  import changed; it was re-measured against the same mirror afterwards.
-- `ls-files` reports 6 146 for the clone against 6 245 in the mount **after**
-  each side committed: the clone had already lost 99 matching LFS paths to the
-  smudge failure above.
+- **`ls-files` reports 0 for the raw clone on vscode this run.** The clone's
+  checkout failed under the git-lfs smudge filter (the same failure the commit
+  disagreement above describes) and left no index behind, so the pathspec
+  matched nothing; running `ls-files` in the leftover clone *after* its commit
+  rebuilt the index reports 6 146. This is variance in the baseline leg, not in
+  GFS — the 2026-08-17 run's clone wrote an index and reported 6 146 at this
+  step.
+- **The harness now waits for the index before timing the warm search.** Without
+  that wait an earlier run of this same build recorded 2.385 s on vscode, which
+  is the tail of the index build rather than a query: the cold query fails with
+  `SNAPSHOT_BUILDING` and the warm one used to start immediately after. Measured
+  against a ready index the query is 0.243–0.248 s across runs, and the table's
+  0.248 s is one of them. The cold step keeps its own timing and its error,
+  which is the property it exists to measure.
 - Clone times exclude network transfer. Over a real network the gap widens well
-  past the wall-clock ratio.
-- The edit step is slower on GFS (2.9 s against 0.005 s on vscode) because five
-  writes go through FUSE with copy-up.
+  past the wall-clock ratio — and widens further for the walk, which used to be
+  thousands of serialized round trips and is now a handful.
+- Prefetching moved 1.26 MB of file content speculatively on vscode (one
+  directory read through during the edit step), which is most of the 1.27 MB
+  this workflow hydrated at all. This benchmark barely reads file content, so it
+  measures the metadata half of prefetching and does not vindicate the content
+  half.
 - **The corpus is still the public stand-in set.** Every number moves when
   `spikes/corpus/corpus.conf` points at the real monorepos. Open since M0.1.
 - The harness selects text files for the edit set. An earlier run picked `.mo`

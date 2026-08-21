@@ -91,6 +91,19 @@ pub struct DirectoryPage {
   pub next_page_token: Vec<u8>,
 }
 
+/// One page of a recursive listing: whole directories, never a partial one.
+#[derive(Debug, Default)]
+pub struct TreePage {
+  /// Every entry of every directory in `directories`, in walk order.
+  pub entries: Vec<TreeEntryInfo>,
+  /// The directories this page describes completely, the walk root included.
+  /// An empty directory appears here with no entries, which is the only way to
+  /// tell "listed, and empty" from "not listed".
+  pub directories: Vec<BytePath>,
+  /// Empty when the walk reached the end of the subtree.
+  pub next_page_token: Vec<u8>,
+}
+
 pub struct SnapshotClient {
   grpc: Grpc,
   /// The same channel, a different service. Multiplexed over one connection,
@@ -136,7 +149,12 @@ impl SnapshotClient {
       })?;
 
     Ok(Arc::new(SnapshotClient {
-      grpc: Grpc::new(channel.clone()),
+      // The decode ceiling is raised from tonic's 4 MiB default to the
+      // protocol's own `MAX_RESPONSE_BYTES`. `ListTree` is why: one page of a
+      // recursive listing is thousands of entries, and a response the server is
+      // allowed to build must be one the client is allowed to read.
+      grpc: Grpc::new(channel.clone())
+        .max_decoding_message_size(gfs_types::limits::MAX_RESPONSE_BYTES),
       search_grpc: SearchGrpc::new(channel),
       http: hyper_util::client::legacy::Client::builder(TokioExecutor::new()).build_http(),
       http_endpoint: http_endpoint.trim_end_matches('/').to_owned(),
@@ -300,6 +318,44 @@ impl SnapshotClient {
     }
     Ok(DirectoryPage {
       entries,
+      next_page_token: page.next_page_token,
+    })
+  }
+
+  /// A whole subtree's directories in one round trip.
+  ///
+  /// The call a recognized walk makes instead of one `ListDirectory` per
+  /// directory. Every directory named in the response is complete, so each can
+  /// be cached as an authoritative listing — including the ones with no entries,
+  /// which is why `directories` is carried separately from `entries`.
+  pub async fn list_tree(
+    &self,
+    root: &BytePath,
+    page_token: Vec<u8>,
+    max_entries: u32,
+  ) -> Result<TreePage, GfsError> {
+    let request = self.authed(v1::ListTreeRequest {
+      repository_id: self.binding.repository_id.as_str().to_owned(),
+      commit_oid: self.binding.commit.to_qualified(),
+      path: root.as_bytes().to_vec(),
+      authorization: self.authorization(),
+      max_entries,
+      page_token,
+    })?;
+    let page = self
+      .grpc
+      .clone()
+      .list_tree(request)
+      .await
+      .map_err(|s| convert::from_status(&s))?
+      .into_inner();
+    let mut entries = Vec::with_capacity(page.entries.len());
+    for entry in page.entries {
+      entries.push(entry.try_into_domain(self.binding.algorithm)?);
+    }
+    Ok(TreePage {
+      entries,
+      directories: page.directories.into_iter().map(BytePath::new).collect(),
       next_page_token: page.next_page_token,
     })
   }

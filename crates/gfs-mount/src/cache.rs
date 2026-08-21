@@ -300,6 +300,20 @@ impl BlobCache {
     }
   }
 
+  /// Fetch a blob into the cache without pinning it.
+  ///
+  /// For prefetching, where nothing holds a descriptor: an unread speculative
+  /// blob must stay evictable, or a wrong guess would hold cache space against
+  /// the reads that were right.
+  pub async fn ensure_cached(
+    &self,
+    client: &SnapshotClient,
+    oid: &ObjectId,
+    ticket: &str,
+  ) -> Result<(), GfsError> {
+    self.ensure(client, oid, ticket).await.map(|_| ())
+  }
+
   /// Read a whole blob, going through the cache.
   pub async fn read(
     &self,

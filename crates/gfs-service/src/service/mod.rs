@@ -93,6 +93,7 @@ impl Server {
       authenticator,
       policy,
       Arc::clone(&registry),
+      Arc::clone(&catalog),
       key.clone(),
       lease_policy,
     ));

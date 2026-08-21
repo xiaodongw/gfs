@@ -48,6 +48,7 @@ pub mod listing;
 pub mod mount;
 pub mod odb;
 pub mod passthrough;
+pub mod prefetch;
 pub mod publish;
 pub mod search;
 pub mod session;

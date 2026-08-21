@@ -404,6 +404,10 @@ ListDirectory(repo, commit_oid, path_bytes, page_token, page_size,
               snapshot_authorization?)
   -> { entries[], next_page_token }
 
+ListTree(repo, commit_oid, path_bytes, max_entries, page_token,
+         snapshot_authorization?)
+  -> { entries[], directories[], next_page_token }
+
 BatchGetEntry(repo, commit_oid, path_bytes[], snapshot_authorization?)
   -> { results[] }
 
@@ -426,6 +430,26 @@ Search(repo, commit_oid, query, mode, path_globs, limits,
          }
      }
 ```
+
+`ListTree` is `ListDirectory`'s recursive form and exists because a client walking
+a tree asks the single-directory version once per directory — 5 328 serialized
+round trips for the first `git status` in a vscode workspace. Its pages break
+*between* directories, never inside one, and each response names the directories
+it described (including empty ones, which contribute no entries): a client caches
+a listing in order to answer the *absence* of a name as well as its presence, and
+a listing it cannot know is complete cannot do that. `max_entries` is therefore a
+soft ceiling that the last directory of a page may cross.
+
+Object authorization for these calls is decided once per `(repository, commit,
+ref generation)` rather than per request. The check — is this commit reachable
+from a ref the repository currently shows — enumerates and peels every ref, which
+is 8.7 ms on a 29 311-ref repository and 24–28 ms on a 73 989-ref one, against
+the ~2.5 µs a directory listing itself costs. A caller presenting a mount
+capability skips it entirely: the capability is signed by this server and binds
+subject, repository, and commit, so verifying it answers the same question for
+one HMAC. Every ref observation advances the repository's generation and
+invalidates the memo, and a short TTL bounds staleness from a ref changed
+underneath the server.
 
 Paths are bytes in the protocol, not assumed UTF-8. CLI JSON includes a lossless
 escaped representation.
@@ -629,6 +653,29 @@ costs zero server round trips. The cache stores raw tree entries, never assigned
 inode numbers or synthesized attributes, so serving from it is indistinguishable
 from serving from the server; it is swapped out with the pin, so a repin starts
 empty by construction.
+
+A *cold* walk is a different problem: nothing is cached yet, and the misses are
+serialized because the walk is. The daemon therefore reads the access pattern and
+fetches ahead of it, in two forms, both bounded and both requiring evidence
+before they fire:
+
+- **Metadata.** Several listing misses inside a short window whose paths descend
+  from a common root are a tree walk. The daemon issues one `ListTree` for that
+  root, fills the listing cache from its pages as they arrive, and has later
+  misses inside the same subtree wait on it rather than issue their own call.
+  Measured on the corpus, a cold `find` over a vscode mount goes from 1 131 s
+  (4 318 `ListDirectory` calls) to 1.7 s (4 `ListDirectory` calls and 3
+  `ListTree` pages), which is within 0.3 s of the same walk warm.
+- **Content.** Several distinct files read from one directory are a directory
+  being read through. The daemon fetches that directory's remaining files into
+  the blob cache in the background, skipping files above a per-file bound,
+  stopping at a per-directory byte bound, and charging what it moves against the
+  job's hydration budget — but never spending the budget's reserve, so a wrong
+  guess can never be the reason a real read is refused.
+
+A job that opens one file still pays for one file: neither detector fires without
+repeated evidence, which is what keeps this from becoming the whole-tree
+materialization the design exists to avoid.
 
 Timestamps and inode numbers are load-bearing for build systems, so they are
 specified rather than incidental. A raw Git committer timestamp cannot be used

@@ -58,7 +58,12 @@ impl Catalog {
     new_oid: Option<&ObjectId>,
   ) -> Result<RefObservation, GfsError> {
     let now = now_secs();
-    self.with_tx(|tx| observe_ref_in_tx(tx, repository_id, ref_name, new_oid, now))
+    let outcome =
+      self.with_tx(|tx| observe_ref_in_tx(tx, repository_id, ref_name, new_oid, now))?;
+    if outcome != RefObservation::Unchanged {
+      self.bump_ref_generation(repository_id);
+    }
+    Ok(outcome)
   }
 }
 
@@ -203,7 +208,7 @@ impl Catalog {
       .collect();
 
     let now = now_secs();
-    self.with_tx(|tx| {
+    let changes = self.with_tx(|tx| {
       let mut changes = Vec::new();
 
       for (name, oid) in &actual_map {
@@ -221,7 +226,12 @@ impl Catalog {
         }
       }
       Ok(changes)
-    })
+    });
+    let changes = changes?;
+    if !changes.is_empty() {
+      self.bump_ref_generation(repository_id);
+    }
+    Ok(changes)
   }
 
   pub fn list_refs(&self, repository_id: &RepositoryId) -> Result<Vec<RefRecord>, GfsError> {
@@ -527,9 +537,7 @@ mod tests {
 
     let changes = cat.reconcile_refs(&repo, &actual).unwrap();
     assert_eq!(changes.len(), 64);
-    assert!(changes
-      .iter()
-      .all(|(_, o)| *o == RefObservation::Created));
+    assert!(changes.iter().all(|(_, o)| *o == RefObservation::Created));
 
     let mut versions: Vec<u64> = cat
       .list_refs(&repo)

@@ -41,6 +41,7 @@
 
 pub mod capability;
 pub mod policy;
+pub mod visibility;
 
 use std::sync::Arc;
 
@@ -49,7 +50,9 @@ use gfs_types::{ObjectId, RepositoryId, SubjectId, Timestamp};
 
 pub use capability::{BlobTicket, CapabilityKey, MountCapability};
 pub use policy::{AllowList, RepositoryPolicy};
+pub use visibility::{VisibilityCache, VisibilityStats};
 
+use crate::catalog::Catalog;
 use crate::registry::Registry;
 
 /// An authenticated caller.
@@ -136,8 +139,12 @@ pub struct Authorizer {
   authenticator: Arc<dyn Authenticator>,
   policy: Arc<dyn RepositoryPolicy>,
   registry: Arc<Registry>,
+  /// Read for one thing only: the repository's ref generation, which is what
+  /// makes a memoized reachability verdict safe to reuse.
+  catalog: Arc<Catalog>,
   key: CapabilityKey,
   lease_policy: gfs_types::LeasePolicy,
+  visibility: VisibilityCache,
 }
 
 impl std::fmt::Debug for Authorizer {
@@ -153,6 +160,7 @@ impl Authorizer {
     authenticator: Arc<dyn Authenticator>,
     policy: Arc<dyn RepositoryPolicy>,
     registry: Arc<Registry>,
+    catalog: Arc<Catalog>,
     key: CapabilityKey,
     lease_policy: gfs_types::LeasePolicy,
   ) -> Self {
@@ -160,13 +168,20 @@ impl Authorizer {
       authenticator,
       policy,
       registry,
+      catalog,
       key,
       lease_policy,
+      visibility: VisibilityCache::new(),
     }
   }
 
   pub fn key(&self) -> &CapabilityKey {
     &self.key
+  }
+
+  /// How often reachability was answered from memory rather than by a ref scan.
+  pub fn visibility_stats(&self) -> VisibilityStats {
+    self.visibility.stats()
   }
 
   pub fn authenticate(&self, bearer: &str) -> Result<Identity, GfsError> {
@@ -201,16 +216,34 @@ impl Authorizer {
 
   /// Object-level authorization for one commit.
   ///
-  /// Two ways to be allowed, in this order:
+  /// Two ways to be allowed:
   ///
-  /// 1. the commit is reachable from a currently visible ref -- ordinary access;
-  /// 2. the caller presents a mount capability binding *this* subject, repository,
-  ///    and commit.
+  /// 1. the caller presents a mount capability binding *this* subject,
+  ///    repository, and commit;
+  /// 2. the commit is reachable from a currently visible ref -- ordinary access.
   ///
-  /// The subject binding is the point. Without it, any repository reader could
-  /// present any leaked capability, and DESIGN.md section 7.1's guarantee --
-  /// "repository access alone does not grant access to every commit retained for
-  /// another mount" -- would be false.
+  /// The subject binding is the point of (1). Without it, any repository reader
+  /// could present any leaked capability, and DESIGN.md section 7.1's guarantee
+  /// -- "repository access alone does not grant access to every commit retained
+  /// for another mount" -- would be false. Repository authorization is checked
+  /// before either route, so a capability outlives neither a revoked repository
+  /// grant nor its own expiry.
+  ///
+  /// # Why the capability is tried first
+  ///
+  /// It used to be tried second, as a fallback for a commit no ref reaches. That
+  /// ordering made every request from a mount -- which always carries a
+  /// capability -- pay a full ref scan first, and on the benchmark corpus that
+  /// scan *is* the request: 8.7 ms of django's 8.7 ms listing, 24-28 ms of
+  /// vscode's. Verifying the capability is one HMAC over a short string.
+  ///
+  /// The two routes are equally authoritative -- the capability is signed by
+  /// this server and binds the exact commit -- so trying the cheap one first
+  /// changes no outcome. It does change what audit records: `via_capability` now
+  /// means "the caller presented a capability and it was used", not "no visible
+  /// ref reached this commit". An expired or non-matching capability still falls
+  /// through to the reachability check, so a mount whose lease lapsed keeps
+  /// reading a commit that is still on a branch.
   pub async fn authorize_commit(
     &self,
     subject: &SubjectId,
@@ -220,8 +253,36 @@ impl Authorizer {
   ) -> Result<CommitAccess, GfsError> {
     self.authorize_repository(subject, repository_id)?;
 
-    let repo = self.registry.repository(repository_id)?;
-    if repo.is_visible(commit.clone()).await? {
+    // Held rather than returned: a capability that does not authorize this
+    // request must not fail it while the commit is still reachable from a ref.
+    // It becomes the failure only once reachability has also said no, which is
+    // what keeps an expired capability reported as `Expired` to its owner
+    // instead of masked -- they need to know to renew, and the token already
+    // proved they knew the commit exists.
+    let mut refusal: Option<GfsError> = None;
+
+    if let Some(token) = auth.mount_capability.as_deref() {
+      match MountCapability::verify(&self.key, token, Timestamp::now()) {
+        // Every binding is checked. A capability for another subject, another
+        // repository, or another commit is not a capability for this request.
+        Ok(cap)
+          if &cap.subject == subject
+            && &cap.repository_id == repository_id
+            && &cap.commit == commit =>
+        {
+          return Ok(CommitAccess {
+            repository_id: repository_id.clone(),
+            commit: commit.clone(),
+            subject: subject.clone(),
+            via_capability: true,
+          });
+        }
+        Ok(_) => refusal = Some(GfsError::masked_denial("no such commit")),
+        Err(e) => refusal = Some(e),
+      }
+    }
+
+    if self.is_visible(repository_id, commit).await? {
       return Ok(CommitAccess {
         repository_id: repository_id.clone(),
         commit: commit.clone(),
@@ -230,26 +291,34 @@ impl Authorizer {
       });
     }
 
-    // Not reachable from any visible ref. Only a matching capability gets in.
-    let Some(token) = auth.mount_capability.as_deref() else {
-      // Masked: the alternative tells an unauthorized caller that a commit exists
-      // and is lease-retained, which is a fact about another subject's job.
-      return Err(GfsError::masked_denial("no such commit"));
-    };
-    let cap = MountCapability::verify(&self.key, token, Timestamp::now())?;
+    // Neither route. Masked by default: the alternative tells an unauthorized
+    // caller that a commit exists and is lease-retained, which is a fact about
+    // another subject's job.
+    Err(refusal.unwrap_or_else(|| GfsError::masked_denial("no such commit")))
+  }
 
-    // Every binding is checked. A capability for another subject, another
-    // repository, or another commit is not a capability for this request.
-    if &cap.subject != subject || &cap.repository_id != repository_id || &cap.commit != commit {
-      return Err(GfsError::masked_denial("no such commit"));
+  /// Whether a commit is reachable from a ref the repository currently shows,
+  /// answered from [`VisibilityCache`] when a verdict for this ref generation is
+  /// still fresh.
+  ///
+  /// The generation is read *before* the scan, so a ref change that lands during
+  /// it stamps the verdict with the generation it was computed under and the
+  /// next caller recomputes.
+  async fn is_visible(
+    &self,
+    repository_id: &RepositoryId,
+    commit: &ObjectId,
+  ) -> Result<bool, GfsError> {
+    let generation = self.catalog.ref_generation(repository_id);
+    if let Some(visible) = self.visibility.get(repository_id, commit, generation) {
+      return Ok(visible);
     }
-
-    Ok(CommitAccess {
-      repository_id: repository_id.clone(),
-      commit: commit.clone(),
-      subject: subject.clone(),
-      via_capability: true,
-    })
+    let repo = self.registry.repository(repository_id)?;
+    let visible = repo.is_visible(commit.clone()).await?;
+    self
+      .visibility
+      .insert(repository_id, commit, generation, visible);
+    Ok(visible)
   }
 
   /// Mint a blob ticket for an authorized commit.

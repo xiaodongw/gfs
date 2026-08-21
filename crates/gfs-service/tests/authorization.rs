@@ -73,6 +73,7 @@ impl Harness {
       authenticator,
       policy,
       Arc::clone(&registry),
+      Arc::clone(&catalog),
       key.clone(),
       policy_lease,
     );
@@ -262,6 +263,74 @@ async fn a_visible_commit_needs_no_capability() {
     .await
     .unwrap();
   assert!(!access.via_capability);
+}
+
+/// The reachability scan is the expensive half of authorization -- a full ref
+/// enumeration, 8.7 ms on django and 24-28 ms on vscode -- and a directory walk
+/// asks the same question thousands of times about one commit. It must be
+/// decided once per ref generation, and re-decided as soon as a ref moves.
+#[tokio::test]
+async fn a_reachability_verdict_is_decided_once_per_ref_generation() {
+  let h = Harness::new();
+  let commit = h.repo().resolve(&h.selector("main")).unwrap().commit;
+  let none = SnapshotAuthorization::default();
+  let ask = || {
+    h.authz
+      .authorize_commit(&h.owner, &h.repo_id, &commit, &none)
+  };
+
+  ask().await.unwrap();
+  ask().await.unwrap();
+  ask().await.unwrap();
+  let stats = h.authz.visibility_stats();
+  assert_eq!(stats.misses, 1, "the ref scan must run once, not per call");
+  assert_eq!(stats.hits, 2);
+
+  // Any observed ref change advances the generation, and the next question is
+  // answered against the repository rather than from memory.
+  h.catalog
+    .observe_ref(&h.repo_id, "refs/heads/another", Some(&commit))
+    .unwrap();
+  ask().await.unwrap();
+  assert_eq!(h.authz.visibility_stats().misses, 2);
+}
+
+/// A mount sends its capability on every call, and it is enough on its own: the
+/// request must not pay a ref scan to discover that the commit is also on a
+/// branch. This is the property that makes a cold `git status` over a mount cost
+/// listings rather than ref enumerations.
+#[tokio::test]
+async fn a_capability_authorizes_without_a_reachability_scan() {
+  let h = Harness::new();
+  let grant = h
+    .mounts
+    .create_mount(&h.repo_id, h.selector("main"), &h.owner, None)
+    .await
+    .unwrap();
+  let before = h.authz.visibility_stats();
+
+  for _ in 0..5 {
+    let access = h
+      .authz
+      .authorize_commit(
+        &h.owner,
+        &h.repo_id,
+        &grant.commit,
+        &SnapshotAuthorization {
+          mount_capability: Some(grant.capability.clone()),
+        },
+      )
+      .await
+      .unwrap();
+    assert!(access.via_capability);
+  }
+
+  let after = h.authz.visibility_stats();
+  assert_eq!(
+    (after.hits - before.hits, after.misses - before.misses),
+    (0, 0),
+    "a capability-authorized call must not consult reachability at all"
+  );
 }
 
 #[tokio::test]

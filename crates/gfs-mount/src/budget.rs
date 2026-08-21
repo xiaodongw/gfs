@@ -162,6 +162,24 @@ impl HydrationBudget {
     Ok(())
   }
 
+  /// The limit itself, or zero when unlimited.
+  pub fn limit(&self) -> u64 {
+    self.limit
+  }
+
+  /// Bytes still available, or `None` when unlimited.
+  ///
+  /// Advisory, and used by prefetching to stop before the reserve: a real read
+  /// decides at [`HydrationBudget::admit`], which is the only place that
+  /// charges, so nothing here can let a job past the limit.
+  pub fn remaining(&self) -> Option<u64> {
+    if self.is_unlimited() {
+      return None;
+    }
+    let state = self.state.lock().expect("hydration budget");
+    Some(self.limit.saturating_sub(state.charged))
+  }
+
   pub fn report(&self) -> BudgetReport {
     let state = self.state.lock().expect("hydration budget");
     BudgetReport {

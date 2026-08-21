@@ -419,6 +419,136 @@ fn paging_a_large_directory_returns_every_entry_exactly_once() {
   assert!(seen.iter().any(|p| p == b"many/pager"));
 }
 
+/// The directory a path sits in, as `list_tree` groups them.
+fn parent_of(path: &BytePath) -> Vec<u8> {
+  let bytes = path.as_bytes();
+  match bytes.iter().rposition(|b| *b == b'/') {
+    Some(i) => bytes[..i].to_vec(),
+    None => Vec::new(),
+  }
+}
+
+/// The recursive listing has to agree with the one-directory-at-a-time listing
+/// it replaces, entry for entry -- a client fills the same cache from either.
+#[test]
+fn a_recursive_listing_returns_every_directory_completely() {
+  let repo = open("modes");
+  let commit = head(&repo);
+
+  let page = repo
+    .list_tree(&commit, &BytePath::root(), None, 100_000)
+    .unwrap();
+  assert_eq!(page.next_page_token, None);
+
+  // Every directory Git reports, including the gitlink, and no others.
+  let bare = gfs_test::bare("modes");
+  let mut expected: Vec<Vec<u8>> = vec![Vec::new()];
+  for line in gfs_test::git(&bare, &["ls-tree", "-r", "-t", "HEAD"])
+    .unwrap()
+    .lines()
+  {
+    let (meta, path) = line.split_once('\t').unwrap();
+    let kind = meta.split_whitespace().nth(1).unwrap();
+    if kind == "tree" || kind == "commit" {
+      expected.push(path.as_bytes().to_vec());
+    }
+  }
+  expected.sort();
+  let mut listed: Vec<Vec<u8>> = page
+    .directories
+    .iter()
+    .map(|d| d.as_bytes().to_vec())
+    .collect();
+  listed.sort();
+  assert_eq!(listed, expected);
+
+  // And each one's entries are exactly what `list_directory` answers for it.
+  for dir in &page.directories {
+    let one = repo.list_directory(&commit, dir, None, 10_000).unwrap();
+    let from_walk: Vec<&gfs_types::TreeEntryInfo> = page
+      .entries
+      .iter()
+      .filter(|e| parent_of(&e.path) == dir.as_bytes())
+      .collect();
+    assert_eq!(
+      from_walk.len(),
+      one.entries.len(),
+      "{} disagrees on entry count",
+      dir.escaped()
+    );
+    for (walked, listed) in from_walk.iter().zip(one.entries.iter()) {
+      assert_eq!(walked.path, listed.path);
+      assert_eq!(walked.oid, listed.oid);
+      assert_eq!(walked.size, listed.size);
+      assert_eq!(walked.kind, listed.kind);
+      assert_eq!(walked.symlink_target, listed.symlink_target);
+    }
+  }
+}
+
+/// Paging must break between directories, never inside one: a client caches
+/// what it receives as a *complete* listing, so half a directory is not a
+/// smaller answer but a wrong one.
+#[test]
+fn a_paged_recursive_listing_never_splits_a_directory() {
+  let repo = open("bigdir");
+  let commit = head(&repo);
+
+  let whole = repo
+    .list_tree(
+      &commit,
+      &BytePath::root(),
+      None,
+      limits::MAX_TREE_PAGE_ENTRIES,
+    )
+    .unwrap();
+
+  let mut entries = Vec::new();
+  let mut directories = Vec::new();
+  let mut token: Option<Vec<u8>> = None;
+  let mut pages = 0;
+  loop {
+    // One entry per page: the most aggressive split a caller can ask for, and
+    // the case where "a page never splits a directory" has to hold by finishing
+    // the directory rather than by the cap not binding.
+    let page = repo
+      .list_tree(&commit, &BytePath::root(), token.as_deref(), 1)
+      .unwrap();
+    pages += 1;
+    assert!(pages < 100, "pagination did not terminate");
+    for dir in &page.directories {
+      let count = page
+        .entries
+        .iter()
+        .filter(|e| parent_of(&e.path) == dir.as_bytes())
+        .count();
+      let expected = repo
+        .list_directory(&commit, dir, None, limits::MAX_DIRECTORY_PAGE_SIZE)
+        .unwrap()
+        .entries
+        .len();
+      assert_eq!(count, expected, "{} arrived in pieces", dir.escaped());
+    }
+    entries.extend(page.entries);
+    directories.extend(page.directories);
+    match page.next_page_token {
+      None => break,
+      Some(t) => token = Some(t),
+    }
+  }
+
+  assert!(pages > 1, "the fixture must actually page");
+  assert_eq!(
+    entries.iter().map(|e| e.path.clone()).collect::<Vec<_>>(),
+    whole
+      .entries
+      .iter()
+      .map(|e| e.path.clone())
+      .collect::<Vec<_>>(),
+  );
+  assert_eq!(directories, whole.directories);
+}
+
 #[test]
 fn a_page_size_above_the_limit_is_clamped_rather_than_honoured() {
   let repo = open("bigdir");
@@ -548,7 +678,9 @@ fn an_lfs_entry_expands_when_its_object_is_available_and_degrades_when_not() {
   assert_eq!(psd.size, 12345);
 
   // The same entry through a directory listing must agree with GetEntry.
-  let page = repo.list_directory(&commit, &BytePath::root(), None, 100).unwrap();
+  let page = repo
+    .list_directory(&commit, &BytePath::root(), None, 100)
+    .unwrap();
   let listed = page
     .entries
     .iter()
@@ -577,7 +709,9 @@ fn an_lfs_entry_expands_when_its_object_is_available_and_degrades_when_not() {
   );
 
   // The write path's question: which paths must be re-cleaned on commit.
-  assert!(repo.lfs_filtered(&commit, &BytePath::new("asset.psd")).unwrap());
+  assert!(repo
+    .lfs_filtered(&commit, &BytePath::new("asset.psd"))
+    .unwrap());
   assert!(!repo
     .lfs_filtered(&commit, &BytePath::new("converted.txt"))
     .unwrap());

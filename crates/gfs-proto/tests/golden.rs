@@ -156,6 +156,28 @@ const PINNED: &[(&str, &[Field])] = &[
     ],
   ),
   (
+    "ListTreeRequest",
+    &[
+      (1, "repository_id", "string"),
+      (2, "commit_oid", "string"),
+      (3, "path", "bytes"),
+      (4, "authorization", ".gfs.v1.SnapshotAuthorization"),
+      (5, "max_entries", "uint32"),
+      // Bytes for the same reason `ListDirectoryRequest.page_token` is: it is a
+      // path, and Git does not constrain those to UTF-8.
+      (6, "page_token", "bytes"),
+    ],
+  ),
+  (
+    "ListTreeResponse",
+    &[
+      (1, "entries", ".gfs.v1.TreeEntry"),
+      (2, "directories", "bytes"),
+      (3, "next_page_token", "bytes"),
+      (4, "commit_oid", "string"),
+    ],
+  ),
+  (
     "BatchGetEntryRequest",
     &[
       (1, "repository_id", "string"),
@@ -697,6 +719,7 @@ fn service_methods_are_stable() {
     "SnapshotService/GetEntry(.gfs.v1.GetEntryRequest) -> .gfs.v1.GetEntryResponse",
     "SnapshotService/ListDirectory(.gfs.v1.ListDirectoryRequest) -> .gfs.v1.ListDirectoryResponse",
     "SnapshotService/ListRefs(.gfs.v1.ListRefsRequest) -> .gfs.v1.ListRefsResponse",
+    "SnapshotService/ListTree(.gfs.v1.ListTreeRequest) -> .gfs.v1.ListTreeResponse",
     "SnapshotService/Log(.gfs.v1.LogRequest) -> .gfs.v1.LogResponse",
     "SnapshotService/PrepareSnapshot(.gfs.v1.PrepareSnapshotRequest) -> .gfs.v1.PrepareSnapshotResponse",
     "SnapshotService/ReleaseMount(.gfs.v1.ReleaseMountRequest) -> .gfs.v1.ReleaseMountResponse",

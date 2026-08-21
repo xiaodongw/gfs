@@ -898,6 +898,19 @@ fn print_report(report: &gfs_mount::control::MountReport) {
     "metadata   {} server requests, {} directory pages, {} listing hits",
     report.stats.metadata_requests, report.stats.directory_pages, report.stats.listing_hits
   );
+  // The prefetch line answers "did reading the pattern pay off": listings
+  // filled by a recursive fetch are the round trips a walk did not make, and
+  // prefetched bytes are what speculation cost.
+  println!(
+    "prefetch   {} walks in {} pages filling {} listings, {} directories read ahead \
+     ({} blobs, {} bytes)",
+    report.stats.tree_prefetches,
+    report.stats.tree_pages,
+    report.stats.prefetched_listings,
+    report.stats.content_prefetches,
+    report.stats.prefetched_blobs,
+    report.stats.prefetched_bytes
+  );
   // The budget line names the remedy, because the EDQUOT the job saw could not
   // (a FUSE reply is an errno, with no room for prose -- ADR 0009).
   if report.budget.limit_bytes > 0 {

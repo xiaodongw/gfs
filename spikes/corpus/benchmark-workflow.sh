@@ -248,6 +248,20 @@ run_one() { # $1 = repository id
       >"$WORK/$repo/search-cold.out" 2>"$WORK/$repo/search-cold.err" )
   c_grep_rc=$?; t1=$(now)
   c_grep_s=$(el "$t0" "$t1"); c_grep=$(wc -l <"$WORK/$repo/search-cold.out")
+  # The warm query must measure a *ready* index, not the tail of the build. The
+  # 2026-08-21 run recorded 2.385 s here on vscode without this wait, against
+  # 0.245 s for the same query once the build had finished -- a number that
+  # reads as a search regression and is not one. The cold step above keeps its
+  # own timing and its `SNAPSHOT_BUILDING` error, which is the property being
+  # measured there.
+  # Exit 2 is ADR 0004's "the search did not complete", which is what an
+  # unbuilt index answers; every other code means the index replied. Not
+  # `&& break`: `-m 1` truncates, and truncation is exit 3.
+  for _ in $(seq 1 600); do
+    ( cd "$ws" && "$BIN/gfs" rg -F "$grep_pat" -m 1 >/dev/null 2>&1 )
+    [ $? -ne 2 ] && break
+    sleep 0.5
+  done
   t0=$(now)
   ( cd "$ws" && "$BIN/gfs" rg -F "$grep_pat" -m "$max_results" \
       >"$WORK/$repo/search-warm.out" 2>"$WORK/$repo/search-warm.err" )

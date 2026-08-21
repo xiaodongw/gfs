@@ -116,11 +116,8 @@ impl Registry {
     if let Some(repo) = open.get(id).cloned() {
       return Ok(repo);
     }
-    let mut repo = Libgit2Repository::open(
-      &record.repo_path,
-      self.max_handles,
-      self.tree_cache_bytes,
-    )?;
+    let mut repo =
+      Libgit2Repository::open(&record.repo_path, self.max_handles, self.tree_cache_bytes)?;
     if let Some(store) = self.lfs_store() {
       repo = repo.with_lfs_check(Arc::new(StoreCheck {
         store,
@@ -136,12 +133,18 @@ impl Registry {
   ///
   /// Needed after maintenance replaces packs, and after a repository leaves and
   /// re-enters the servable state.
+  ///
+  /// Advances the ref generation as well. An eviction says the repository's
+  /// on-disk state changed underneath the server, and the memoized reachability
+  /// verdicts in [`crate::auth::VisibilityCache`] are facts about exactly that
+  /// state -- so the same call that discards the handle discards them.
   pub fn evict(&self, id: &RepositoryId) {
     self
       .open
       .write()
       .unwrap_or_else(|e| e.into_inner())
       .remove(id);
+    self.catalog.bump_ref_generation(id);
   }
 
   /// Open a repository and confirm its format, moving it from `CREATING` to
