@@ -592,8 +592,60 @@ footer .mono { font-size: 12px; letter-spacing: .04em; }
             <marker id="ars" markerWidth="9" markerHeight="9" refX="8" refY="4.5" orient="auto">
               <path d="M0,1 L8,4.5 L0,8 z" fill="var(--server)"/>
             </marker>
+            <filter id="tipshadow" x="-25%" y="-25%" width="150%" height="150%">
+              <feDropShadow dx="0" dy="7" stdDeviation="9" flood-color="#0F1519" flood-opacity=".26"/>
+            </filter>
           </defs>
-          <g font-family="JetBrains Mono, ui-monospace, monospace">
+          <style>
+            /* Hover (or focus) a box to reveal its what / why / how panel.
+               The panels are the last children of #arch-g, so they paint on top
+               of everything and a plain sibling selector is all this needs. */
+            #arch-g .node { cursor: help; }
+            #arch-g .node > rect { transition: stroke-width .12s ease; }
+            #arch-g .node:hover > rect { stroke-width: 1.9; }
+            #arch-g .node:focus { outline: none; }
+            #arch-g .node:focus-visible > rect { stroke: var(--client); stroke-width: 2; }
+            #arch-g > path { pointer-events: none; }
+
+            #arch-g .tip {
+              opacity: 0; pointer-events: none; transition: opacity .12s ease;
+              font-family: "Ubuntu", system-ui, -apple-system, "Segoe UI", sans-serif;
+            }
+            #arch-g .tip-bg { fill: var(--surface); stroke: var(--line-strong); filter: url(#tipshadow); }
+            #arch-g .tip-h { font-size: 12.5px; font-weight: 600; fill: var(--ink); }
+            #arch-g .tip-k {
+              font-family: "JetBrains Mono", ui-monospace, monospace;
+              font-size: 9.5px; letter-spacing: .07em; fill: var(--ink-3);
+            }
+            #arch-g .tip-v { font-size: 11.5px; fill: var(--ink-2); }
+
+            #n-agent:hover ~ #t-agent, #n-agent:focus ~ #t-agent,
+            #n-shims:hover ~ #t-shims, #n-shims:focus ~ #t-shims,
+            #n-kfuse:hover ~ #t-kfuse, #n-kfuse:focus ~ #t-kfuse,
+            #n-stockgit:hover ~ #t-stockgit, #n-stockgit:focus ~ #t-stockgit,
+            #n-finder:hover ~ #t-finder, #n-finder:focus ~ #t-finder,
+            #n-workspace:hover ~ #t-workspace, #n-workspace:focus ~ #t-workspace,
+            #n-daemon:hover ~ #t-daemon, #n-daemon:focus ~ #t-daemon,
+            #n-blobcache:hover ~ #t-blobcache, #n-blobcache:focus ~ #t-blobcache,
+            #n-listcache:hover ~ #t-listcache, #n-listcache:focus ~ #t-listcache,
+            #n-blockcache:hover ~ #t-blockcache, #n-blockcache:focus ~ #t-blockcache,
+            #n-budget:hover ~ #t-budget, #n-budget:focus ~ #t-budget,
+            #n-overlay:hover ~ #t-overlay, #n-overlay:focus ~ #t-overlay,
+            #n-lease:hover ~ #t-lease, #n-lease:focus ~ #t-lease,
+            #n-snapshot:hover ~ #t-snapshot, #n-snapshot:focus ~ #t-snapshot,
+            #n-search:hover ~ #t-search, #n-search:focus ~ #t-search,
+            #n-lfs:hover ~ #t-lfs, #n-lfs:focus ~ #t-lfs,
+            #n-gateway:hover ~ #t-gateway, #n-gateway:focus ~ #t-gateway,
+            #n-dav:hover ~ #t-dav, #n-dav:focus ~ #t-dav,
+            #n-bare:hover ~ #t-bare, #n-bare:focus ~ #t-bare {
+              opacity: 1;
+            }
+
+            @media (prefers-reduced-motion: reduce) {
+              #arch-g .tip, #arch-g .node > rect { transition: none; }
+            }
+          </style>
+          <g id="arch-g" font-family="JetBrains Mono, ui-monospace, monospace">
 
             <!-- lane frames -->
             <rect x="8" y="46" width="276" height="470" rx="6" fill="none" stroke="var(--line)" stroke-dasharray="3 4"/>
@@ -604,78 +656,116 @@ footer .mono { font-size: 12px; letter-spacing: .04em; }
             <text x="690" y="34" font-size="12" letter-spacing="1.6" fill="var(--server)">GFS-SERVER</text>
 
             <!-- agent lane -->
-            <rect x="30" y="70" width="232" height="66" rx="4" fill="var(--surface-2)" stroke="var(--line)"/>
-            <text x="46" y="96" font-size="14" fill="var(--ink)">agent process</text>
-            <text x="46" y="118" font-size="12" fill="var(--ink-3)">git &middot; rg &middot; cc &middot; editors &middot; LSP</text>
+            <g class="node" id="n-agent" tabindex="0" role="group" aria-label="agent process" aria-describedby="t-agent">
+              <rect x="30" y="70" width="232" height="66" rx="4" fill="var(--surface-2)" stroke="var(--line)"/>
+              <text x="46" y="96" font-size="14" fill="var(--ink)">agent process</text>
+              <text x="46" y="118" font-size="12" fill="var(--ink-3)">git &middot; rg &middot; cc &middot; editors &middot; LSP</text>
+            </g>
 
-            <rect x="30" y="156" width="232" height="60" rx="4" fill="var(--client-soft)" stroke="var(--client)"/>
-            <text x="46" y="181" font-size="14" fill="var(--client)">PATH shims</text>
-            <text x="46" y="201" font-size="12" fill="var(--ink-3)">git &middot; grep &middot; find &middot; rg &rarr; cheap route</text>
+            <g class="node" id="n-shims" tabindex="0" role="group" aria-label="PATH shims" aria-describedby="t-shims">
+              <rect x="30" y="156" width="232" height="60" rx="4" fill="var(--client-soft)" stroke="var(--client)"/>
+              <text x="46" y="181" font-size="14" fill="var(--client)">PATH shims</text>
+              <text x="46" y="201" font-size="12" fill="var(--ink-3)">git &middot; grep &middot; find &middot; rg &rarr; cheap route</text>
+            </g>
 
-            <rect x="30" y="238" width="232" height="60" rx="4" fill="var(--surface-2)" stroke="var(--line)"/>
-            <text x="46" y="263" font-size="14" fill="var(--ink)">kernel FUSE</text>
-            <text x="46" y="283" font-size="12" fill="var(--ink-3)">/dev/fuse &middot; dentry + attr cache</text>
+            <g class="node" id="n-kfuse" tabindex="0" role="group" aria-label="kernel FUSE" aria-describedby="t-kfuse">
+              <rect x="30" y="238" width="232" height="60" rx="4" fill="var(--surface-2)" stroke="var(--line)"/>
+              <text x="46" y="263" font-size="14" fill="var(--ink)">kernel FUSE</text>
+              <text x="46" y="283" font-size="12" fill="var(--ink-3)">/dev/fuse &middot; dentry + attr cache</text>
+            </g>
 
-            <rect x="30" y="330" width="232" height="60" rx="4" fill="var(--surface-2)" stroke="var(--line)"/>
-            <text x="46" y="355" font-size="14" fill="var(--ink)">stock git client</text>
-            <text x="46" y="375" font-size="12" fill="var(--ink-3)">clone / fetch / push</text>
+            <g class="node" id="n-stockgit" tabindex="0" role="group" aria-label="stock git client" aria-describedby="t-stockgit">
+              <rect x="30" y="330" width="232" height="60" rx="4" fill="var(--surface-2)" stroke="var(--line)"/>
+              <text x="46" y="355" font-size="14" fill="var(--ink)">stock git client</text>
+              <text x="46" y="375" font-size="12" fill="var(--ink-3)">clone / fetch / push</text>
+            </g>
 
-            <rect x="30" y="412" width="232" height="60" rx="4" fill="var(--surface-2)" stroke="var(--line)"/>
-            <text x="46" y="437" font-size="14" fill="var(--ink)">Finder / Explorer</text>
-            <text x="46" y="457" font-size="12" fill="var(--ink-3)">no client software</text>
+            <g class="node" id="n-finder" tabindex="0" role="group" aria-label="Finder / Explorer" aria-describedby="t-finder">
+              <rect x="30" y="412" width="232" height="60" rx="4" fill="var(--surface-2)" stroke="var(--line)"/>
+              <text x="46" y="437" font-size="14" fill="var(--ink)">Finder / Explorer</text>
+              <text x="46" y="457" font-size="12" fill="var(--ink-3)">no client software</text>
+            </g>
 
             <!-- host lane -->
-            <rect x="338" y="70" width="286" height="76" rx="4" fill="var(--client-soft)" stroke="var(--client)"/>
-            <text x="356" y="96" font-size="14" fill="var(--client)">workspace mount</text>
-            <text x="356" y="117" font-size="12" fill="var(--ink-3)">projected tree + passthrough .git</text>
-            <text x="356" y="135" font-size="12" fill="var(--ink-3)">bind-mounted into the job</text>
+            <g class="node" id="n-workspace" tabindex="0" role="group" aria-label="workspace mount" aria-describedby="t-workspace">
+              <rect x="338" y="70" width="286" height="76" rx="4" fill="var(--client-soft)" stroke="var(--client)"/>
+              <text x="356" y="96" font-size="14" fill="var(--client)">workspace mount</text>
+              <text x="356" y="117" font-size="12" fill="var(--ink-3)">projected tree + passthrough .git</text>
+              <text x="356" y="135" font-size="12" fill="var(--ink-3)">bind-mounted into the job</text>
+            </g>
 
-            <rect x="338" y="166" width="286" height="150" rx="4" fill="var(--surface)" stroke="var(--client)"/>
-            <text x="356" y="192" font-size="14" fill="var(--client)">gfs-fuse host daemon</text>
-            <rect x="352" y="206" width="128" height="44" rx="3" fill="var(--surface-2)" stroke="var(--line)"/>
-            <text x="364" y="224" font-size="11.5" fill="var(--ink)">blob cache</text>
-            <text x="364" y="240" font-size="11" fill="var(--ink-3)">per repo, shared</text>
-            <rect x="490" y="206" width="120" height="44" rx="3" fill="var(--surface-2)" stroke="var(--line)"/>
-            <text x="502" y="224" font-size="11.5" fill="var(--ink)">listing cache</text>
-            <text x="502" y="240" font-size="11" fill="var(--ink-3)">per pin, LRU</text>
-            <rect x="352" y="258" width="128" height="44" rx="3" fill="var(--surface-2)" stroke="var(--line)"/>
-            <text x="364" y="276" font-size="11.5" fill="var(--ink)">block cache</text>
-            <text x="364" y="292" font-size="11" fill="var(--ink-3)">64 KiB, pack-keyed</text>
-            <rect x="490" y="258" width="120" height="44" rx="3" fill="var(--surface-2)" stroke="var(--line)"/>
-            <text x="502" y="276" font-size="11.5" fill="var(--ink)">budget</text>
-            <text x="502" y="292" font-size="11" fill="var(--ink-3)">EDQUOT at open</text>
+            <g class="node" id="n-daemon" tabindex="0" role="group" aria-label="gfs-fuse host daemon" aria-describedby="t-daemon">
+              <rect x="338" y="166" width="286" height="150" rx="4" fill="var(--surface)" stroke="var(--client)"/>
+              <text x="356" y="192" font-size="14" fill="var(--client)">gfs-fuse host daemon</text>
+            </g>
+            <g class="node" id="n-blobcache" tabindex="0" role="group" aria-label="blob cache" aria-describedby="t-blobcache">
+              <rect x="352" y="206" width="128" height="44" rx="3" fill="var(--surface-2)" stroke="var(--line)"/>
+              <text x="364" y="224" font-size="11.5" fill="var(--ink)">blob cache</text>
+              <text x="364" y="240" font-size="11" fill="var(--ink-3)">per repo, shared</text>
+            </g>
+            <g class="node" id="n-listcache" tabindex="0" role="group" aria-label="listing cache" aria-describedby="t-listcache">
+              <rect x="490" y="206" width="120" height="44" rx="3" fill="var(--surface-2)" stroke="var(--line)"/>
+              <text x="502" y="224" font-size="11.5" fill="var(--ink)">listing cache</text>
+              <text x="502" y="240" font-size="11" fill="var(--ink-3)">per pin, LRU</text>
+            </g>
+            <g class="node" id="n-blockcache" tabindex="0" role="group" aria-label="block cache" aria-describedby="t-blockcache">
+              <rect x="352" y="258" width="128" height="44" rx="3" fill="var(--surface-2)" stroke="var(--line)"/>
+              <text x="364" y="276" font-size="11.5" fill="var(--ink)">block cache</text>
+              <text x="364" y="292" font-size="11" fill="var(--ink-3)">64 KiB, pack-keyed</text>
+            </g>
+            <g class="node" id="n-budget" tabindex="0" role="group" aria-label="budget" aria-describedby="t-budget">
+              <rect x="490" y="258" width="120" height="44" rx="3" fill="var(--surface-2)" stroke="var(--line)"/>
+              <text x="502" y="276" font-size="11.5" fill="var(--ink)">budget</text>
+              <text x="502" y="292" font-size="11" fill="var(--ink-3)">EDQUOT at open</text>
+            </g>
 
-            <rect x="338" y="336" width="286" height="66" rx="4" fill="var(--surface)" stroke="var(--client)"/>
-            <text x="356" y="362" font-size="14" fill="var(--client)">overlay + journal</text>
-            <text x="356" y="383" font-size="12" fill="var(--ink-3)">copy-on-write, whiteouts, renames</text>
+            <g class="node" id="n-overlay" tabindex="0" role="group" aria-label="overlay + journal" aria-describedby="t-overlay">
+              <rect x="338" y="336" width="286" height="66" rx="4" fill="var(--surface)" stroke="var(--client)"/>
+              <text x="356" y="362" font-size="14" fill="var(--client)">overlay + journal</text>
+              <text x="356" y="383" font-size="12" fill="var(--ink-3)">copy-on-write, whiteouts, renames</text>
+            </g>
 
-            <rect x="338" y="422" width="286" height="66" rx="4" fill="var(--surface)" stroke="var(--client)"/>
-            <text x="356" y="448" font-size="14" fill="var(--client)">lease heartbeat</text>
-            <text x="356" y="469" font-size="12" fill="var(--ink-3)">keeps the pinned commit reachable</text>
+            <g class="node" id="n-lease" tabindex="0" role="group" aria-label="lease heartbeat" aria-describedby="t-lease">
+              <rect x="338" y="422" width="286" height="66" rx="4" fill="var(--surface)" stroke="var(--client)"/>
+              <text x="356" y="448" font-size="14" fill="var(--client)">lease heartbeat</text>
+              <text x="356" y="469" font-size="12" fill="var(--ink-3)">keeps the pinned commit reachable</text>
+            </g>
 
             <!-- server lane -->
-            <rect x="700" y="70" width="290" height="66" rx="4" fill="var(--server-soft)" stroke="var(--server)"/>
-            <text x="718" y="96" font-size="14" fill="var(--server)">snapshot service</text>
-            <text x="718" y="117" font-size="12" fill="var(--ink-3)">GetEntry &middot; ListDirectory &middot; blobs</text>
+            <g class="node" id="n-snapshot" tabindex="0" role="group" aria-label="snapshot service" aria-describedby="t-snapshot">
+              <rect x="700" y="70" width="290" height="66" rx="4" fill="var(--server-soft)" stroke="var(--server)"/>
+              <text x="718" y="96" font-size="14" fill="var(--server)">snapshot service</text>
+              <text x="718" y="117" font-size="12" fill="var(--ink-3)">GetEntry &middot; ListDirectory &middot; blobs</text>
+            </g>
 
-            <rect x="700" y="150" width="290" height="66" rx="4" fill="var(--server-soft)" stroke="var(--server)"/>
-            <text x="718" y="176" font-size="14" fill="var(--server)">search service</text>
-            <text x="718" y="197" font-size="12" fill="var(--ink-3)">trigrams &middot; roaring &middot; Tantivy</text>
+            <g class="node" id="n-search" tabindex="0" role="group" aria-label="search service" aria-describedby="t-search">
+              <rect x="700" y="150" width="290" height="66" rx="4" fill="var(--server-soft)" stroke="var(--server)"/>
+              <text x="718" y="176" font-size="14" fill="var(--server)">search service</text>
+              <text x="718" y="197" font-size="12" fill="var(--ink-3)">trigrams &middot; roaring &middot; Tantivy</text>
+            </g>
 
-            <rect x="700" y="230" width="290" height="66" rx="4" fill="var(--server-soft)" stroke="var(--server)"/>
-            <text x="718" y="256" font-size="14" fill="var(--server)">LFS store</text>
-            <text x="718" y="277" font-size="12" fill="var(--ink-3)">lfs-sha256:{oid} served expanded</text>
+            <g class="node" id="n-lfs" tabindex="0" role="group" aria-label="LFS store" aria-describedby="t-lfs">
+              <rect x="700" y="230" width="290" height="66" rx="4" fill="var(--server-soft)" stroke="var(--server)"/>
+              <text x="718" y="256" font-size="14" fill="var(--server)">LFS store</text>
+              <text x="718" y="277" font-size="12" fill="var(--ink-3)">lfs-sha256:{oid} served expanded</text>
+            </g>
 
-            <rect x="700" y="310" width="290" height="66" rx="4" fill="var(--server-soft)" stroke="var(--server)"/>
-            <text x="718" y="336" font-size="14" fill="var(--server)">smart-HTTP gateway</text>
-            <text x="718" y="357" font-size="12" fill="var(--ink-3)">sandboxed git upload-pack</text>
+            <g class="node" id="n-gateway" tabindex="0" role="group" aria-label="smart-HTTP gateway" aria-describedby="t-gateway">
+              <rect x="700" y="310" width="290" height="66" rx="4" fill="var(--server-soft)" stroke="var(--server)"/>
+              <text x="718" y="336" font-size="14" fill="var(--server)">smart-HTTP gateway</text>
+              <text x="718" y="357" font-size="12" fill="var(--ink-3)">sandboxed git upload-pack</text>
+            </g>
 
-            <rect x="700" y="390" width="290" height="52" rx="4" fill="var(--server-soft)" stroke="var(--server)"/>
-            <text x="718" y="421" font-size="14" fill="var(--server)">WebDAV, read-only</text>
+            <g class="node" id="n-dav" tabindex="0" role="group" aria-label="WebDAV, read-only" aria-describedby="t-dav">
+              <rect x="700" y="390" width="290" height="52" rx="4" fill="var(--server-soft)" stroke="var(--server)"/>
+              <text x="718" y="421" font-size="14" fill="var(--server)">WebDAV, read-only</text>
+            </g>
 
-            <rect x="700" y="456" width="290" height="52" rx="4" fill="var(--surface-2)" stroke="var(--line-strong)"/>
-            <text x="718" y="480" font-size="14" fill="var(--ink)">bare repositories</text>
-            <text x="718" y="498" font-size="11.5" fill="var(--ink-3)">the source of truth</text>
+            <g class="node" id="n-bare" tabindex="0" role="group" aria-label="bare repositories" aria-describedby="t-bare">
+              <rect x="700" y="456" width="290" height="52" rx="4" fill="var(--surface-2)" stroke="var(--line-strong)"/>
+              <text x="718" y="480" font-size="14" fill="var(--ink)">bare repositories</text>
+              <text x="718" y="498" font-size="11.5" fill="var(--ink-3)">the source of truth</text>
+            </g>
 
             <!-- arrows: agent -> mount -->
             <path d="M262 100 L338 100" stroke="var(--line-strong)" fill="none" marker-end="url(#ar)"/>
@@ -702,6 +792,198 @@ footer .mono { font-size: 12px; letter-spacing: .04em; }
             <path d="M845 296 L845 310" stroke="var(--line-strong)" fill="none" marker-end="url(#ar)"/>
             <path d="M845 376 L845 390" stroke="var(--line-strong)" fill="none" marker-end="url(#ar)"/>
             <path d="M845 442 L845 456" stroke="var(--line-strong)" fill="none" marker-end="url(#ar)"/>
+
+            <!-- hover briefs: what / why / how -->
+            <g class="tip" role="tooltip" id="t-agent" transform="translate(274,22)">
+              <rect class="tip-bg" width="372" height="162" rx="5"/>
+              <text class="tip-h" x="14" y="25">agent process</text>
+              <text class="tip-k" x="14" y="47">WHAT</text>
+              <text class="tip-v" x="52" y="47">The job's own unmodified tooling: git, rg,<tspan x="52" dy="15">compilers, editors, LSP servers.</tspan></text>
+              <text class="tip-k" x="14" y="83">WHY</text>
+              <text class="tip-v" x="52" y="83">A workspace that needs a patched toolchain<tspan x="52" dy="15">is one nobody adopts.</tspan></text>
+              <text class="tip-k" x="14" y="119">HOW</text>
+              <text class="tip-v" x="52" y="119">Everything reaches the tree through<tspan x="52" dy="15">ordinary POSIX calls. No process here links</tspan><tspan x="52" dy="15">a GFS library.</tspan></text>
+            </g>
+            <g class="tip" role="tooltip" id="t-shims" transform="translate(274,98)">
+              <rect class="tip-bg" width="372" height="177" rx="5"/>
+              <text class="tip-h" x="14" y="25">PATH shims</text>
+              <text class="tip-k" x="14" y="47">WHAT</text>
+              <text class="tip-v" x="52" y="47">Symlinks early on PATH that route four<tspan x="52" dy="15">commands to a cheaper server-side answer.</tspan></text>
+              <text class="tip-k" x="14" y="83">WHY</text>
+              <text class="tip-v" x="52" y="83">A repository-wide grep run locally would<tspan x="52" dy="15">hydrate every file in the tree.</tspan></text>
+              <text class="tip-k" x="14" y="119">HOW</text>
+              <text class="tip-v" x="52" y="119">An unimplemented flag is refused by name<tspan x="52" dy="15">before any output exists and the real tool</tspan><tspan x="52" dy="15">runs instead — slow rather than wrong</tspan><tspan x="52" dy="15">(ADR&#160;0007).</tspan></text>
+            </g>
+            <g class="tip" role="tooltip" id="t-kfuse" transform="translate(274,180)">
+              <rect class="tip-bg" width="372" height="177" rx="5"/>
+              <text class="tip-h" x="14" y="25">kernel FUSE</text>
+              <text class="tip-k" x="14" y="47">WHAT</text>
+              <text class="tip-v" x="52" y="47">The kernel half of the filesystem, turning<tspan x="52" dy="15">syscalls into requests on /dev/fuse.</tspan></text>
+              <text class="tip-k" x="14" y="83">WHY</text>
+              <text class="tip-v" x="52" y="83">It is what lets unmodified processes see a<tspan x="52" dy="15">real directory tree.</tspan></text>
+              <text class="tip-k" x="14" y="119">HOW</text>
+              <text class="tip-v" x="52" y="119">Its dentry and attribute caches absorb<tspan x="52" dy="15">repeat lookups. It never caches directory</tspan><tspan x="52" dy="15">listings, which is why the daemon keeps its</tspan><tspan x="52" dy="15">own.</tspan></text>
+            </g>
+            <g class="tip" role="tooltip" id="t-stockgit" transform="translate(274,286)">
+              <rect class="tip-bg" width="372" height="147" rx="5"/>
+              <text class="tip-h" x="14" y="25">stock git client</text>
+              <text class="tip-k" x="14" y="47">WHAT</text>
+              <text class="tip-v" x="52" y="47">Ordinary Git talking to the server over<tspan x="52" dy="15">HTTP, with no mount involved.</tspan></text>
+              <text class="tip-k" x="14" y="83">WHY</text>
+              <text class="tip-v" x="52" y="83">CI jobs, laptops and scripts still want a<tspan x="52" dy="15">clone, not a projected workspace.</tspan></text>
+              <text class="tip-k" x="14" y="119">HOW</text>
+              <text class="tip-v" x="52" y="119">The smart-HTTP gateway answers it — same<tspan x="52" dy="15">repositories, same authorization.</tspan></text>
+            </g>
+            <g class="tip" role="tooltip" id="t-finder" transform="translate(274,368)">
+              <rect class="tip-bg" width="372" height="147" rx="5"/>
+              <text class="tip-h" x="14" y="25">Finder / Explorer</text>
+              <text class="tip-k" x="14" y="47">WHAT</text>
+              <text class="tip-v" x="52" y="47">A plain file browser on a machine with no<tspan x="52" dy="15">FUSE and nothing installed.</tspan></text>
+              <text class="tip-k" x="14" y="83">WHY</text>
+              <text class="tip-v" x="52" y="83">Reading a branch tip should not require a<tspan x="52" dy="15">client.</tspan></text>
+              <text class="tip-k" x="14" y="119">HOW</text>
+              <text class="tip-v" x="52" y="119">Mount the WebDAV URL and browse. Read-only,<tspan x="52" dy="15">and LFS files arrive expanded.</tspan></text>
+            </g>
+            <g class="tip" role="tooltip" id="t-workspace" transform="translate(636,20)">
+              <rect class="tip-bg" width="372" height="177" rx="5"/>
+              <text class="tip-h" x="14" y="25">workspace mount</text>
+              <text class="tip-k" x="14" y="47">WHAT</text>
+              <text class="tip-v" x="52" y="47">One self-contained folder holding the<tspan x="52" dy="15">projected tree and a real .git.</tspan></text>
+              <text class="tip-k" x="14" y="83">WHY</text>
+              <text class="tip-v" x="52" y="83">A single folder can be bind-mounted, moved,<tspan x="52" dy="15">and unmounted back to a plain working tree</tspan><tspan x="52" dy="15">(ADR&#160;0011).</tspan></text>
+              <text class="tip-k" x="14" y="134">HOW</text>
+              <text class="tip-v" x="52" y="134">The daemon creates the folder, keeps<tspan x="52" dy="15">handles to the .git inside it, then mounts</tspan><tspan x="52" dy="15">over it.</tspan></text>
+            </g>
+            <g class="tip" role="tooltip" id="t-daemon" transform="translate(636,152)">
+              <rect class="tip-bg" width="372" height="177" rx="5"/>
+              <text class="tip-h" x="14" y="25">gfs-fuse host daemon</text>
+              <text class="tip-k" x="14" y="47">WHAT</text>
+              <text class="tip-v" x="52" y="47">The privileged process that answers every<tspan x="52" dy="15">FUSE request for the mount.</tspan></text>
+              <text class="tip-k" x="14" y="83">WHY</text>
+              <text class="tip-v" x="52" y="83">FUSE privilege must stay outside the job<tspan x="52" dy="15">container: the agent gets a bind mount and</tspan><tspan x="52" dy="15">a scoped socket, never a credential.</tspan></text>
+              <text class="tip-k" x="14" y="134">HOW</text>
+              <text class="tip-v" x="52" y="134">One Rust daemon per host serving many<tspan x="52" dy="15">mounts. The caches, the overlay and the</tspan><tspan x="52" dy="15">budget all live in it.</tspan></text>
+            </g>
+            <g class="tip" role="tooltip" id="t-blobcache" transform="translate(636,140)">
+              <rect class="tip-bg" width="372" height="177" rx="5"/>
+              <text class="tip-h" x="14" y="25">blob cache</text>
+              <text class="tip-k" x="14" y="47">WHAT</text>
+              <text class="tip-v" x="52" y="47">Whole file contents, keyed by Git object ID<tspan x="52" dy="15">and shared across mounts.</tspan></text>
+              <text class="tip-k" x="14" y="83">WHY</text>
+              <text class="tip-v" x="52" y="83">The same blob recurs across commits and<tspan x="52" dy="15">jobs, so a host should fetch it once.</tspan></text>
+              <text class="tip-k" x="14" y="119">HOW</text>
+              <text class="tip-v" x="52" y="119">Written to a temp file, hashed as a<tspan x="52" dy="15">canonical Git blob, atomically renamed — a</tspan><tspan x="52" dy="15">hit is the same object a fetch would have</tspan><tspan x="52" dy="15">produced.</tspan></text>
+            </g>
+            <g class="tip" role="tooltip" id="t-listcache" transform="translate(636,132)">
+              <rect class="tip-bg" width="372" height="192" rx="5"/>
+              <text class="tip-h" x="14" y="25">listing cache</text>
+              <text class="tip-k" x="14" y="47">WHAT</text>
+              <text class="tip-v" x="52" y="47">Complete base directory listings for the<tspan x="52" dy="15">pinned commit.</tspan></text>
+              <text class="tip-k" x="14" y="83">WHY</text>
+              <text class="tip-v" x="52" y="83">Against an immutable commit one listing<tspan x="52" dy="15">answers a directory's children and the</tspan><tspan x="52" dy="15">absence of every other name, so a warm git</tspan><tspan x="52" dy="15">status costs zero round trips.</tspan></text>
+              <text class="tip-k" x="14" y="149">HOW</text>
+              <text class="tip-v" x="52" y="149">Bounded at 32&#160;768 directories and 150&#160;000<tspan x="52" dy="15">entries, dropped whole on repin. A cold</tspan><tspan x="52" dy="15">walk fills it from one recursive ListTree.</tspan></text>
+            </g>
+            <g class="tip" role="tooltip" id="t-blockcache" transform="translate(636,192)">
+              <rect class="tip-bg" width="372" height="177" rx="5"/>
+              <text class="tip-h" x="14" y="25">block cache</text>
+              <text class="tip-k" x="14" y="47">WHAT</text>
+              <text class="tip-v" x="52" y="47">64&#160;KiB ranges of the packs behind the<tspan x="52" dy="15">projected object database.</tspan></text>
+              <text class="tip-k" x="14" y="83">WHY</text>
+              <text class="tip-v" x="52" y="83">Git's object access is sparse and random:<tspan x="52" dy="15">8&#160;MiB chunks moved 2&#160;320&#160;MiB for one blame</tspan><tspan x="52" dy="15">where 64&#160;KiB moved 274&#160;MiB.</tspan></text>
+              <text class="tip-k" x="14" y="134">HOW</text>
+              <text class="tip-v" x="52" y="134">Keyed by (pack name, offset). A pack's<tspan x="52" dy="15">filename is its own checksum, so a cached</tspan><tspan x="52" dy="15">block cannot go stale.</tspan></text>
+            </g>
+            <g class="tip" role="tooltip" id="t-budget" transform="translate(636,184)">
+              <rect class="tip-bg" width="372" height="192" rx="5"/>
+              <text class="tip-h" x="14" y="25">budget</text>
+              <text class="tip-k" x="14" y="47">WHAT</text>
+              <text class="tip-v" x="52" y="47">A ceiling on the bytes one job is allowed<tspan x="52" dy="15">to hydrate.</tspan></text>
+              <text class="tip-k" x="14" y="83">WHY</text>
+              <text class="tip-v" x="52" y="83">Without it a single recursive read quietly<tspan x="52" dy="15">downloads the repository — the failure</tspan><tspan x="52" dy="15">ADR&#160;0009 exists to prevent.</tspan></text>
+              <text class="tip-k" x="14" y="134">HOW</text>
+              <text class="tip-v" x="52" y="134">Charged once per blob and refused at open<tspan x="52" dy="15">with EDQUOT, so the job fails loudly at a</tspan><tspan x="52" dy="15">named file. Prefetch stops with 25&#160;%</tspan><tspan x="52" dy="15">unspent.</tspan></text>
+            </g>
+            <g class="tip" role="tooltip" id="t-overlay" transform="translate(636,280)">
+              <rect class="tip-bg" width="372" height="177" rx="5"/>
+              <text class="tip-h" x="14" y="25">overlay + journal</text>
+              <text class="tip-k" x="14" y="47">WHAT</text>
+              <text class="tip-v" x="52" y="47">Where local mutations live: created files,<tspan x="52" dy="15">copy-ups, deletes, renames.</tspan></text>
+              <text class="tip-k" x="14" y="83">WHY</text>
+              <text class="tip-v" x="52" y="83">The projection is immutable, so writes need<tspan x="52" dy="15">somewhere a later commit can read back</tspan><tspan x="52" dy="15">exactly.</tspan></text>
+              <text class="tip-k" x="14" y="134">HOW</text>
+              <text class="tip-v" x="52" y="134">A SQLite journal for path state beside a<tspan x="52" dy="15">directory of file data. gfs status reads</tspan><tspan x="52" dy="15">the journal instead of walking the tree.</tspan></text>
+            </g>
+            <g class="tip" role="tooltip" id="t-lease" transform="translate(636,366)">
+              <rect class="tip-bg" width="372" height="177" rx="5"/>
+              <text class="tip-h" x="14" y="25">lease heartbeat</text>
+              <text class="tip-k" x="14" y="47">WHAT</text>
+              <text class="tip-v" x="52" y="47">A renewal ping for the mount's retention<tspan x="52" dy="15">lease on the server.</tspan></text>
+              <text class="tip-k" x="14" y="83">WHY</text>
+              <text class="tip-v" x="52" y="83">A force push or a branch deletion upstream<tspan x="52" dy="15">would otherwise let git gc prune objects</tspan><tspan x="52" dy="15">out from under a running job.</tspan></text>
+              <text class="tip-k" x="14" y="134">HOW</text>
+              <text class="tip-v" x="52" y="134">The server anchors refs/gfs/mounts/{id}<tspan x="52" dy="15">before returning the handle; expiry with a</tspan><tspan x="52" dy="15">grace interval is the crash fallback.</tspan></text>
+            </g>
+            <g class="tip" role="tooltip" id="t-snapshot" transform="translate(316,7)">
+              <rect class="tip-bg" width="372" height="192" rx="5"/>
+              <text class="tip-h" x="14" y="25">snapshot service</text>
+              <text class="tip-k" x="14" y="47">WHAT</text>
+              <text class="tip-v" x="52" y="47">Trees, entries and blob bytes for one<tspan x="52" dy="15">pinned commit, over gRPC.</tspan></text>
+              <text class="tip-k" x="14" y="83">WHY</text>
+              <text class="tip-v" x="52" y="83">It is the read path the whole mount stands<tspan x="52" dy="15">on — every lookup and every file read lands</tspan><tspan x="52" dy="15">here.</tspan></text>
+              <text class="tip-k" x="14" y="134">HOW</text>
+              <text class="tip-v" x="52" y="134">libgit2 walks the pinned tree directly, so<tspan x="52" dy="15">a one- file read costs no pack negotiation.</tspan><tspan x="52" dy="15">Authorization is decided once per ref</tspan><tspan x="52" dy="15">generation, not per request.</tspan></text>
+            </g>
+            <g class="tip" role="tooltip" id="t-search" transform="translate(316,94)">
+              <rect class="tip-bg" width="372" height="177" rx="5"/>
+              <text class="tip-h" x="14" y="25">search service</text>
+              <text class="tip-k" x="14" y="47">WHAT</text>
+              <text class="tip-v" x="52" y="47">Content and symbol search over a revision,<tspan x="52" dy="15">answered without moving file bytes.</tspan></text>
+              <text class="tip-k" x="14" y="83">WHY</text>
+              <text class="tip-v" x="52" y="83">Search is the one question a projected tree<tspan x="52" dy="15">cannot answer cheaply.</tspan></text>
+              <text class="tip-k" x="14" y="119">HOW</text>
+              <text class="tip-v" x="52" y="119">Trigram posting lists in roaring bitmaps<tspan x="52" dy="15">over a Tantivy index, built per snapshot.</tspan><tspan x="52" dy="15">An unready index is an error, never a</tspan><tspan x="52" dy="15">silently empty answer (ADR&#160;0004).</tspan></text>
+            </g>
+            <g class="tip" role="tooltip" id="t-lfs" transform="translate(316,174)">
+              <rect class="tip-bg" width="372" height="177" rx="5"/>
+              <text class="tip-h" x="14" y="25">LFS store</text>
+              <text class="tip-k" x="14" y="47">WHAT</text>
+              <text class="tip-v" x="52" y="47">Git LFS objects, expanded on the server.</text>
+              <text class="tip-k" x="14" y="68">WHY</text>
+              <text class="tip-v" x="52" y="68">Running git-lfs in the job would smudge<tspan x="52" dy="15">gigabytes into the overlay, where the</tspan><tspan x="52" dy="15">journal cannot tell a smudge from an edit.</tspan></text>
+              <text class="tip-k" x="14" y="119">HOW</text>
+              <text class="tip-v" x="52" y="119">An entry with filter=lfs and a pointer body<tspan x="52" dy="15">reports its expanded size and the key</tspan><tspan x="52" dy="15">lfs-sha256:{oid}. An unfetchable object</tspan><tspan x="52" dy="15">degrades that one file (ADR&#160;0012).</tspan></text>
+            </g>
+            <g class="tip" role="tooltip" id="t-gateway" transform="translate(316,254)">
+              <rect class="tip-bg" width="372" height="177" rx="5"/>
+              <text class="tip-h" x="14" y="25">smart-HTTP gateway</text>
+              <text class="tip-k" x="14" y="47">WHAT</text>
+              <text class="tip-v" x="52" y="47">Git's own wire protocol v2, served over<tspan x="52" dy="15">HTTP.</tspan></text>
+              <text class="tip-k" x="14" y="83">WHY</text>
+              <text class="tip-v" x="52" y="83">Stock git clone and fetch have to work<tspan x="52" dy="15">against GFS with no mount and no install.</tspan></text>
+              <text class="tip-k" x="14" y="119">HOW</text>
+              <text class="tip-v" x="52" y="119">A sandboxed upload-pack per request over<tspan x="52" dy="15">the bare repository, with the refs/gfs/</tspan><tspan x="52" dy="15">lease namespace hidden from advertisement</tspan><tspan x="52" dy="15">and fetch.</tspan></text>
+            </g>
+            <g class="tip" role="tooltip" id="t-dav" transform="translate(316,335)">
+              <rect class="tip-bg" width="372" height="162" rx="5"/>
+              <text class="tip-h" x="14" y="25">WebDAV, read-only</text>
+              <text class="tip-k" x="14" y="47">WHAT</text>
+              <text class="tip-v" x="52" y="47">The pinned tree as an HTTP filesystem:<tspan x="52" dy="15">PROPFIND and GET.</tspan></text>
+              <text class="tip-k" x="14" y="83">WHY</text>
+              <text class="tip-v" x="52" y="83">A machine with no FUSE should still be able<tspan x="52" dy="15">to read a branch.</tspan></text>
+              <text class="tip-k" x="14" y="119">HOW</text>
+              <text class="tip-v" x="52" y="119">The same internal services behind a<tspan x="52" dy="15">different surface, never a second</tspan><tspan x="52" dy="15">implementation of them.</tspan></text>
+            </g>
+            <g class="tip" role="tooltip" id="t-bare" transform="translate(316,377)">
+              <rect class="tip-bg" width="372" height="177" rx="5"/>
+              <text class="tip-h" x="14" y="25">bare repositories</text>
+              <text class="tip-k" x="14" y="47">WHAT</text>
+              <text class="tip-v" x="52" y="47">Ordinary bare Git repositories on the<tspan x="52" dy="15">server's disk.</tspan></text>
+              <text class="tip-k" x="14" y="83">WHY</text>
+              <text class="tip-v" x="52" y="83">The object database is authoritative; every<tspan x="52" dy="15">index, cache and manifest above it is</tspan><tspan x="52" dy="15">derived and rebuildable.</tspan></text>
+              <text class="tip-k" x="14" y="134">HOW</text>
+              <text class="tip-v" x="52" y="134">Mirrored from upstream and read in-process<tspan x="52" dy="15">by libgit2. Nothing GFS stores alters an</tspan><tspan x="52" dy="15">object's identity.</tspan></text>
+            </g>
           </g>
         </svg>
       </div>
@@ -709,6 +991,7 @@ footer .mono { font-size: 12px; letter-spacing: .04em; }
         Every surface is a gateway onto the same internal services, never a second implementation.
         The snapshot and blob paths never invoke <code>upload-pack</code>: they use libgit2 to walk
         the pinned tree and return decoded bytes, so a one-file read costs no pack negotiation.
+        <b>Hover or tab to any box</b> for what it is, why it exists, and how it is built.
       </figcaption>
     </figure>
   </div>
