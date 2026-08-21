@@ -1044,35 +1044,26 @@ were not searched: 312 binary, 98 lfs,
     <div class="sec-head" style="margin-top:52px">
       <p class="eyebrow"><b>The other direction</b> &middot; what this run cost</p>
       <div class="prose">
-        <h2>The three numbers that were minutes long</h2>
+        <h2>Three steps that used to take minutes</h2>
         <p>
-          An earlier run of this benchmark had three costs measured in minutes: the first
-          <code>git status</code>, the first <code>commit</code>, and the server's first import.
-          All three turned out to be defects rather than the price of a networked working tree, and
-          all three are fixed. What is left is the honest cost: reading objects that are not local
-          yet.
+          None of them were the price of a working tree on the far side of a network. Each was a
+          defect with one specific cause, and each is measured here before and after. The last card
+          is not a defect: it is what reading objects you do not have actually costs.
         </p>
       </div>
     </div>
 
     <div class="cards" style="margin-bottom:34px">
       <div class="card">
-        <div class="role">First full-tree walk &middot; fixed</div>
-        <h3>555 s of asking the same question 5 328 times</h3>
+        <div class="role">First <code>git status</code></div>
+        <h3>The same question, 5 328 times</h3>
         <p>
-          The first <code>git status</code> in a fresh workspace is not re-hashing content — the
-          budget recorded <b>28 blobs, 3 672 bytes</b> for the whole run. It was populating the
-          untracked cache, which means reading every directory once: <b>5 328 listings</b>,
-          uncached, serialized by a single-threaded walk, at 38–126 ms each.
-        </p>
-        <p>
-          Profiling said the listing was not the cost. Every snapshot request re-decided object
-          authorization by enumerating and peeling all <b>73 989 refs</b> — 24–28 ms — around a
-          tree read that costs <b>2.5 µs</b>. Deciding that once per ref generation, and skipping
-          it entirely for a caller holding a mount capability, made a listing 0.18 ms. Then the
-          daemon learned to recognize the walk itself: four misses descending from a common root
-          make it fetch the whole subtree with one <code>ListTree</code>, and vscode's 4 318
-          directories arrive in three pages.
+          Populating the untracked cache reads every directory once, serialized. The listing was
+          never the cost: every request re-decided object authorization by peeling all
+          <b>73 989 refs</b> — 24–28 ms — around a tree read that costs <b>2.5 µs</b>. That verdict
+          is now decided once per ref generation, and a recognized walk fetches the whole subtree
+          in one <code>ListTree</code>. Cold is now within 0.3 s of warm, so what is left is FUSE
+          rather than the network.
         </p>
         <div class="tablewrap" style="border:0">
           <table style="min-width:0">
@@ -1082,42 +1073,39 @@ were not searched: 312 binary, 98 lfs,
             </tbody>
           </table>
         </div>
-        <p style="margin-top:12px">
-          Measured on its own, a cold walk of every directory is <b>1.71 s</b> against 1.41 s warm
-          — the remaining difference is FUSE and the walker, not the network.
-        </p>
       </div>
       <div class="card">
-        <div class="role">First commit &middot; fixed</div>
-        <h3>1 448 s, for the same reason</h3>
+        <div class="role">First commit</div>
+        <h3>The same cause, one command later</h3>
         <p>
-          <code>git commit</code> walks the tree too, so it paid the same per-request ref scan
-          thousands of times over. It is now <b>14.5 s</b>, and what remains is real work: reading
-          pack blocks out of the projected object store to write and verify the new objects.
+          <code>git commit</code> walks the tree too, so it paid that ref scan thousands of times
+          over. What remains is real work: reading pack blocks through the projection to write and
+          verify the new objects.
         </p>
+        <div class="tablewrap" style="border:0">
+          <table style="min-width:0">
+            <tbody>
+              <tr><td>before</td><td class="num">1 448 s</td></tr>
+              <tr class="win"><td>after</td><td class="num">14.5 s</td></tr>
+            </tbody>
+          </table>
+        </div>
       </div>
       <div class="card">
-        <div class="role">Server-side, once per repository &middot; fixed</div>
-        <h3>312 s to import 73 989 refs, now 1.8 s</h3>
+        <div class="role">Server-side, once per repository</div>
+        <h3>Importing 73 989 refs</h3>
         <p>
-          Before the first mount the server reconciles every ref into its catalog, and until that
-          finishes it does not bind its listeners. No Git data is fetched — the bare repository is
-          already on disk — so this was pure bookkeeping, and it was <b>quadratic</b>: one
-          transaction per ref, each running <code>SELECT MAX(ref_version) WHERE repository_id = ?</code>
-          against a table indexed only by <code>(repository_id, ref_name)</code>, so every
-          observation scanned every row written before it.
-        </p>
-        <p>
-          Two changes: an index on <code>(repository_id, ref_version)</code>, which turns the
-          high-water-mark query into a lookup, and a reconcile that runs all 73 989 observations in
-          <b>one</b> transaction — also the more correct shape, since a crash halfway through now
-          leaves the catalog on the state it was reconciling from rather than on a prefix of it.
+          Before the first mount the server reconciles every ref into its catalog, and does not
+          bind its listeners until it finishes. No Git data moves — the bare repository is already
+          on disk — and it was <b>quadratic</b>: every observation scanned for its repository's
+          <code>MAX(ref_version)</code> against a table that did not index it. One index, and one
+          transaction for the whole repository.
         </p>
         <div class="tablewrap" style="border:0">
           <table style="min-width:0">
             <tbody>
               <tr><td>before</td><td class="num">311.8 s</td></tr>
-              <tr class="win"><td>after</td><td class="num">1.78 s</td></tr>
+              <tr class="win"><td>after</td><td class="num">1.8 s</td></tr>
             </tbody>
           </table>
         </div>
@@ -1126,10 +1114,9 @@ were not searched: 312 binary, 98 lfs,
         <div class="role">History through the projection</div>
         <h3>55 ms for <code>log -10</code></h3>
         <p>
-          Stock Git reading ten commits through the object-store projection fetches
-          <b>7.96 MB</b> of 64 KiB pack blocks. That step used to take 1.5 s, nearly all of it the
-          per-request ref scan; against 0.006 s in a local clone the remaining 55 ms is the price
-          of the fetch itself, and the blocks stay cached for every command after it.
+          Stock Git reading ten commits through the object-store projection fetches <b>7.96 MB</b>
+          of 64 KiB pack blocks. Against 0.006 s in a local clone, those 55 ms are the price of the
+          fetch itself — and the blocks stay cached for every command after it.
         </p>
       </div>
     </div>
