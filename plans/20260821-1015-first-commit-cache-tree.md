@@ -110,8 +110,11 @@ Built as planned.
 * **What is left is `git add -A`** — 1.19 s on django, 1.46 s on vscode. That is
   the full-tree `lstat` refresh over FUSE, the same walk as a cold `git status`,
   and a different problem from this one.
-* **The index grows** by the extension: django 940 717 → 1 048 385 bytes
-  (+11.4 %), vscode 2 615 877 → 2 760 989 (+5.5 %).
+* **The index grows** by the extension, measured on what the server ships:
+  django 786 984 → 894 652 bytes (+13.7 %), vscode 2 410 336 → 2 555 448
+  (+6.0 %). Not the file sizes seen in a live workspace — once Git rewrites the
+  index it adds its own `UNTR` and `FSMN` extensions, which are larger than this
+  one.
 * **A mis-sorted cache tree is benign, a mis-counted one is not.** Git's reader
   inserts subtrees into a sorted array, so file order is recovered on read — a
   deliberately reversed extension still produced correct trees. The counts have
