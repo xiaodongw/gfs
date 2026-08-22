@@ -85,6 +85,7 @@ a surface nobody had materialized.
 | artifact | why |
 | --- | --- |
 | index with `snapshot_time` stat data | `core.checkStat=minimal` compares mode, size and whole-second mtime. DESIGN.md section 8.2's deterministic `snapshot_time` makes one index valid on every host that mounts the commit |
+| index with a `TREE` cache tree | without it the *first* `git commit` re-derives and rewrites every tree in the repository — 12.34 s and 4 299 objects on vscode for a five-file change, against 0.21 s and 25 with it. The server already walks the tree to build the entries, so the nodes cost nothing there, and the index describes a commit, so no node is ever invalid |
 | `commit-graph` with `--changed-paths` | answers graph traversal and `log -- <path>` without reading commit or tree objects |
 
 ### The required configuration

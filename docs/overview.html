@@ -339,14 +339,14 @@ footer .mono { font-size: 12px; letter-spacing: .04em; }
 
     <div class="stats">
       <div class="stat">
-        <div class="stat-num">0.25<span>s</span></div>
-        <div class="stat-label">To acquire a vscode workspace, against 56.2&nbsp;s for a full clone of the same commit.</div>
+        <div class="stat-num">0.26<span>s</span></div>
+        <div class="stat-label">To acquire a vscode workspace, against 57.0&nbsp;s for a full clone of the same commit.</div>
         <div class="stat-sub">microsoft/vscode &middot; 2 485 MiB mirror</div>
       </div>
       <div class="stat">
-        <div class="stat-num">22<span>MB</span></div>
+        <div class="stat-num">3.5<span>MB</span></div>
         <div class="stat-label">Local disk for that workspace, against 1 648&nbsp;MiB for the clone it replaces.</div>
-        <div class="stat-sub">+ 147 MB host cache, shared per repo</div>
+        <div class="stat-sub">+ 67 MB host cache, shared per repo</div>
       </div>
       <div class="stat">
         <div class="stat-num">0<span>bytes</span></div>
@@ -354,9 +354,9 @@ footer .mono { font-size: 12px; letter-spacing: .04em; }
         <div class="stat-sub">measured before and after</div>
       </div>
       <div class="stat">
-        <div class="stat-num">10<span>ms</span></div>
+        <div class="stat-num">11<span>ms</span></div>
         <div class="stat-label"><code>gfs status</code> after five edits, derived from the journal without touching the tree.</div>
-        <div class="stat-sub">stock git in the mount: 0.30 s</div>
+        <div class="stat-sub">stock git in the mount: 0.07 s</div>
       </div>
     </div>
   </div>
@@ -1254,16 +1254,17 @@ maintenance.auto   = false</pre>
           </tr>
         </thead>
         <tbody>
-          <tr class="win"><td>acquire a workspace</td><td class="num">56.174 s</td><td class="num">9.856 s</td><td class="num">0.246 s</td><td>clone vs. mount</td></tr>
-          <tr><td><code>log -10</code></td><td class="num">0.006 s</td><td class="num">0.006 s</td><td class="num">0.053 s</td><td>10 commits both</td></tr>
-          <tr><td><code>ls-files '*test*'</code></td><td class="num">0.007 s</td><td class="num">0.005 s</td><td class="num">0.020 s</td><td>6 245 files in the mount</td></tr>
-          <tr><td>grep <code>TODO</code></td><td class="num">0.041 s</td><td class="num">0.038 s</td><td class="num">0.248 s</td><td>1 683 vs. 1 574 lines, ready index</td></tr>
-          <tr><td>edit 5 files</td><td class="num">0.006 s</td><td class="num">0.005 s</td><td class="num">0.070 s</td><td>copy-up through FUSE</td></tr>
-          <tr class="win"><td><code>git status</code>, first ever</td><td class="num">0.037 s</td><td class="num">0.029 s</td><td class="num">2.344 s</td><td>one full directory walk, prefetched</td></tr>
-          <tr><td><code>git status</code>, warm</td><td class="num">0.035 s</td><td class="num">0.029 s</td><td class="num">0.297 s</td><td>fsmonitor + untracked cache</td></tr>
-          <tr class="win"><td><code>gfs status</code></td><td class="num">&mdash;</td><td class="num">&mdash;</td><td class="num">0.010 s</td><td>read from the journal</td></tr>
-          <tr><td>commit</td><td class="num">1.002 s</td><td class="num">0.908 s</td><td class="num">14.501 s</td><td>same tree, five changes</td></tr>
-          <tr class="win"><td><b>local disk</b></td><td class="num">1 648 MiB</td><td class="num">363 MiB</td><td class="num">22 MB</td><td>+147 MB cache, shared per repo</td></tr>
+          <tr class="win"><td>acquire a workspace</td><td class="num">56.983 s</td><td class="num">10.164 s</td><td class="num">0.258 s</td><td>clone vs. mount</td></tr>
+          <tr><td><code>log -10</code></td><td class="num">0.007 s</td><td class="num">0.007 s</td><td class="num">0.066 s</td><td>10 commits both</td></tr>
+          <tr><td><code>ls-files '*test*'</code></td><td class="num">0.007 s</td><td class="num">0.006 s</td><td class="num">0.026 s</td><td>6 245 files in the mount</td></tr>
+          <tr><td>grep <code>TODO</code></td><td class="num">0.043 s</td><td class="num">0.047 s</td><td class="num">0.259 s</td><td>1 683 vs. 1 574 lines, ready index</td></tr>
+          <tr><td>edit 5 files</td><td class="num">0.007 s</td><td class="num">0.007 s</td><td class="num">0.064 s</td><td>copy-up through FUSE</td></tr>
+          <tr class="win"><td><code>git status</code>, first ever</td><td class="num">0.041 s</td><td class="num">0.042 s</td><td class="num">1.701 s</td><td>one full directory walk, prefetched</td></tr>
+          <tr><td><code>git status</code>, warm</td><td class="num">0.036 s</td><td class="num">0.030 s</td><td class="num">0.070 s</td><td>fsmonitor + untracked cache</td></tr>
+          <tr class="win"><td><code>gfs status</code></td><td class="num">&mdash;</td><td class="num">&mdash;</td><td class="num">0.011 s</td><td>read from the journal</td></tr>
+          <tr class="win"><td>commit</td><td class="num">0.957 s</td><td class="num">0.946 s</td><td class="num">1.953 s</td><td>same tree, five changes</td></tr>
+          <tr class="win"><td><b>whole task</b></td><td class="num">58.044 s</td><td class="num">11.219 s</td><td class="num">4.327 s</td><td>every step above, end to end</td></tr>
+          <tr class="win"><td><b>local disk</b></td><td class="num">1 648 MiB</td><td class="num">363 MiB</td><td class="num">3.5 MB</td><td>+67 MB cache, shared per repo</td></tr>
         </tbody>
       </table>
     </div>
@@ -1352,24 +1353,26 @@ were not searched: 312 binary, 98 lfs,
           <table style="min-width:0">
             <tbody>
               <tr><td>before</td><td class="num">555 s</td><td class="num">5 328 listings</td></tr>
-              <tr class="win"><td>after</td><td class="num">2.34 s</td><td class="num">5 listings</td></tr>
+              <tr class="win"><td>after</td><td class="num">1.70 s</td><td class="num">5 listings</td></tr>
             </tbody>
           </table>
         </div>
       </div>
       <div class="card">
         <div class="role">First commit</div>
-        <h3>The same cause, one command later</h3>
+        <h3>Rewriting a repository to change five files</h3>
         <p>
           <code>git commit</code> walks the tree too, so it paid that ref scan thousands of times
-          over. What remains is real work: reading pack blocks through the projection to write and
-          verify the new objects.
+          over. Underneath sat a second cause: the shipped index carried no cache tree, so Git could
+          not tell that any directory was unchanged and re-derived all 4 318 of them, writing 4 299
+          objects it already had. The index ships one now.
         </p>
         <div class="tablewrap" style="border:0">
           <table style="min-width:0">
             <tbody>
               <tr><td>before</td><td class="num">1 448 s</td></tr>
-              <tr class="win"><td>after</td><td class="num">14.5 s</td></tr>
+              <tr><td>after the ref scan</td><td class="num">14.5 s</td></tr>
+              <tr class="win"><td>after the cache tree</td><td class="num">1.95 s</td></tr>
             </tbody>
           </table>
         </div>

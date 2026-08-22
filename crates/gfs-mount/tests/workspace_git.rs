@@ -653,3 +653,67 @@ async fn a_remount_past_local_commits_is_refused_and_their_base_still_mounts() {
   assert_eq!(content, "unpushed\n");
   daemon.shutdown().await;
 }
+
+/// A first commit must write what changed, not the whole repository.
+///
+/// Two mechanisms meet here, and both were broken. The shipped index carries a
+/// cache tree, so Git reuses every directory the commit did not touch instead of
+/// re-deriving all of them; and a `utimensat` on the projection succeeds, so
+/// Git's "do I already have this object" check can say yes about a packed object
+/// rather than writing a duplicate loose copy. Without the first, a five-file
+/// change on vscode wrote 4 299 objects and took 12.3 s.
+///
+/// `siblings` is the fixture because it has a dozen directories: the object
+/// count separates "wrote the changed path" from "wrote the tree".
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_first_commit_writes_the_changed_path_and_not_the_whole_tree() {
+  let backend = Backend::start("siblings").await;
+  let job = Job::start(&backend, "main").await;
+  let ws = job.workspace.clone();
+
+  let (before, after_hash, after_commit, status, dirs) = on_fs(move || {
+    let objects = ws.join(".git/objects");
+    let before = walk_count(&objects);
+
+    // Re-hashing content the projection already holds must reuse the packed
+    // object. This is the call that used to fail: Git freshens the pack first,
+    // and a refusal there reads as "cannot vouch for it", so it wrote a copy.
+    let (ok, out) = git_in(&ws, &["hash-object", "-w", "--", "b/f.txt"]);
+    assert!(ok, "{out}");
+    let after_hash = walk_count(&objects);
+
+    std::fs::write(ws.join("a/f.txt"), b"edited by an agent\n").unwrap();
+    let (ok, out) = git_in(&ws, &["add", "-A"]);
+    assert!(ok, "{out}");
+    let (ok, out) = git_in(&ws, &["commit", "-m", "one file"]);
+    assert!(ok, "{out}");
+    let after_commit = walk_count(&objects);
+
+    let (_, status) = git_in(&ws, &["status", "--porcelain"]);
+    let (_, dirs) = git_in(&ws, &["ls-tree", "-r", "-d", "--name-only", "HEAD"]);
+    (before, after_hash, after_commit, status, dirs)
+  })
+  .await;
+
+  assert_eq!(
+    after_hash, before,
+    "an object the projection already holds must not be written again"
+  );
+  // One blob, the tree for `a/`, the new root tree, the commit.
+  let written = after_commit - after_hash;
+  let directories = dirs.lines().count();
+  assert!(
+    written <= 5,
+    "a one-file commit wrote {written} objects across {directories} directories; \
+     the cache tree is missing or wrong"
+  );
+  assert!(
+    directories >= 10,
+    "the fixture must have enough directories for this to mean anything: {directories}"
+  );
+  assert_eq!(
+    status.trim(),
+    "",
+    "the commit must leave a clean tree: {status}"
+  );
+}

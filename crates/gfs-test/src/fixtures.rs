@@ -26,7 +26,7 @@ use std::process::Command;
 use anyhow::{bail, Context, Result};
 
 /// Bump to invalidate every cached fixture.
-pub const FIXTURE_VERSION: &str = "v2";
+pub const FIXTURE_VERSION: &str = "v3";
 
 #[derive(Debug)]
 pub struct Fixture {
@@ -114,6 +114,12 @@ pub const FIXTURES: &[Fixture] = &[
     name: "attrs",
     rationale: ".gitattributes text/eol and an LFS pointer; the mount serves raw bytes",
     build: build_attrs,
+    openable: true,
+  },
+  Fixture {
+    name: "siblings",
+    rationale: "directory names a Git tree and a cache tree sort differently",
+    build: build_siblings,
     openable: true,
   },
 ];
@@ -427,6 +433,29 @@ fn build_attrs(dir: &Path) -> Result<()> {
       size 12345\n",
   )?;
   commit_all(dir, "attributes")?;
+  Ok(())
+}
+
+/// Sibling directories whose two sort orders disagree.
+///
+/// A Git tree sorts a directory as though its name ended in `/`; the index's
+/// cache tree sorts subtrees shorter-name-first, then by bytes. So a tree lists
+/// `aa, ab, a-b, a.b, b, c, zzz, a` and a cache tree lists `a, b, c, aa, ab,
+/// zzz, a-b, a.b` — an index writer that reuses the walk's order gets it wrong.
+///
+/// Not hypothetical: django's `docs/_theme` and seventeen directories in vscode,
+/// `extensions/` among them, hit exactly this. The nesting is here because the
+/// rule applies at every level, not only the root.
+fn build_siblings(dir: &Path) -> Result<()> {
+  init(dir, &[])?;
+  for name in ["a", "aa", "ab", "b", "c", "zzz", "a-b", "a.b"] {
+    write(dir, &format!("{name}/f.txt"), b"x\n")?;
+  }
+  for name in ["n", "nn", "n-x"] {
+    write(dir, &format!("nest/{name}/f.txt"), b"x\n")?;
+  }
+  write(dir, "top.txt", b"top\n")?;
+  commit_all(dir, "siblings")?;
   Ok(())
 }
 

@@ -2326,8 +2326,8 @@ impl Filesystem for GfsFilesystem {
     _req: &Request,
     ino: INodeNo,
     mode: Option<u32>,
-    _uid: Option<u32>,
-    _gid: Option<u32>,
+    uid: Option<u32>,
+    gid: Option<u32>,
     size: Option<u64>,
     // Accepted and discarded, deliberately. The mount is `noatime` (see
     // `session.rs`) and the overlay models one modification time per entry, so
@@ -2341,7 +2341,7 @@ impl Filesystem for GfsFilesystem {
     // every one of them — a far worse outcome than a timestamp that tracks mtime.
     // pjdfstest's `utimensat/02`, `/04`, `/05`, `/08` and `/09` fail against this
     // by design; `docs/reports/posix-conformance.md` records it as scope.
-    _atime: Option<fuser::TimeOrNow>,
+    atime: Option<fuser::TimeOrNow>,
     mtime: Option<fuser::TimeOrNow>,
     _ctime: Option<std::time::SystemTime>,
     _fh: Option<FileHandle>,
@@ -2357,6 +2357,22 @@ impl Filesystem for GfsFilesystem {
         return reply.error(Errno::ESTALE);
       };
       if record.node.is_odb() {
+        // A `utimensat` on the projection is Git *freshening* a pack: before
+        // writing an object it already has, `freshen_packed_object()` touches
+        // the containing pack so `gc` will not prune it, and reads a failed
+        // touch as "cannot vouch for this object" -- so it writes a duplicate
+        // loose copy instead. Refusing this cost the first commit in a
+        // workspace thousands of redundant objects.
+        //
+        // Accepted as a no-op rather than refused, because there is nothing here
+        // for it to change and nothing for `gc` to prune: the projection's
+        // mtimes are synthetic and its packs are the server's. Anything that
+        // would really alter the projection -- a mode, a size, an owner -- is
+        // still EROFS.
+        let times_only = mode.is_none() && size.is_none() && uid.is_none() && gid.is_none();
+        if times_only && (atime.is_some() || mtime.is_some()) {
+          return reply.attr(&fs.config.ttl, &fs.attr(&record));
+        }
         return reply.error(Errno::EROFS);
       }
       // The passthrough setattr: chmod, truncate, and utimens land on the real

@@ -1314,6 +1314,15 @@ impl GitRepository for Libgit2Repository {
       .odb()
       .map_err(|e| GfsError::internal(format!("opening the object database: {e}")))?;
 
+    // What the whole descent holds constant, so the recursion carries only what
+    // actually varies: a tree, its name, and its path.
+    struct Walk<'a> {
+      this: &'a Libgit2Repository,
+      repo: &'a git2::Repository,
+      commit: &'a ObjectId,
+      odb: &'a git2::Odb<'a>,
+    }
+
     // Recursive descent in tree-entry order, recursing into a directory at the
     // point it appears. That interleaving is what yields Git's index order --
     // byte-wise by full path -- because tree entries sort directories as
@@ -1321,28 +1330,36 @@ impl GitRepository for Libgit2Repository {
     // first and its subtrees after, which is a *different* order, and an index
     // whose entries are out of order is silently misread; `write_index_v2`
     // asserts the order as a backstop.
+    //
+    // The same descent also yields the cache tree, because every directory it
+    // visits is one Git can reuse whole: this index describes a commit, so
+    // nothing in it is modified. Building it here rather than letting Git build
+    // it on first commit is the difference between a 12 s first commit and a
+    // 0.2 s one on vscode -- see `index.rs`. Note the cache tree's *subtree*
+    // order is not this walk's order; `write_index_v2` sorts it.
     fn descend(
-      this: &Libgit2Repository,
-      repo: &git2::Repository,
-      commit: &ObjectId,
-      odb: &git2::Odb<'_>,
+      w: &Walk<'_>,
       tree_oid: git2::Oid,
+      name: &[u8],
       prefix: &gfs_types::BytePath,
       out: &mut Vec<crate::index::IndexEntry>,
-    ) -> Result<(), GfsError> {
-      let tree = this.decoded_tree(repo, tree_oid)?;
+    ) -> Result<crate::index::CacheTree, GfsError> {
+      let this = w.this;
+      let tree = this.decoded_tree(w.repo, tree_oid)?;
+      let mut node = crate::index::CacheTree {
+        name: name.to_vec(),
+        oid: this.to_oid(tree_oid)?,
+        entries: 0,
+        children: Vec::new(),
+      };
       for entry in tree.entries() {
         let path = prefix.join(&entry.name);
         if entry.mode == mode::DIRECTORY {
-          descend(
-            this,
-            repo,
-            commit,
-            odb,
-            this.git_oid(&entry.oid)?,
-            &path,
-            out,
-          )?;
+          let child = descend(w, this.git_oid(&entry.oid)?, &entry.name, &path, out)?;
+          node.entries = node.entries.checked_add(child.entries).ok_or_else(|| {
+            GfsError::new(ErrorCode::ResourceLimit, "too many entries for an index")
+          })?;
+          node.children.push(child);
           continue;
         }
         // A gitlink names a commit in *another* repository; reading its header
@@ -1351,7 +1368,8 @@ impl GitRepository for Libgit2Repository {
         let size = if entry.mode == mode::GITLINK {
           0
         } else {
-          let (size, _) = odb
+          let (size, _) = w
+            .odb
             .read_header(this.git_oid(&entry.oid)?)
             .map_err(|e| not_found(&e, "blob"))?;
           size as u64
@@ -1363,7 +1381,7 @@ impl GitRepository for Libgit2Repository {
         let size = match &this.lfs_check {
           Some(check) => {
             let kind = EntryKind::from_mode(entry.mode);
-            match this.lfs_pointer_for(repo, commit, &path, kind, &entry.oid, size)? {
+            match this.lfs_pointer_for(w.repo, w.commit, &path, kind, &entry.oid, size)? {
               Some(pointer) if check.contains(&pointer.oid) => pointer.size,
               _ => size,
             }
@@ -1376,21 +1394,24 @@ impl GitRepository for Libgit2Repository {
           oid: entry.oid.clone(),
           size,
         });
+        // A gitlink is one entry of its parent, never a cache tree node of its
+        // own: the tree it names lives in another repository.
+        node.entries = node.entries.checked_add(1).ok_or_else(|| {
+          GfsError::new(ErrorCode::ResourceLimit, "too many entries for an index")
+        })?;
       }
-      Ok(())
+      Ok(node)
     }
 
     let mut entries = Vec::new();
-    descend(
-      self,
+    let walk = Walk {
+      this: self,
       repo,
       commit,
-      &odb,
-      root,
-      &gfs_types::BytePath::root(),
-      &mut entries,
-    )?;
-    crate::index::write_index_v2(&entries, snapshot_time)
+      odb: &odb,
+    };
+    let cache_tree = descend(&walk, root, b"", &gfs_types::BytePath::root(), &mut entries)?;
+    crate::index::write_index_v2(&entries, snapshot_time, Some(cache_tree))
   }
 
   fn lfs_pointers(&self, commit: &ObjectId) -> Result<Vec<LfsEntry>, GfsError> {

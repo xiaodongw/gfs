@@ -38,53 +38,59 @@ add, one delete, one rename — to the **same four paths**, chosen once from
 
 ## Results: vscode
 
-| step | raw git full | raw git shallow+blobless | GFS | GFS on 2026-08-17 | raw result | GFS result |
+| step | raw git full | raw git shallow+blobless | GFS | GFS before the cache tree | raw result | GFS result |
 | --- | ---: | ---: | ---: | ---: | --- | --- |
-| acquire | 56.174 s | 9.856 s | **0.246 s** | 0.300 s | clone | mount |
-| `log -10` | 0.006 s | 0.006 s | 0.053 s | 1.503 s | 10 commits | 10 commits |
-| `ls-files '*test*'` | 0.007 s | 0.005 s | 0.020 s | 0.021 s | 0 files, see below | 6 245 files |
-| grep `TODO`, cold index | 0.041 s | 0.038 s | 5.786 s | 6.426 s | 1 683 lines | error, see below |
-| grep `TODO`, warm | 0.041 s | 0.038 s | 0.248 s | 0.283 s | 1 683 lines | 1 574 lines |
-| edit 5 files | 0.006 s | 0.005 s | 0.070 s | 2.908 s | | |
-| `git status`, cold | 0.037 s | 0.029 s | **2.344 s** | 555 s | | |
-| `git status`, warm | 0.035 s | 0.029 s | 0.297 s | 1.753 s | | |
-| `gfs status` | – | – | **0.010 s** | 0.0097 s | | journal |
-| commit | 1.002 s | 0.908 s | **14.501 s** | 1 448 s | | |
-| **total** | **57.272 s** | **10.849 s** | **17.482 s** | ~1 521 s | | |
-| **local disk** | 1 648 MiB | 363 MiB | **22 MB** + 147 MB host cache | 21 MB + 145 MB | | |
+| acquire | 56.983 s | 10.164 s | **0.258 s** | 0.246 s | clone | mount |
+| `log -10` | 0.007 s | 0.007 s | 0.066 s | 0.053 s | 10 commits | 10 commits |
+| `ls-files '*test*'` | 0.007 s | 0.006 s | 0.026 s | 0.020 s | 0 files, see below | 6 245 files |
+| grep `TODO`, cold index | 0.043 s | 0.047 s | 5.881 s | 5.786 s | 1 683 lines | error, see below |
+| grep `TODO`, warm | 0.043 s | 0.047 s | 0.259 s | 0.248 s | 1 683 lines | 1 574 lines |
+| edit 5 files | 0.007 s | 0.007 s | 0.064 s | 0.070 s | | |
+| `git status`, cold | 0.041 s | 0.042 s | 1.701 s | 2.344 s | | |
+| `git status`, warm | 0.036 s | 0.030 s | 0.070 s | 0.297 s | | |
+| `gfs status` | – | – | **0.011 s** | 0.010 s | | journal |
+| commit | 0.957 s | 0.946 s | **1.953 s** | 14.501 s | | |
+| **total** | **58.044 s** | **11.219 s** | **4.327 s** | 17.482 s | | |
+| **local disk** | 1 648 MiB | 363 MiB | **3.5 MB** + 66.9 MB host cache | 22 MB + 147 MB | | |
 
 ## Results: django
 
-| step | raw git full | raw git shallow+blobless | GFS | GFS on 2026-08-17 |
+| step | raw git full | raw git shallow+blobless | GFS | GFS before the cache tree |
 | --- | ---: | ---: | ---: | ---: |
-| acquire | 11.187 s | 2.583 s | **0.108 s** | 0.180 s |
-| `log -10` | 0.006 s | 0.006 s | 0.046 s | 0.241 s |
-| `ls-files '*test*'` | 0.007 s | 0.007 s | 0.014 s (2 621 files, both) | 0.019 s |
-| grep `TODO`, cold index | 0.019 s | 0.019 s | 1.546 s (35 lines, both) | 1.461 s |
-| grep `TODO`, warm | 0.019 s | 0.019 s | 0.035 s | 0.217 s |
-| edit 5 files | 0.005 s | 0.005 s | 0.055 s | 0.482 s |
-| `git status`, cold | 0.130 s | 0.127 s | **1.436 s** | 7.229 s |
-| `git status`, warm | 0.037 s | 0.126 s | 0.119 s | 0.116 s |
-| `gfs status` | – | – | **0.010 s** | 0.011 s |
-| commit | 0.054 s | 0.054 s | 9.705 s | 9.811 s |
-| **local disk** | 338 MiB | 68 MiB | **15.6 MB** + 46.9 MB host cache | same |
+| acquire | 11.298 s | 2.646 s | **0.116 s** | 0.108 s |
+| `log -10` | 0.007 s | 0.006 s | 0.046 s | 0.046 s |
+| `ls-files '*test*'` | 0.008 s | 0.007 s | 0.015 s (2 621 files, both) | 0.014 s |
+| grep `TODO`, cold index | 0.019 s | 0.018 s | 1.576 s (35 lines, both) | 1.546 s |
+| grep `TODO`, warm | 0.019 s | 0.018 s | 0.036 s | 0.035 s |
+| edit 5 files | 0.006 s | 0.006 s | 0.056 s | 0.055 s |
+| `git status`, cold | 0.130 s | 0.136 s | 1.190 s | 1.436 s |
+| `git status`, warm | 0.035 s | 0.036 s | 0.041 s | 0.119 s |
+| `gfs status` | – | – | **0.011 s** | 0.010 s |
+| commit | 0.055 s | 0.055 s | **1.372 s** | 9.705 s |
+| **total** | **11.523 s** | **2.873 s** | **2.831 s** | 11.399 s |
+| **local disk** | 338 MiB | 68 MiB | **1.4 MB** + 25.0 MB host cache | 15.6 MB + 46.9 MB |
 
 Commit correctness: **PASS**, both flows produced tree
 `c297292656bb794d6e231778d3f9272d22a52c03`.
 
 ## What the numbers say
 
+**The whole task is now cheaper than the cheapest clone that still works.**
+On vscode the full workflow takes **4.327 s** against 11.219 s for a shallow
+blobless clone and 58.044 s for a full one, and on django **2.831 s** against
+2.873 s and 11.523 s. Two fixes got it there, and neither was where the step's
+name pointed.
+
 **The first full-tree walk was the whole cost, and it is gone.** The first
-`git status` in a fresh vscode workspace used to take **555 s** and the first
-`commit` **1 448 s**, because each walks every directory once to populate the
-untracked cache — 5 328 uncached listings, serialized, at 38–126 ms apiece. Both
-numbers were a *server* cost that had nothing to do with reading trees:
-every snapshot request re-decided object authorization by enumerating and
-peeling all 73 989 refs (24–28 ms), around a directory read that costs ~2.5 µs.
-Deciding that once per ref generation, and answering a recognized walk with one
-recursive `ListTree` instead of one call per directory, leaves cold `status` at
-**2.344 s** and commit at **14.501 s**. `gfs inspect` shows the mechanism at the
-end of the vscode run:
+`git status` in a fresh vscode workspace used to take **555 s**, because it walks
+every directory once to populate the untracked cache — 5 328 uncached listings,
+serialized, at 38–126 ms apiece. That was a *server* cost with nothing to do with
+reading trees: every snapshot request re-decided object authorization by
+enumerating and peeling all 73 989 refs (24–28 ms), around a directory read that
+costs ~2.5 µs. Deciding that once per ref generation, and answering a recognized
+walk with one recursive `ListTree` instead of one call per directory, leaves cold
+`status` at **1.701 s**. `gfs inspect` shows the mechanism at the end of the
+vscode run:
 
 ```
 metadata   32 server requests, 5 directory pages, 34225 listing hits
@@ -93,6 +99,24 @@ prefetch   1 walks in 3 pages filling 4318 listings, 1 directories read ahead
 
 Five per-directory listings for a repository with 4 318 directories: the walk
 detector fired after four misses and the rest arrived in three pages.
+
+**The first commit was rewriting the repository, not reading it.** With the walk
+fixed, `commit` still cost **14.501 s** on vscode and 9.705 s on django, and the
+reason was one missing index extension. The shipped index carried no `TREE`
+cache tree, so Git could not tell that any directory was unchanged: the *first*
+commit in a workspace re-derived every tree in the repository and wrote each one
+out — 4 299 loose objects for a five-file change, 4 275 of them duplicates of
+objects the projection already served. It compounded with a second defect:
+`utime()` on a projected pack returned `EROFS`, and Git reads a failed freshen as
+"cannot vouch for this object", so it wrote a copy rather than reusing the packed
+one. Shipping the cache tree and accepting the freshen leaves commit at
+**1.953 s** on vscode and **1.372 s** on django, writing 25 and 14 objects.
+
+The same change is most of why local disk fell from 22 MB to **3.5 MB** on
+vscode, and why the object store fetched 65 MB instead of 146 MB: Git is no
+longer reading the whole tree through the projection to recompute what it
+already had. The sub-second `status` steps also improved between the two runs;
+that is run-to-run variance on this machine, not a claim of this change.
 
 **Cold is now within a rounding error of warm.** Measured on its own — a `find`
 over every directory, nothing else running — the cold walk is **1.71 s** against

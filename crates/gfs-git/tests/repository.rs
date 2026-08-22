@@ -1433,3 +1433,82 @@ fn stock_git_reads_the_shipped_index_and_reports_a_clean_tree() {
   listed.sort();
   assert_eq!(listed, walked);
 }
+
+/// The shipped cache tree must be the one Git itself would have written.
+///
+/// Git *trusts* a well-formed `TREE` extension: a directory whose recorded OID
+/// and entry count are wrong is reused whole at the next commit, producing a
+/// wrong tree with no diagnostic. So the oracle is Git, not a re-derivation —
+/// `git read-tree` builds its own cache tree for the same commit, and the two
+/// must agree byte for byte.
+///
+/// Ordering is the part this is really guarding. A Git tree sorts a directory as
+/// though its name ended in `/`; a cache tree sorts subtrees shorter-name-first.
+/// The `siblings` fixture exists because the corpus hits that difference, and
+/// `modes` because a gitlink is one entry of its parent and never a node of its
+/// own.
+#[test]
+fn the_shipped_cache_tree_is_the_one_git_would_have_written() {
+  /// The `TREE` extension's payload, or `None` if the index carries no cache tree.
+  fn cache_tree(index: &[u8]) -> Option<Vec<u8>> {
+    // Extensions follow the entries and precede the 20-byte trailer. Scanning
+    // for the signature is enough here because both files hold exactly one.
+    let body = &index[..index.len() - 20];
+    let at = body
+      .windows(4)
+      .position(|w| w == b"TREE")
+      .filter(|at| at + 8 <= body.len())?;
+    let size = u32::from_be_bytes(body[at + 4..at + 8].try_into().ok()?) as usize;
+    body.get(at + 8..at + 8 + size).map(<[u8]>::to_vec)
+  }
+
+  for name in [
+    "siblings", "basic", "modes", "bytes", "deep", "bigdir", "packed", "attrs",
+  ] {
+    let repo = open(name);
+    let commit = head(&repo);
+    let ours = repo
+      .index_for_commit(&commit, gfs_types::Timestamp::from_secs(1_600_000_000))
+      .unwrap();
+
+    // Git's own, from a scratch gitdir that reaches the fixture's objects
+    // through `alternates` -- no worktree, because `read-tree` needs none.
+    let dir = tempfile::tempdir().unwrap();
+    let gitdir = dir.path().join("git");
+    std::fs::create_dir_all(gitdir.join("objects/info")).unwrap();
+    std::fs::create_dir_all(gitdir.join("refs/heads")).unwrap();
+    std::fs::write(gitdir.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+    std::fs::write(
+      gitdir.join("config"),
+      "[core]\n\trepositoryformatversion = 0\n\tbare = true\n",
+    )
+    .unwrap();
+    std::fs::write(
+      gitdir.join("objects/info/alternates"),
+      format!("{}\n", gfs_test::bare(name).join("objects").display()),
+    )
+    .unwrap();
+    let out = std::process::Command::new("git")
+      .env_clear()
+      .env("GIT_CONFIG_GLOBAL", "/dev/null")
+      .env("GIT_CONFIG_SYSTEM", "/dev/null")
+      .env("PATH", "/usr/bin:/bin")
+      .env("GIT_DIR", &gitdir)
+      .args(["read-tree", &commit.to_hex()])
+      .output()
+      .unwrap();
+    assert!(
+      out.status.success(),
+      "{name}: {}",
+      String::from_utf8_lossy(&out.stderr)
+    );
+    let theirs = std::fs::read(gitdir.join("index")).unwrap();
+
+    let ours = cache_tree(&ours).unwrap_or_else(|| panic!("{name}: no cache tree was shipped"));
+    let theirs = cache_tree(&theirs).unwrap_or_else(|| panic!("{name}: git wrote no cache tree"));
+    assert_eq!(
+      ours, theirs,
+      "{name}: the shipped cache tree differs from the one git builds"
+    );
+  }
+}
