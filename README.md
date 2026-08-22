@@ -37,8 +37,12 @@ The system has three entry points:
 
 Supporting libraries live under `crates/` (`gfs-git`, `gfs-search`,
 `gfs-overlay`, `gfs-mount`, `gfs-service`, `gfs-proto`, `gfs-types`,
-`gfs-test`). The full design rationale is in [docs/DESIGN.md](docs/DESIGN.md);
-architecture decisions are in [docs/adr/](docs/adr/).
+`gfs-test`).
+
+For how it works — what runs where, what happens on a read, a write, and a
+commit — read [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md). The full design
+rationale is in [docs/DESIGN.md](docs/DESIGN.md); architecture decisions are in
+[docs/adr/](docs/adr/).
 
 ## Shims: the pre-configured tool surface
 
