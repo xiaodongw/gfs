@@ -460,7 +460,7 @@ impl Gfs {
     overlay: Arc<Overlay>,
     snapshot_time: Timestamp,
     root: TreeEntryInfo,
-  ) -> Vec<(u64, Vec<u8>)> {
+  ) -> Vec<crate::inode::StaleEntry> {
     // Assembled here rather than by the caller so the listing cache is always
     // born empty and sized from this mount's config.
     let pinned = Pinned {
@@ -1199,6 +1199,26 @@ fn open_cached(path: &std::path::Path) -> Result<std::fs::File, GfsError> {
   })
 }
 
+/// What the kernel may keep for a descriptor.
+///
+/// `NOFLUSH` for every file: nothing is buffered above the host filesystem (a
+/// write reaches its content file inside the callback that carried it, see
+/// `flush`), so the `FUSE_FLUSH` the kernel would otherwise send on every
+/// `close` is a round trip that answers nothing. `KEEP_CACHE` for a base
+/// blob: the bytes behind a pinned commit never change under one inode, so
+/// the page cache may outlive the descriptor and the next open of the same
+/// file reads from memory without asking. A write goes through the kernel,
+/// which keeps its own cache coherent; a re-pin invalidates the inodes it
+/// moves; and a path re-created after a delete announces a new size, which
+/// the kernel treats as a reason to drop what it held.
+fn fopen_flags(state: &FileState) -> fuser::FopenFlags {
+  let mut flags = fuser::FopenFlags::FOPEN_NOFLUSH;
+  if matches!(state, FileState::Memory { .. } | FileState::Blob { .. }) {
+    flags |= fuser::FopenFlags::FOPEN_KEEP_CACHE;
+  }
+  flags
+}
+
 /// The `fuser` adapter: an `Arc<Gfs>` plus the runtime its callbacks dispatch to.
 pub struct GfsFilesystem {
   fs: Arc<Gfs>,
@@ -1216,15 +1236,36 @@ impl GfsFilesystem {
     GfsFilesystem { fs, runtime }
   }
 
-  /// Run a fallible operation on the runtime and reply from there.
+  /// Run an operation and reply from wherever it finishes.
   ///
   /// The one place the ADR 0003 rule is implemented, so there is exactly one
-  /// place to check that no callback blocks.
+  /// place to check that no callback blocks. The future is polled once right
+  /// here, on the FUSE thread, inside the runtime's context: an operation the
+  /// caches can answer -- a lookup in a listed directory, an open of a blob
+  /// the source holds in memory, a read of that blob, a page of a directory
+  /// already assembled -- completes without leaving this thread, and the
+  /// reply is written before the next request is read. Only a future that
+  /// has to wait (a fetch, a `spawn_blocking`, a lock someone holds) is handed
+  /// to the runtime, which polls it again the moment a worker picks it up.
+  ///
+  /// Measured on the local-mode workspace: the hand-off alone was a third of
+  /// the daemon's per-request wall time, and for a workload that opens and
+  /// reads one small file after another every request is a cache hit.
+  ///
+  /// The first poll uses a waker that does nothing. That is sound because a
+  /// spawned task is polled once unconditionally, and every primitive the
+  /// futures here wait on re-registers whichever waker the current poll
+  /// carries -- the `Future` contract, not a property of one crate.
   fn spawn<F>(&self, future: F)
   where
     F: std::future::Future<Output = ()> + Send + 'static,
   {
-    self.runtime.spawn(future);
+    let mut future = Box::pin(future);
+    let _runtime = self.runtime.enter();
+    let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+    if future.as_mut().poll(&mut context).is_pending() {
+      self.runtime.spawn(future);
+    }
   }
 }
 
@@ -1246,6 +1287,28 @@ impl Filesystem for GfsFilesystem {
         "the kernel refused FUSE_ATOMIC_O_TRUNC; replacing a file will copy its \
          old contents up before discarding them"
       );
+    }
+    // Everything below trades daemon round trips for kernel-side state, and
+    // each one is safe here for a reason worth writing down:
+    // * `PARALLEL_DIROPS`: the kernel otherwise serializes lookups and
+    //   listings inside one directory. Every handler here is already
+    //   concurrent across directories; nothing in the listing cache or the
+    //   overlay assumes one caller per parent.
+    // * `DO_READDIRPLUS` + `READDIRPLUS_AUTO`: `readdirplus` has always been
+    //   implemented below but never advertised, so the kernel never used it.
+    //   With `AUTO` the kernel asks for it only after seeing a listing followed
+    //   by lookups of the listed names (`ls -l`, a walk that stats), and keeps
+    //   plain `readdir` for a walk that does not.
+    // Symlink caching is deliberately absent: a path keeps its inode number
+    // across delete and re-create, and the kernel does not drop a cached link
+    // target for a symlink whose inode it already holds.
+    let wanted = fuser::InitFlags::FUSE_PARALLEL_DIROPS;
+    let offered = wanted & config.capabilities();
+    if let Err(refused) = config.add_capabilities(offered) {
+      tracing::warn!(?refused, "the kernel refused directory capabilities it offered");
+    }
+    if offered != wanted {
+      tracing::info!(missing = ?(wanted - offered), "the kernel does not offer every directory capability");
     }
     Ok(())
   }
@@ -1545,6 +1608,7 @@ impl Filesystem for GfsFilesystem {
           }
         },
       };
+      let flags = fopen_flags(&state);
       let handle = fs.new_handle();
       fs.inodes.lock().expect("inode table").open(ino.0);
       fs.files
@@ -1552,7 +1616,7 @@ impl Filesystem for GfsFilesystem {
         .expect("file handles")
         .insert(handle, Arc::new(state));
       fs.bump(|s| s.opens += 1);
-      reply.opened(FileHandle(handle), fuser::FopenFlags::empty());
+      reply.opened(FileHandle(handle), flags);
     });
   }
 
@@ -1635,7 +1699,7 @@ impl Filesystem for GfsFilesystem {
               &attr,
               GENERATION,
               FileHandle(handle),
-              fuser::FopenFlags::empty(),
+              fuser::FopenFlags::FOPEN_NOFLUSH,
             )
           }
           Ok(Err(e)) => {
@@ -1703,7 +1767,7 @@ impl Filesystem for GfsFilesystem {
         &attr,
         GENERATION,
         FileHandle(handle),
-        fuser::FopenFlags::empty(),
+        fuser::FopenFlags::FOPEN_NOFLUSH,
       );
     });
   }
@@ -2130,6 +2194,22 @@ impl Filesystem for GfsFilesystem {
       },
     }
 
+    // The kernel may keep the listing of a merged-view directory in its page
+    // cache across `opendir` calls: the base never changes under one pin, every
+    // overlay mutation goes through the kernel (which bumps the directory's
+    // version itself), and a re-pin invalidates the inodes it moves. The two
+    // passthrough trees are excluded because the daemon writes into them
+    // behind the kernel's back -- the index, `packed-refs`, the projection.
+    //
+    // `CACHE_DIR` alone is not enough: `fuse_dir_open` drops a directory's
+    // pages on every open unless `KEEP_CACHE` is set too, and the listing
+    // cache lives in those pages. Without both, the kernel refilled the cache
+    // on every `opendir` and never once read from it.
+    let flags = if record.node.is_git() || record.node.is_odb() {
+      fuser::FopenFlags::empty()
+    } else {
+      fuser::FopenFlags::FOPEN_CACHE_DIR | fuser::FopenFlags::FOPEN_KEEP_CACHE
+    };
     let handle = self.fs.new_handle();
     self.fs.inodes.lock().expect("inode table").open(ino.0);
     self
@@ -2138,7 +2218,7 @@ impl Filesystem for GfsFilesystem {
       .lock()
       .expect("dir handles")
       .insert(handle, Arc::new(tokio::sync::Mutex::new(state)));
-    reply.opened(FileHandle(handle), fuser::FopenFlags::empty());
+    reply.opened(FileHandle(handle), flags);
   }
 
   fn readdir(

@@ -832,7 +832,7 @@ impl Mount {
   /// the outcome being asked for; the rest would each, at worst, leave one name
   /// to expire on its TTL, and none is a reason to fail a switch that has
   /// already happened.
-  async fn invalidate(&self, entries: Vec<(u64, Vec<u8>)>) {
+  async fn invalidate(&self, entries: Vec<crate::inode::StaleEntry>) {
     if entries.is_empty() {
       return;
     }
@@ -846,8 +846,15 @@ impl Mount {
     let count = entries.len();
     let _ = tokio::task::spawn_blocking(move || {
       use std::os::unix::ffi::OsStrExt;
-      for (parent, name) in entries {
-        let _ = notifier.inval_entry(fuser::INodeNo(parent), std::ffi::OsStr::from_bytes(&name));
+      for entry in entries {
+        // The dentry first, then the inode's pages: with `KEEP_CACHE` and
+        // `CACHE_DIR` the kernel may hold the old commit's bytes or listing
+        // under an inode number the same path keeps across the re-pin.
+        let _ = notifier.inval_entry(
+          fuser::INodeNo(entry.parent),
+          std::ffi::OsStr::from_bytes(&entry.name),
+        );
+        let _ = notifier.inval_inode(fuser::INodeNo(entry.ino), 0, 0);
       }
     })
     .await;

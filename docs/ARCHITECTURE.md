@@ -160,6 +160,17 @@ charges the hydration budget *before* fetching, so an over-budget job fails at a
 named file with `EDQUOT` rather than after spending what the budget existed to
 protect.
 
+Two things about *how* a request is answered matter as much as what answers
+it (ADR 0014). Each handler's future is polled once on the FUSE thread that
+read the request, inside the runtime's context, and handed to the runtime
+only if it has to wait — so a cache hit is answered by the thread that
+received it, and a fetch is the only thing that crosses to a worker. And the
+kernel is told what a pinned commit cannot change: a base blob's pages stay
+cached across opens (`FOPEN_KEEP_CACHE`), a directory's listing stays cached
+across `opendir` calls (`FOPEN_CACHE_DIR`), and `close` sends no `flush`.
+A warm re-read is a page-cache hit with no request; a second walk of the tree
+asks only to open and release each directory.
+
 ### The three client caches
 
 | cache | keyed by | scope | why that scope |
@@ -516,11 +527,12 @@ image installs on `PATH`.
 
 | for | read |
 | --- | --- |
-| why any of this is the way it is | [`adr/`](adr/) — twelve decision records |
+| why any of this is the way it is | [`adr/`](adr/) — fourteen decision records |
 | the object authorization boundary | [ADR 0002](adr/0002-git-object-authorization-boundary.md) |
 | why the workspace carries a real ODB | [ADR 0009](adr/0009-raw-git-over-a-projected-object-store.md) |
 | why one folder, not two | [ADR 0011](adr/0011-single-mount-workspace.md) |
 | a workspace over a local clone, no server | [ADR 0013](adr/0013-local-mode.md), [`../benchmarks/local-mode.md`](../benchmarks/local-mode.md) |
+| why a round trip costs what it costs, and which ones are gone | [ADR 0014](adr/0014-answer-on-the-fuse-thread-and-let-the-kernel-keep-it.md) |
 | measured numbers, end to end | [`../benchmarks/agent-workflow.md`](../benchmarks/agent-workflow.md) |
 | the narrative version, with charts | [`overview.html`](overview.html) |
 | running it locally | [`../README.md`](../README.md), [`manual-test.md`](manual-test.md) |

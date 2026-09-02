@@ -332,3 +332,14 @@ The exchange this ADR's first amendment asked M2 for is therefore still honoured
   what the job touched. A job that walked a monorepo pays for that walk again at
   the next switch. If that ever matters, the fix is to invalidate only the
   subtree the diff touched — the manifest diff already knows it.
+
+## Amendment, 2026-09-02: a callback may complete on the FUSE thread
+
+[ADR 0014](0014-answer-on-the-fuse-thread-and-let-the-kernel-keep-it.md)
+refines the dispatch rule. The first half stands: a callback never blocks.
+The second half — the work runs on the runtime — was implemented as "spawn
+every handler and reply from a worker", which made a cache hit cost a thread
+hop and a wait. Each handler's future is now polled once on the FUSE thread
+inside the runtime's context and handed to the runtime only if it returns
+pending. The measurement in section 3 still governs what may run in that
+synchronous prefix: nothing that waits on I/O.

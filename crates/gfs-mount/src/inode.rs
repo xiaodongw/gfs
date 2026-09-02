@@ -102,6 +102,16 @@ pub struct InodeTable {
   next: u64,
 }
 
+/// A kernel-cached name a re-pin has moved out from under: the dentry to drop
+/// (`parent` + `name`) and the inode whose cached pages -- file content, or a
+/// directory listing -- may no longer describe what the path holds.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StaleEntry {
+  pub parent: u64,
+  pub name: Vec<u8>,
+  pub ino: u64,
+}
+
 impl InodeTable {
   /// Build a table whose root is the snapshot root.
   pub fn new(root: TreeEntryInfo) -> Self {
@@ -317,19 +327,19 @@ impl InodeTable {
   /// The result is `(parent inode, name)` pairs rather than paths because that
   /// is what `FUSE_NOTIFY_INVAL_ENTRY` takes, and resolving a parent path to its
   /// number needs `by_path` — which lives here and nowhere else.
-  pub fn repin(&mut self, root: TreeEntryInfo) -> Vec<(u64, Vec<u8>)> {
+  pub fn repin(&mut self, root: TreeEntryInfo) -> Vec<StaleEntry> {
     if let Some(record) = self.records.get_mut(&ROOT_INO) {
       record.node = Node::Base(root);
     }
-    let paths: Vec<BytePath> = self
+    let paths: Vec<(u64, BytePath)> = self
       .records
       .values()
       .filter(|record| record.ino != ROOT_INO)
-      .map(|record| record.path.clone())
+      .map(|record| (record.ino, record.path.clone()))
       .collect();
     paths
       .into_iter()
-      .filter_map(|path| {
+      .filter_map(|(ino, path)| {
         let bytes = path.as_bytes();
         let (parent, name) = match bytes.iter().rposition(|b| *b == b'/') {
           Some(slash) => (&bytes[..slash], &bytes[slash + 1..]),
@@ -342,7 +352,11 @@ impl InodeTable {
         // parent is numbered too. `filter_map` rather than `expect` because a
         // missing parent is a reason to invalidate less, never to abort a switch.
         let parent_ino = *self.by_path.get(parent)?;
-        Some((parent_ino, name.to_vec()))
+        Some(StaleEntry {
+          parent: parent_ino,
+          name: name.to_vec(),
+          ino,
+        })
       })
       .collect()
   }
