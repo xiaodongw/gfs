@@ -269,6 +269,8 @@ impl Mount {
       // surface the shim and stock Git are tested against.
       refs: client.list_refs().await.ok(),
       work_ref_root: (!grant.work_ref_root.is_empty()).then(|| grant.work_ref_root.clone()),
+      local_clone: None,
+      objects_dir: None,
     };
 
     let overlay_dir = tempfile::tempdir().unwrap();
@@ -308,7 +310,7 @@ impl Mount {
     )
     .await
     .unwrap();
-    let git = Arc::new(GitPassthrough::new(handle, Arc::clone(&odb.store)));
+    let git = Arc::new(GitPassthrough::new(handle, Some(Arc::clone(&odb.store))));
 
     let fs = Gfs::new(
       client,
@@ -402,6 +404,7 @@ pub fn mount_spec(
     overlay,
     mount: MountConfig::default(),
     lease_policy: gfs_types::LeasePolicy::adr_0006(),
+    local_clone: None,
   }
 }
 
@@ -419,6 +422,8 @@ pub struct Job {
   pub daemon: Arc<gfs_mount::Mount>,
   pub workspace: PathBuf,
   pub state_dir: PathBuf,
+  /// Local mode only: the clone the workspace was mounted from.
+  pub clone: Option<PathBuf>,
   _tmp: tempfile::TempDir,
   _cache: tempfile::TempDir,
 }
@@ -490,6 +495,84 @@ impl Job {
       daemon,
       workspace,
       state_dir,
+      clone: None,
+      _tmp: tmp,
+      _cache: cache,
+    }
+  }
+
+  /// A local-mode job (ADR 0013): a non-bare clone of the fixture in a
+  /// temporary directory, mounted through an in-process host with no server
+  /// behind it. The endpoints in the host config point at a closed port, which
+  /// is the assertion that nothing reaches for one.
+  pub async fn local(fixture: &str, revision: &str) -> Job {
+    let tmp = tempfile::tempdir().unwrap();
+    let clone = tmp.path().join("clone");
+    Job::clone_fixture(fixture, &clone);
+    Job::local_from(&clone, revision, tmp).await
+  }
+
+  /// A non-bare `git clone` of a fixture at `dest`, the shape local mode is for.
+  pub fn clone_fixture(fixture: &str, dest: &Path) {
+    let status = std::process::Command::new("git")
+      .env_clear()
+      .env("GIT_CONFIG_GLOBAL", "/dev/null")
+      .env("GIT_CONFIG_SYSTEM", "/dev/null")
+      .env("PATH", "/usr/bin:/bin")
+      .args(["clone", "-q"])
+      .arg(crate::fixtures::bare(fixture))
+      .arg(dest)
+      .status()
+      .unwrap();
+    assert!(status.success(), "cloning the fixture");
+  }
+
+  /// A local-mode job over an existing clone. `tmp` holds the workspace and
+  /// the host socket and is dropped with the job; the clone is the caller's.
+  pub async fn local_from(clone: &Path, revision: &str, tmp: tempfile::TempDir) -> Job {
+    Mount::require_fuse();
+    let cache = tempfile::tempdir().unwrap();
+    let clone = clone.to_path_buf();
+    let workspace = tmp.path().join("ws");
+    let state_dir = gfs_mount::state::state_dir_for_workspace(&workspace);
+
+    let config = gfs_mount::HostConfig {
+      socket: tmp.path().join("host.sock"),
+      grpc_endpoint: "http://127.0.0.1:1".to_owned(),
+      http_endpoint: "http://127.0.0.1:1".to_owned(),
+      token: String::new(),
+      lease_policy: gfs_types::LeasePolicy::adr_0006(),
+      fs: FsConfig::default(),
+      odb_residency_bytes: 0,
+    };
+    let (host, listener) = gfs_mount::MountHost::bind(config).unwrap();
+    tokio::spawn(Arc::clone(&host).serve(listener));
+
+    let daemon = host
+      .mount(gfs_mount::MountSpec {
+        workspace: workspace.clone(),
+        cache_dir: cache.path().to_path_buf(),
+        grpc_endpoint: String::new(),
+        http_endpoint: String::new(),
+        token: String::new(),
+        repository_id: gfs_types::RepositoryId::parse("local-pending").unwrap(),
+        revision_selector: revision.to_owned(),
+        cache_quota_bytes: 1 << 30,
+        fs: FsConfig::default(),
+        overlay: gfs_overlay::OverlayConfig::default(),
+        mount: MountConfig::default(),
+        lease_policy: gfs_types::LeasePolicy::adr_0006(),
+        local_clone: Some(clone.clone()),
+      })
+      .await
+      .unwrap();
+
+    Job {
+      host,
+      daemon,
+      workspace,
+      state_dir,
+      clone: Some(clone),
       _tmp: tmp,
       _cache: cache,
     }

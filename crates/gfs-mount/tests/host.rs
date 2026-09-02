@@ -200,6 +200,7 @@ async fn a_client_from_another_state_format_is_refused_rather_than_served() {
     grpc_endpoint: None,
     http_endpoint: None,
     token: None,
+    local_clone: None,
   };
   let HostResponse::Error { code, .. } =
     call(&socket, HostRequest::CreateMount(Box::new(request))).await
@@ -243,6 +244,7 @@ async fn a_mount_created_over_the_host_socket_is_usable_immediately() {
     grpc_endpoint: None,
     http_endpoint: None,
     token: None,
+    local_clone: None,
   };
   let HostResponse::Mounted(report) =
     call(&socket, HostRequest::CreateMount(Box::new(request))).await

@@ -12,6 +12,9 @@ gfs-types = { workspace = true }
 gfs-proto = { workspace = true }
 gfs-overlay = { workspace = true }
 gfs-search = { workspace = true }
+# Local mode (ADR 0013): the mount reads a clone on this machine through the
+# same `GitRepository` the server uses, so libgit2 is in the daemon's graph.
+gfs-git = { workspace = true }
 
 fuser = { workspace = true }
 libc = { workspace = true }

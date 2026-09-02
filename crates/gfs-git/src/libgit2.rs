@@ -93,6 +93,16 @@ impl Libgit2Repository {
     self.pool.path()
   }
 
+  /// The directory Git's `objects/info/alternates` should name to borrow this
+  /// repository's object store: the *common* dir's `objects`, which is the
+  /// right answer whether the path opened was a bare repository, a clone, or
+  /// one of a clone's linked worktrees.
+  pub fn objects_directory(&self) -> Result<std::path::PathBuf, GfsError> {
+    let pooled = self.checkout()?;
+    let repo: &git2::Repository = &pooled;
+    Ok(repo.commondir().join("objects"))
+  }
+
   fn to_oid(&self, oid: git2::Oid) -> Result<ObjectId, GfsError> {
     // The algorithm comes from the validated repository format, not from the
     // length of whatever OID libgit2 happened to produce. The M0 spike derived it

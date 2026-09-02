@@ -54,6 +54,11 @@ pub struct GitDirFacts {
   /// local branches into; `None` on servers that predate the field, which
   /// seeds no remote and leaves `gfs push` as the only push path.
   pub work_ref_root: Option<String>,
+  /// Local mode (ADR 0013): the clone this workspace was mounted from, and
+  /// the object directory `objects/info/alternates` borrows outright. `None`
+  /// seeds the relative pointer at the projection instead.
+  pub local_clone: Option<std::path::PathBuf>,
+  pub objects_dir: Option<std::path::PathBuf>,
 }
 
 /// A commit's identity lines, with the byte-exact fields base64url-encoded.
@@ -105,6 +110,7 @@ fn gfs_json(facts: &GitDirFacts) -> Vec<u8> {
     "surface": "real",
     "adr": "docs/adr/0011-single-mount-workspace.md",
     "commit_meta": facts.commit_meta.as_ref().map(commit_json),
+    "local_clone": facts.local_clone.as_ref().map(|p| p.display().to_string()),
   });
   let mut bytes = serde_json::to_vec_pretty(&value).unwrap_or_else(|_| b"{}".to_vec());
   bytes.push(b'\n');
@@ -210,11 +216,17 @@ pub fn seed_git_dir(spec: &SeedSpec<'_>) -> Result<(), gfs_types::error::GfsErro
   // wherever the folder happens to sit — copied to another machine included.
   // An absolute path would silently re-introduce the location dependence the
   // single-mount layout exists to remove.
-  std::fs::write(
-    dir.join("objects/info/alternates"),
-    format!("{}\n", crate::passthrough::ALTERNATES_POINTER),
-  )
-  .map_err(|e| io("alternates", e))?;
+  //
+  // Local mode is the deliberate exception: the workspace borrows the clone's
+  // object store where it stands, exactly as `git worktree` does, and an
+  // absolute path is the truthful one — this folder cannot outlive that
+  // clone, wherever it is copied.
+  let alternates = match &facts.objects_dir {
+    Some(objects) => format!("{}\n", objects.display()),
+    None => format!("{}\n", crate::passthrough::ALTERNATES_POINTER),
+  };
+  std::fs::write(dir.join("objects/info/alternates"), alternates)
+    .map_err(|e| io("alternates", e))?;
 
   // The required configuration, and the reason each line exists. None of this
   // is enforceable -- `git -c` overrides any of it -- which is why the
@@ -334,6 +346,33 @@ pub fn seed_git_dir(spec: &SeedSpec<'_>) -> Result<(), gfs_types::error::GfsErro
          \tremote = origin\n\
          \tmerge = refs/heads/{branch}\n"
       ));
+    }
+  }
+  if facts.work_ref_root.is_none() {
+    if let Some(clone) = &facts.local_clone {
+      // Local mode: the clone is `origin`, over the filesystem, so `git fetch`
+      // and `git push origin <branch>` move work between the workspace and
+      // the clone with no credential and no gateway. Git refuses a push onto
+      // the clone's checked-out branch by default, which is the right refusal.
+      config.push_str(&format!(
+        "[remote \"origin\"]\n\
+         \turl = {url}\n\
+         \tfetch = +refs/heads/*:refs/remotes/origin/*\n\
+         [push]\n\
+         \tdefault = simple\n",
+        url = clone.display(),
+      ));
+      if let Some(branch) = facts
+        .ref_name
+        .as_deref()
+        .and_then(|n| n.strip_prefix("refs/heads/"))
+      {
+        config.push_str(&format!(
+          "[branch \"{branch}\"]\n\
+           \tremote = origin\n\
+           \tmerge = refs/heads/{branch}\n"
+        ));
+      }
     }
   }
   config.push_str(&format!(
@@ -523,6 +562,8 @@ mod tests {
       http_endpoint: "http://127.0.0.1:8430".to_owned(),
       generation: 1,
       commit_meta: None,
+      local_clone: None,
+      objects_dir: None,
       refs: Some(vec![
         gfs_types::RefTarget {
           name: "refs/heads/main".to_owned(),

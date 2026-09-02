@@ -155,8 +155,15 @@ enum Command {
 
   /// Mount a pinned commit as a workspace.
   Mount {
-    #[arg(long)]
-    repo: String,
+    /// The repository on the gateway. Exactly one of `--repo` and `--local`.
+    #[arg(long, conflicts_with = "local", required_unless_present = "local")]
+    repo: Option<String>,
+    /// Local mode (ADR 0013): mount from a clone on this machine. No gateway,
+    /// no lease, no shims; the clone's object store is borrowed as-is, the
+    /// way `git worktree` does, but the tree is presented lazily instead of
+    /// copied.
+    #[arg(long, value_name = "CLONE")]
+    local: Option<PathBuf>,
     #[arg(long, default_value = "HEAD")]
     rev: String,
     /// The path the job will use. State lives inside it, at `.git/gfs`
@@ -801,7 +808,15 @@ fn do_mount(cli: &Cli, args: MountArgs) -> Result<()> {
   // and a relative `gfs clone <url> dir` resolved there would mount somewhere
   // other than where the caller stands — `git clone` semantics say here.
   let workspace = std::path::absolute(&args.workspace).unwrap_or_else(|_| args.workspace.clone());
-  let args = MountArgs { workspace, ..args };
+  let local = args
+    .local
+    .as_ref()
+    .map(|clone| std::path::absolute(clone).unwrap_or_else(|_| clone.clone()));
+  let args = MountArgs {
+    workspace,
+    local,
+    ..args
+  };
   let cache_dir = args.cache_dir.clone().unwrap_or_else(default_cache_dir);
 
   let socket = host_socket(cli, &args.workspace, args.foreground);
@@ -829,6 +844,7 @@ fn do_mount(cli: &Cli, args: MountArgs) -> Result<()> {
     grpc_endpoint: Some(cli.endpoint.clone()),
     http_endpoint: Some(cli.http_endpoint.clone()),
     token: Some(cli.token.clone()),
+    local_clone: args.local.clone(),
   };
   let response = call_host(
     &socket,
@@ -856,6 +872,9 @@ fn do_mount(cli: &Cli, args: MountArgs) -> Result<()> {
 
 struct MountArgs {
   repo: String,
+  /// Local mode: the clone to mount from, absolutized before it crosses the
+  /// socket for the same reason the workspace is.
+  local: Option<PathBuf>,
   rev: String,
   workspace: PathBuf,
   cache_dir: Option<PathBuf>,
@@ -869,6 +888,9 @@ struct MountArgs {
 fn print_report(report: &gfs_mount::control::MountReport) {
   println!("workspace  {}", report.workspace);
   println!("repository {}", report.repository_id);
+  if let Some(clone) = &report.local_clone {
+    println!("origin     local {clone}");
+  }
   // The pinned commit, shown because it is the thing that matters: the branch
   // name was only a selector, and PLAN.md M2.1 requires the CLI to show it.
   println!("commit     {}", report.commit);
@@ -1246,6 +1268,7 @@ async fn main() -> Result<()> {
           &cli,
           MountArgs {
             repo: response.repository_id.clone(),
+            local: None,
             rev,
             workspace,
             cache_dir: cache_dir.clone(),
@@ -1261,6 +1284,7 @@ async fn main() -> Result<()> {
 
     Command::Mount {
       repo,
+      local,
       rev,
       workspace,
       cache_dir,
@@ -1277,7 +1301,8 @@ async fn main() -> Result<()> {
         do_mount(
           &cli,
           MountArgs {
-            repo: repo.clone(),
+            repo: repo.clone().unwrap_or_default(),
+            local: local.clone(),
             rev: rev.clone(),
             workspace: workspace.clone(),
             cache_dir: cache_dir.clone(),

@@ -115,6 +115,9 @@ pub struct MountHost {
   /// of that repository. Weak so that a repository nobody mounts any more stops
   /// costing an in-memory index.
   caches: Mutex<HashMap<(PathBuf, String), Weak<BlobCache>>>,
+  /// One opened clone per canonical path (local mode, ADR 0013), shared by
+  /// every workspace mounted from it; weak for the same reason as the rest.
+  locals: Mutex<HashMap<PathBuf, Weak<crate::local::LocalRepository>>>,
   _lock: SingletonLock,
 }
 
@@ -162,6 +165,7 @@ impl MountHost {
       mounts: Mutex::new(HashMap::new()),
       caches: Mutex::new(HashMap::new()),
       odbs: Mutex::new(HashMap::new()),
+      locals: Mutex::new(HashMap::new()),
       _lock: lock,
     });
     Ok((host, listener))
@@ -229,7 +233,14 @@ impl MountHost {
         .http_endpoint
         .unwrap_or_else(|| self.config.http_endpoint.clone()),
       token: request.token.unwrap_or_else(|| self.config.token.clone()),
-      repository_id: RepositoryId::parse(&request.repository_id)?,
+      // In local mode the identity comes from the clone, once it is opened;
+      // the placeholder is replaced in `mount` before anything reads it.
+      repository_id: if request.local_clone.is_some() {
+        RepositoryId::parse("local-pending")?
+      } else {
+        RepositoryId::parse(&request.repository_id)?
+      },
+      local_clone: request.local_clone,
       revision_selector: request.revision_selector,
       cache_quota_bytes: request.cache_quota_bytes,
       fs: self.config.fs.clone(),
@@ -279,16 +290,30 @@ impl MountHost {
       ));
     }
 
+    let (spec, backing) = match spec.local_clone.clone() {
+      Some(clone) => {
+        let local = self.local_for(&clone).await?;
+        let spec = MountSpec {
+          repository_id: local.repository_id().clone(),
+          local_clone: Some(local.clone_path().to_path_buf()),
+          ..spec
+        };
+        (spec, crate::mount::Backing::Local(local))
+      }
+      None => {
+        let odb = self
+          .odb_for(
+            &spec.cache_dir,
+            &spec.repository_id,
+            &spec.http_endpoint,
+            &spec.token,
+          )
+          .await?;
+        (spec, crate::mount::Backing::Remote(odb))
+      }
+    };
     let cache = self.cache_for(&spec.cache_dir, &spec.repository_id, spec.cache_quota_bytes)?;
-    let odb = self
-      .odb_for(
-        &spec.cache_dir,
-        &spec.repository_id,
-        &spec.http_endpoint,
-        &spec.token,
-      )
-      .await?;
-    let mount = Mount::start(spec, cache, odb).await?;
+    let mount = Mount::start(spec, cache, backing).await?;
     let listener = match mount.bind_control() {
       Ok(listener) => listener,
       Err(e) => {
@@ -365,6 +390,40 @@ impl MountHost {
     }
     odbs.insert(key, Arc::downgrade(&projection));
     Ok(projection)
+  }
+
+  /// The opened clone at a path (local mode), opening it if this is the first
+  /// workspace to ask. Keyed by canonical path, so two spellings of one clone
+  /// share one handle pool and one blob memory.
+  async fn local_for(&self, clone: &Path) -> Result<Arc<crate::local::LocalRepository>, GfsError> {
+    let key = clone.canonicalize().map_err(|e| {
+      GfsError::new(
+        ErrorCode::NotFound,
+        format!("no clone at {}: {e}", clone.display()),
+      )
+    })?;
+    {
+      let mut locals = self.locals.lock().expect("local clones");
+      if let Some(existing) = locals.get(&key).and_then(Weak::upgrade) {
+        return Ok(existing);
+      }
+      locals.retain(|_, handle| handle.strong_count() > 0);
+    }
+    // Opened outside the lock and off the runtime: libgit2 opens its handles
+    // synchronously, and a second concurrent asker at worst opens a duplicate
+    // that drops on insert.
+    let opened = {
+      let key = key.clone();
+      tokio::task::spawn_blocking(move || crate::local::LocalRepository::open(&key))
+        .await
+        .map_err(|e| GfsError::internal(format!("opening the clone: {e}")))??
+    };
+    let mut locals = self.locals.lock().expect("local clones");
+    if let Some(existing) = locals.get(&key).and_then(Weak::upgrade) {
+      return Ok(existing);
+    }
+    locals.insert(key, Arc::downgrade(&opened));
+    Ok(opened)
   }
 
   /// Start a mount's tasks and record it.

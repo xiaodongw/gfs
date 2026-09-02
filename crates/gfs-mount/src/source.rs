@@ -201,6 +201,16 @@ pub trait SnapshotSource: Send + Sync + std::fmt::Debug {
   /// entry when asked for one; a source that needs no ticket ignores it.
   async fn read_blob(&self, oid: &ObjectId, ticket: &str) -> Result<Vec<u8>, GfsError>;
 
+  /// The same bytes, shared. A source that already holds the blob in memory
+  /// hands out its own `Arc` rather than copying; the default copies once.
+  async fn read_blob_shared(
+    &self,
+    oid: &ObjectId,
+    ticket: &str,
+  ) -> Result<std::sync::Arc<Vec<u8>>, GfsError> {
+    Ok(std::sync::Arc::new(self.read_blob(oid, ticket).await?))
+  }
+
   /// The `.git/index` for a commit, with ADR 0009's stat data and cache tree.
   async fn commit_index(&self, commit: &ObjectId) -> Result<Vec<u8>, GfsError>;
 

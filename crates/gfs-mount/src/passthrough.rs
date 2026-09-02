@@ -272,8 +272,10 @@ impl OdbTree {
 /// which commit the tree shows, not where the git dir lives.
 pub struct GitPassthrough {
   handle: Arc<GitDirHandle>,
-  store: Arc<BlockStore>,
-  odb: OdbTree,
+  /// `None` in local mode: the workspace borrows the clone's object store
+  /// through an absolute `alternates` and presents no projection at all.
+  store: Option<Arc<BlockStore>>,
+  odb: Option<OdbTree>,
   /// This workspace's share of the store's traffic (per-job attribution,
   /// ADR 0009 — the view survives, only its mountpoint moved inside).
   counters: Arc<ViewCounters>,
@@ -319,8 +321,8 @@ pub fn in_object_namespace(git_relative_dir: &[u8]) -> bool {
 }
 
 impl GitPassthrough {
-  pub fn new(handle: Arc<GitDirHandle>, store: Arc<BlockStore>) -> GitPassthrough {
-    let odb = OdbTree::build(&store.listing());
+  pub fn new(handle: Arc<GitDirHandle>, store: Option<Arc<BlockStore>>) -> GitPassthrough {
+    let odb = store.as_ref().map(|store| OdbTree::build(&store.listing()));
     GitPassthrough {
       handle,
       store,
@@ -333,8 +335,13 @@ impl GitPassthrough {
     &self.handle
   }
 
-  pub fn store(&self) -> &Arc<BlockStore> {
-    &self.store
+  pub fn store(&self) -> Option<&Arc<BlockStore>> {
+    self.store.as_ref()
+  }
+
+  /// Whether `.git/gfs/objects` exists at all in this workspace.
+  pub fn has_projection(&self) -> bool {
+    self.odb.is_some()
   }
 
   pub fn counters(&self) -> &Arc<ViewCounters> {
@@ -370,13 +377,15 @@ impl GitPassthrough {
 
   /// The projection entry at an odb-relative path, if the manifest has one.
   pub fn odb_node(&self, rel: &[u8]) -> Option<OdbNode> {
-    self.odb.get(rel).cloned()
+    self.odb.as_ref()?.get(rel).cloned()
   }
 
   /// The names in a projected directory, sorted.
   pub fn odb_children(&self, rel: &[u8]) -> Vec<(Vec<u8>, OdbNode)> {
-    self
-      .odb
+    let Some(odb) = self.odb.as_ref() else {
+      return Vec::new();
+    };
+    odb
       .child_names(rel)
       .iter()
       .filter_map(|name| {
@@ -385,10 +394,7 @@ impl GitPassthrough {
           child.push(b'/');
         }
         child.extend_from_slice(name);
-        self
-          .odb
-          .get(&child)
-          .map(|node| (name.clone(), node.clone()))
+        odb.get(&child).map(|node| (name.clone(), node.clone()))
       })
       .collect()
   }
@@ -401,7 +407,7 @@ impl GitPassthrough {
   /// disk does not have — so the namespace is never merged.
   pub fn list(&self, git_relative: &[u8]) -> std::io::Result<Vec<(Vec<u8>, GitMeta)>> {
     let mut out = Vec::new();
-    let at_state_dir = git_relative == STATE_SUBDIR.as_bytes();
+    let at_state_dir = self.odb.is_some() && git_relative == STATE_SUBDIR.as_bytes();
     for entry in std::fs::read_dir(self.real(git_relative))? {
       let entry = entry?;
       let name = entry.file_name().as_bytes().to_vec();

@@ -166,6 +166,9 @@ pub enum Request {
 pub struct MountReport {
   pub mount_id: String,
   pub repository_id: String,
+  /// Local mode: the clone this workspace reads from.
+  #[serde(default)]
+  pub local_clone: Option<String>,
   pub revision_selector: String,
   /// The work branch this view is on, when `gfs switch` put it on one.
   #[serde(default)]
@@ -482,6 +485,12 @@ pub struct MountRequest {
   pub grpc_endpoint: Option<String>,
   pub http_endpoint: Option<String>,
   pub token: Option<String>,
+  /// Local mode (ADR 0013): mount from this clone on the host's own disk
+  /// rather than from a gateway. `repository_id` and the endpoints are
+  /// ignored when set; the host derives the repository identity from the
+  /// clone's canonical path.
+  #[serde(default)]
+  pub local_clone: Option<PathBuf>,
 }
 
 /// What the CLI asks the `gfs-fuse` process, as opposed to one workspace.

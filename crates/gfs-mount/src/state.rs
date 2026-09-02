@@ -108,6 +108,10 @@ pub struct MountState {
   pub snapshot_time: Timestamp,
   pub grpc_endpoint: String,
   pub http_endpoint: String,
+  /// Local mode (ADR 0013): the clone the workspace reads. Endpoints above
+  /// are empty when this is set.
+  #[serde(default)]
+  pub local_clone: Option<PathBuf>,
   /// The path the job uses, which is also the FUSE mount point. A crashed
   /// daemon's mount is unmounted through this, so it is stored absolute.
   pub workspace: PathBuf,
@@ -203,6 +207,7 @@ mod tests {
       snapshot_time: Timestamp::from_secs(1_600_000_000),
       grpc_endpoint: "http://127.0.0.1:8431".to_owned(),
       http_endpoint: "http://127.0.0.1:8430".to_owned(),
+      local_clone: None,
       workspace: dir.join("ws"),
       generation: 1,
       lease: LeaseRecord {

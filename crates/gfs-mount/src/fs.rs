@@ -291,6 +291,10 @@ enum FileState {
     oid: ObjectId,
     file: Arc<std::fs::File>,
   },
+  /// A base blob held in memory for the life of the descriptor: what a source
+  /// that serves from a local object store hands out instead of a cache file
+  /// (local mode, ADR 0013).
+  Memory { bytes: Arc<Vec<u8>> },
   /// Overlay content. Held open, which is what keeps an unlinked file readable
   /// through a descriptor that outlives its name — the overlay removes the
   /// content file, and the kernel keeps the inode alive until this closes.
@@ -308,6 +312,25 @@ enum FileState {
   },
   /// A projected object-store file, read block-wise from the shared store.
   Odb { path: String },
+}
+
+/// What `open_blob` produced: a descriptor on a verified cache file, or the
+/// blob itself when the source serves from memory.
+enum OpenedBlob {
+  File(std::fs::File),
+  Memory(Arc<Vec<u8>>),
+}
+
+impl OpenedBlob {
+  fn into_state(self, oid: &ObjectId) -> FileState {
+    match self {
+      OpenedBlob::File(file) => FileState::Blob {
+        oid: oid.clone(),
+        file: Arc::new(file),
+      },
+      OpenedBlob::Memory(bytes) => FileState::Memory { bytes },
+    }
+  }
 }
 
 /// What a path is, and what the pinned base has there.
@@ -875,7 +898,7 @@ impl Gfs {
       // The projection appears at `.git/gfs/objects` — injected as an Odb
       // child, so the record behind its inode routes to the projection and
       // never to a disk stat of a name the disk does not have.
-      if rel == crate::passthrough::STATE_SUBDIR.as_bytes() {
+      if self.git.has_projection() && rel == crate::passthrough::STATE_SUBDIR.as_bytes() {
         state.children.push(Child::Odb {
           name: b"objects".to_vec(),
           node: OdbNode::Dir,
@@ -955,11 +978,17 @@ impl Gfs {
   /// one attached to every metadata lookup would usually expire unused; and when
   /// the blob is already cached, no ticket -- and no round trip -- is needed at
   /// all, which is what makes a warm reopen free.
-  async fn open_blob(&self, path: &BytePath, oid: &ObjectId) -> Result<std::fs::File, GfsError> {
+  async fn open_blob(&self, path: &BytePath, oid: &ObjectId) -> Result<OpenedBlob, GfsError> {
     // Evidence for the read detector, taken whether or not the blob is cached:
     // what makes a directory look read-through is which files a job asked for,
     // not which of them happened to be local already.
     self.note_read(path);
+    let source = self.client();
+    if source.serves_blobs_in_memory() {
+      // No cache file, no hash, no budget: the bytes are already on this
+      // machine, and the source hands out the inflated blob it holds.
+      return Ok(OpenedBlob::Memory(source.read_blob_shared(oid, "").await?));
+    }
     if !self.cache.contains(oid) {
       let fresh = self
         .base_entry(path, true)
@@ -992,10 +1021,10 @@ impl Gfs {
         .cache
         .open_blob(&self.pinned().client, oid, &ticket)
         .await?;
-      return open_cached(&cached);
+      return open_cached(&cached).map(OpenedBlob::File);
     }
     let (cached, _) = self.cache.open_blob(&self.pinned().client, oid, "").await?;
-    open_cached(&cached)
+    open_cached(&cached).map(OpenedBlob::File)
   }
 
   /// Give a path local content, fetching the base blob only when the caller will
@@ -1043,15 +1072,24 @@ impl Gfs {
       return Err(GfsError::internal("nothing to copy up from"));
     };
     let blob = self.open_blob(&blob_path(record), &oid).await?;
-    let size = blob.metadata().map(|m| m.len()).unwrap_or(0);
+    let size = match &blob {
+      OpenedBlob::File(file) => file.metadata().map(|m| m.len()).unwrap_or(0),
+      OpenedBlob::Memory(bytes) => bytes.len() as u64,
+    };
     self.bump(|s| {
       s.copy_ups += 1;
       s.copy_up_bytes += size;
     });
     let target = path.clone();
-    Self::blocking(move || {
-      let mut reader = std::io::BufReader::new(blob);
-      overlay.materialize(&target, base, ino, Source::Reader(&mut reader))
+    Self::blocking(move || match blob {
+      OpenedBlob::File(file) => {
+        let mut reader = std::io::BufReader::new(file);
+        overlay.materialize(&target, base, ino, Source::Reader(&mut reader))
+      }
+      OpenedBlob::Memory(bytes) => {
+        let mut reader = std::io::Cursor::new(bytes.as_slice());
+        overlay.materialize(&target, base, ino, Source::Reader(&mut reader))
+      }
     })
     .await
     .map_err(overlay_as_service_error)
@@ -1389,10 +1427,11 @@ impl Filesystem for GfsFilesystem {
         Node::Git(_) | Node::Odb(_) => return reply.error(Errno::EINVAL),
       };
       match fs.open_blob(&blob_path(&record), &oid).await {
-        Ok(file) => match read_all(&file, expected) {
+        Ok(OpenedBlob::File(file)) => match read_all(&file, expected) {
           Ok(bytes) => reply.data(&bytes),
           Err(e) => reply.error(errno_of(&e)),
         },
+        Ok(OpenedBlob::Memory(bytes)) => reply.data(&bytes),
         Err(e) => reply.error(errno_of(&e)),
       }
     });
@@ -1489,10 +1528,7 @@ impl Filesystem for GfsFilesystem {
           // A row whose bytes are still the base's: a mode change or a rename.
           None => match entry.content.base_oid() {
             Some(oid) => match fs.open_blob(&blob_path(&record), oid).await {
-              Ok(file) => FileState::Blob {
-                oid: oid.clone(),
-                file: Arc::new(file),
-              },
+              Ok(opened) => opened.into_state(oid),
               Err(e) => {
                 fs.bump(|s| s.errors += 1);
                 return reply.error(errno_of(&e));
@@ -1502,10 +1538,7 @@ impl Filesystem for GfsFilesystem {
           },
         },
         Node::Base(entry) => match fs.open_blob(&record.path, &entry.oid).await {
-          Ok(file) => FileState::Blob {
-            oid: entry.oid.clone(),
-            file: Arc::new(file),
-          },
+          Ok(opened) => opened.into_state(&entry.oid),
           Err(e) => {
             fs.bump(|s| s.errors += 1);
             return reply.error(errno_of(&e));
@@ -1697,7 +1730,9 @@ impl Filesystem for GfsFilesystem {
           // The projection read: absent blocks are fetched, resident ones
           // served, and the cost attributed to this workspace's view.
           let path = path.clone();
-          let store = Arc::clone(fs.git.store());
+          let Some(store) = fs.git.store().cloned() else {
+            return reply.error(Errno::EIO);
+          };
           match store.read(&path, offset, size).await {
             Ok((bytes, cost)) => {
               fs.git.counters().add(&cost);
@@ -1721,6 +1756,17 @@ impl Filesystem for GfsFilesystem {
               return reply.error(errno);
             }
           }
+        }
+        FileState::Memory { bytes, .. } => {
+          // A slice of the inflated blob. Nothing blocks and nothing is copied
+          // beyond the reply itself.
+          let start = (offset as usize).min(bytes.len());
+          let end = start.saturating_add(size as usize).min(bytes.len());
+          fs.bump(|s| {
+            s.reads += 1;
+            s.read_bytes += (end - start) as u64;
+          });
+          return reply.data(&bytes[start..end]);
         }
         FileState::Blob { file, .. }
         | FileState::Local { file, .. }
@@ -1904,8 +1950,9 @@ impl Filesystem for GfsFilesystem {
           Err(_) => reply.error(Errno::EIO),
         };
       }
-      // A projected file has nothing local to make durable.
-      if let Some(FileState::Odb { .. }) = state.as_deref() {
+      // A projected file has nothing local to make durable, and neither does a
+      // blob held in memory.
+      if let Some(FileState::Odb { .. } | FileState::Memory { .. }) = state.as_deref() {
         return reply.ok();
       }
       // Both halves, and in this order: the content file, then the journal that

@@ -99,6 +99,18 @@ pub struct MountSpec {
   pub overlay: OverlayConfig,
   pub mount: MountConfig,
   pub lease_policy: LeasePolicy,
+  /// Local mode (ADR 0013): read from this clone instead of the gateway named
+  /// by the endpoints above, which are then unused.
+  pub local_clone: Option<PathBuf>,
+}
+
+/// What stands behind a mount's object store.
+#[derive(Debug)]
+pub enum Backing {
+  /// The gateway's object database, projected and block-cached (ADR 0009).
+  Remote(Arc<crate::odb::OdbProjection>),
+  /// A clone on this machine, borrowed through `alternates` (ADR 0013).
+  Local(Arc<crate::local::LocalRepository>),
 }
 
 /// One path's contribution to a commit.
@@ -252,8 +264,10 @@ pub struct Mount {
   cache: Arc<BlobCache>,
   /// The per-repository object-database projection this workspace borrows.
   /// Held so the projection outlives every workspace that references it
-  /// (ADR 0009).
-  odb: Arc<crate::odb::OdbProjection>,
+  /// (ADR 0009). `None` in local mode, where there is nothing to project.
+  odb: Option<Arc<crate::odb::OdbProjection>>,
+  /// Local mode's clone, shared by every workspace mounted from it.
+  local: Option<Arc<crate::local::LocalRepository>>,
   /// The retained handle to the real `.git` (ADR 0011). Opened before the
   /// workspace was mounted over its directory; everything the daemon does to
   /// its own state afterwards resolves through it, because the on-disk path
@@ -301,17 +315,28 @@ impl Mount {
   pub async fn start(
     config: MountSpec,
     cache: Arc<BlobCache>,
-    odb: Arc<crate::odb::OdbProjection>,
+    backing: Backing,
   ) -> Result<Arc<Self>, GfsError> {
+    let (odb, local) = match backing {
+      Backing::Remote(odb) => (Some(odb), None),
+      Backing::Local(local) => (None, Some(local)),
+    };
     // Absolute before anything else, so the daemon keeps working if something
     // later changes its working directory, and so `mount.json` names a path an
     // orchestrator cleaning up after a crash can act on without knowing where
     // the daemon was started.
-    let config = MountSpec {
+    let mut config = MountSpec {
       workspace: absolute(&config.workspace)?,
       cache_dir: absolute(&config.cache_dir)?,
       ..config
     };
+    if local.is_some() {
+      // Nothing crosses a network in local mode, so there is nothing for the
+      // hydration budget to bound and nothing for the read detector to fetch
+      // ahead of — blobs are served from memory, not copied into the cache.
+      config.fs.hydration_budget_bytes = 0;
+      config.fs.read_prefetch_threshold = 0;
+    }
     // Recovery ordering (ADR 0011, load-bearing): lazy-unmount whatever a dead
     // daemon left over the workspace, *then* open the real `.git`, then mount.
     // Opening first would open through the dead mount and get ENOTCONN.
@@ -355,9 +380,14 @@ impl Mount {
       }
       e
     };
-    let resolved = resolve_pin(&config, &config.revision_selector.clone(), 1)
-      .await
-      .map_err(unwind)?;
+    let resolved = resolve_pin(
+      &config,
+      local.as_ref(),
+      &config.revision_selector.clone(),
+      1,
+    )
+    .await
+    .map_err(unwind)?;
     // The refusal half of the local-commits story, now that the selector is a
     // commit and the two can be compared. Mounting past the base would need a
     // rebase nobody asked for; mounting *at* it (the arm below) is how the
@@ -425,7 +455,7 @@ impl Mount {
       Arc::clone(&cache),
       Arc::new(GitPassthrough::new(
         Arc::clone(&git),
-        Arc::clone(&odb.store),
+        odb.as_ref().map(|odb| Arc::clone(&odb.store)),
       )),
       Arc::clone(&overlay),
       resolved.root,
@@ -443,6 +473,7 @@ impl Mount {
     let mount = Arc::new(Mount {
       cache,
       odb,
+      local,
       git,
       overlay,
       publisher,
@@ -509,6 +540,7 @@ impl Mount {
       snapshot_time: current.snapshot_time,
       grpc_endpoint: self.config.grpc_endpoint.clone(),
       http_endpoint: self.config.http_endpoint.clone(),
+      local_clone: self.config.local_clone.clone(),
       workspace: self.config.workspace.clone(),
       generation: current.epoch,
       lease: LeaseRecord {
@@ -536,6 +568,11 @@ impl Mount {
     MountReport {
       mount_id: current.monitor.mount_id().as_str().to_owned(),
       repository_id: self.config.repository_id.as_str().to_owned(),
+      local_clone: self
+        .config
+        .local_clone
+        .as_ref()
+        .map(|p| p.display().to_string()),
       revision_selector: self.selector.lock().expect("selector").clone(),
       work_branch: self.work_branch.lock().expect("work branch").clone(),
       commit: current.commit.to_qualified(),
@@ -554,7 +591,11 @@ impl Mount {
       stats: self.fs.stats(),
       cache: self.cache.stats(),
       budget: self.fs.budget_report(),
-      odb: self.odb.store.stats(),
+      odb: self
+        .odb
+        .as_ref()
+        .map(|odb| odb.store.stats())
+        .unwrap_or_default(),
       odb_job: self.fs.git().view_stats(),
       live_inodes: self.fs.inode_counts().0,
       assigned_inodes: self.fs.inode_counts().1,
@@ -630,6 +671,13 @@ impl Mount {
 
   /// Run the heartbeat until shutdown.
   pub async fn run_heartbeat(self: Arc<Self>) {
+    // An unleased pin (local mode) has nothing to renew, and a heartbeat that
+    // failed every interval would report a critical lease on a workspace that
+    // cannot lose one.
+    let leased = self.current.lock().expect("current pin").client.leased();
+    if !leased {
+      return;
+    }
     loop {
       let interval = self
         .current
@@ -720,7 +768,7 @@ impl Mount {
       }
     }
 
-    let resolved = resolve_pin(&self.config, &selector, next_epoch).await?;
+    let resolved = resolve_pin(&self.config, self.local.as_ref(), &selector, next_epoch).await?;
     let commit = resolved.pin.commit.clone();
 
     // Re-seed HEAD, the branch ref, and the index to the new pin. The index
@@ -1844,7 +1892,15 @@ struct Resolved {
 /// whether this is the first pin (mount it) or a replacement (swap it in). That
 /// split is what makes a failed `gfs switch` a no-op — the mount is only
 /// disturbed once this has already succeeded.
-async fn resolve_pin(config: &MountSpec, selector: &str, epoch: u64) -> Result<Resolved, GfsError> {
+async fn resolve_pin(
+  config: &MountSpec,
+  local: Option<&Arc<crate::local::LocalRepository>>,
+  selector: &str,
+  epoch: u64,
+) -> Result<Resolved, GfsError> {
+  if let Some(local) = local {
+    return resolve_local_pin(config, local, selector, epoch).await;
+  }
   let grant = create_mount(config, selector).await?;
 
   let commit = ObjectId::parse_qualified(&grant.commit_oid)
@@ -1919,6 +1975,8 @@ async fn resolve_pin(config: &MountSpec, selector: &str, epoch: u64) -> Result<R
     commit_meta,
     refs,
     work_ref_root: (!grant.work_ref_root.is_empty()).then(|| grant.work_ref_root.clone()),
+    local_clone: None,
+    objects_dir: None,
   };
 
   let root = crate::fs::root_entry(tree.clone());
@@ -1934,6 +1992,73 @@ async fn resolve_pin(config: &MountSpec, selector: &str, epoch: u64) -> Result<R
       tree,
       ref_name: grant.ref_name,
       snapshot_time,
+    },
+  })
+}
+
+/// The local-mode half of [`resolve_pin`]: the same shape, answered by the
+/// clone. No lease, so the monitor is given an expiry that never arrives and
+/// the heartbeat never runs; the anchor ref in the clone is what holds the
+/// commit, and `release_mount` removes it.
+async fn resolve_local_pin(
+  config: &MountSpec,
+  local: &Arc<crate::local::LocalRepository>,
+  selector: &str,
+  epoch: u64,
+) -> Result<Resolved, GfsError> {
+  let pin = local.pin(selector, &config.workspace).await?;
+  let client: Arc<dyn SnapshotSource> = pin.source;
+
+  // Both best-effort, as on the remote path, and for the same reasons.
+  let commit_meta = match client.get_commit().await {
+    Ok(meta) => Some(meta),
+    Err(e) => {
+      tracing::warn!(error = %e.message, "commit metadata unavailable; `git log -1` will be unsupported");
+      None
+    }
+  };
+  let refs = match client.list_refs().await {
+    Ok(refs) => Some(refs),
+    Err(e) => {
+      tracing::warn!(error = %e.message, "ref listing unavailable; tags and remote-tracking refs will not be materialized");
+      None
+    }
+  };
+
+  let facts = GitDirFacts {
+    repository_id: config.repository_id.clone(),
+    commit: pin.commit.clone(),
+    tree: pin.tree.clone(),
+    ref_name: pin.ref_name.clone(),
+    mount_id: pin.mount_id.clone(),
+    control_socket: workspace_control_socket(&config.workspace),
+    snapshot_time: pin.snapshot_time,
+    grpc_endpoint: String::new(),
+    http_endpoint: String::new(),
+    generation: epoch,
+    commit_meta,
+    refs,
+    work_ref_root: None,
+    local_clone: Some(local.clone_path().to_path_buf()),
+    objects_dir: Some(local.objects_directory().to_path_buf()),
+  };
+  let root = crate::fs::root_entry(pin.tree.clone());
+  Ok(Resolved {
+    facts,
+    root,
+    pin: Pin {
+      epoch,
+      client,
+      monitor: LeaseMonitor::new(
+        pin.mount_id,
+        crate::local::far_future(),
+        config.lease_policy.heartbeat_interval,
+        config.lease_policy,
+      ),
+      commit: pin.commit,
+      tree: pin.tree,
+      ref_name: pin.ref_name,
+      snapshot_time: pin.snapshot_time,
     },
   })
 }
