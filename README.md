@@ -74,6 +74,31 @@ path bypasses them and still gets correct answers, just the expensive ones:
 Outside a GFS workspace every shim passes through silently, which is what makes
 a `PATH`-wide install safe; `GFS_SHIM_BYPASS` disables delegation outright.
 
+## Local mode: a workspace per change, without a server
+
+The same daemon can serve a workspace from a clone that is already on the
+machine (ADR 0013). No `gfs-server`, no lease, no shims:
+
+```sh
+gfs mount --local ~/src/monorepo --rev main --workspace ~/work/change-1
+gfs mount --local ~/src/monorepo --rev main --workspace ~/work/change-2
+```
+
+Each workspace is a lazily presented tree over the clone's own object
+database: `objects/info/alternates` borrows the clone's `objects` directory
+outright, as `git worktree` does, and the index, `packed-refs`, history, and
+search are answered by libgit2 in-process. Blobs are served from memory, so
+nothing is copied to disk; a lease anchor under `refs/gfs/mounts/` in the
+clone holds the pinned commit against `gc` until unmount. The clone is
+seeded as `origin`, so `git push origin HEAD:my-branch` moves a commit back
+over the filesystem. The measured comparison with `git worktree add` and with
+the server mount is in [benchmarks/local-mode.md](benchmarks/local-mode.md).
+
+What local mode does not do: expand LFS pointers (the tree shows the
+pointer files, as `GIT_LFS_SKIP_SMUDGE=1` would), or build a search index —
+`gfs rg` scans the pack in parallel instead, which is the honest answer for
+one machine.
+
 ## How it compares to raw Git
 
 GFS is not a Git replacement — the server stores real Git repositories and

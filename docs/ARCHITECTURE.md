@@ -52,7 +52,7 @@ flowchart LR
 | process | runs where | responsible for |
 | --- | --- | --- |
 | `gfs-server` | the repository service | imports bare repos, resolves revisions, serves trees/blobs, search, history, LFS expansion, the Git wire protocol, WebDAV |
-| `gfs-fuse` | the trusted host, one per machine | serves every FUSE request for every mount on that host; owns the caches, the overlay, and the hydration budget |
+| `gfs-fuse` | the trusted host, one per machine | serves every FUSE request for every mount on that host; owns the caches, the overlay, and the hydration budget. In **local mode** (§6a) it answers from a clone on the machine and the server is not involved |
 | `gfs` | inside the job | the agent-facing CLI: `mount`, `status`, `commit`, `search`, `inspect`, and the `PATH` shims |
 
 FUSE privilege stays in the host daemon (ADR 0003). The job gets a bind-mounted
@@ -264,6 +264,37 @@ everything GFS already had. There is nothing here for `gc` to prune, so
 accepting the call is a lie with no consequence. Mode, size, and owner are still
 `EROFS`.
 
+### 6a. Local mode: the clone is the object store
+
+The filesystem asks its questions through one trait, `SnapshotSource`. The
+gRPC/HTTP client is one implementation; the other is libgit2 over a clone on
+the same machine (ADR 0013), which is what a developer who wants a workspace
+per change instead of a `git worktree add` gets.
+
+```mermaid
+flowchart LR
+  fs["Gfs (fs.rs)"] -->|"SnapshotSource"| src{"which source?"}
+  src -->|remote| client["SnapshotClient<br/>gRPC + HTTP"]
+  src -->|local| local["LocalSource<br/>libgit2, spawn_blocking"]
+  local --> clone[("the clone's .git/objects")]
+  git["stock git in the workspace"] --> alt[".git/objects/info/alternates<br/>absolute path"]
+  alt --> clone
+```
+
+What changes, and what stays:
+
+| | remote | local |
+| --- | --- | --- |
+| pin | `CreateMount` on the server, lease + capability | `resolve` in-process, an anchor ref `refs/gfs/mounts/<id>` in the clone, no heartbeat |
+| index, refs | built by the server, fetched over HTTP | `index_for_commit` and `visible_ref_targets` in-process |
+| object store | projected at `.git/gfs/objects`, 64 KiB block cache | not projected; `alternates` names the clone's `objects` directly |
+| blob reads | verified on-disk cache, hydration budget | served from memory behind a bounded LRU; no cache file, no budget |
+| search | trigram index per snapshot | a parallel scan of the pack with the overlay's own scanner |
+| everything else | the listing cache, the overlay, the journal, fsmonitor, `gfs status`, the control socket | unchanged |
+
+The listing cache and walk detector still apply: locally a listing costs
+microseconds, but a FUSE round trip per directory is still a round trip.
+
 ---
 
 ## 7. The shipped index
@@ -471,7 +502,7 @@ command is orders of magnitude below.
 | `gfs-git` | libgit2 behind a `GitRepository` trait — objects, trees, refs, the index and its cache tree, attributes, worker pools |
 | `gfs-service` | server internals: catalog, auth, mirror, ingest, LFS, search services, the smart-HTTP gateway, mounts and leases, audit |
 | `gfs-search` | trigram postings, snapshot manifests, blob registry, text classification, local overlay search |
-| `gfs-mount` | the FUSE filesystem: inodes, attributes, listings, blob and block caches, budget, prefetch, the gitdir passthrough and ODB projection, host and control sockets |
+| `gfs-mount` | the FUSE filesystem: inodes, attributes, listings, blob and block caches, budget, prefetch, the gitdir passthrough and ODB projection, host and control sockets; the `SnapshotSource` seam and its two implementations, the wire client and the local clone |
 | `gfs-overlay` | the journal, copy-up store, status, diff, export, merge, fault injection |
 | `gfs-types` / `gfs-proto` | byte paths, OIDs carrying their algorithm, revisions, limits, redaction; the protobuf surface |
 | `gfs-test` | fixtures, mount harness, a million-entry big-tree corpus, a real-Git oracle |
@@ -489,6 +520,7 @@ image installs on `PATH`.
 | the object authorization boundary | [ADR 0002](adr/0002-git-object-authorization-boundary.md) |
 | why the workspace carries a real ODB | [ADR 0009](adr/0009-raw-git-over-a-projected-object-store.md) |
 | why one folder, not two | [ADR 0011](adr/0011-single-mount-workspace.md) |
+| a workspace over a local clone, no server | [ADR 0013](adr/0013-local-mode.md), [`../benchmarks/local-mode.md`](../benchmarks/local-mode.md) |
 | measured numbers, end to end | [`../benchmarks/agent-workflow.md`](../benchmarks/agent-workflow.md) |
 | the narrative version, with charts | [`overview.html`](overview.html) |
 | running it locally | [`../README.md`](../README.md), [`manual-test.md`](manual-test.md) |
