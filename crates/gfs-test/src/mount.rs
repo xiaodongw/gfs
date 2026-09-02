@@ -18,6 +18,7 @@ use std::sync::Arc;
 use gfs_mount::client::MountBinding;
 use gfs_mount::{
   BlobCache, FsConfig, Gfs, GitDirFacts, GitDirHandle, GitPassthrough, MountConfig, SnapshotClient,
+  SnapshotSource,
 };
 use gfs_overlay::{Binding, Overlay, OverlayConfig};
 use gfs_proto::v1;

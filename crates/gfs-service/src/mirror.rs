@@ -768,15 +768,21 @@ mod tests {
       Some(commit),
       "a pruning fetch must not remove the lease anchor"
     );
-    let upstream_refs =
-      gfs_test::git(&mirror, &["for-each-ref", "--format=%(refname)", UPSTREAM_REF_ROOT]).unwrap();
+    let upstream_refs = gfs_test::git(
+      &mirror,
+      &["for-each-ref", "--format=%(refname)", UPSTREAM_REF_ROOT],
+    )
+    .unwrap();
     assert!(
       !upstream_refs.contains("upstream/feature"),
       "the prune must have removed the deleted branch from the upstream \
        namespace, or this test proves nothing: {upstream_refs}"
     );
-    let branches =
-      gfs_test::git(&mirror, &["for-each-ref", "--format=%(refname)", "refs/heads"]).unwrap();
+    let branches = gfs_test::git(
+      &mirror,
+      &["for-each-ref", "--format=%(refname)", "refs/heads"],
+    )
+    .unwrap();
     assert!(
       branches.contains("refs/heads/feature"),
       "a fork keeps its branches when upstream deletes them: {branches}"
@@ -817,7 +823,11 @@ mod tests {
       .unwrap()
       .trim()
       .to_owned();
-      gfs_test::git(&upstream, &["update-ref", &format!("refs/heads/{branch}"), &moved]).unwrap();
+      gfs_test::git(
+        &upstream,
+        &["update-ref", &format!("refs/heads/{branch}"), &moved],
+      )
+      .unwrap();
     }
 
     let outcome = fetch(&mirror, upstream.to_str().unwrap(), None, Path::new("git")).unwrap();

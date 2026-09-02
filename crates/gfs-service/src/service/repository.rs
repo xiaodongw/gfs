@@ -531,7 +531,9 @@ impl RepositoryService for RepositoryApi {
               )
             })
             .await
-            .map_err(|e| GfsError::internal(format!("the LFS upload task did not finish: {e}")))??;
+            .map_err(|e| {
+              GfsError::internal(format!("the LFS upload task did not finish: {e}"))
+            })??;
             if uploaded > 0 {
               tracing::info!(
                 request_id = %ctx.request_id,

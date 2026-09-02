@@ -563,7 +563,11 @@ async fn a_remount_over_local_commits_adopts_them_when_the_pin_matches_their_bas
   assert!(ok, "{expected}");
   assert_eq!(head, expected, "HEAD is still the local commit's branch");
   assert_eq!(content, "unpushed\n", "the committed edit is still served");
-  assert_eq!(status.trim(), "", "the preserved index matches the local HEAD");
+  assert_eq!(
+    status.trim(),
+    "",
+    "the preserved index matches the local HEAD"
+  );
   daemon.shutdown().await;
 }
 
@@ -642,13 +646,8 @@ async fn a_remount_past_local_commits_is_refused_and_their_base_still_mounts() {
     .await
     .expect("the recovery the error names must mount at the base");
   let ws = workspace.clone();
-  let (ok, content) = on_fs(move || {
-    (
-      true,
-      std::fs::read_to_string(ws.join("local.txt")).unwrap(),
-    )
-  })
-  .await;
+  let (ok, content) =
+    on_fs(move || (true, std::fs::read_to_string(ws.join("local.txt")).unwrap())).await;
   assert!(ok);
   assert_eq!(content, "unpushed\n");
   daemon.shutdown().await;

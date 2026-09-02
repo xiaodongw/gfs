@@ -108,10 +108,12 @@ fn gfs_clone(clone_args: &[String]) {
     .status()
   {
     Ok(status) if status.success() => std::process::exit(0),
-    Ok(status) => eprintln!(
-      "gfs: note: gfs clone did not succeed ({status}); falling back to real git clone"
-    ),
-    Err(error) => eprintln!("gfs: note: cannot run gfs clone ({error}); falling back to real git clone"),
+    Ok(status) => {
+      eprintln!("gfs: note: gfs clone did not succeed ({status}); falling back to real git clone")
+    }
+    Err(error) => {
+      eprintln!("gfs: note: cannot run gfs clone ({error}); falling back to real git clone")
+    }
   }
 }
 
@@ -282,8 +284,14 @@ mod tests {
   #[test]
   fn download_tuning_flags_are_dropped_because_there_is_no_download() {
     assert_eq!(
-      translated(&["--depth", "1", "--filter=blob:none", "-q", "https://example.com/r.git"])
-        .unwrap(),
+      translated(&[
+        "--depth",
+        "1",
+        "--filter=blob:none",
+        "-q",
+        "https://example.com/r.git"
+      ])
+      .unwrap(),
       vec!["https://example.com/r.git"]
     );
   }

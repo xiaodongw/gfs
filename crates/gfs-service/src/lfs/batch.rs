@@ -220,7 +220,10 @@ impl BatchClient {
       if let Some(err) = &answer.error {
         return Err(GfsError::new(
           ErrorCode::FailedPrecondition,
-          format!("upstream refused LFS object {hex}: {} ({})", err.message, err.code),
+          format!(
+            "upstream refused LFS object {hex}: {} ({})",
+            err.message, err.code
+          ),
         ));
       }
       let Some(actions) = &answer.actions else {
@@ -228,15 +231,17 @@ impl BatchClient {
         continue;
       };
       if let Some(action) = &actions.upload {
-        let object_path = store.object_path_for(repository, &want.oid).ok_or_else(|| {
-          GfsError::new(
-            ErrorCode::FailedPrecondition,
-            format!(
-              "LFS object {hex} is referenced by the branch but not in the \
+        let object_path = store
+          .object_path_for(repository, &want.oid)
+          .ok_or_else(|| {
+            GfsError::new(
+              ErrorCode::FailedPrecondition,
+              format!(
+                "LFS object {hex} is referenced by the branch but not in the \
                store; it cannot be uploaded"
-            ),
-          )
-        })?;
+              ),
+            )
+          })?;
         let mut config = String::new();
         config.push_str(&format!(
           "upload-file = {}\n",
@@ -275,9 +280,7 @@ impl BatchClient {
         }
         config.push_str(&format!(
           "data = {}\n",
-          curl_quote(
-            &serde_json::json!({ "oid": hex, "size": want.size }).to_string()
-          )
+          curl_quote(&serde_json::json!({ "oid": hex, "size": want.size }).to_string())
         ));
         config.push_str(&format!("url = {}\n", curl_quote(&verify.href)));
         self.run_curl(&config)?;
@@ -364,7 +367,10 @@ impl BatchClient {
 
 /// `Authorization: Basic <base64(credential)>` for a `user:token` credential.
 fn basic_auth(credential: &str) -> String {
-  format!("Authorization: Basic {}", base64_standard(credential.as_bytes()))
+  format!(
+    "Authorization: Basic {}",
+    base64_standard(credential.as_bytes())
+  )
 }
 
 /// Quote a value for a curl config file: double quotes, with `\`, `"`, and
@@ -393,7 +399,11 @@ fn base64_standard(input: &[u8]) -> String {
   const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
   let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
   for chunk in input.chunks(3) {
-    let b = [chunk[0], *chunk.get(1).unwrap_or(&0), *chunk.get(2).unwrap_or(&0)];
+    let b = [
+      chunk[0],
+      *chunk.get(1).unwrap_or(&0),
+      *chunk.get(2).unwrap_or(&0),
+    ];
     let n = u32::from_be_bytes([0, b[0], b[1], b[2]]);
     out.push(ALPHABET[(n >> 18) as usize & 63] as char);
     out.push(ALPHABET[(n >> 12) as usize & 63] as char);
@@ -493,8 +503,14 @@ mod tests {
       Some("https://github.com/org/repo.git/info/lfs")
     );
     // No batch API to derive for non-HTTP transports.
-    assert_eq!(BatchClient::endpoint_for("file:///srv/fixtures/basic.git"), None);
-    assert_eq!(BatchClient::endpoint_for("git@github.com:org/repo.git"), None);
+    assert_eq!(
+      BatchClient::endpoint_for("file:///srv/fixtures/basic.git"),
+      None
+    );
+    assert_eq!(
+      BatchClient::endpoint_for("git@github.com:org/repo.git"),
+      None
+    );
     assert_eq!(BatchClient::endpoint_for("/srv/local/repo.git"), None);
   }
 
@@ -534,7 +550,14 @@ mod tests {
     let parsed: BatchResponse = serde_json::from_str(json).unwrap();
     assert_eq!(parsed.objects.len(), 3);
     assert_eq!(
-      parsed.objects[0].actions.as_ref().unwrap().download.as_ref().unwrap().href,
+      parsed.objects[0]
+        .actions
+        .as_ref()
+        .unwrap()
+        .download
+        .as_ref()
+        .unwrap()
+        .href,
       "https://cdn/x"
     );
     assert_eq!(parsed.objects[1].error.as_ref().unwrap().code, 404);

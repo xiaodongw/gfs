@@ -215,7 +215,14 @@ pub fn ingest(
   // (the catalog stores credential references, never secrets). Best-effort by
   // design: an unfetchable object degrades its entries to pointers, and a
   // clone must not fail because a CDN hiccupped.
-  prefetch_lfs(registry, config, &record.repository_id, url, credential, &default_branch);
+  prefetch_lfs(
+    registry,
+    config,
+    &record.repository_id,
+    url,
+    credential,
+    &default_branch,
+  );
 
   let mut summary = outcome.summary;
   if !outcome.diverged.is_empty() {
@@ -260,8 +267,7 @@ fn prefetch_lfs(
   };
   let result = (|| -> Result<crate::lfs::DownloadReport, GfsError> {
     let repo = registry.blocking_repository(repository_id)?;
-    let selector =
-      gfs_types::RevisionSelector::parse(default_branch, repo.algorithm())?;
+    let selector = gfs_types::RevisionSelector::parse(default_branch, repo.algorithm())?;
     let tip = repo.resolve(&selector)?.commit;
     let mut wanted = Vec::new();
     let mut seen = std::collections::HashSet::new();

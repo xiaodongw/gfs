@@ -211,7 +211,11 @@ async fn the_token_advances_when_the_workspace_changes() {
   );
   // A token the daemon never issued is the one case that must answer "rescan".
   let (_, paths) = ask("0");
-  assert_eq!(paths, vec!["/".to_owned()], "an alien token forces a rescan");
+  assert_eq!(
+    paths,
+    vec!["/".to_owned()],
+    "an alien token forces a rescan"
+  );
 
   let ws = job.workspace.clone();
   on_fs(move || {

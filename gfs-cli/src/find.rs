@@ -45,10 +45,19 @@ const SUPPORTED: &[(&str, &str)] = &[
   ("-iname PATTERN", "case-insensitive -name"),
   ("-path PATTERN", "glob against the whole printed path"),
   ("-ipath PATTERN", "case-insensitive -path"),
-  ("-type f|d", "files or directories (Git tracks no other kind here)"),
-  ("-maxdepth N", "descend at most N levels below a start point"),
+  (
+    "-type f|d",
+    "files or directories (Git tracks no other kind here)",
+  ),
+  (
+    "-maxdepth N",
+    "descend at most N levels below a start point",
+  ),
   ("-mindepth N", "print nothing shallower than N levels"),
-  ("-print", "accepted for compatibility; printing is the default"),
+  (
+    "-print",
+    "accepted for compatibility; printing is the default",
+  ),
   ("--hydrate", "run real find over the mount instead"),
 ];
 
@@ -156,7 +165,11 @@ pub fn run(argv: &[String]) -> Result<i32> {
         if !root_rel.is_empty() && rest.is_empty() {
           continue;
         }
-        let rel = if root_rel.is_empty() { file.as_str() } else { rest };
+        let rel = if root_rel.is_empty() {
+          file.as_str()
+        } else {
+          rest
+        };
         let components: Vec<String> = rel.split('/').map(str::to_owned).collect();
         for len in 1..=components.len() {
           if args.maxdepth.is_some_and(|m| len > m) {
@@ -307,9 +320,7 @@ fn glob_match(pattern: &str, text: &str, case_insensitive: bool) -> bool {
   fn matches(pat: &[char], text: &[char]) -> bool {
     match pat.first() {
       None => text.is_empty(),
-      Some('*') => {
-        (0..=text.len()).any(|skip| matches(&pat[1..], &text[skip..]))
-      }
+      Some('*') => (0..=text.len()).any(|skip| matches(&pat[1..], &text[skip..])),
       Some('?') => !text.is_empty() && matches(&pat[1..], &text[1..]),
       Some('[') => {
         let Some(end) = pat.iter().skip(1).position(|&c| c == ']').map(|p| p + 1) else {
@@ -491,7 +502,15 @@ mod tests {
   #[test]
   fn the_supported_subset_parses() {
     let args = parsed(&[
-      ".", "-maxdepth", "2", "-type", "f", "-iname", "*.RS", "-path", "./src/*",
+      ".",
+      "-maxdepth",
+      "2",
+      "-type",
+      "f",
+      "-iname",
+      "*.RS",
+      "-path",
+      "./src/*",
     ])
     .unwrap();
     assert_eq!(args.maxdepth, Some(2));

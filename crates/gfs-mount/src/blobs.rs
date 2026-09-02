@@ -24,7 +24,7 @@ use gfs_types::error::GfsError;
 use gfs_types::{BytePath, ObjectId};
 
 use crate::cache::BlobCache;
-use crate::client::SnapshotClient;
+use crate::source::SnapshotSource;
 
 #[derive(Debug, Default)]
 pub struct PreloadedBase {
@@ -34,7 +34,7 @@ pub struct PreloadedBase {
 impl PreloadedBase {
   /// Fetch every base blob the change set refers to.
   pub async fn fetch(
-    client: &Arc<SnapshotClient>,
+    client: &Arc<dyn SnapshotSource>,
     cache: &Arc<BlobCache>,
     status: &Status,
     overlay: &Overlay,
@@ -101,7 +101,7 @@ impl BaseContent for PreloadedBase {
 /// One blob, through the shared cache so a diff of a file the job already read
 /// costs nothing.
 async fn read_blob(
-  client: &Arc<SnapshotClient>,
+  client: &Arc<dyn SnapshotSource>,
   cache: &Arc<BlobCache>,
   oid: &ObjectId,
   path: &BytePath,

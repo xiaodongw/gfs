@@ -136,6 +136,10 @@ fuser = "0.18"
 sha1 = "0.10"
 libc = "0.2"
 
+# The mount's snapshot source is a trait object with async methods, so every
+# implementation -- the wire client and the local clone -- is swappable behind
+# one `Arc<dyn SnapshotSource>` without making the filesystem generic.
+async-trait = "0.1"
 anyhow = "1"
 thiserror = "2"
 serde = { version = "1", features = ["derive"] }

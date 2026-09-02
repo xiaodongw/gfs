@@ -26,83 +26,19 @@ use bytes::Bytes;
 use gfs_proto::convert;
 use gfs_proto::v1;
 use gfs_types::error::{ErrorCode, GfsError};
-use gfs_types::{
-  BytePath, CommitMeta, HashAlgorithm, MountId, ObjectId, RepositoryId, Timestamp, TreeEntryInfo,
-};
+use gfs_types::{BytePath, CommitMeta, MountId, ObjectId, Timestamp, TreeEntryInfo};
 use http_body_util::{BodyExt, Empty};
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::rt::TokioExecutor;
 
+use crate::source::SnapshotSource;
+pub use crate::source::{
+  Blame, DiffQuery, DirectoryPage, LogQuery, MountBinding, RevDiff, TreePage,
+};
+
 type Grpc = v1::snapshot_service_client::SnapshotServiceClient<tonic::transport::Channel>;
 type SearchGrpc = v1::search_service_client::SearchServiceClient<tonic::transport::Channel>;
 type Http = hyper_util::client::legacy::Client<HttpConnector, Empty<Bytes>>;
-
-/// Everything the client needs that does not change for the life of a mount.
-#[derive(Clone, Debug)]
-pub struct MountBinding {
-  pub repository_id: RepositoryId,
-  pub commit: ObjectId,
-  pub algorithm: HashAlgorithm,
-  pub snapshot_time: Timestamp,
-}
-
-/// What a revwalk should cover. The wire's `LogRequest` in domain terms.
-#[derive(Clone, Debug, Default)]
-pub struct LogQuery {
-  pub skip: u32,
-  pub limit: u32,
-  pub first_parent: bool,
-  pub paths: Vec<BytePath>,
-}
-
-/// What to diff and how to render it.
-#[derive(Clone, Debug, Default)]
-pub struct DiffQuery {
-  pub paths: Vec<BytePath>,
-  pub format: gfs_types::DiffFormat,
-  /// `None` takes the server's default of 3. `Some(0)` genuinely means no
-  /// context, which is why this is an `Option` rather than a bare count.
-  pub context_lines: Option<u32>,
-  /// Zero takes the server's default.
-  pub max_bytes: u64,
-}
-
-/// A rendered commit-to-commit diff.
-#[derive(Clone, Debug)]
-pub struct RevDiff {
-  pub rendered: Vec<u8>,
-  pub files: Vec<gfs_types::DiffFileChange>,
-  pub truncated: bool,
-}
-
-/// Blame hunks and the bytes they describe.
-#[derive(Clone, Debug)]
-pub struct Blame {
-  pub hunks: Vec<gfs_types::BlameHunk>,
-  pub content: Vec<u8>,
-  pub truncated: bool,
-}
-
-/// One page of a directory listing.
-#[derive(Clone, Debug)]
-pub struct DirectoryPage {
-  pub entries: Vec<TreeEntryInfo>,
-  /// Empty when this was the last page.
-  pub next_page_token: Vec<u8>,
-}
-
-/// One page of a recursive listing: whole directories, never a partial one.
-#[derive(Debug, Default)]
-pub struct TreePage {
-  /// Every entry of every directory in `directories`, in walk order.
-  pub entries: Vec<TreeEntryInfo>,
-  /// The directories this page describes completely, the walk root included.
-  /// An empty directory appears here with no entries, which is the only way to
-  /// tell "listed, and empty" from "not listed".
-  pub directories: Vec<BytePath>,
-  /// Empty when the walk reached the end of the subtree.
-  pub next_page_token: Vec<u8>,
-}
 
 pub struct SnapshotClient {
   grpc: Grpc,
@@ -164,10 +100,6 @@ impl SnapshotClient {
     }))
   }
 
-  pub fn binding(&self) -> &MountBinding {
-    &self.binding
-  }
-
   /// Install the capability a renewal returned.
   pub fn set_capability(&self, capability: String) {
     *self.capability.write().expect("capability lock") = capability;
@@ -175,15 +107,6 @@ impl SnapshotClient {
 
   fn capability(&self) -> String {
     self.capability.read().expect("capability lock").clone()
-  }
-
-  /// The current capability, for writing into `mount.json`.
-  ///
-  /// Deliberately verbose. This is the one call that takes a credential out of
-  /// the client, and a reviewer reading `state.rs` should be able to see that it
-  /// was an explicit decision rather than an accessor someone reached for.
-  pub fn capability_for_persistence(&self) -> String {
-    self.capability()
   }
 
   /// The authorization proof for a commit-scoped call.
@@ -214,19 +137,62 @@ impl SnapshotClient {
     Ok(request)
   }
 
-  /// One path's metadata, or `None` when the commit has no such path.
-  ///
-  /// The `None` is deliberate: a negative lookup is the most common FUSE result
-  /// during a build, and the gRPC `NOT_FOUND` status lets the caller cache it as
-  /// negative without inspecting a body.
-  pub async fn get_entry(
-    &self,
-    path: &BytePath,
-    want_blob_ticket: bool,
-  ) -> Result<Option<TreeEntryInfo>, GfsError> {
-    self
-      .get_entry_at(&self.binding.commit, path, want_blob_ticket)
+  /// One GET against the HTTP endpoint, bearer-authenticated, whole body.
+  async fn http_get(&self, url: &str) -> Result<Vec<u8>, GfsError> {
+    let uri: http::Uri = url
+      .parse()
+      .map_err(|_| GfsError::invalid("invalid request URL"))?;
+
+    let mut builder = http::Request::builder().uri(uri);
+    if !self.token.is_empty() {
+      builder = builder.header(
+        http::header::AUTHORIZATION,
+        format!("Bearer {}", self.token),
+      );
+    }
+    let request = builder
+      .body(Empty::<Bytes>::new())
+      .map_err(|e| GfsError::internal(format!("building a request: {e}")))?;
+
+    let response = self.http.request(request).await.map_err(|e| {
+      GfsError::new(
+        ErrorCode::Unavailable,
+        format!("request did not complete: {e}"),
+      )
+    })?;
+    let status = response.status();
+    let body = response
+      .into_body()
+      .collect()
       .await
+      .map_err(|e| {
+        GfsError::new(
+          ErrorCode::Unavailable,
+          format!("response body did not complete: {e}"),
+        )
+      })?
+      .to_bytes();
+
+    if !status.is_success() {
+      return Err(http_error(status, &body));
+    }
+    Ok(body.to_vec())
+  }
+}
+
+#[async_trait::async_trait]
+impl SnapshotSource for SnapshotClient {
+  fn binding(&self) -> &MountBinding {
+    &self.binding
+  }
+
+  /// The current capability, for writing into `mount.json`.
+  ///
+  /// This is the one call that takes a credential out of the client, and a
+  /// reviewer reading `state.rs` should be able to see that it was an explicit
+  /// decision rather than an accessor someone reached for.
+  fn capability_for_persistence(&self) -> String {
+    self.capability()
   }
 
   /// The same, in any commit this mount's capability reaches.
@@ -236,7 +202,7 @@ impl SnapshotClient {
   /// a branch in the reserved namespace, which is reachable from no visible ref.
   /// A direct request for it is refused — correctly — and only the mount's own
   /// capability opens it.
-  pub async fn get_entry_at(
+  async fn get_entry_at(
     &self,
     commit: &ObjectId,
     path: &BytePath,
@@ -268,27 +234,9 @@ impl SnapshotClient {
     }
   }
 
-  pub async fn list_directory(
-    &self,
-    path: &BytePath,
-    page_token: Vec<u8>,
-    page_size: u32,
-    want_blob_tickets: bool,
-  ) -> Result<DirectoryPage, GfsError> {
-    self
-      .list_directory_at(
-        &self.binding.commit,
-        path,
-        page_token,
-        page_size,
-        want_blob_tickets,
-      )
-      .await
-  }
-
   /// The same, in any commit this mount's capability reaches. See
-  /// [`SnapshotClient::get_entry_at`] for why the capability is the point.
-  pub async fn list_directory_at(
+  /// [`SnapshotSource::get_entry_at`] for why the capability is the point.
+  async fn list_directory_at(
     &self,
     commit: &ObjectId,
     path: &BytePath,
@@ -328,7 +276,7 @@ impl SnapshotClient {
   /// directory. Every directory named in the response is complete, so each can
   /// be cached as an authoritative listing — including the ones with no entries,
   /// which is why `directories` is carried separately from `entries`.
-  pub async fn list_tree(
+  async fn list_tree(
     &self,
     root: &BytePath,
     page_token: Vec<u8>,
@@ -365,7 +313,7 @@ impl SnapshotClient {
   /// Per-path failures are folded into `None` rather than surfaced: the caller is
   /// a prefetch path, and a batch is an optimisation whose partial failure must
   /// degrade to an individual `GetEntry` rather than to an error.
-  pub async fn batch_get_entry(
+  async fn batch_get_entry(
     &self,
     paths: &[BytePath],
     want_blob_tickets: bool,
@@ -404,7 +352,7 @@ impl SnapshotClient {
   /// whether its last attempt landed recoverable: the previous capability stays
   /// valid until its own expiry, so a renewal whose *response* was lost does not
   /// strand the daemon holding a token the server has forgotten.
-  pub async fn renew_mount(&self, mount_id: &MountId) -> Result<Timestamp, GfsError> {
+  async fn renew_mount(&self, mount_id: &MountId) -> Result<Timestamp, GfsError> {
     let request = self.authed(v1::RenewMountRequest {
       mount_id: mount_id.as_str().to_owned(),
       mount_capability: self.capability(),
@@ -426,7 +374,7 @@ impl SnapshotClient {
   }
 
   /// Release the lease eagerly. Expiry is the crash fallback, not the normal path.
-  pub async fn release_mount(&self, mount_id: &MountId) -> Result<(), GfsError> {
+  async fn release_mount(&self, mount_id: &MountId) -> Result<(), GfsError> {
     let request = self.authed(v1::ReleaseMountRequest {
       mount_id: mount_id.as_str().to_owned(),
       mount_capability: self.capability(),
@@ -440,16 +388,12 @@ impl SnapshotClient {
     Ok(())
   }
 
-  pub async fn get_commit(&self) -> Result<CommitMeta, GfsError> {
-    self.get_commit_at(&self.binding.commit).await
-  }
-
   /// Metadata for any commit the caller may read, not only the pin.
   ///
   /// Needed because `gfs show <rev>` has to learn which parent to diff against
   /// before it can ask for the diff, and that commit is by definition not the
   /// one the mount is pinned to.
-  pub async fn get_commit_at(&self, commit: &ObjectId) -> Result<CommitMeta, GfsError> {
+  async fn get_commit_at(&self, commit: &ObjectId) -> Result<CommitMeta, GfsError> {
     let request = self.authed(v1::GetCommitRequest {
       repository_id: self.binding.repository_id.as_str().to_owned(),
       commit_oid: commit.to_qualified(),
@@ -468,7 +412,7 @@ impl SnapshotClient {
   /// The ancestry of `from`, newest first. `None` walks the pinned commit.
   ///
   /// Returns the page and whether ancestry remains beyond it.
-  pub async fn log(
+  async fn log(
     &self,
     from: Option<&ObjectId>,
     options: &LogQuery,
@@ -506,7 +450,7 @@ impl SnapshotClient {
   /// still holds: this does not re-pin anything. It answers "what commit does
   /// `HEAD~1` mean" for `gfs show` and `gfs diff`, which read history rather than
   /// the mounted tree, and the filesystem never calls it.
-  pub async fn resolve(&self, selector: &str) -> Result<ObjectId, GfsError> {
+  async fn resolve(&self, selector: &str) -> Result<ObjectId, GfsError> {
     let request = self.authed(v1::ResolveRevisionRequest {
       repository_id: self.binding.repository_id.as_str().to_owned(),
       revision_selector: selector.to_owned(),
@@ -527,7 +471,7 @@ impl SnapshotClient {
   /// filesystem path — a workspace's ref view is fixed at the pin, exactly like
   /// its branch ref and its index, so re-asking mid-generation would only be a
   /// way to disagree with them.
-  pub async fn list_refs(&self) -> Result<Vec<gfs_types::RefTarget>, GfsError> {
+  async fn list_refs(&self) -> Result<Vec<gfs_types::RefTarget>, GfsError> {
     let request = self.authed(v1::ListRefsRequest {
       repository_id: self.binding.repository_id.as_str().to_owned(),
     })?;
@@ -549,7 +493,7 @@ impl SnapshotClient {
   ///
   /// `from` is `None` for a root commit, which is diffed against the empty tree.
   /// Nothing is hydrated: the patch is built where the object database is.
-  pub async fn diff_commits(
+  async fn diff_commits(
     &self,
     from: Option<&ObjectId>,
     to: &ObjectId,
@@ -585,7 +529,7 @@ impl SnapshotClient {
   }
 
   /// Line attribution for one path at one commit, with the file's bytes.
-  pub async fn blame(&self, commit: &ObjectId, path: &BytePath) -> Result<Blame, GfsError> {
+  async fn blame(&self, commit: &ObjectId, path: &BytePath) -> Result<Blame, GfsError> {
     let request = self.authed(v1::BlameRequest {
       repository_id: self.binding.repository_id.as_str().to_owned(),
       commit_oid: commit.to_qualified(),
@@ -621,7 +565,7 @@ impl SnapshotClient {
   /// still running server-side and a later search may succeed; the distinction
   /// between "building" and "failed" is preserved in the error rather than
   /// folded into the boolean, because one is worth retrying and the other is not.
-  pub async fn prepare_snapshot(&self) -> Result<bool, GfsError> {
+  async fn prepare_snapshot(&self) -> Result<bool, GfsError> {
     let request = self.authed(v1::PrepareSnapshotRequest {
       repository_id: self.binding.repository_id.as_str().to_owned(),
       commit_oid: self.binding.commit.to_qualified(),
@@ -662,7 +606,7 @@ impl SnapshotClient {
   /// never an empty result. A caller therefore cannot accidentally treat a
   /// dropped connection as "no matches" -- there is no code path that produces
   /// that value.
-  pub async fn search(
+  async fn search(
     &self,
     query: &gfs_search::Query,
     max_results: u32,
@@ -745,7 +689,7 @@ impl SnapshotClient {
   /// Whole-blob, not ranged: DESIGN.md section 12 fixes whole-blob fetch as the
   /// MVP boundary, and the cache verifies the canonical object hash, which a
   /// partial body cannot satisfy.
-  pub async fn read_blob(&self, oid: &ObjectId, ticket: &str) -> Result<Vec<u8>, GfsError> {
+  async fn read_blob(&self, oid: &ObjectId, ticket: &str) -> Result<Vec<u8>, GfsError> {
     let url = format!(
       "{}/v1/repos/{}/blobs/{}?ticket={}",
       self.http_endpoint,
@@ -753,44 +697,18 @@ impl SnapshotClient {
       oid.to_qualified(),
       ticket,
     );
-    let uri: http::Uri = url
-      .parse()
-      .map_err(|_| GfsError::invalid("invalid blob URL"))?;
+    self.http_get(&url).await
+  }
 
-    let mut builder = http::Request::builder().uri(uri);
-    if !self.token.is_empty() {
-      builder = builder.header(
-        http::header::AUTHORIZATION,
-        format!("Bearer {}", self.token),
-      );
-    }
-    let request = builder
-      .body(Empty::<Bytes>::new())
-      .map_err(|e| GfsError::internal(format!("building blob request: {e}")))?;
-
-    let response = self.http.request(request).await.map_err(|e| {
-      GfsError::new(
-        ErrorCode::Unavailable,
-        format!("blob request did not complete: {e}"),
-      )
-    })?;
-    let status = response.status();
-    let body = response
-      .into_body()
-      .collect()
-      .await
-      .map_err(|e| {
-        GfsError::new(
-          ErrorCode::Unavailable,
-          format!("blob body did not complete: {e}"),
-        )
-      })?
-      .to_bytes();
-
-    if !status.is_success() {
-      return Err(http_error(status, &body));
-    }
-    Ok(body.to_vec())
+  /// The gateway-built index, over HTTP with `ETag: "<commit>"` (ADR 0009).
+  async fn commit_index(&self, commit: &ObjectId) -> Result<Vec<u8>, GfsError> {
+    let url = format!(
+      "{}/v1/repos/{}/index?commit={}",
+      self.http_endpoint,
+      self.binding.repository_id.as_str(),
+      commit.to_qualified()
+    );
+    self.http_get(&url).await
   }
 }
 

@@ -290,7 +290,11 @@ impl IndexManager {
           .build_incremental(&ctx, commit, &parent, &base, &lfs, cancel)
           .await?
       }
-      None => self.build_full(&ctx, commit, &lfs, cancel, snapshots).await?,
+      None => {
+        self
+          .build_full(&ctx, commit, &lfs, cancel, snapshots)
+          .await?
+      }
     };
 
     cancel.check()?;

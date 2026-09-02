@@ -245,7 +245,10 @@ mod tests {
   #[test]
   fn lfs_key_round_trips_and_is_not_a_git_object_format() {
     let lfs = ObjectId::from_hex(HashAlgorithm::LfsSha256, &"ef".repeat(32)).unwrap();
-    assert_eq!(lfs.to_qualified(), format!("lfs-sha256:{}", "ef".repeat(32)));
+    assert_eq!(
+      lfs.to_qualified(),
+      format!("lfs-sha256:{}", "ef".repeat(32))
+    );
     assert_eq!(ObjectId::parse_qualified(&lfs.to_qualified()).unwrap(), lfs);
     assert!(!HashAlgorithm::LfsSha256.is_git_object_format());
     // Same digest bytes under Git's sha256 spelling is a different identity:

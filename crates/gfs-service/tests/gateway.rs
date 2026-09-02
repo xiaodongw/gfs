@@ -1358,7 +1358,14 @@ async fn a_push_to_a_branch_lands_on_the_branch() {
   // branch pushes now.
   for refspec in ["HEAD:refs/heads/main", "HEAD:refs/heads/topic"] {
     let out = git_client(
-      &["-C", clone.to_str().unwrap(), "push", "-q", "origin", refspec],
+      &[
+        "-C",
+        clone.to_str().unwrap(),
+        "push",
+        "-q",
+        "origin",
+        refspec,
+      ],
       Some(OWNER_TOKEN),
     );
     assert!(out.status.success(), "{refspec}: {}", stderr(&out));
@@ -1366,7 +1373,10 @@ async fn a_push_to_a_branch_lands_on_the_branch() {
   let local = git_client(&["-C", clone.to_str().unwrap(), "rev-parse", "HEAD"], None);
   let local = stdout(&local).trim().to_owned();
   assert_eq!(server_ref(&fx, "refs/heads/main").as_deref(), Some(&*local));
-  assert_eq!(server_ref(&fx, "refs/heads/topic").as_deref(), Some(&*local));
+  assert_eq!(
+    server_ref(&fx, "refs/heads/topic").as_deref(),
+    Some(&*local)
+  );
   fsck_clean(&fx.repo_path);
 }
 

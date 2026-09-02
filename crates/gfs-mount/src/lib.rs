@@ -52,10 +52,11 @@ pub mod prefetch;
 pub mod publish;
 pub mod search;
 pub mod session;
+pub mod source;
 pub mod state;
 
 pub use cache::{BlobCache, CacheStats, Hydration};
-pub use client::{MountBinding, SnapshotClient};
+pub use client::SnapshotClient;
 pub use fs::{root_entry, FsConfig, FsStats, Gfs, GfsFilesystem};
 pub use gitdir::GitDirFacts;
 pub use host::{HostConfig, MountHost};
@@ -64,4 +65,5 @@ pub use mount::{Mount, MountSpec};
 pub use passthrough::{GitDirHandle, GitPassthrough};
 pub use publish::{DirectMountPublisher, MountPublisher};
 pub use session::{spawn_mount, MountConfig};
+pub use source::{MountBinding, SnapshotSource};
 pub use state::MountState;

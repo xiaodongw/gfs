@@ -72,7 +72,7 @@ use gfs_types::{
 };
 
 use crate::cache::BlobCache;
-use crate::client::{MountBinding, SnapshotClient};
+use crate::client::SnapshotClient;
 use crate::control::{MountReport, RefreshReport, Request, Response};
 use crate::fs::{FsConfig, Gfs, GfsFilesystem};
 use crate::gitdir::GitDirFacts;
@@ -80,6 +80,7 @@ use crate::lease::{LeaseHealth, LeaseMonitor};
 use crate::passthrough::{GitDirHandle, GitPassthrough, GIT_DIR_NAME};
 use crate::publish::{DirectMountPublisher, MountPublisher};
 use crate::session::MountConfig;
+use crate::source::{MountBinding, SnapshotSource};
 use crate::state::{
   prepare_state_dir, state_dir_for_workspace, workspace_control_socket, LeaseRecord, MountState,
 };
@@ -157,7 +158,7 @@ struct Pin {
   /// the `.git` surface reports it and an operator watching `gfs inspect` can
   /// tell one switch from the next.
   epoch: u64,
-  client: Arc<SnapshotClient>,
+  client: Arc<dyn SnapshotSource>,
   monitor: Arc<LeaseMonitor>,
   commit: ObjectId,
   tree: ObjectId,
@@ -405,7 +406,8 @@ impl Mount {
       None
     } else {
       Some(
-        odb
+        resolved
+          .pin
           .client
           .commit_index(&resolved.pin.commit)
           .await
@@ -567,7 +569,7 @@ impl Mount {
   /// holds nothing on the server, so a superseded lease is released outright
   /// rather than kept warm.
   pub async fn renew_all(&self) {
-    let entries: Vec<(Arc<SnapshotClient>, Arc<LeaseMonitor>)> = {
+    let entries: Vec<(Arc<dyn SnapshotSource>, Arc<LeaseMonitor>)> = {
       let current = self.current.lock().expect("current pin");
       vec![(Arc::clone(&current.client), Arc::clone(&current.monitor))]
     };
@@ -725,7 +727,7 @@ impl Mount {
     // fetch is the only network dependency; failing the switch here leaves the
     // old pin fully intact, which is the same guarantee resolve_pin's ordering
     // already gives.
-    let index = self.odb.client.commit_index(&commit).await?;
+    let index = resolved.pin.client.commit_index(&commit).await?;
     crate::gitdir::seed_git_dir(&crate::gitdir::SeedSpec {
       git_dir: &git_dir_path,
       facts: &resolved.facts,
@@ -1172,7 +1174,7 @@ impl Mount {
   /// walks the ancestry of the right commit.
   async fn resolve_here(
     &self,
-    client: &crate::client::SnapshotClient,
+    client: &Arc<dyn SnapshotSource>,
     pin: &ObjectId,
     selector: &str,
   ) -> Result<ObjectId, GfsError> {
@@ -1781,12 +1783,10 @@ impl Mount {
             .map_err(|e| GfsError::invalid(format!("not a content key: {e}")))
         });
         match decoded {
-          Ok((path, oid)) => {
-            match self.lfs_smudge(&gfs_types::BytePath::new(path), &oid).await {
-              Ok(path) => Response::LfsSmudge { path },
-              Err(e) => Response::from_error(&e),
-            }
-          }
+          Ok((path, oid)) => match self.lfs_smudge(&gfs_types::BytePath::new(path), &oid).await {
+            Ok(path) => Response::LfsSmudge { path },
+            Err(e) => Response::from_error(&e),
+          },
           Err(e) => Response::from_error(&e),
         }
       }
@@ -1866,7 +1866,7 @@ async fn resolve_pin(config: &MountSpec, selector: &str, epoch: u64) -> Result<R
     Duration::from_secs(grant.heartbeat_interval_seconds)
   };
 
-  let client = SnapshotClient::connect(
+  let client: Arc<dyn SnapshotSource> = SnapshotClient::connect(
     &config.grpc_endpoint,
     &config.http_endpoint,
     &config.token,

@@ -31,6 +31,7 @@
 use std::sync::Arc;
 
 use gfs_mount::client::{MountBinding, SnapshotClient};
+use gfs_mount::SnapshotSource;
 use gfs_proto::v1;
 use gfs_proto::{SearchService, SearchServiceServer};
 use gfs_search::{exit_code, ExecutionStatus, SearchOutcome};

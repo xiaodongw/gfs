@@ -167,18 +167,13 @@ async fn start() -> Fixture {
 
 fn authed<T>(request: T) -> tonic::Request<T> {
   let mut request = tonic::Request::new(request);
-  request.metadata_mut().insert(
-    "authorization",
-    format!("Bearer {TOKEN}").parse().unwrap(),
-  );
+  request
+    .metadata_mut()
+    .insert("authorization", format!("Bearer {TOKEN}").parse().unwrap());
   request
 }
 
-async fn get_entry(
-  f: &Fixture,
-  commit: &str,
-  path: &[u8],
-) -> v1::TreeEntry {
+async fn get_entry(f: &Fixture, commit: &str, path: &[u8]) -> v1::TreeEntry {
   let channel = tonic::transport::Endpoint::from_shared(f.grpc.clone())
     .unwrap()
     .connect()
@@ -211,7 +206,9 @@ async fn http_get(url: &str) -> (http::StatusCode, Vec<u8>, http::HeaderMap) {
   use hyper_util::rt::TokioIo;
   let uri: http::Uri = url.parse().unwrap();
   let authority = uri.authority().unwrap().to_string();
-  let stream = tokio::net::TcpStream::connect(authority.clone()).await.unwrap();
+  let stream = tokio::net::TcpStream::connect(authority.clone())
+    .await
+    .unwrap();
   let (mut sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(stream))
     .await
     .unwrap();
@@ -225,7 +222,13 @@ async fn http_get(url: &str) -> (http::StatusCode, Vec<u8>, http::HeaderMap) {
   let response = sender.send_request(request).await.unwrap();
   let status = response.status();
   let headers = response.headers().clone();
-  let body = response.into_body().collect().await.unwrap().to_bytes().to_vec();
+  let body = response
+    .into_body()
+    .collect()
+    .await
+    .unwrap()
+    .to_bytes()
+    .to_vec();
   (status, body, headers)
 }
 
@@ -254,7 +257,11 @@ async fn an_lfs_entry_serves_expanded_metadata_and_content_end_to_end() {
   // An entry whose object the store lacks degrades to its pointer: git blob
   // identity, pointer-sized, pointer bytes behind the ticket.
   let degraded = get_entry(&f, &commit, b"degraded.bin").await;
-  assert!(degraded.oid.starts_with("sha1:"), "oid was {}", degraded.oid);
+  assert!(
+    degraded.oid.starts_with("sha1:"),
+    "oid was {}",
+    degraded.oid
+  );
   assert_eq!(degraded.size, pointer_text(b"never fetched").len() as u64);
   let ticket = degraded.blob_ticket.expect("a blob ticket");
   let url = format!(

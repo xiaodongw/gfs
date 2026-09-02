@@ -461,9 +461,8 @@ fn helper_hook(
   };
   let hook = git_dir.join(format!("hooks/{name}"));
   let script = format!("#!/bin/sh\nexec {} \"$@\"\n", binary.display());
-  std::fs::write(&hook, script).map_err(|e| {
-    gfs_types::error::GfsError::internal(format!("writing the {name} hook: {e}"))
-  })?;
+  std::fs::write(&hook, script)
+    .map_err(|e| gfs_types::error::GfsError::internal(format!("writing the {name} hook: {e}")))?;
   let mut perms = std::fs::metadata(&hook)
     .map_err(|e| gfs_types::error::GfsError::internal(format!("hook metadata: {e}")))?
     .permissions();
@@ -758,7 +757,11 @@ mod tests {
       preserve_local_head: true,
     })
     .unwrap();
-    assert_eq!(local_head(&git).unwrap(), local, "the local commit survives");
+    assert_eq!(
+      local_head(&git).unwrap(),
+      local,
+      "the local commit survives"
+    );
     assert_eq!(
       seeded_commit(&git).unwrap(),
       "ab".repeat(20),

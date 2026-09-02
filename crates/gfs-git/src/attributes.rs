@@ -56,7 +56,9 @@ impl AttributeFile {
       if line[0] == b'!' {
         continue;
       }
-      let mut fields = line.split(|b| b.is_ascii_whitespace()).filter(|f| !f.is_empty());
+      let mut fields = line
+        .split(|b| b.is_ascii_whitespace())
+        .filter(|f| !f.is_empty());
       let Some(pattern) = fields.next() else {
         continue;
       };
@@ -72,9 +74,7 @@ impl AttributeFile {
           b"-filter" => Some(FilterState::Unset),
           b"!filter" => Some(FilterState::Unspecified),
           _ => match attr.strip_prefix(b"filter=") {
-            Some(v) => Some(FilterState::Value(
-              String::from_utf8_lossy(v).into_owned(),
-            )),
+            Some(v) => Some(FilterState::Value(String::from_utf8_lossy(v).into_owned())),
             None => state,
           },
         };
@@ -101,10 +101,7 @@ impl AttributeFile {
   ///
   /// The last matching line wins, per `gitattributes(5)`.
   fn filter_for(&self, rel_path: &[u8]) -> Option<&FilterState> {
-    let basename = rel_path
-      .rsplit(|b| *b == b'/')
-      .next()
-      .unwrap_or(rel_path);
+    let basename = rel_path.rsplit(|b| *b == b'/').next().unwrap_or(rel_path);
     self
       .rules
       .iter()

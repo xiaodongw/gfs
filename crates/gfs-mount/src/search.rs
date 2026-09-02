@@ -56,7 +56,7 @@ use gfs_search::SearchOutcome;
 use gfs_types::error::{ErrorCode, GfsError};
 use gfs_types::BytePath;
 
-use crate::client::SnapshotClient;
+use crate::source::SnapshotSource;
 
 /// The name of an ignore file, in one place.
 const GITIGNORE: &[u8] = b".gitignore";
@@ -200,7 +200,7 @@ impl OverlayView {
 ///
 /// `client` supplies the base half; `overlay` supplies the local half.
 pub async fn search(
-  client: &Arc<SnapshotClient>,
+  client: &Arc<dyn SnapshotSource>,
   overlay: &Arc<Overlay>,
   request: &SearchRequest,
 ) -> Result<(SearchOutcome, usize), GfsError> {
@@ -214,7 +214,7 @@ pub async fn search(
   .await
   .map_err(|e| GfsError::internal(format!("the overlay scan task failed: {e}")))?;
 
-  // The base half. Always the pinned commit: `SnapshotClient` is constructed
+  // The base half. Always the pinned commit: a `SnapshotSource` is constructed
   // around one commit and has no method that takes a selector, so this cannot
   // accidentally become a branch query.
   let base = match client.search(&query, request.max_results).await {
@@ -292,7 +292,7 @@ fn build_query(request: &SearchRequest) -> Query {
 /// Only those. See the module docs: this is the one base access a local search
 /// makes, and a clean workspace makes none.
 async fn load_ignore_rules(
-  client: &Arc<SnapshotClient>,
+  client: &Arc<dyn SnapshotSource>,
   overlay: &Arc<Overlay>,
   view: &OverlayView,
   request: &SearchRequest,
@@ -375,7 +375,7 @@ async fn read_overlay_file(
 }
 
 async fn read_base_file(
-  client: &Arc<SnapshotClient>,
+  client: &Arc<dyn SnapshotSource>,
   path: &BytePath,
 ) -> Result<Option<Vec<u8>>, GfsError> {
   let Some(entry) = client.get_entry(path, true).await? else {

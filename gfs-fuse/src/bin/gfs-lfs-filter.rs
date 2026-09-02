@@ -151,11 +151,7 @@ fn serve_process(input: &mut impl Read, output: &mut impl Write) -> std::io::Res
   write_flush(output)?;
 
   let theirs = read_kv_until_flush(input)?;
-  let wants = |cap: &str| {
-    theirs
-      .iter()
-      .any(|(k, v)| k == "capability" && v == cap)
-  };
+  let wants = |cap: &str| theirs.iter().any(|(k, v)| k == "capability" && v == cap);
   if wants("clean") {
     write_text_pkt(output, "capability=clean")?;
   }

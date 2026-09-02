@@ -43,7 +43,7 @@ use sha1::{Digest, Sha1};
 use sha2::Sha256;
 use tokio::sync::broadcast;
 
-use crate::client::SnapshotClient;
+use crate::source::SnapshotSource;
 
 /// Compute the content key of a blob's bytes under the given algorithm.
 ///
@@ -264,7 +264,7 @@ impl BlobCache {
   /// exists.
   pub async fn open_blob(
     &self,
-    client: &SnapshotClient,
+    client: &Arc<dyn SnapshotSource>,
     oid: &ObjectId,
     ticket: &str,
   ) -> Result<(PathBuf, Hydration), GfsError> {
@@ -307,7 +307,7 @@ impl BlobCache {
   /// the reads that were right.
   pub async fn ensure_cached(
     &self,
-    client: &SnapshotClient,
+    client: &Arc<dyn SnapshotSource>,
     oid: &ObjectId,
     ticket: &str,
   ) -> Result<(), GfsError> {
@@ -317,7 +317,7 @@ impl BlobCache {
   /// Read a whole blob, going through the cache.
   pub async fn read(
     &self,
-    client: &SnapshotClient,
+    client: &Arc<dyn SnapshotSource>,
     oid: &ObjectId,
     ticket: &str,
   ) -> Result<Vec<u8>, GfsError> {
@@ -332,7 +332,7 @@ impl BlobCache {
 
   async fn ensure(
     &self,
-    client: &SnapshotClient,
+    client: &Arc<dyn SnapshotSource>,
     oid: &ObjectId,
     ticket: &str,
   ) -> Result<Hydration, GfsError> {
@@ -388,7 +388,7 @@ impl BlobCache {
 
   async fn fetch_and_publish(
     &self,
-    client: &SnapshotClient,
+    client: &Arc<dyn SnapshotSource>,
     oid: &ObjectId,
     ticket: &str,
   ) -> Result<u64, GfsError> {

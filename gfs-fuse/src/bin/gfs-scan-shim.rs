@@ -257,7 +257,10 @@ fn translate_grep(args: &[String]) -> Option<Vec<String>> {
 
 /// `-A3` / `-B2` / `-C1`, the attached-value spelling.
 fn attached_context(arg: &str) -> Option<(String, String)> {
-  let rest = arg.strip_prefix("-A").or_else(|| arg.strip_prefix("-B")).or_else(|| arg.strip_prefix("-C"))?;
+  let rest = arg
+    .strip_prefix("-A")
+    .or_else(|| arg.strip_prefix("-B"))
+    .or_else(|| arg.strip_prefix("-C"))?;
   if rest.is_empty() || !rest.chars().all(|c| c.is_ascii_digit()) {
     return None;
   }

@@ -43,8 +43,7 @@ impl LfsStore {
   /// substitution checks: present means "expanded", absent means the entry
   /// degrades to its pointer.
   pub fn contains(&self, repository: &RepositoryId, oid: &ObjectId) -> bool {
-    oid.algorithm() == HashAlgorithm::LfsSha256
-      && self.object_path(repository, oid).is_file()
+    oid.algorithm() == HashAlgorithm::LfsSha256 && self.object_path(repository, oid).is_file()
   }
 
   /// The on-disk path of a stored object, or `None` when it is not here.
@@ -69,9 +68,7 @@ impl LfsStore {
     match std::fs::read(self.object_path(repository, oid)) {
       Ok(bytes) => Ok(Some(bytes)),
       Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-      Err(e) => Err(GfsError::internal(format!(
-        "reading LFS object {oid}: {e}"
-      ))),
+      Err(e) => Err(GfsError::internal(format!("reading LFS object {oid}: {e}"))),
     }
   }
 
@@ -162,7 +159,10 @@ mod tests {
 
     store.put(&repo, &oid, content).unwrap();
     assert!(store.contains(&repo, &oid));
-    assert_eq!(store.read(&repo, &oid).unwrap().as_deref(), Some(&content[..]));
+    assert_eq!(
+      store.read(&repo, &oid).unwrap().as_deref(),
+      Some(&content[..])
+    );
 
     // Idempotent republish.
     store.put(&repo, &oid, content).unwrap();

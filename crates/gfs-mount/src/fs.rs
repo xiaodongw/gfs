@@ -67,12 +67,12 @@ use gfs_types::{BytePath, EntryKind, ObjectId, Timestamp, TreeEntryInfo};
 
 use crate::attr::{attr_of, errno_of, errno_of_overlay, Ownership};
 use crate::cache::{BlobCache, CacheStats};
-use crate::client::SnapshotClient;
 use crate::inode::{InodeTable, Node, Record, ROOT_INO};
 use crate::listing::Listing;
 use crate::passthrough::{
   errno_io, git_rel, in_object_namespace, odb_rel, GitMeta, GitPassthrough, OdbNode, GIT_DIR_NAME,
 };
+use crate::source::SnapshotSource;
 
 /// Inode numbers are never reused for a different path, so there is nothing for a
 /// generation to disambiguate. See the module docs on [`crate::inode`].
@@ -329,7 +329,7 @@ struct Resolved {
 /// dir on disk, but where the git dir lives never changes.
 #[derive(Debug)]
 pub struct Pinned {
-  pub client: Arc<SnapshotClient>,
+  pub client: Arc<dyn SnapshotSource>,
   pub overlay: Arc<Overlay>,
   pub snapshot_time: Timestamp,
   /// Complete base listings for this pin. Living *inside* `Pinned` is the
@@ -377,7 +377,7 @@ impl std::fmt::Debug for Gfs {
 
 impl Gfs {
   pub fn new(
-    client: Arc<SnapshotClient>,
+    client: Arc<dyn SnapshotSource>,
     cache: Arc<BlobCache>,
     git: Arc<GitPassthrough>,
     overlay: Arc<Overlay>,
@@ -433,7 +433,7 @@ impl Gfs {
   /// behind too: replacing a file does not reach into a reader's descriptor.
   pub fn repin(
     &self,
-    client: Arc<SnapshotClient>,
+    client: Arc<dyn SnapshotSource>,
     overlay: Arc<Overlay>,
     snapshot_time: Timestamp,
     root: TreeEntryInfo,
@@ -483,7 +483,7 @@ impl Gfs {
   /// capability*, which is refreshed by every heartbeat renewal. A second client
   /// built for search would hold a copy that goes stale, and its first read
   /// after a force push -- the exact moment a mount must not break -- would fail.
-  pub fn client(&self) -> Arc<SnapshotClient> {
+  pub fn client(&self) -> Arc<dyn SnapshotSource> {
     Arc::clone(&self.pinned().client)
   }
 

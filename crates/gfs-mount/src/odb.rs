@@ -190,17 +190,6 @@ impl OdbClient {
     );
     self.get(&url, Some((start, end))).await
   }
-
-  /// The shipped index for a pinned commit (ADR 0009's workspace seed).
-  pub async fn commit_index(&self, commit: &gfs_types::ObjectId) -> Result<Vec<u8>, GfsError> {
-    let url = format!(
-      "{}/v1/repos/{}/index?commit={}",
-      self.endpoint,
-      self.repository_id.as_str(),
-      commit.to_qualified()
-    );
-    self.get(&url, None).await
-  }
 }
 
 // ---------------------------------------------------------------------------

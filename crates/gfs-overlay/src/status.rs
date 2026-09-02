@@ -166,9 +166,7 @@ impl Overlay {
       // compare unequal to its own base forever — a phantom modification
       // that blocks `gfs switch` and pads every commit plan.
       let hash_algorithm = match &entry.base {
-        Some(base) if base.oid.algorithm() == HashAlgorithm::LfsSha256 => {
-          HashAlgorithm::LfsSha256
-        }
+        Some(base) if base.oid.algorithm() == HashAlgorithm::LfsSha256 => HashAlgorithm::LfsSha256,
         _ => algorithm,
       };
       let new_oid = self.workspace_oid(entry, hash_algorithm)?;
