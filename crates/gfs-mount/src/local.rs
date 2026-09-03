@@ -372,6 +372,15 @@ impl SnapshotSource for LocalSource {
     self.repo.blob(oid).await
   }
 
+  fn forget_blob(&self, oid: &ObjectId) {
+    self
+      .repo
+      .blobs
+      .lock()
+      .expect("blob memory")
+      .remove(&oid.to_hex());
+  }
+
   async fn commit_index(&self, commit: &ObjectId) -> Result<Vec<u8>, GfsError> {
     self
       .repo
@@ -709,6 +718,13 @@ impl BlobMemory {
     *tick = self.tick;
     self.order.insert(self.tick, key.to_owned());
     Some(Arc::clone(bytes))
+  }
+
+  fn remove(&mut self, key: &str) {
+    if let Some((tick, bytes)) = self.entries.remove(key) {
+      self.order.remove(&tick);
+      self.bytes -= bytes.len() as u64;
+    }
   }
 
   fn insert(&mut self, key: String, bytes: Arc<Vec<u8>>) {

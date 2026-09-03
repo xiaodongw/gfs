@@ -1042,6 +1042,41 @@ impl Overlay {
     Ok(written)
   }
 
+  /// Record what a content file reached while the kernel wrote it directly
+  /// (FUSE passthrough): the row catches up when the descriptor closes.
+  ///
+  /// Not a quota check -- the bytes are already on disk -- but the accounting
+  /// moves with the row, so the next write through the daemon sees them.
+  /// `None` when no row names the content any more (unlinked while open).
+  pub fn refresh_content(
+    &self,
+    content_id: u64,
+    size: u64,
+    mtime: Timestamp,
+  ) -> Result<Option<OverlayEntry>> {
+    let mut inner = self.lock();
+    let Some(entry) = inner
+      .by_content
+      .get(&content_id)
+      .and_then(|path| inner.entries.get(path.as_slice()))
+      .cloned()
+    else {
+      return Ok(None);
+    };
+    if entry.size == size && entry.mtime == mtime {
+      return Ok(Some(entry));
+    }
+    let now = self.next_time(&mut inner);
+    let updated = OverlayEntry {
+      size,
+      mtime,
+      ctime: now,
+      ..entry
+    };
+    self.commit(&mut inner, vec![Change::Put(updated.clone())], Vec::new())?;
+    Ok(Some(updated))
+  }
+
   /// Set a materialized file's length.
   pub fn truncate(&self, path: &BytePath, size: u64) -> Result<OverlayEntry> {
     let mut inner = self.lock();

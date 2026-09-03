@@ -506,6 +506,11 @@ impl Mount {
     &self.config
   }
 
+  /// Whether the kernel serves opens on this mount from backing files.
+  pub fn passthrough_active(&self) -> bool {
+    self.fs.passthrough_active()
+  }
+
   /// A one-line view of this mount, for the host's `ListMounts`.
   pub fn summary(&self) -> crate::control::MountSummary {
     let current = self.current.lock().expect("current pin");

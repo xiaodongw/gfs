@@ -47,11 +47,12 @@
 //! write path keeps the page cache coherent; entries the overlay has never seen
 //! keep the long TTL.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::OsStr;
+use std::os::fd::AsFd;
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::FileExt;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::os::unix::fs::{FileExt, MetadataExt};
+use std::sync::atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
@@ -215,6 +216,9 @@ pub struct FsStats {
   pub prefetched_blobs: u64,
   pub prefetched_bytes: u64,
   pub opens: u64,
+  /// Opens the kernel serves itself from a backing file (passthrough): no
+  /// `read` or `write` request for them ever reaches the daemon.
+  pub passthrough_opens: u64,
   pub reads: u64,
   pub read_bytes: u64,
   pub writes: u64,
@@ -312,6 +316,157 @@ enum FileState {
   },
   /// A projected object-store file, read block-wise from the shared store.
   Odb { path: String },
+  /// A descriptor the kernel serves itself (passthrough): every read and
+  /// write goes to the backing file and none reaches the daemon. `blob` is a
+  /// server-mode cache file to unpin at `release`; `writer` is the overlay
+  /// content file behind a writable handle, whose size and mtime the daemon
+  /// reads back when the handle closes.
+  Kernel {
+    backing: Arc<Backing>,
+    blob: Option<ObjectId>,
+    writer: Option<KernelWriter>,
+  },
+}
+
+/// A file the kernel reads and writes directly (FUSE passthrough).
+///
+/// Dropping the id closes the registration; the kernel keeps the file itself
+/// alive for as long as any open descriptor uses it, so the daemon need not.
+#[derive(Debug)]
+pub struct Backing {
+  id: fuser::BackingId,
+  key: BackingKey,
+  /// Memory the backing pins: the memfd's size, zero for a file on disk.
+  bytes: u64,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+enum BackingKey {
+  Blob(String),
+  Content(u64),
+}
+
+#[derive(Debug)]
+struct KernelWriter {
+  ino: u64,
+  content_id: u64,
+  file: Arc<std::fs::File>,
+}
+
+/// Where the mount stands with passthrough. `Offered`: the kernel accepted
+/// the flag at `init` and no registration has been tried. `Active`: one
+/// succeeded, so every later open of a blob or overlay file must use it too
+/// (the kernel refuses to mix passthrough and cached opens on one inode).
+/// `Refused`: the first one failed, and the mount never asks again.
+const PASSTHROUGH_UNAVAILABLE: u8 = 0;
+const PASSTHROUGH_OFFERED: u8 = 1;
+const PASSTHROUGH_ACTIVE: u8 = 2;
+const PASSTHROUGH_REFUSED: u8 = 3;
+
+/// A blob this size or smaller is copied into its memfd on the FUSE thread;
+/// a larger one on a blocking worker.
+const INLINE_MEMFD_BYTES: u64 = 1024 * 1024;
+/// Memory the registered memfds may pin per mount, and how many backing files
+/// of any kind stay registered between opens.
+const BACKING_CACHE_BYTES: u64 = 256 * 1024 * 1024;
+const BACKING_CACHE_ENTRIES: usize = 4096;
+
+/// A bounded LRU of registered backing files, keyed by what they hold.
+#[derive(Debug, Default)]
+struct BackingCache {
+  bytes: u64,
+  tick: u64,
+  entries: HashMap<BackingKey, (u64, Arc<Backing>)>,
+  order: BTreeMap<u64, BackingKey>,
+}
+
+impl BackingCache {
+  fn get(&mut self, key: &BackingKey) -> Option<Arc<Backing>> {
+    let (tick, backing) = self.entries.get_mut(key)?;
+    self.order.remove(tick);
+    self.tick += 1;
+    *tick = self.tick;
+    self.order.insert(self.tick, key.clone());
+    Some(Arc::clone(backing))
+  }
+
+  fn insert(&mut self, key: BackingKey, backing: Arc<Backing>) {
+    if backing.bytes > BACKING_CACHE_BYTES || self.entries.contains_key(&key) {
+      return;
+    }
+    while self.bytes + backing.bytes > BACKING_CACHE_BYTES
+      || self.entries.len() >= BACKING_CACHE_ENTRIES
+    {
+      let Some((_, oldest)) = self.order.pop_first() else {
+        break;
+      };
+      if let Some((_, evicted)) = self.entries.remove(&oldest) {
+        self.bytes -= evicted.bytes;
+      }
+    }
+    self.tick += 1;
+    self.order.insert(self.tick, key.clone());
+    self.bytes += backing.bytes;
+    self.entries.insert(key, (self.tick, backing));
+  }
+
+  fn remove(&mut self, key: &BackingKey) {
+    if let Some((tick, evicted)) = self.entries.remove(key) {
+      self.order.remove(&tick);
+      self.bytes -= evicted.bytes;
+    }
+  }
+}
+
+/// The two replies that can carry a backing id.
+trait OpenReply: Sync {
+  fn open_backing(&self, fd: std::os::fd::BorrowedFd<'_>) -> std::io::Result<fuser::BackingId>;
+}
+
+impl OpenReply for fuser::ReplyOpen {
+  fn open_backing(&self, fd: std::os::fd::BorrowedFd<'_>) -> std::io::Result<fuser::BackingId> {
+    fuser::ReplyOpen::open_backing(self, fd)
+  }
+}
+
+impl OpenReply for fuser::ReplyCreate {
+  fn open_backing(&self, fd: std::os::fd::BorrowedFd<'_>) -> std::io::Result<fuser::BackingId> {
+    fuser::ReplyCreate::open_backing(self, fd)
+  }
+}
+
+/// An anonymous memory file holding `bytes`, for the kernel to read directly.
+fn memfd_holding(bytes: &[u8]) -> std::io::Result<std::fs::File> {
+  use std::io::Write;
+  use std::os::fd::FromRawFd;
+  // The workspace denies `unsafe_code`; this is the documented opt-out, on the
+  // same reasoning as `host::SingletonLock`. `memfd_create` reads a C string
+  // and a flag word, touches no other memory, and returns a descriptor this
+  // process owns, which the `File` below takes over.
+  #[allow(unsafe_code)]
+  let fd = unsafe { libc::memfd_create(c"gfs-blob".as_ptr(), libc::MFD_CLOEXEC) };
+  if fd < 0 {
+    return Err(std::io::Error::last_os_error());
+  }
+  #[allow(unsafe_code)]
+  let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
+  file.write_all(bytes)?;
+  Ok(file)
+}
+
+/// Whether this process may register backing files: the kernel gates the
+/// ioctl on `CAP_SYS_ADMIN` in the initial user namespace.
+fn has_cap_sys_admin() -> bool {
+  const CAP_SYS_ADMIN: u32 = 21;
+  std::fs::read_to_string("/proc/self/status")
+    .ok()
+    .and_then(|status| {
+      status
+        .lines()
+        .find_map(|line| line.strip_prefix("CapEff:"))
+        .and_then(|hex| u64::from_str_radix(hex.trim(), 16).ok())
+    })
+    .is_some_and(|effective| effective & (1 << CAP_SYS_ADMIN) != 0)
 }
 
 /// What `open_blob` produced: a descriptor on a verified cache file, or the
@@ -387,6 +542,14 @@ pub struct Gfs {
   /// Deliberately not inside [`Pinned`]: a re-pin changes which commit the job is
   /// looking at and does not refund what it has already spent.
   budget: Arc<crate::budget::HydrationBudget>,
+  /// Kernel passthrough: where the mount stands (`PASSTHROUGH_*`), the
+  /// backing files it has registered, and the content files passthrough
+  /// writers hold open per inode -- what `attr` must `fstat` while the kernel
+  /// writes them behind the daemon.
+  passthrough: AtomicU8,
+  backings: Mutex<BackingCache>,
+  writers: Mutex<HashMap<u64, (usize, Arc<std::fs::File>)>>,
+  writer_count: AtomicUsize,
 }
 
 impl std::fmt::Debug for Gfs {
@@ -433,7 +596,16 @@ impl Gfs {
       next_handle: AtomicU64::new(1),
       stats: Arc::new(Mutex::new(FsStats::default())),
       budget: Arc::new(budget),
+      passthrough: AtomicU8::new(PASSTHROUGH_UNAVAILABLE),
+      backings: Mutex::new(BackingCache::default()),
+      writers: Mutex::new(HashMap::new()),
+      writer_count: AtomicUsize::new(0),
     })
+  }
+
+  /// Whether the kernel is serving opens from backing files on this mount.
+  pub fn passthrough_active(&self) -> bool {
+    self.passthrough.load(Ordering::Relaxed) == PASSTHROUGH_ACTIVE
   }
 
   /// The commit this mount is currently looking at, as one consistent value.
@@ -550,6 +722,23 @@ impl Gfs {
         attr.mtime = crate::attr::to_system_time(mtime);
         attr.ctime = crate::attr::to_system_time(ctime);
         attr.atime = attr.mtime;
+      }
+    }
+    // A file the kernel is writing directly has a size the journal row does
+    // not know yet; the content file does.
+    if let Node::Overlay(entry) = &record.node {
+      if entry.content.local_id().is_some() {
+        if let Some(file) = self.writer_file(record.ino) {
+          if let Ok(meta) = file.metadata() {
+            attr.size = meta.len();
+            attr.blocks = meta.len().div_ceil(512);
+            if let Ok(mtime) = meta.modified() {
+              attr.mtime = mtime;
+            }
+            attr.ctime = std::time::UNIX_EPOCH
+              + Duration::new(meta.ctime().max(0) as u64, meta.ctime_nsec() as u32);
+          }
+        }
       }
     }
     attr
@@ -1096,6 +1285,284 @@ impl Gfs {
   }
 
   /// Refresh a record from the overlay and return its attributes.
+  // -------------------------------------------------------------------------
+  // Kernel passthrough
+  // -------------------------------------------------------------------------
+
+  /// Whether an `open` may hand the kernel a backing file: the kernel offered
+  /// passthrough at `init` and has not refused a registration since.
+  fn passthrough_possible(&self) -> bool {
+    matches!(
+      self.passthrough.load(Ordering::Relaxed),
+      PASSTHROUGH_OFFERED | PASSTHROUGH_ACTIVE
+    )
+  }
+
+  fn cached_backing(&self, key: &BackingKey) -> Option<Arc<Backing>> {
+    self.backings.lock().expect("backing files").get(key)
+  }
+
+  /// Register a backing file for `key`, or record why the mount cannot.
+  ///
+  /// The first refusal decides for the mount, because the kernel refuses to
+  /// mix passthrough and cached opens on one inode: a mount whose first
+  /// registration failed must never try again, and one whose first succeeded
+  /// keeps trying. `EPERM` is the expected refusal -- the ioctl needs
+  /// `CAP_SYS_ADMIN` -- and is logged once.
+  fn register_backing(
+    &self,
+    key: BackingKey,
+    bytes: u64,
+    open: impl FnOnce() -> std::io::Result<fuser::BackingId>,
+  ) -> Option<Arc<Backing>> {
+    match open() {
+      Ok(id) => {
+        self
+          .passthrough
+          .store(PASSTHROUGH_ACTIVE, Ordering::Relaxed);
+        let backing = Arc::new(Backing {
+          id,
+          key: key.clone(),
+          bytes,
+        });
+        self
+          .backings
+          .lock()
+          .expect("backing files")
+          .insert(key, Arc::clone(&backing));
+        Some(backing)
+      }
+      Err(e) => {
+        let first = self
+          .passthrough
+          .compare_exchange(
+            PASSTHROUGH_OFFERED,
+            PASSTHROUGH_REFUSED,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+          )
+          .is_ok();
+        if first {
+          tracing::warn!(
+            "the kernel refused to register a backing file ({e}); reads and writes go \
+             through the daemon. Passthrough needs CAP_SYS_ADMIN on gfs-fuse"
+          );
+        } else {
+          tracing::warn!(?key, "registering a backing file failed: {e}");
+        }
+        None
+      }
+    }
+  }
+
+  /// Open a base blob for reading: through the kernel when passthrough is on,
+  /// through the daemon otherwise.
+  ///
+  /// A blob whose backing file is still registered costs no inflate and no
+  /// copy: the kernel reads the memfd (local mode) or the cache file (server
+  /// mode) it was given the first time. Otherwise the blob is opened as
+  /// before and, if the kernel accepts a backing file for it, handed over.
+  async fn open_base(
+    &self,
+    reply: &dyn OpenReply,
+    path: &BytePath,
+    oid: &ObjectId,
+  ) -> Result<FileState, GfsError> {
+    let key = BackingKey::Blob(oid.to_hex());
+    if self.passthrough_possible() {
+      if let Some(backing) = self.cached_backing(&key) {
+        self.note_read(path);
+        return Ok(FileState::Kernel {
+          backing,
+          blob: None,
+          writer: None,
+        });
+      }
+    }
+    let opened = self.open_blob(path, oid).await?;
+    if !self.passthrough_possible() {
+      return Ok(opened.into_state(oid));
+    }
+    match opened {
+      OpenedBlob::Memory(bytes) => {
+        let len = bytes.len() as u64;
+        // A memcpy at tmpfs speed: inline for the common small file, on a
+        // blocking worker for a large one so a FUSE thread never spends
+        // milliseconds on it.
+        let memfd = if len <= INLINE_MEMFD_BYTES {
+          memfd_holding(&bytes)
+        } else {
+          let shared = Arc::clone(&bytes);
+          match tokio::task::spawn_blocking(move || memfd_holding(&shared)).await {
+            Ok(result) => result,
+            Err(_) => Err(std::io::Error::other("the memfd task failed")),
+          }
+        };
+        let memfd = match memfd {
+          Ok(memfd) => memfd,
+          Err(e) => {
+            tracing::warn!("creating a memfd for a blob failed: {e}");
+            return Ok(FileState::Memory { bytes });
+          }
+        };
+        match self.register_backing(key, len, || reply.open_backing(memfd.as_fd())) {
+          Some(backing) => {
+            // The memfd holds the bytes now; the source need not.
+            self.client().forget_blob(oid);
+            Ok(FileState::Kernel {
+              backing,
+              blob: None,
+              writer: None,
+            })
+          }
+          None => Ok(FileState::Memory { bytes }),
+        }
+      }
+      OpenedBlob::File(file) => {
+        match self.register_backing(key, 0, || reply.open_backing(file.as_fd())) {
+          Some(backing) => Ok(FileState::Kernel {
+            backing,
+            blob: Some(oid.clone()),
+            writer: None,
+          }),
+          None => Ok(FileState::Blob {
+            oid: oid.clone(),
+            file: Arc::new(file),
+          }),
+        }
+      }
+    }
+  }
+
+  /// Open overlay content: through the kernel when passthrough is on.
+  fn kernel_or_local(
+    &self,
+    reply: &dyn OpenReply,
+    ino: u64,
+    content_id: u64,
+    file: std::fs::File,
+    writable: bool,
+  ) -> FileState {
+    if self.passthrough_possible() {
+      let key = BackingKey::Content(content_id);
+      let backing = self
+        .cached_backing(&key)
+        .or_else(|| self.register_backing(key, 0, || reply.open_backing(file.as_fd())));
+      if let Some(backing) = backing {
+        let file = Arc::new(file);
+        let writer = writable.then(|| {
+          self.add_writer(ino, Arc::clone(&file));
+          KernelWriter {
+            ino,
+            content_id,
+            file,
+          }
+        });
+        return FileState::Kernel {
+          backing,
+          blob: None,
+          writer,
+        };
+      }
+    }
+    FileState::Local {
+      content_id,
+      file: Arc::new(file),
+      writable,
+    }
+  }
+
+  fn add_writer(&self, ino: u64, file: Arc<std::fs::File>) {
+    let mut writers = self.writers.lock().expect("passthrough writers");
+    writers
+      .entry(ino)
+      .and_modify(|(count, _)| *count += 1)
+      .or_insert((1, file));
+    self.writer_count.store(writers.len(), Ordering::Relaxed);
+  }
+
+  fn remove_writer(&self, ino: u64) {
+    let mut writers = self.writers.lock().expect("passthrough writers");
+    if let Some((count, _)) = writers.get_mut(&ino) {
+      *count -= 1;
+      if *count == 0 {
+        writers.remove(&ino);
+      }
+    }
+    self.writer_count.store(writers.len(), Ordering::Relaxed);
+  }
+
+  /// The content file a passthrough writer holds open on `ino`, if any.
+  fn writer_file(&self, ino: u64) -> Option<Arc<std::fs::File>> {
+    if self.writer_count.load(Ordering::Relaxed) == 0 {
+      return None;
+    }
+    self
+      .writers
+      .lock()
+      .expect("passthrough writers")
+      .get(&ino)
+      .map(|(_, file)| Arc::clone(file))
+  }
+
+  /// What a passthrough writer's content file reached while the kernel wrote
+  /// it, read back at `release` into the journal row and the inode record.
+  async fn settle_writer(&self, writer: &KernelWriter) {
+    let (size, mtime) = match writer.file.metadata() {
+      Ok(meta) => (
+        meta.len(),
+        meta
+          .modified()
+          .map(Timestamp::from_system_time)
+          .unwrap_or_else(|_| Timestamp::now()),
+      ),
+      Err(e) => {
+        tracing::warn!("fstat of a passthrough writer failed: {e}");
+        return;
+      }
+    };
+    let overlay = self.overlay();
+    let content_id = writer.content_id;
+    match Self::blocking(move || overlay.refresh_content(content_id, size, mtime)).await {
+      Ok(Some(entry)) => {
+        let path = entry.path.clone();
+        self.republish(&path, entry);
+      }
+      // Unlinked while open: no row is left, so the record carries the size.
+      Ok(None) => {
+        if let Some(record) = self.record(writer.ino) {
+          if let Node::Overlay(entry) = &record.node {
+            let grown = OverlayEntry {
+              size,
+              mtime,
+              ..(**entry).clone()
+            };
+            self
+              .inodes
+              .lock()
+              .expect("inode table")
+              .refresh(writer.ino, Node::Overlay(Box::new(grown)));
+          }
+        }
+      }
+      Err(e) => tracing::warn!("recording a passthrough write failed: {e}"),
+    }
+  }
+
+  /// Let go of the backing file a closed handle used. A blob's stays in the
+  /// bounded cache for the next open. Overlay content's goes with the last
+  /// handle on it, so a deleted file's blocks are not pinned by a kernel
+  /// reference the daemon keeps for no one; the next open re-registers it.
+  fn release_backing(&self, backing: &Arc<Backing>) {
+    if let BackingKey::Content(_) = backing.key {
+      let mut backings = self.backings.lock().expect("backing files");
+      // Two references: the cache's and the closing handle's.
+      if Arc::strong_count(backing) <= 2 {
+        backings.remove(&backing.key);
+      }
+    }
+  }
+
   fn republish(&self, path: &BytePath, entry: OverlayEntry) -> FileAttr {
     let record = self
       .inodes
@@ -1288,6 +1755,31 @@ impl Filesystem for GfsFilesystem {
          old contents up before discarding them"
       );
     }
+    // Kernel passthrough: the kernel reads and writes a backing file the
+    // daemon registers at `open`, and no `read` or `write` request is made.
+    // Asked for only when the daemon holds the capability the backing ioctl
+    // demands, so a mount without it never pays a refused ioctl for a
+    // refusal it could have predicted.
+    if config
+      .capabilities()
+      .contains(fuser::InitFlags::FUSE_PASSTHROUGH)
+    {
+      if !has_cap_sys_admin() {
+        tracing::info!(
+          "the kernel offers passthrough but gfs-fuse lacks CAP_SYS_ADMIN; reads and \
+           writes go through the daemon"
+        );
+      } else if config
+        .add_capabilities(fuser::InitFlags::FUSE_PASSTHROUGH)
+        .is_ok()
+        && config.set_max_stack_depth(1).is_ok()
+      {
+        self
+          .fs
+          .passthrough
+          .store(PASSTHROUGH_OFFERED, Ordering::Relaxed);
+      }
+    }
     // Everything below trades daemon round trips for kernel-side state, and
     // each one is safe here for a reason worth writing down:
     // * `PARALLEL_DIROPS`: the kernel otherwise serializes lookups and
@@ -1305,7 +1797,10 @@ impl Filesystem for GfsFilesystem {
     let wanted = fuser::InitFlags::FUSE_PARALLEL_DIROPS;
     let offered = wanted & config.capabilities();
     if let Err(refused) = config.add_capabilities(offered) {
-      tracing::warn!(?refused, "the kernel refused directory capabilities it offered");
+      tracing::warn!(
+        ?refused,
+        "the kernel refused directory capabilities it offered"
+      );
     }
     if offered != wanted {
       tracing::info!(missing = ?(wanted - offered), "the kernel does not offer every directory capability");
@@ -1565,11 +2060,7 @@ impl Filesystem for GfsFilesystem {
             match fs.overlay().content_store().open_write(id) {
               Ok(file) => {
                 fs.republish(&record.path, entry);
-                FileState::Local {
-                  content_id: id,
-                  file: Arc::new(file),
-                  writable: true,
-                }
+                fs.kernel_or_local(&reply, ino.0, id, file, true)
               }
               Err(e) => return reply.error(errno_of_overlay(&e)),
             }
@@ -1581,17 +2072,13 @@ impl Filesystem for GfsFilesystem {
         },
         Node::Overlay(entry) => match entry.content.local_id() {
           Some(id) => match fs.overlay().content_store().open_read(id) {
-            Ok(file) => FileState::Local {
-              content_id: id,
-              file: Arc::new(file),
-              writable: false,
-            },
+            Ok(file) => fs.kernel_or_local(&reply, ino.0, id, file, false),
             Err(e) => return reply.error(errno_of_overlay(&e)),
           },
           // A row whose bytes are still the base's: a mode change or a rename.
           None => match entry.content.base_oid() {
-            Some(oid) => match fs.open_blob(&blob_path(&record), oid).await {
-              Ok(opened) => opened.into_state(oid),
+            Some(oid) => match fs.open_base(&reply, &blob_path(&record), oid).await {
+              Ok(state) => state,
               Err(e) => {
                 fs.bump(|s| s.errors += 1);
                 return reply.error(errno_of(&e));
@@ -1600,8 +2087,8 @@ impl Filesystem for GfsFilesystem {
             None => return reply.error(Errno::EIO),
           },
         },
-        Node::Base(entry) => match fs.open_blob(&record.path, &entry.oid).await {
-          Ok(opened) => opened.into_state(&entry.oid),
+        Node::Base(entry) => match fs.open_base(&reply, &record.path, &entry.oid).await {
+          Ok(state) => state,
           Err(e) => {
             fs.bump(|s| s.errors += 1);
             return reply.error(errno_of(&e));
@@ -1611,12 +2098,19 @@ impl Filesystem for GfsFilesystem {
       let flags = fopen_flags(&state);
       let handle = fs.new_handle();
       fs.inodes.lock().expect("inode table").open(ino.0);
+      let state = Arc::new(state);
       fs.files
         .lock()
         .expect("file handles")
-        .insert(handle, Arc::new(state));
+        .insert(handle, Arc::clone(&state));
       fs.bump(|s| s.opens += 1);
-      reply.opened(FileHandle(handle), flags);
+      match &*state {
+        FileState::Kernel { backing, .. } => {
+          fs.bump(|s| s.passthrough_opens += 1);
+          reply.opened_passthrough(FileHandle(handle), flags, &backing.id)
+        }
+        _ => reply.opened(FileHandle(handle), flags),
+      }
     });
   }
 
@@ -1749,26 +2243,36 @@ impl Filesystem for GfsFilesystem {
       let attr = fs.attr(&record);
       let handle = fs.new_handle();
       fs.inodes.lock().expect("inode table").open(record.ino);
-      fs.files.lock().expect("file handles").insert(
-        handle,
-        Arc::new(FileState::Local {
-          content_id: id,
-          file: Arc::new(file),
-          writable: true,
-        }),
-      );
+      let state = Arc::new(fs.kernel_or_local(&reply, record.ino, id, file, true));
+      fs.files
+        .lock()
+        .expect("file handles")
+        .insert(handle, Arc::clone(&state));
       fs.bump(|s| {
         s.lookups += 1;
         s.opens += 1;
       });
       fs.touch_parent(&parent).await;
-      reply.created(
-        &fs.config.ttl,
-        &attr,
-        GENERATION,
-        FileHandle(handle),
-        fuser::FopenFlags::FOPEN_NOFLUSH,
-      );
+      match &*state {
+        FileState::Kernel { backing, .. } => {
+          fs.bump(|s| s.passthrough_opens += 1);
+          reply.created_passthrough(
+            &fs.config.ttl,
+            &attr,
+            GENERATION,
+            FileHandle(handle),
+            fuser::FopenFlags::FOPEN_NOFLUSH,
+            &backing.id,
+          )
+        }
+        _ => reply.created(
+          &fs.config.ttl,
+          &attr,
+          GENERATION,
+          FileHandle(handle),
+          fuser::FopenFlags::FOPEN_NOFLUSH,
+        ),
+      }
     });
   }
 
@@ -1821,6 +2325,9 @@ impl Filesystem for GfsFilesystem {
             }
           }
         }
+        // The kernel reads a passthrough descriptor itself; a request for one
+        // is a kernel that did not do what its open reply said.
+        FileState::Kernel { .. } => return reply.error(Errno::EIO),
         FileState::Memory { bytes, .. } => {
           // A slice of the inflated blob. Nothing blocks and nothing is copied
           // beyond the reply itself.
@@ -1966,15 +2473,47 @@ impl Filesystem for GfsFilesystem {
     reply: fuser::ReplyEmpty,
   ) {
     let state = self.fs.files.lock().expect("file handles").remove(&fh.0);
+    let fs = Arc::clone(&self.fs);
     if let Some(state) = state {
-      if let FileState::Blob { oid, .. } = &*state {
+      match &*state {
         // Unpin only when this was the last reference to the state, which it is:
         // the map owned the only other `Arc`, and a concurrent `read` holding one
         // keeps the file open through its own clone.
-        self.fs.cache.release_blob(oid);
+        FileState::Blob { oid, .. } => fs.cache.release_blob(oid),
+        FileState::Kernel {
+          backing,
+          blob,
+          writer,
+        } => {
+          if let Some(oid) = blob {
+            fs.cache.release_blob(oid);
+          }
+          if writer.is_some() {
+            // The kernel wrote behind the daemon; read back what it left
+            // before the descriptor is gone.
+            self.spawn(async move {
+              if let FileState::Kernel {
+                backing,
+                writer: Some(writer),
+                ..
+              } = &*state
+              {
+                fs.settle_writer(writer).await;
+                fs.remove_writer(writer.ino);
+                fs.release_backing(backing);
+              }
+              drop(state);
+              fs.inodes.lock().expect("inode table").close(ino.0);
+              reply.ok();
+            });
+            return;
+          }
+          fs.release_backing(backing);
+        }
+        _ => {}
       }
     }
-    self.fs.inodes.lock().expect("inode table").close(ino.0);
+    fs.inodes.lock().expect("inode table").close(ino.0);
     reply.ok();
   }
 
@@ -2016,7 +2555,10 @@ impl Filesystem for GfsFilesystem {
       }
       // A projected file has nothing local to make durable, and neither does a
       // blob held in memory.
-      if let Some(FileState::Odb { .. } | FileState::Memory { .. }) = state.as_deref() {
+      if let Some(
+        FileState::Odb { .. } | FileState::Memory { .. } | FileState::Kernel { writer: None, .. },
+      ) = state.as_deref()
+      {
         return reply.ok();
       }
       // Both halves, and in this order: the content file, then the journal that
@@ -2025,6 +2567,10 @@ impl Filesystem for GfsFilesystem {
       // window a power loss could land in.
       let file = match state.as_deref() {
         Some(FileState::Local { file, .. }) => Some(Arc::clone(file)),
+        Some(FileState::Kernel {
+          writer: Some(writer),
+          ..
+        }) => Some(Arc::clone(&writer.file)),
         _ => None,
       };
       let overlay = fs.overlay();
@@ -2105,12 +2651,7 @@ impl Filesystem for GfsFilesystem {
     let Some(record) = self.fs.record(ino.0) else {
       return reply.error(Errno::ESTALE);
     };
-    let size = match &record.node {
-      Node::Base(entry) => entry.size,
-      Node::Overlay(entry) => entry.size,
-      Node::Git(meta) => meta.size,
-      Node::Odb(node) => node.size(),
-    } as i64;
+    let size = self.fs.attr(&record).size as i64;
     if offset < 0 || offset >= size {
       return reply.error(Errno::ENXIO);
     }

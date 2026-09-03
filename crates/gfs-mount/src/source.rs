@@ -203,6 +203,11 @@ pub trait SnapshotSource: Send + Sync + std::fmt::Debug {
 
   /// The same bytes, shared. A source that already holds the blob in memory
   /// hands out its own `Arc` rather than copying; the default copies once.
+  /// The daemon no longer needs its copy of a blob: the kernel holds the
+  /// bytes (a passthrough memfd). A source that keeps blobs in memory drops
+  /// them; every other source has nothing to drop.
+  fn forget_blob(&self, _oid: &ObjectId) {}
+
   async fn read_blob_shared(
     &self,
     oid: &ObjectId,

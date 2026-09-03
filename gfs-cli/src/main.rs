@@ -914,6 +914,10 @@ fn print_report(report: &gfs_mount::control::MountReport) {
     "hydration  {} blobs, {} bytes, {} cache hits",
     report.cache.fetches, report.cache.bytes_fetched, report.cache.hits
   );
+  println!(
+    "kernel     {} opens served by passthrough",
+    report.stats.passthrough_opens
+  );
   // The listing-cache line: server requests that stop growing while listing
   // hits climb is what "a warm metadata walk is server-silent" looks like.
   println!(

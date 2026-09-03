@@ -209,3 +209,68 @@ async fn a_local_mount_reads_history_and_blame_from_the_clone() {
     "no hydration budget in local mode"
   );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn writes_are_visible_by_size_before_close_and_to_git_after() {
+  // The write path has two shapes -- every write through the daemon, or the
+  // kernel writing a backing file directly when passthrough is on -- and the
+  // contract is the same for both: `stat` on an open, half-written file tells
+  // the truth, the bytes read back, and Git sees the modification.
+  let clone_dir = tempfile::tempdir().unwrap();
+  let clone = clone_dir.path().join("clone");
+  Job::clone_fixture("basic", &clone);
+  let job = Job::local_from(&clone, "main", tempfile::tempdir().unwrap()).await;
+  let ws = job.workspace.clone();
+
+  let (base_len, mid_size, after_size, appended, chunked, status) = on_fs({
+    let ws = ws.clone();
+    move || {
+      use std::io::{Read, Write};
+      let readme = ws.join("README.md");
+      let base_len = std::fs::metadata(&readme).unwrap().len();
+      // Append to a base file: copy-up, then bytes the row does not know yet.
+      let mut file = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&readme)
+        .unwrap();
+      file.write_all(b"more\n").unwrap();
+      let mid_size = std::fs::metadata(&readme).unwrap().len();
+      drop(file);
+      let after_size = std::fs::metadata(&readme).unwrap().len();
+      let mut appended = String::new();
+      std::fs::File::open(&readme)
+        .unwrap()
+        .read_to_string(&mut appended)
+        .unwrap();
+      // A new file written in small pieces, read back whole.
+      let fresh = ws.join("chunks.bin");
+      let mut file = std::fs::File::create(&fresh).unwrap();
+      let chunk = vec![7u8; 4096];
+      for _ in 0..64 {
+        file.write_all(&chunk).unwrap();
+      }
+      drop(file);
+      let chunked = std::fs::read(&fresh).unwrap();
+      let status = git_in(&ws, &["status", "--porcelain"]).1;
+      (base_len, mid_size, after_size, appended, chunked, status)
+    }
+  })
+  .await;
+
+  assert_eq!(
+    mid_size,
+    base_len + 5,
+    "size is live while the file is open"
+  );
+  assert_eq!(after_size, base_len + 5);
+  assert!(appended.ends_with("more\n"), "{appended:?}");
+  assert_eq!(chunked.len(), 64 * 4096);
+  assert!(chunked.iter().all(|b| *b == 7));
+  assert!(status.contains(" M README.md"), "{status}");
+  assert!(status.contains("?? chunks.bin"), "{status}");
+
+  let stats = job.daemon.inspect().stats;
+  if job.daemon.passthrough_active() {
+    assert!(stats.passthrough_opens > 0, "{stats:?}");
+  }
+}
