@@ -118,3 +118,15 @@ from the blocking thread instead of hopping back through a worker —
 each hop removed is on the order of 50–80 µs here. Not done: it changes
 the "nothing that waits on I/O on a FUSE thread" rule, since the WAL write
 can block on ext4, and wants its own decision.
+
+## Dispatch experiment (2026-09-03)
+`--fuse-threads N` and `--dispatch pool|mutations-inline|all-inline` on
+`gfs mount`, default unchanged. Columns 10–13 in `benchmarks/fuse-levers/`.
+- mutations inline: create+close 413 → 330 µs wall (406 → 225 µs daemon
+  CPU); `cp -r` 10 225 files 8.9 → 6.2 s; 4 KiB write 155 → 107 µs.
+- all inline: same as mutations inline on every row (local mode has no
+  other hop worth removing).
+- 16 FUSE threads: no gain on any serial row; first `rg` over vscode
+  0.69 → 1.65 s in every mode (contention among parallel cold inflates).
+Recommendation: `mutations-inline` with the default thread count, as an
+amendment to ADR 0003/0014; not the blocking model.

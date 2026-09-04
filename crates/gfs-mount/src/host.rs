@@ -246,6 +246,7 @@ impl MountHost {
       cache_quota_bytes: request.cache_quota_bytes,
       fs: FsConfig {
         writeback_cache: request.writeback_cache,
+        dispatch: request.dispatch,
         ..self.config.fs.clone()
       },
       overlay: gfs_overlay::OverlayConfig {

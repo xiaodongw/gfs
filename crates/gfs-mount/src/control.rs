@@ -490,6 +490,10 @@ pub struct MountRequest {
   /// event-loop thread" rule is expressed. A caller overrides it only to
   /// experiment.
   pub fuse_threads: Option<usize>,
+  /// Where a handler's blocking work runs; `pool` unless experimenting. See
+  /// [`crate::fs::Dispatch`].
+  #[serde(default)]
+  pub dispatch: crate::fs::Dispatch,
   /// Where this mount's gateway is. `None` means the host's own default, which
   /// is the ordinary case; a caller sends one only to reach a different gateway
   /// than the host was started against.

@@ -87,8 +87,44 @@ fn generation(record: &Record) -> Generation {
   Generation(record.generation)
 }
 
+/// Where the work behind a request runs, after ADR 0003 and ADR 0014.
+///
+/// `Pool` is the rule those ADRs set: a handler's synchronous prefix runs on
+/// the FUSE thread, and anything that may wait on I/O goes to the blocking
+/// pool. `MutationsInline` runs the overlay's journal and content-file work
+/// (create, mkdir, symlink, unlink, rmdir, rename, setattr, write, the
+/// release of a local writer) on the FUSE thread too: one `openat` and one
+/// buffered WAL write, a few tens of microseconds, at the price that an ext4
+/// stall parks that thread. `AllInline` runs every `Gfs::blocking` call on
+/// the FUSE thread, which is the fully blocking model ADR 0003 measured
+/// against; it caps concurrency at the FUSE thread count.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Dispatch {
+  #[default]
+  Pool,
+  MutationsInline,
+  AllInline,
+}
+
+impl std::str::FromStr for Dispatch {
+  type Err = String;
+  fn from_str(s: &str) -> Result<Self, String> {
+    match s {
+      "pool" => Ok(Dispatch::Pool),
+      "mutations-inline" => Ok(Dispatch::MutationsInline),
+      "all-inline" => Ok(Dispatch::AllInline),
+      other => Err(format!(
+        "unknown dispatch {other:?} (pool, mutations-inline, all-inline)"
+      )),
+    }
+  }
+}
+
 #[derive(Clone, Debug)]
 pub struct FsConfig {
+  /// Where a handler's blocking work runs. See [`Dispatch`].
+  pub dispatch: Dispatch,
   /// How long the kernel may cache attributes and directory entries.
   pub ttl: Duration,
   /// How long the kernel may cache the absence of a name.
@@ -159,6 +195,7 @@ pub struct FsConfig {
 impl Default for FsConfig {
   fn default() -> Self {
     FsConfig {
+      dispatch: Dispatch::Pool,
       // One hour. The commit is immutable, so the only cost of a long TTL is
       // memory the kernel is free to reclaim, and the benefit is the metadata
       // sweep that never reaches the network.
@@ -798,11 +835,30 @@ impl Gfs {
   }
 
   /// Run blocking overlay work off the event loop. See the module docs.
-  async fn blocking<T, F>(f: F) -> Result<T, OverlayError>
+  async fn blocking<T, F>(&self, f: F) -> Result<T, OverlayError>
   where
     F: FnOnce() -> Result<T, OverlayError> + Send + 'static,
     T: Send + 'static,
   {
+    if self.config.dispatch == Dispatch::AllInline {
+      return f();
+    }
+    match tokio::task::spawn_blocking(f).await {
+      Ok(result) => result,
+      Err(e) => Err(OverlayError::io(format!("the overlay task failed: {e}"))),
+    }
+  }
+
+  /// Run an overlay mutation: on the pool under [`Dispatch::Pool`], on the
+  /// calling thread otherwise. See [`Dispatch`] for the trade.
+  async fn mutation<T, F>(&self, f: F) -> Result<T, OverlayError>
+  where
+    F: FnOnce() -> Result<T, OverlayError> + Send + 'static,
+    T: Send + 'static,
+  {
+    if self.config.dispatch != Dispatch::Pool {
+      return f();
+    }
     match tokio::task::spawn_blocking(f).await {
       Ok(result) => result,
       Err(e) => Err(OverlayError::io(format!("the overlay task failed: {e}"))),
@@ -1264,7 +1320,8 @@ impl Gfs {
       if entry.content.local_id().is_some() {
         if truncating && entry.size > 0 {
           let target = path.clone();
-          return Self::blocking(move || overlay.truncate(&target, 0))
+          return self
+            .mutation(move || overlay.truncate(&target, 0))
             .await
             .map_err(overlay_as_service_error);
         }
@@ -1284,7 +1341,8 @@ impl Gfs {
 
     if truncating {
       let target = path.clone();
-      return Self::blocking(move || overlay.materialize(&target, base, ino, Source::Empty))
+      return self
+        .mutation(move || overlay.materialize(&target, base, ino, Source::Empty))
         .await
         .map_err(overlay_as_service_error);
     }
@@ -1302,18 +1360,19 @@ impl Gfs {
       s.copy_up_bytes += size;
     });
     let target = path.clone();
-    Self::blocking(move || match blob {
-      OpenedBlob::File(file) => {
-        let mut reader = std::io::BufReader::new(file);
-        overlay.materialize(&target, base, ino, Source::Reader(&mut reader))
-      }
-      OpenedBlob::Memory(bytes) => {
-        let mut reader = std::io::Cursor::new(bytes.as_slice());
-        overlay.materialize(&target, base, ino, Source::Reader(&mut reader))
-      }
-    })
-    .await
-    .map_err(overlay_as_service_error)
+    self
+      .blocking(move || match blob {
+        OpenedBlob::File(file) => {
+          let mut reader = std::io::BufReader::new(file);
+          overlay.materialize(&target, base, ino, Source::Reader(&mut reader))
+        }
+        OpenedBlob::Memory(bytes) => {
+          let mut reader = std::io::Cursor::new(bytes.as_slice());
+          overlay.materialize(&target, base, ino, Source::Reader(&mut reader))
+        }
+      })
+      .await
+      .map_err(overlay_as_service_error)
   }
 
   // -------------------------------------------------------------------------
@@ -1554,7 +1613,10 @@ impl Gfs {
     };
     let overlay = self.overlay();
     let content_id = writer.content_id;
-    match Self::blocking(move || overlay.refresh_content(content_id, size, mtime)).await {
+    match self
+      .mutation(move || overlay.refresh_content(content_id, size, mtime))
+      .await
+    {
       Ok(Some(entry)) => {
         let path = entry.path.clone();
         self.republish(&path, entry);
@@ -2270,9 +2332,9 @@ impl Filesystem for GfsFilesystem {
       let dir = Parent::new(parent.ino, Gfs::parent_base(&parent));
       let target = path.clone();
       let ino = fs.number_for(&path);
-      let created =
-        Gfs::blocking(move || overlay.create_file(&target, resolved.base, dir, ino, executable))
-          .await;
+      let created = fs
+        .mutation(move || overlay.create_file(&target, resolved.base, dir, ino, executable))
+        .await;
       let (entry, file) = match created {
         Ok(created) => created,
         Err(e) => {
@@ -2469,8 +2531,9 @@ impl Filesystem for GfsFilesystem {
         _ => return reply.error(Errno::EBADF),
       };
       let overlay = fs.overlay();
-      let written =
-        Gfs::blocking(move || overlay.write_content(content_id, &file, offset, &data)).await;
+      let written = fs
+        .mutation(move || overlay.write_content(content_id, &file, offset, &data))
+        .await;
       match written {
         Ok(written) => {
           fs.bump(|s| {
@@ -2569,7 +2632,10 @@ impl Filesystem for GfsFilesystem {
           let content_id = *content_id;
           self.spawn(async move {
             let overlay = fs.overlay();
-            match Gfs::blocking(move || overlay.settle_content(content_id)).await {
+            match fs
+              .mutation(move || overlay.settle_content(content_id))
+              .await
+            {
               Ok(Some(entry)) => {
                 let path = entry.path.clone();
                 fs.republish(&path, entry);
@@ -3180,7 +3246,7 @@ impl Filesystem for GfsFilesystem {
         }
         let overlay = fs.overlay();
         let path = record.path.clone();
-        if let Err(e) = Gfs::blocking(move || overlay.truncate(&path, size)).await {
+        if let Err(e) = fs.mutation(move || overlay.truncate(&path, size)).await {
           return reply.error(errno_of_overlay(&e));
         }
       }
@@ -3191,8 +3257,9 @@ impl Filesystem for GfsFilesystem {
         let base = base.clone();
         let ino = record.ino;
         let executable = mode & 0o111 != 0;
-        if let Err(e) =
-          Gfs::blocking(move || overlay.set_executable(&path, base, ino, executable)).await
+        if let Err(e) = fs
+          .mutation(move || overlay.set_executable(&path, base, ino, executable))
+          .await
         {
           return reply.error(errno_of_overlay(&e));
         }
@@ -3210,9 +3277,11 @@ impl Filesystem for GfsFilesystem {
         // `touch .` on the workspace root: the root keeps its times in meta
         // rather than in a row, so it cannot go through `set_times`.
         let outcome = if path.is_empty() {
-          Gfs::blocking(move || overlay.touch_root(requested).map(|_| ())).await
+          fs.mutation(move || overlay.touch_root(requested).map(|_| ()))
+            .await
         } else {
-          Gfs::blocking(move || overlay.set_times(&path, base, ino, requested).map(|_| ())).await
+          fs.mutation(move || overlay.set_times(&path, base, ino, requested).map(|_| ()))
+            .await
         };
         if let Err(e) = outcome {
           return reply.error(errno_of_overlay(&e));
@@ -3275,7 +3344,10 @@ impl Filesystem for GfsFilesystem {
       let dir = Parent::new(parent.ino, Gfs::parent_base(&parent));
       let target = path.clone();
       let ino = fs.number_for(&path);
-      match Gfs::blocking(move || overlay.mkdir(&target, resolved.base, dir, ino)).await {
+      match fs
+        .mutation(move || overlay.mkdir(&target, resolved.base, dir, ino))
+        .await
+      {
         Ok(entry) => {
           let record = fs
             .inodes
@@ -3337,7 +3409,8 @@ impl Filesystem for GfsFilesystem {
       let dir = Parent::new(parent.ino, Gfs::parent_base(&parent));
       let link_path = path.clone();
       let ino = fs.number_for(&path);
-      match Gfs::blocking(move || overlay.symlink(&link_path, &target, resolved.base, dir, ino))
+      match fs
+        .mutation(move || overlay.symlink(&link_path, &target, resolved.base, dir, ino))
         .await
       {
         Ok(entry) => {
@@ -3523,7 +3596,7 @@ impl Filesystem for GfsFilesystem {
       }
       let overlay = fs.overlay();
       let path = record.path.clone();
-      match Gfs::blocking(move || overlay.truncate(&path, wanted)).await {
+      match fs.mutation(move || overlay.truncate(&path, wanted)).await {
         Ok(entry) => {
           fs.republish(&record.path, entry);
           reply.ok();
@@ -3655,7 +3728,8 @@ impl Gfs {
     let overlay = self.overlay();
     let target = path.clone();
     let dir = Parent::new(parent.ino, Gfs::parent_base(&parent));
-    Self::blocking(move || overlay.remove(&target, resolved.base, dir, expect_dir, empty))
+    self
+      .mutation(move || overlay.remove(&target, resolved.base, dir, expect_dir, empty))
       .await
       .map_err(|e| errno_of_overlay(&e))?;
     self.republish_parent(&parent);
@@ -3793,22 +3867,23 @@ impl Gfs {
     let from_base = source.base.clone();
     let to_base = target.base.clone();
     let from_ino = self.number_for(&from);
-    Self::blocking(move || {
-      overlay.rename(
-        &from_path,
-        from_ino,
-        from_base,
-        from_dir,
-        &to_path,
-        to_base,
-        to_dir,
-        &descendants,
-        to_empty,
-        no_replace,
-      )
-    })
-    .await
-    .map_err(|e| errno_of_overlay(&e))?;
+    self
+      .mutation(move || {
+        overlay.rename(
+          &from_path,
+          from_ino,
+          from_base,
+          from_dir,
+          &to_path,
+          to_base,
+          to_dir,
+          &descendants,
+          to_empty,
+          no_replace,
+        )
+      })
+      .await
+      .map_err(|e| errno_of_overlay(&e))?;
 
     // The kernel relinks the dentry it already has rather than looking the
     // destination up again, so every inode number under `from` is now the

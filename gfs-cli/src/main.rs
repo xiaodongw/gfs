@@ -201,6 +201,15 @@ enum Command {
     /// may never read; `gfs inspect` reports progress.
     #[arg(long, requires = "local")]
     prewarm: bool,
+    /// How many threads read requests from the kernel. The host's default
+    /// unless given; an experiment knob.
+    #[arg(long)]
+    fuse_threads: Option<usize>,
+    /// Where a handler's blocking work runs: `pool` (the default), or
+    /// `mutations-inline` / `all-inline` to run overlay work on the FUSE
+    /// thread that took the request. An experiment knob; see ADR 0003.
+    #[arg(long, default_value = "pool")]
+    dispatch: gfs_mount::fs::Dispatch,
   },
 
   /// Release the lease, unmount, and drop the workspace from its host.
@@ -854,7 +863,8 @@ fn do_mount(cli: &Cli, args: MountArgs) -> Result<()> {
     cache_quota_bytes: args.cache_quota,
     overlay_quota_bytes: args.overlay_quota,
     allow_other: args.allow_other,
-    fuse_threads: None,
+    fuse_threads: args.fuse_threads,
+    dispatch: args.dispatch,
     grpc_endpoint: Some(cli.endpoint.clone()),
     http_endpoint: Some(cli.http_endpoint.clone()),
     token: Some(cli.token.clone()),
@@ -901,6 +911,8 @@ struct MountArgs {
   timeout_seconds: u64,
   writeback_cache: bool,
   prewarm: bool,
+  fuse_threads: Option<usize>,
+  dispatch: gfs_mount::fs::Dispatch,
 }
 
 fn print_report(report: &gfs_mount::control::MountReport) {
@@ -1310,6 +1322,8 @@ async fn main() -> Result<()> {
             timeout_seconds: *timeout_seconds,
             writeback_cache: false,
             prewarm: false,
+            fuse_threads: None,
+            dispatch: Default::default(),
           },
         )
       })?;
@@ -1318,6 +1332,8 @@ async fn main() -> Result<()> {
     Command::Mount {
       writeback_cache,
       prewarm,
+      fuse_threads,
+      dispatch,
       repo,
       local,
       rev,
@@ -1348,6 +1364,8 @@ async fn main() -> Result<()> {
             timeout_seconds: *timeout_seconds,
             writeback_cache: *writeback_cache,
             prewarm: *prewarm,
+            fuse_threads: *fuse_threads,
+            dispatch: *dispatch,
           },
         )
       })?;
