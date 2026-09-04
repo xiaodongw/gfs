@@ -381,9 +381,14 @@ const PASSTHROUGH_REFUSED: u8 = 3;
 /// a larger one on a blocking worker.
 const INLINE_MEMFD_BYTES: u64 = 1024 * 1024;
 /// Memory the registered memfds may pin per mount, and how many backing files
-/// of any kind stay registered between opens.
+/// of any kind stay registered between opens. The entry cap has to exceed
+/// the file count of a tree a tool walks whole: at 4 096, a second `rg` over
+/// vscode's 17 926 files missed on every open and re-inflated the tree
+/// (0.16 s became 0.66 s). A registration is a kernel-side file reference,
+/// not a daemon descriptor, so the count is cheap; the bytes cap bounds the
+/// memory.
 const BACKING_CACHE_BYTES: u64 = 256 * 1024 * 1024;
-const BACKING_CACHE_ENTRIES: usize = 4096;
+const BACKING_CACHE_ENTRIES: usize = 65_536;
 
 /// A bounded LRU of registered backing files, keyed by what they hold.
 #[derive(Debug, Default)]
