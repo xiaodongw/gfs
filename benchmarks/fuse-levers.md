@@ -28,61 +28,64 @@ The columns, in the order the commits landed:
 - **+ writeback cache** — [ADR 0016](../docs/adr/0016-writeback-cache.md),
   mounted with `--writeback-cache`, without the capability (the two levers
   are independent; this column isolates the second).
+- **+ prewarm** — `gfs mount --local … --prewarm`, without the other two:
+  the benchmark waits for `gfs inspect` to report the prewarm done before
+  the task starts, and the wait is its own row.
 
 <!-- merged tables begin -->
 ### vscode
 
 mount flags: (none)   read-through: 2000 files under src/   largest blob: src/vs/base/test/node/uri.perf.data.txt (8874330 bytes)   copy: 10225 files
 
-| step | baseline | passthrough code, no cap | + writeback cache |
-| --- | ---: | ---: | ---: |
-| mount | 0.270 s | 0.226 s | 0.161 s |
-| prewarm (waited) | – | – | – |
-| read 2000 files, cold | 0.746 s | 0.740 s | 0.733 s |
-| read again, warm | 0.264 s | 0.265 s | 0.264 s |
-| `rg -F TODO`, first (1683 lines) | 0.654 s | 0.634 s | 0.630 s |
-| `rg -F TODO`, second | 0.158 s | 0.164 s | 0.174 s |
-| read largest blob, cold | 0.006 s | 0.006 s | 0.006 s |
-| read largest blob, warm | 0.005 s | 0.006 s | 0.006 s |
-| write 64 MiB, 4 KiB `dd` | 3.950 s | 4.260 s | 0.854 s |
-| `cp -r` 10225 files in | 29.383 s | 27.599 s | 28.899 s |
-| read the 64 MiB back | 0.048 s | 0.075 s | 0.060 s |
-| read the copied files back | 2.772 s | 2.799 s | 2.813 s |
-| `git status` after the writes | 0.728 s | 0.717 s | 0.715 s |
-| `git add -A` + commit | 4.919 s | 5.010 s | 4.923 s |
-| open+close, base blob | 63.5 µs | 63.7 µs | 63.3 µs |
-| open+read+close, base blob | 65.9 µs | 65.2 µs | 65.4 µs |
-| stat, cached | 1.8 µs | 1.9 µs | 1.9 µs |
-| write 4 KiB, overlay file | 244.1 µs | 249.1 µs | 52.3 µs |
-| open+close, overlay file | 72.1 µs | 72.6 µs | 73.4 µs |
-| open+read+close, overlay file | 216.2 µs | 219.7 µs | 221.9 µs |
+| step | baseline | passthrough code, no cap | + writeback cache | + prewarm |
+| --- | ---: | ---: | ---: | ---: |
+| mount | 0.270 s | 0.226 s | 0.161 s | 0.170 s |
+| prewarm (waited) | – | – | – | 0.373 s |
+| read 2000 files, cold | 0.746 s | 0.740 s | 0.733 s | 0.493 s |
+| read again, warm | 0.264 s | 0.265 s | 0.264 s | 0.263 s |
+| `rg -F TODO`, first (1683 lines) | 0.654 s | 0.634 s | 0.630 s | 0.399 s |
+| `rg -F TODO`, second | 0.158 s | 0.164 s | 0.174 s | 0.160 s |
+| read largest blob, cold | 0.006 s | 0.006 s | 0.006 s | 0.006 s |
+| read largest blob, warm | 0.005 s | 0.006 s | 0.006 s | 0.005 s |
+| write 64 MiB, 4 KiB `dd` | 3.950 s | 4.260 s | 0.854 s | 4.042 s |
+| `cp -r` 10225 files in | 29.383 s | 27.599 s | 28.899 s | 26.861 s |
+| read the 64 MiB back | 0.048 s | 0.075 s | 0.060 s | 0.057 s |
+| read the copied files back | 2.772 s | 2.799 s | 2.813 s | 2.812 s |
+| `git status` after the writes | 0.728 s | 0.717 s | 0.715 s | 0.727 s |
+| `git add -A` + commit | 4.919 s | 5.010 s | 4.923 s | 4.991 s |
+| open+close, base blob | 63.5 µs | 63.7 µs | 63.3 µs | 62.9 µs |
+| open+read+close, base blob | 65.9 µs | 65.2 µs | 65.4 µs | 65.8 µs |
+| stat, cached | 1.8 µs | 1.9 µs | 1.9 µs | 1.9 µs |
+| write 4 KiB, overlay file | 244.1 µs | 249.1 µs | 52.3 µs | 249.1 µs |
+| open+close, overlay file | 72.1 µs | 72.6 µs | 73.4 µs | 73.2 µs |
+| open+read+close, overlay file | 216.2 µs | 219.7 µs | 221.9 µs | 220.8 µs |
 
 ### django
 
 mount flags: (none)   read-through: 2000 files under django/   largest blob: tests/gis_tests/data/rasters/raster.numpy.txt (709050 bytes)   copy: 3688 files
 
-| step | baseline | passthrough code, no cap | + writeback cache |
-| --- | ---: | ---: | ---: |
-| mount | 0.087 s | 0.091 s | 0.091 s |
-| prewarm (waited) | – | – | – |
-| read 2000 files, cold | 0.695 s | 0.726 s | 0.709 s |
-| read again, warm | 0.255 s | 0.269 s | 0.271 s |
-| `rg -F TODO`, first (35 lines) | 0.218 s | 0.221 s | 0.228 s |
-| `rg -F TODO`, second | 0.082 s | 0.083 s | 0.082 s |
-| read largest blob, cold | 0.005 s | 0.005 s | 0.005 s |
-| read largest blob, warm | 0.005 s | 0.005 s | 0.005 s |
-| write 64 MiB, 4 KiB `dd` | 3.943 s | 3.970 s | 0.839 s |
-| `cp -r` 3688 files in | 11.345 s | 10.345 s | 10.982 s |
-| read the 64 MiB back | 0.049 s | 0.054 s | 0.053 s |
-| read the copied files back | 1.335 s | 1.345 s | 1.356 s |
-| `git status` after the writes | 0.448 s | 0.458 s | 0.451 s |
-| `git add -A` + commit | 8.976 s | 9.002 s | 10.305 s |
-| open+close, base blob | 62.9 µs | 64.1 µs | 64.4 µs |
-| open+read+close, base blob | 66.3 µs | 65.6 µs | 66.3 µs |
-| stat, cached | 2.0 µs | 1.9 µs | 1.9 µs |
-| write 4 KiB, overlay file | 243.9 µs | 244.4 µs | 51.9 µs |
-| open+close, overlay file | 72.7 µs | 73.1 µs | 73.0 µs |
-| open+read+close, overlay file | 218.4 µs | 219.9 µs | 223.5 µs |
+| step | baseline | passthrough code, no cap | + writeback cache | + prewarm |
+| --- | ---: | ---: | ---: | ---: |
+| mount | 0.087 s | 0.091 s | 0.091 s | 0.084 s |
+| prewarm (waited) | – | – | – | 0.129 s |
+| read 2000 files, cold | 0.695 s | 0.726 s | 0.709 s | 0.470 s |
+| read again, warm | 0.255 s | 0.269 s | 0.271 s | 0.259 s |
+| `rg -F TODO`, first (35 lines) | 0.218 s | 0.221 s | 0.228 s | 0.169 s |
+| `rg -F TODO`, second | 0.082 s | 0.083 s | 0.082 s | 0.082 s |
+| read largest blob, cold | 0.005 s | 0.005 s | 0.005 s | 0.005 s |
+| read largest blob, warm | 0.005 s | 0.005 s | 0.005 s | 0.005 s |
+| write 64 MiB, 4 KiB `dd` | 3.943 s | 3.970 s | 0.839 s | 4.029 s |
+| `cp -r` 3688 files in | 11.345 s | 10.345 s | 10.982 s | 10.238 s |
+| read the 64 MiB back | 0.049 s | 0.054 s | 0.053 s | 0.059 s |
+| read the copied files back | 1.335 s | 1.345 s | 1.356 s | 1.351 s |
+| `git status` after the writes | 0.448 s | 0.458 s | 0.451 s | 0.455 s |
+| `git add -A` + commit | 8.976 s | 9.002 s | 10.305 s | 9.029 s |
+| open+close, base blob | 62.9 µs | 64.1 µs | 64.4 µs | 63.0 µs |
+| open+read+close, base blob | 66.3 µs | 65.6 µs | 66.3 µs | 64.8 µs |
+| stat, cached | 2.0 µs | 1.9 µs | 1.9 µs | 1.9 µs |
+| write 4 KiB, overlay file | 243.9 µs | 244.4 µs | 51.9 µs | 250.6 µs |
+| open+close, overlay file | 72.7 µs | 73.1 µs | 73.0 µs | 73.6 µs |
+| open+read+close, overlay file | 218.4 µs | 219.9 µs | 223.5 µs | 220.9 µs |
 
 <!-- merged tables end -->
 
@@ -109,3 +112,19 @@ sends a `flush` per close again. Answering `flush` with `ENOSYS` once makes
 the kernel stop sending it for the life of the mount, which is what the
 column shows. The flag stays off by default because it moves a refused
 write's error from `write(2)` to `close` (see the ADR).
+
+**Commit 3, prewarm: the cold read path, at the price of a third of a
+second.** The walk inflates vscode's whole tree — 17 336 blobs, 232 MB —
+in 0.38 s on eight blocking workers (django: 6 289 blobs in 0.12 s), and the
+first read of 2 000 files drops from 0.75 s to 0.49 s, the first `rg` from
+0.65 s to 0.40 s. What remains above the warm figure (0.26 s) is the
+`read` request itself: prewarm fills the daemon's memory, not the kernel's
+page cache, and only passthrough removes that request. Everything else is
+unchanged. It is a flag because a job that opens a hundred files gains
+nothing from inflating seventeen thousand.
+
+**Where the cost is now.** Per file read: `open` and `release`, at the
+kernel's floor, plus one `read` on the first open (gone under passthrough).
+Per file written by a tool like `cp`: about 2.8 ms, none of it in `write`
+— it is `create`, `release` and the journal row each commits. That is the
+next lever, and it is in the overlay, not in FUSE.

@@ -241,6 +241,7 @@ impl MountHost {
         RepositoryId::parse(&request.repository_id)?
       },
       local_clone: request.local_clone,
+      prewarm: request.prewarm,
       revision_selector: request.revision_selector,
       cache_quota_bytes: request.cache_quota_bytes,
       fs: FsConfig {

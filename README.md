@@ -94,6 +94,15 @@ seeded as `origin`, so `git push origin HEAD:my-branch` moves a commit back
 over the filesystem. The measured comparison with `git worktree add` and with
 the server mount is in [benchmarks/local-mode.md](benchmarks/local-mode.md).
 
+Three flags trade something for speed, measured in
+[benchmarks/fuse-levers.md](benchmarks/fuse-levers.md): `--prewarm` inflates
+the tree into memory in the background so the first read is as fast as the
+second; `--writeback-cache` lets the kernel gather small writes (a refused
+write is then reported at `close`, not at `write`); and when `gfs-fuse`
+carries `CAP_SYS_ADMIN` (`sudo setcap cap_sys_admin+ep target/release/gfs-fuse`)
+the kernel reads and writes files itself through FUSE passthrough, with no
+flag needed.
+
 What local mode does not do: expand LFS pointers (the tree shows the
 pointer files, as `GIT_LFS_SKIP_SMUDGE=1` would), or build a search index —
 `gfs rg` scans the pack in parallel instead, which is the honest answer for

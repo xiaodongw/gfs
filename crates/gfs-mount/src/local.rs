@@ -67,7 +67,7 @@ use crate::source::{
 /// A build's hot set — the headers and modules it opens again and again — fits
 /// comfortably; a whole-tree read streams through it. Sized so that ten mounted
 /// clones on one host stay well inside a developer machine's memory.
-const BLOB_MEMORY_BYTES: u64 = 256 * 1024 * 1024;
+pub const BLOB_MEMORY_BYTES: u64 = 256 * 1024 * 1024;
 
 /// How long a local search may run before it reports itself truncated.
 ///

@@ -202,6 +202,7 @@ async fn a_client_from_another_state_format_is_refused_rather_than_served() {
     token: None,
     local_clone: None,
     writeback_cache: false,
+    prewarm: false,
   };
   let HostResponse::Error { code, .. } =
     call(&socket, HostRequest::CreateMount(Box::new(request))).await
@@ -247,6 +248,7 @@ async fn a_mount_created_over_the_host_socket_is_usable_immediately() {
     token: None,
     local_clone: None,
     writeback_cache: false,
+    prewarm: false,
   };
   let HostResponse::Mounted(report) =
     call(&socket, HostRequest::CreateMount(Box::new(request))).await

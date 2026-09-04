@@ -102,6 +102,112 @@ pub struct MountSpec {
   /// Local mode (ADR 0013): read from this clone instead of the gateway named
   /// by the endpoints above, which are then unused.
   pub local_clone: Option<PathBuf>,
+  /// Local mode: inflate the pinned tree's blobs into the source's memory in
+  /// the background once the mount is up, so the first read of a file costs
+  /// what the second does. Ignored without `local_clone`.
+  pub prewarm: bool,
+}
+
+/// How much of the tree a prewarm inflates: the source's blob memory, so
+/// nothing it warms is evicted by the warming itself; and no single blob
+/// above the cap, because a build's hot set is small files.
+const PREWARM_BYTES: u64 = crate::local::BLOB_MEMORY_BYTES;
+const PREWARM_MAX_BLOB_BYTES: u64 = 8 * 1024 * 1024;
+const PREWARM_CONCURRENCY: usize = 8;
+
+/// A background inflate of the pinned tree (`gfs mount --local --prewarm`).
+#[derive(Debug, Default)]
+pub struct Prewarm {
+  done: AtomicBool,
+  blobs: std::sync::atomic::AtomicU64,
+  bytes: std::sync::atomic::AtomicU64,
+  elapsed_ms: std::sync::atomic::AtomicU64,
+}
+
+impl Prewarm {
+  pub fn report(&self) -> crate::control::PrewarmReport {
+    crate::control::PrewarmReport {
+      done: self.done.load(Ordering::Relaxed),
+      blobs: self.blobs.load(Ordering::Relaxed),
+      bytes: self.bytes.load(Ordering::Relaxed),
+      elapsed_ms: self.elapsed_ms.load(Ordering::Relaxed),
+    }
+  }
+
+  /// Walk the tree in order, then inflate the regular blobs that fit the
+  /// budget, a few at a time. Errors are logged and skipped: a prewarm that
+  /// stops early has only left the mount as it was.
+  async fn run(self: Arc<Self>, client: Arc<dyn crate::source::SnapshotSource>) {
+    let started = std::time::Instant::now();
+    let mut token = Vec::new();
+    let mut planned = 0u64;
+    let mut seen = std::collections::HashSet::new();
+    let mut queue = Vec::new();
+    'pages: loop {
+      let page = match client
+        .list_tree(
+          &gfs_types::BytePath::root(),
+          token,
+          gfs_types::limits::MAX_TREE_PAGE_ENTRIES as u32,
+        )
+        .await
+      {
+        Ok(page) => page,
+        Err(e) => {
+          tracing::warn!("prewarm stopped listing the tree: {e}");
+          break;
+        }
+      };
+      for entry in page.entries {
+        let regular = matches!(
+          entry.kind,
+          gfs_types::EntryKind::Regular | gfs_types::EntryKind::Executable
+        );
+        if !regular || entry.size > PREWARM_MAX_BLOB_BYTES || !seen.insert(entry.oid.clone()) {
+          continue;
+        }
+        if planned + entry.size > PREWARM_BYTES {
+          break 'pages;
+        }
+        planned += entry.size;
+        queue.push(entry.oid);
+      }
+      if page.next_page_token.is_empty() {
+        break;
+      }
+      token = page.next_page_token;
+    }
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(PREWARM_CONCURRENCY));
+    let mut tasks = tokio::task::JoinSet::new();
+    for oid in queue {
+      let permit = match Arc::clone(&semaphore).acquire_owned().await {
+        Ok(permit) => permit,
+        Err(_) => break,
+      };
+      let client = Arc::clone(&client);
+      let progress = Arc::clone(&self);
+      tasks.spawn(async move {
+        let _permit = permit;
+        if let Ok(bytes) = client.read_blob_shared(&oid, "").await {
+          progress.blobs.fetch_add(1, Ordering::Relaxed);
+          progress
+            .bytes
+            .fetch_add(bytes.len() as u64, Ordering::Relaxed);
+        }
+      });
+    }
+    while tasks.join_next().await.is_some() {}
+    self
+      .elapsed_ms
+      .store(started.elapsed().as_millis() as u64, Ordering::Relaxed);
+    self.done.store(true, Ordering::Relaxed);
+    tracing::info!(
+      blobs = self.blobs.load(Ordering::Relaxed),
+      bytes = self.bytes.load(Ordering::Relaxed),
+      elapsed_ms = self.elapsed_ms.load(Ordering::Relaxed),
+      "prewarm finished"
+    );
+  }
 }
 
 /// What stands behind a mount's object store.
@@ -284,6 +390,8 @@ pub struct Mount {
   /// The filesystem, created once and re-pointed by every switch. Outlives every
   /// [`Pin`], which is what makes the workspace path stable.
   fs: Arc<Gfs>,
+  /// The background prewarm, when the mount asked for one.
+  prewarm: Option<Arc<Prewarm>>,
   /// The one FUSE session. `None` only after shutdown has taken it.
   session: Mutex<Option<fuser::BackgroundSession>>,
   current: Mutex<Pin>,
@@ -462,6 +570,7 @@ impl Mount {
       config.fs.clone(),
     );
 
+    let prewarm_client = Arc::clone(&resolved.pin.client);
     let mountpoint = publisher.mountpoint().to_path_buf();
     let session = crate::session::spawn_mount(
       GfsFilesystem::new(Arc::clone(&fs), tokio::runtime::Handle::current()),
@@ -484,9 +593,14 @@ impl Mount {
       shutting_down: AtomicBool::new(false),
       selector: Mutex::new(config.revision_selector.clone()),
       work_branch: Mutex::new(None),
+      prewarm: (config.prewarm && config.local_clone.is_some())
+        .then(|| Arc::new(Prewarm::default())),
       config,
     });
     mount.persist()?;
+    if let Some(prewarm) = &mount.prewarm {
+      tokio::spawn(Arc::clone(prewarm).run(prewarm_client));
+    }
     Ok(mount)
   }
 
@@ -632,6 +746,7 @@ impl Mount {
       odb_job: self.fs.git().view_stats(),
       live_inodes: self.fs.inode_counts().0,
       assigned_inodes: self.fs.inode_counts().1,
+      prewarm: self.prewarm.as_ref().map(|p| p.report()),
     }
   }
 

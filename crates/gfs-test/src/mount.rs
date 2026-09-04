@@ -405,6 +405,7 @@ pub fn mount_spec(
     mount: MountConfig::default(),
     lease_policy: gfs_types::LeasePolicy::adr_0006(),
     local_clone: None,
+    prewarm: false,
   }
 }
 
@@ -530,6 +531,16 @@ impl Job {
   /// A local-mode job over an existing clone. `tmp` holds the workspace and
   /// the host socket and is dropped with the job; the clone is the caller's.
   pub async fn local_from(clone: &Path, revision: &str, tmp: tempfile::TempDir) -> Job {
+    Self::local_from_with(clone, revision, tmp, false).await
+  }
+
+  /// [`Job::local_from`] with the background prewarm on or off.
+  pub async fn local_from_with(
+    clone: &Path,
+    revision: &str,
+    tmp: tempfile::TempDir,
+    prewarm: bool,
+  ) -> Job {
     Mount::require_fuse();
     let cache = tempfile::tempdir().unwrap();
     let clone = clone.to_path_buf();
@@ -563,6 +574,7 @@ impl Job {
         mount: MountConfig::default(),
         lease_policy: gfs_types::LeasePolicy::adr_0006(),
         local_clone: Some(clone.clone()),
+        prewarm,
       })
       .await
       .unwrap();

@@ -208,6 +208,17 @@ pub struct MountReport {
   pub odb_job: crate::odb::OdbViewStats,
   pub live_inodes: usize,
   pub assigned_inodes: usize,
+  /// The background prewarm (`gfs mount --local --prewarm`), when one ran.
+  #[serde(default)]
+  pub prewarm: Option<PrewarmReport>,
+}
+
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+pub struct PrewarmReport {
+  pub done: bool,
+  pub blobs: u64,
+  pub bytes: u64,
+  pub elapsed_ms: u64,
 }
 
 /// One commit, rendered for a log.
@@ -495,6 +506,10 @@ pub struct MountRequest {
   /// writes; a refused write is reported at `close` instead of `write(2)`.
   #[serde(default)]
   pub writeback_cache: bool,
+  /// Local mode: inflate the pinned tree's blobs into memory in the
+  /// background once the mount is up.
+  #[serde(default)]
+  pub prewarm: bool,
 }
 
 /// What the CLI asks the `gfs-fuse` process, as opposed to one workspace.

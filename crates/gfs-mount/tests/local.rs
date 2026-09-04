@@ -274,3 +274,31 @@ async fn writes_are_visible_by_size_before_close_and_to_git_after() {
     assert!(stats.passthrough_opens > 0, "{stats:?}");
   }
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_prewarmed_local_mount_inflates_the_tree_in_the_background() {
+  let clone_dir = tempfile::tempdir().unwrap();
+  let clone = clone_dir.path().join("clone");
+  Job::clone_fixture("basic", &clone);
+  let job = Job::local_from_with(&clone, "main", tempfile::tempdir().unwrap(), true).await;
+
+  let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+  let report = loop {
+    let report = job
+      .daemon
+      .inspect()
+      .prewarm
+      .expect("a prewarm was asked for");
+    if report.done || std::time::Instant::now() > deadline {
+      break report;
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+  };
+  assert!(report.done, "{report:?}");
+  assert!(report.blobs > 0 && report.bytes > 0, "{report:?}");
+
+  // The mount still reads correctly after the walk.
+  let readme = job.workspace.join("README.md");
+  let content = on_fs(move || std::fs::read(&readme).unwrap()).await;
+  assert_eq!(content, b"# basic\n");
+}

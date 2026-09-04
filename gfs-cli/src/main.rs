@@ -193,6 +193,12 @@ enum Command {
     /// reported when the file is closed, not when it is written.
     #[arg(long)]
     writeback_cache: bool,
+    /// Local mode only: inflate the pinned tree's blobs into memory in the
+    /// background after the mount is up, so the first read of a file costs
+    /// what the second does. Spends CPU and up to 256 MiB on a tree the job
+    /// may never read; `gfs inspect` reports progress.
+    #[arg(long, requires = "local")]
+    prewarm: bool,
   },
 
   /// Release the lease, unmount, and drop the workspace from its host.
@@ -852,6 +858,7 @@ fn do_mount(cli: &Cli, args: MountArgs) -> Result<()> {
     token: Some(cli.token.clone()),
     local_clone: args.local.clone(),
     writeback_cache: args.writeback_cache,
+    prewarm: args.prewarm,
   };
   let response = call_host(
     &socket,
@@ -891,6 +898,7 @@ struct MountArgs {
   foreground: bool,
   timeout_seconds: u64,
   writeback_cache: bool,
+  prewarm: bool,
 }
 
 fn print_report(report: &gfs_mount::control::MountReport) {
@@ -926,6 +934,15 @@ fn print_report(report: &gfs_mount::control::MountReport) {
     "kernel     {} opens served by passthrough",
     report.stats.passthrough_opens
   );
+  if let Some(prewarm) = &report.prewarm {
+    println!(
+      "prewarm    {}, {} blobs, {} bytes in {} ms",
+      if prewarm.done { "done" } else { "running" },
+      prewarm.blobs,
+      prewarm.bytes,
+      prewarm.elapsed_ms
+    );
+  }
   // The listing-cache line: server requests that stop growing while listing
   // hits climb is what "a warm metadata walk is server-silent" looks like.
   println!(
@@ -1290,6 +1307,7 @@ async fn main() -> Result<()> {
             foreground: *foreground,
             timeout_seconds: *timeout_seconds,
             writeback_cache: false,
+            prewarm: false,
           },
         )
       })?;
@@ -1297,6 +1315,7 @@ async fn main() -> Result<()> {
 
     Command::Mount {
       writeback_cache,
+      prewarm,
       repo,
       local,
       rev,
@@ -1326,6 +1345,7 @@ async fn main() -> Result<()> {
             foreground: *foreground,
             timeout_seconds: *timeout_seconds,
             writeback_cache: *writeback_cache,
+            prewarm: *prewarm,
           },
         )
       })?;
