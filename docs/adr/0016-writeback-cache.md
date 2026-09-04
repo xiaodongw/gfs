@@ -88,8 +88,13 @@ and names the dentry to invalidate.
   journal, which is written when the requests arrive; a `close` flushes
   before it returns, so a file is in the journal before the tool that wrote
   it can ask Git about it.
-- **Passthrough files (ADR 0015) do not use the page cache** and are
-  untouched by this; the two levers stack.
+- **The two levers do not stack.** The kernel refuses `FUSE_PASSTHROUGH`
+  together with `FUSE_WRITEBACK_CACHE` and, asked for both, grants neither
+  (found by measurement: a mount with both flags served zero passthrough
+  opens). A mount that has passthrough drops the writeback request and
+  logs it. Passthrough is the better of the two for writes anyway: the same
+  52 µs per 4 KiB write, and the refusal semantics of `write(2)` are the
+  content file's, not the page cache's.
 
 ## Alternatives considered
 

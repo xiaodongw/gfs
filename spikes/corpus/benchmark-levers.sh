@@ -11,7 +11,8 @@
 # status`, commit. Then a per-operation loop in Python on one base file and
 # one overlay file. Every number is wall-clock seconds, one run.
 #
-# Set GFS_BENCH_WAIT_PREWARM=1 to wait for `gfs inspect` to report the prewarm
+# Set GFS_BENCH_NATIVE=1 to run the task in a `git worktree add` checkout
+# instead (the native column). Set GFS_BENCH_WAIT_PREWARM=1 to wait for `gfs inspect` to report the prewarm
 # finished before the task starts (and to record how long that took).
 
 set -uo pipefail
@@ -112,9 +113,14 @@ run_one() { # $1 = repo
   local ws="$WORK/$repo/ws"
   local t0 t1
 
-  t0=$(now); "$BIN/gfs" mount --local "$clone" --rev HEAD --workspace "$ws" "${MOUNT_FLAGS[@]}" >"$WORK/$repo/mount.log" 2>&1; t1=$(now)
+  local native="${GFS_BENCH_NATIVE:-0}"
+  if [ "$native" = 1 ]; then
+    t0=$(now); git -C "$clone" "${GITC[@]}" worktree add -q --detach "$ws" HEAD >"$WORK/$repo/mount.log" 2>&1; t1=$(now)
+  else
+    t0=$(now); "$BIN/gfs" mount --local "$clone" --rev HEAD --workspace "$ws" "${MOUNT_FLAGS[@]}" >"$WORK/$repo/mount.log" 2>&1; t1=$(now)
+  fi
   local r_mount; r_mount=$(el "$t0" "$t1")
-  if ! grep -q '^origin' "$WORK/$repo/mount.log"; then echo "[$repo] mount failed:" >&2; cat "$WORK/$repo/mount.log" >&2; return 1; fi
+  if [ "$native" != 1 ] && ! grep -q '^origin' "$WORK/$repo/mount.log"; then echo "[$repo] mount failed:" >&2; cat "$WORK/$repo/mount.log" >&2; return 1; fi
   local r_prewarm="–"
   if [ "${GFS_BENCH_WAIT_PREWARM:-0}" = 1 ]; then
     t0=$(now); wait_prewarm "$ws" || echo "[$repo] prewarm did not finish" >&2; t1=$(now)
@@ -135,12 +141,17 @@ run_one() { # $1 = repo
   t0=$(now); git -C "$ws" "${GITC[@]}" status --porcelain >/dev/null; t1=$(now); local r_stat=$(el "$t0" "$t1")
   t0=$(now); git -C "$ws" "${GITC[@]}" add -A >/dev/null 2>&1; git -C "$ws" "${GITC[@]}" commit -q -m bench >/dev/null 2>&1; t1=$(now); local r_cmt=$(el "$t0" "$t1")
   local perop; perop=$(per_op "$ws" "$(head -1 "$list")")
-  "$BIN/gfs" inspect --workspace "$ws" >"$WORK/$repo/inspect.txt" 2>&1
-  "$BIN/gfs" unmount --workspace "$ws" >/dev/null 2>&1
+  if [ "$native" = 1 ]; then
+    : >"$WORK/$repo/inspect.txt"
+    git -C "$clone" worktree remove --force "$ws" >/dev/null 2>&1; git -C "$clone" worktree prune >/dev/null 2>&1
+  else
+    "$BIN/gfs" inspect --workspace "$ws" >"$WORK/$repo/inspect.txt" 2>&1
+    "$BIN/gfs" unmount --workspace "$ws" >/dev/null 2>&1
+  fi
   local anchors; anchors=$(git -C "$clone" for-each-ref refs/gfs/ | wc -l)
 
   echo "## $repo — $label"
-  echo "mount flags: ${MOUNT_FLAGS[*]:-(none)}   read-through: $(wc -l <"$list") files under $read_dir/   largest blob: $big_path ($big_size bytes)   copy: $n_cp files"
+  echo "mount flags: $([ "$native" = 1 ] && echo "native worktree" || echo "${MOUNT_FLAGS[*]:-(none)}")   read-through: $(wc -l <"$list") files under $read_dir/   largest blob: $big_path ($big_size bytes)   copy: $n_cp files"
   echo
   printf '| step | %s |\n| --- | ---: |\n' "$label"
   printf '| mount | %.3f s |\n' "$r_mount"

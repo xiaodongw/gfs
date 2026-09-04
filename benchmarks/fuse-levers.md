@@ -18,6 +18,9 @@ back, `git status`, commit; then a per-operation loop.
 
 The columns, in the order the commits landed:
 
+- **native worktree** — the same task in a `git worktree add` checkout of
+  the same clone (`GFS_BENCH_NATIVE=1`): ext4, no daemon, the number every
+  other column is measured against.
 - **baseline** — the ADR 0014 build (`f779597`).
 - **passthrough code, no cap** — [ADR 0015](../docs/adr/0015-kernel-passthrough.md)
   built and running *without* `CAP_SYS_ADMIN`: the daemon sees the kernel
@@ -31,6 +34,12 @@ The columns, in the order the commits landed:
 - **+ writeback cache** — [ADR 0016](../docs/adr/0016-writeback-cache.md),
   mounted with `--writeback-cache`, without the capability (the two levers
   are independent; this column isolates the second).
+- **passthrough + prewarm** — the best configuration: the capability set
+  and `--prewarm`. Not `--writeback-cache` as well: the kernel refuses
+  passthrough and writeback together and grants neither (a run with all
+  three flags served zero passthrough opens and looked like the baseline
+  with prewarm), so the daemon now drops the writeback request when it has
+  passthrough.
 - **+ prewarm** — `gfs mount --local … --prewarm`, without the other two:
   the benchmark waits for `gfs inspect` to report the prewarm done before
   the task starts, and the wait is its own row.
@@ -38,57 +47,57 @@ The columns, in the order the commits landed:
 <!-- merged tables begin -->
 ### vscode
 
-mount flags: (none)   read-through: 2000 files under src/   largest blob: src/vs/base/test/node/uri.perf.data.txt (8874330 bytes)   copy: 10225 files
+mount flags: native worktree   read-through: 2000 files under src/   largest blob: src/vs/base/test/node/uri.perf.data.txt (8874330 bytes)   copy: 10225 files
 
-| step | baseline | passthrough code, no cap | passthrough, 4 096-entry cache | passthrough | + writeback cache | + prewarm |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| mount | 0.270 s | 0.226 s | 0.185 s | 0.194 s | 0.161 s | 0.170 s |
-| prewarm (waited) | – | – | – | – | – | 0.373 s |
-| read 2000 files, cold | 0.746 s | 0.740 s | 0.671 s | 0.679 s | 0.733 s | 0.493 s |
-| read again, warm | 0.264 s | 0.265 s | 0.273 s | 0.274 s | 0.264 s | 0.263 s |
-| `rg -F TODO`, first (1683 lines) | 0.654 s | 0.634 s | 0.712 s | 0.617 s | 0.630 s | 0.399 s |
-| `rg -F TODO`, second | 0.158 s | 0.164 s | 0.658 s | 0.180 s | 0.174 s | 0.160 s |
-| read largest blob, cold | 0.006 s | 0.006 s | 0.044 s | 0.006 s | 0.006 s | 0.006 s |
-| read largest blob, warm | 0.005 s | 0.006 s | 0.006 s | 0.006 s | 0.006 s | 0.005 s |
-| write 64 MiB, 4 KiB `dd` | 3.950 s | 4.260 s | 0.893 s | 0.862 s | 0.854 s | 4.042 s |
-| `cp -r` 10225 files in | 29.383 s | 27.599 s | 25.813 s | 26.288 s | 28.899 s | 26.861 s |
-| read the 64 MiB back | 0.048 s | 0.075 s | 0.008 s | 0.009 s | 0.060 s | 0.057 s |
-| read the copied files back | 2.772 s | 2.799 s | 1.758 s | 1.796 s | 2.813 s | 2.812 s |
-| `git status` after the writes | 0.728 s | 0.717 s | 0.741 s | 0.789 s | 0.715 s | 0.727 s |
-| `git add -A` + commit | 4.919 s | 5.010 s | 3.864 s | 3.937 s | 4.923 s | 4.991 s |
-| open+close, base blob | 63.5 µs | 63.7 µs | 64.5 µs | 64.9 µs | 63.3 µs | 62.9 µs |
-| open+read+close, base blob | 65.9 µs | 65.2 µs | 70.8 µs | 67.7 µs | 65.4 µs | 65.8 µs |
-| stat, cached | 1.8 µs | 1.9 µs | 1.9 µs | 1.9 µs | 1.9 µs | 1.9 µs |
-| write 4 KiB, overlay file | 244.1 µs | 249.1 µs | 50.9 µs | 52.2 µs | 52.3 µs | 249.1 µs |
-| open+close, overlay file | 72.1 µs | 72.6 µs | 81.6 µs | 82.3 µs | 73.4 µs | 73.2 µs |
-| open+read+close, overlay file | 216.2 µs | 219.7 µs | 84.6 µs | 87.3 µs | 221.9 µs | 220.8 µs |
+| step | native worktree | baseline | passthrough code, no cap | passthrough, 4 096-entry cache | passthrough | + writeback cache | + prewarm | passthrough + prewarm |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| mount | 2.488 s | 0.270 s | 0.226 s | 0.185 s | 0.194 s | 0.161 s | 0.170 s | 0.196 s |
+| prewarm (waited) | – | – | – | – | – | – | 0.373 s | 0.450 s |
+| read 2000 files, cold | 0.041 s | 0.746 s | 0.740 s | 0.671 s | 0.679 s | 0.733 s | 0.493 s | 0.452 s |
+| read again, warm | 0.040 s | 0.264 s | 0.265 s | 0.273 s | 0.274 s | 0.264 s | 0.263 s | 0.273 s |
+| `rg -F TODO`, first (1683 lines) | 0.041 s | 0.654 s | 0.634 s | 0.712 s | 0.617 s | 0.630 s | 0.399 s | 0.413 s |
+| `rg -F TODO`, second | 0.034 s | 0.158 s | 0.164 s | 0.658 s | 0.180 s | 0.174 s | 0.160 s | 0.182 s |
+| read largest blob, cold | 0.006 s | 0.006 s | 0.006 s | 0.044 s | 0.006 s | 0.006 s | 0.006 s | 0.007 s |
+| read largest blob, warm | 0.007 s | 0.005 s | 0.006 s | 0.006 s | 0.006 s | 0.006 s | 0.005 s | 0.006 s |
+| write 64 MiB, 4 KiB `dd` | 0.070 s | 3.950 s | 4.260 s | 0.893 s | 0.862 s | 0.854 s | 4.042 s | 0.894 s |
+| `cp -r` 10225 files in | 1.100 s | 29.383 s | 27.599 s | 25.813 s | 26.288 s | 28.899 s | 26.861 s | 26.060 s |
+| read the 64 MiB back | 0.009 s | 0.048 s | 0.075 s | 0.008 s | 0.009 s | 0.060 s | 0.057 s | 0.008 s |
+| read the copied files back | 0.202 s | 2.772 s | 2.799 s | 1.758 s | 1.796 s | 2.813 s | 2.812 s | 1.796 s |
+| `git status` after the writes | 0.549 s | 0.728 s | 0.717 s | 0.741 s | 0.789 s | 0.715 s | 0.727 s | 0.762 s |
+| `git add -A` + commit | 1.140 s | 4.919 s | 5.010 s | 3.864 s | 3.937 s | 4.923 s | 4.991 s | 3.782 s |
+| open+close, base blob | 2.7 µs | 63.5 µs | 63.7 µs | 64.5 µs | 64.9 µs | 63.3 µs | 62.9 µs | 65.3 µs |
+| open+read+close, base blob | 3.6 µs | 65.9 µs | 65.2 µs | 70.8 µs | 67.7 µs | 65.4 µs | 65.8 µs | 68.3 µs |
+| stat, cached | 1.8 µs | 1.8 µs | 1.9 µs | 1.9 µs | 1.9 µs | 1.9 µs | 1.9 µs | 2.0 µs |
+| write 4 KiB, overlay file | 3.0 µs | 244.1 µs | 249.1 µs | 50.9 µs | 52.2 µs | 52.3 µs | 249.1 µs | 51.6 µs |
+| open+close, overlay file | 2.7 µs | 72.1 µs | 72.6 µs | 81.6 µs | 82.3 µs | 73.4 µs | 73.2 µs | 79.7 µs |
+| open+read+close, overlay file | 5.0 µs | 216.2 µs | 219.7 µs | 84.6 µs | 87.3 µs | 221.9 µs | 220.8 µs | 86.1 µs |
 
 ### django
 
-mount flags: (none)   read-through: 2000 files under django/   largest blob: tests/gis_tests/data/rasters/raster.numpy.txt (709050 bytes)   copy: 3688 files
+mount flags: native worktree   read-through: 2000 files under django/   largest blob: tests/gis_tests/data/rasters/raster.numpy.txt (709050 bytes)   copy: 3688 files
 
-| step | baseline | passthrough code, no cap | passthrough, 4 096-entry cache | passthrough | + writeback cache | + prewarm |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| mount | 0.087 s | 0.091 s | 0.090 s | 0.095 s | 0.091 s | 0.084 s |
-| prewarm (waited) | – | – | – | – | – | 0.129 s |
-| read 2000 files, cold | 0.695 s | 0.726 s | 0.638 s | 0.651 s | 0.709 s | 0.470 s |
-| read again, warm | 0.255 s | 0.269 s | 0.270 s | 0.272 s | 0.271 s | 0.259 s |
-| `rg -F TODO`, first (35 lines) | 0.218 s | 0.221 s | 0.248 s | 0.223 s | 0.228 s | 0.169 s |
-| `rg -F TODO`, second | 0.082 s | 0.083 s | 0.219 s | 0.090 s | 0.082 s | 0.082 s |
-| read largest blob, cold | 0.005 s | 0.005 s | 0.009 s | 0.006 s | 0.005 s | 0.005 s |
-| read largest blob, warm | 0.005 s | 0.005 s | 0.006 s | 0.006 s | 0.005 s | 0.005 s |
-| write 64 MiB, 4 KiB `dd` | 3.943 s | 3.970 s | 0.848 s | 0.861 s | 0.839 s | 4.029 s |
-| `cp -r` 3688 files in | 11.345 s | 10.345 s | 9.964 s | 10.095 s | 10.982 s | 10.238 s |
-| read the 64 MiB back | 0.049 s | 0.054 s | 0.009 s | 0.011 s | 0.053 s | 0.059 s |
-| read the copied files back | 1.335 s | 1.345 s | 1.008 s | 1.032 s | 1.356 s | 1.351 s |
-| `git status` after the writes | 0.448 s | 0.458 s | 0.469 s | 0.474 s | 0.451 s | 0.455 s |
-| `git add -A` + commit | 8.976 s | 9.002 s | 8.716 s | 8.813 s | 10.305 s | 9.029 s |
-| open+close, base blob | 62.9 µs | 64.1 µs | 66.8 µs | 65.9 µs | 64.4 µs | 63.0 µs |
-| open+read+close, base blob | 66.3 µs | 65.6 µs | 68.6 µs | 70.8 µs | 66.3 µs | 64.8 µs |
-| stat, cached | 2.0 µs | 1.9 µs | 1.9 µs | 1.9 µs | 1.9 µs | 1.9 µs |
-| write 4 KiB, overlay file | 243.9 µs | 244.4 µs | 51.8 µs | 58.6 µs | 51.9 µs | 250.6 µs |
-| open+close, overlay file | 72.7 µs | 73.1 µs | 78.9 µs | 86.0 µs | 73.0 µs | 73.6 µs |
-| open+read+close, overlay file | 218.4 µs | 219.9 µs | 85.7 µs | 87.5 µs | 223.5 µs | 220.9 µs |
+| step | native worktree | baseline | passthrough code, no cap | passthrough, 4 096-entry cache | passthrough | + writeback cache | + prewarm | passthrough + prewarm |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| mount | 1.300 s | 0.087 s | 0.091 s | 0.090 s | 0.095 s | 0.091 s | 0.084 s | 0.089 s |
+| prewarm (waited) | – | – | – | – | – | – | 0.129 s | 0.132 s |
+| read 2000 files, cold | 0.041 s | 0.695 s | 0.726 s | 0.638 s | 0.651 s | 0.709 s | 0.470 s | 0.432 s |
+| read again, warm | 0.040 s | 0.255 s | 0.269 s | 0.270 s | 0.272 s | 0.271 s | 0.259 s | 0.269 s |
+| `rg -F TODO`, first (35 lines) | 0.021 s | 0.218 s | 0.221 s | 0.248 s | 0.223 s | 0.228 s | 0.169 s | 0.168 s |
+| `rg -F TODO`, second | 0.018 s | 0.082 s | 0.083 s | 0.219 s | 0.090 s | 0.082 s | 0.082 s | 0.086 s |
+| read largest blob, cold | 0.006 s | 0.005 s | 0.005 s | 0.009 s | 0.006 s | 0.005 s | 0.005 s | 0.006 s |
+| read largest blob, warm | 0.005 s | 0.005 s | 0.005 s | 0.006 s | 0.006 s | 0.005 s | 0.005 s | 0.007 s |
+| write 64 MiB, 4 KiB `dd` | 0.072 s | 3.943 s | 3.970 s | 0.848 s | 0.861 s | 0.839 s | 4.029 s | 0.854 s |
+| `cp -r` 3688 files in | 0.788 s | 11.345 s | 10.345 s | 9.964 s | 10.095 s | 10.982 s | 10.238 s | 10.070 s |
+| read the 64 MiB back | 0.010 s | 0.049 s | 0.054 s | 0.009 s | 0.011 s | 0.053 s | 0.059 s | 0.009 s |
+| read the copied files back | 0.097 s | 1.335 s | 1.345 s | 1.008 s | 1.032 s | 1.356 s | 1.351 s | 1.012 s |
+| `git status` after the writes | 0.118 s | 0.448 s | 0.458 s | 0.469 s | 0.474 s | 0.451 s | 0.455 s | 0.470 s |
+| `git add -A` + commit | 1.063 s | 8.976 s | 9.002 s | 8.716 s | 8.813 s | 10.305 s | 9.029 s | 1.959 s |
+| open+close, base blob | 2.7 µs | 62.9 µs | 64.1 µs | 66.8 µs | 65.9 µs | 64.4 µs | 63.0 µs | 65.3 µs |
+| open+read+close, base blob | 3.5 µs | 66.3 µs | 65.6 µs | 68.6 µs | 70.8 µs | 66.3 µs | 64.8 µs | 67.5 µs |
+| stat, cached | 1.8 µs | 2.0 µs | 1.9 µs | 1.9 µs | 1.9 µs | 1.9 µs | 1.9 µs | 1.9 µs |
+| write 4 KiB, overlay file | 2.9 µs | 243.9 µs | 244.4 µs | 51.8 µs | 58.6 µs | 51.9 µs | 250.6 µs | 51.3 µs |
+| open+close, overlay file | 2.7 µs | 72.7 µs | 73.1 µs | 78.9 µs | 86.0 µs | 73.0 µs | 73.6 µs | 81.9 µs |
+| open+read+close, overlay file | 5.1 µs | 218.4 µs | 219.9 µs | 85.7 µs | 87.5 µs | 223.5 µs | 220.9 µs | 88.2 µs |
 
 <!-- merged tables end -->
 
@@ -141,6 +150,37 @@ first read of 2 000 files drops from 0.75 s to 0.49 s, the first `rg` from
 page cache, and only passthrough removes that request. Everything else is
 unchanged. It is a flag because a job that opens a hundred files gains
 nothing from inflating seventeen thousand.
+
+**Against a native worktree.** With everything on, the mount is created
+13× faster than the worktree (0.20 s against 2.49 s on vscode) and holds
+no copy of the tree; from there every operation costs more than ext4, by
+an amount that is now almost entirely round trips per file, not bytes:
+
+| vscode | native | passthrough + prewarm | ratio |
+| --- | ---: | ---: | ---: |
+| read 2 000 files, first time | 0.041 s | 0.452 s | 11× |
+| read again | 0.040 s | 0.273 s | 7× |
+| `rg` over the tree, first | 0.041 s | 0.413 s | 10× |
+| `rg` again | 0.034 s | 0.182 s | 5× |
+| 64 MiB in 4 KiB writes | 0.070 s | 0.894 s | 13× |
+| `cp -r` 10 225 files in | 1.10 s | 26.1 s | 24× |
+| read those files back | 0.20 s | 1.80 s | 9× |
+| `git status` | 0.55 s | 0.76 s | 1.4× |
+| `git add -A` + commit | 1.14 s | 3.78 s | 3.3× |
+| open+close | 2.7 µs | 65 µs | 24× |
+| 4 KiB write | 3.0 µs | 52 µs | 17× |
+
+Per file, ext4 answers an `open`+`close` in 2.7 µs and the mount in 65 µs:
+two kernel round trips at this machine's 16–25 µs floor plus the daemon's
+work, which is the ADR 0014 residue and the reason a whole-tree read is
+about 10× native regardless of how warm the blobs are. Per 4 KiB write the
+gap is 3 µs against 52 µs: passthrough removed the request, and what is left
+is the page-cache write through a backing file plus the kernel's attribute
+bookkeeping on the FUSE inode after each write. The one thing that is
+*not* round trips is the `cp -r` gap, 24×, which is the journal commit per
+`create`/`release`; without it the copy would sit near the 10× the read
+side shows. `git status` is the closest to native because fsmonitor
+answers from the journal and Git walks nothing.
 
 **Where the cost is now.** Per file read: `open` and `release`, at the
 kernel's floor, plus one `read` on the first open (gone under passthrough).

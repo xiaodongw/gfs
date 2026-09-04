@@ -1834,9 +1834,20 @@ impl Filesystem for GfsFilesystem {
     //   behind the kernel is a re-pin, which hands the kernel a new inode
     //   generation for every regular file it may hold -- and a refused write
     //   (quota, a lost server) is reported at `close`, not at `write(2)`.
+    //   The kernel refuses the combination of passthrough and writeback
+    //   cache -- it enables neither when both are asked for -- and
+    //   passthrough already makes writes direct, so a mount that got
+    //   passthrough drops the writeback request and says so.
     let mut wanted = fuser::InitFlags::FUSE_PARALLEL_DIROPS;
     if self.fs.config.writeback_cache {
-      wanted |= fuser::InitFlags::FUSE_WRITEBACK_CACHE;
+      if self.fs.passthrough.load(Ordering::Relaxed) == PASSTHROUGH_OFFERED {
+        tracing::info!(
+          "--writeback-cache ignored: the kernel does not combine it with passthrough, \
+           which already writes files directly"
+        );
+      } else {
+        wanted |= fuser::InitFlags::FUSE_WRITEBACK_CACHE;
+      }
     }
     let offered = wanted & config.capabilities();
     if let Err(refused) = config.add_capabilities(offered) {

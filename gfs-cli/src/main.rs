@@ -190,7 +190,9 @@ enum Command {
     /// Let the kernel gather writes and send them in large requests (ADR
     /// 0016). Much faster for tools that write in small pieces; the price is
     /// that a write the overlay refuses -- quota, a lost server -- is
-    /// reported when the file is closed, not when it is written.
+    /// reported when the file is closed, not when it is written. Ignored
+    /// when the daemon has kernel passthrough, which the kernel does not
+    /// combine with it and which already writes files directly.
     #[arg(long)]
     writeback_cache: bool,
     /// Local mode only: inflate the pinned tree's blobs into memory in the
