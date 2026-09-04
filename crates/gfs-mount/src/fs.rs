@@ -77,7 +77,14 @@ use crate::source::SnapshotSource;
 
 /// Inode numbers are never reused for a different path, so there is nothing for a
 /// generation to disambiguate. See the module docs on [`crate::inode`].
+/// The generation of a negative entry and of a directory's own `.`/`..`
+/// entries: nothing the kernel could hold stale. Every real entry carries
+/// its record's generation (see `Record::generation`).
 const GENERATION: Generation = Generation(0);
+
+fn generation(record: &Record) -> Generation {
+  Generation(record.generation)
+}
 
 #[derive(Clone, Debug)]
 pub struct FsConfig {
@@ -140,6 +147,12 @@ pub struct FsConfig {
   /// `EDQUOT`. Zero is unlimited. See [`crate::budget`] for why this is
   /// mandatory rather than opt-in.
   pub hydration_budget_bytes: u64,
+  /// Ask the kernel for `FUSE_WRITEBACK_CACHE` (ADR 0016): writes are
+  /// gathered in the page cache and sent in large requests at `close`,
+  /// `fsync` or memory pressure. Off by default because it changes when a
+  /// refused write is reported -- at `close`, not at `write(2)` -- and a
+  /// program that ignores `close`'s result loses the bytes silently.
+  pub writeback_cache: bool,
 }
 
 impl Default for FsConfig {
@@ -192,6 +205,7 @@ impl Default for FsConfig {
       // orders of magnitude below it. Retune from real jobs (PLAN.md M6.2); do not
       // turn it off to make a workload fit.
       hydration_budget_bytes: 1 << 30,
+      writeback_cache: false,
     }
   }
 }
@@ -601,6 +615,18 @@ impl Gfs {
       writers: Mutex::new(HashMap::new()),
       writer_count: AtomicUsize::new(0),
     })
+  }
+
+  /// The daemon rewrote a regular file under the mount without going through
+  /// the kernel. Returns the entry to invalidate, with the record now on a
+  /// new generation so the kernel replaces the inode rather than trusting
+  /// the size it cached (writeback cache, see `Record::generation`).
+  pub fn rewrote_behind_kernel(&self, path: &BytePath) -> Option<crate::inode::StaleEntry> {
+    self
+      .inodes
+      .lock()
+      .expect("inode table")
+      .rewritten_behind_kernel(path)
   }
 
   /// Whether the kernel is serving opens from backing files on this mount.
@@ -1794,7 +1820,19 @@ impl Filesystem for GfsFilesystem {
     // Symlink caching is deliberately absent: a path keeps its inode number
     // across delete and re-create, and the kernel does not drop a cached link
     // target for a symlink whose inode it already holds.
-    let wanted = fuser::InitFlags::FUSE_PARALLEL_DIROPS;
+    // * `WRITEBACK_CACHE`, when the mount asked for it (ADR 0016): the
+    //   kernel gathers small writes into pages and sends them in
+    //   `max_write`-sized requests instead of one per `write(2)`, and every
+    //   overlay write request commits a journal row. Two prices: the kernel
+    //   then owns size, mtime and ctime of every regular file and ignores
+    //   what `getattr` says -- the one thing here that changes a regular file
+    //   behind the kernel is a re-pin, which hands the kernel a new inode
+    //   generation for every regular file it may hold -- and a refused write
+    //   (quota, a lost server) is reported at `close`, not at `write(2)`.
+    let mut wanted = fuser::InitFlags::FUSE_PARALLEL_DIROPS;
+    if self.fs.config.writeback_cache {
+      wanted |= fuser::InitFlags::FUSE_WRITEBACK_CACHE;
+    }
     let offered = wanted & config.capabilities();
     if let Err(refused) = config.add_capabilities(offered) {
       tracing::warn!(
@@ -1830,7 +1868,7 @@ impl Filesystem for GfsFilesystem {
               .expect("inode table")
               .insert_lookup(path, node);
             fs.bump(|s| s.lookups += 1);
-            reply.entry(&fs.config.git_ttl, &fs.attr(&record), GENERATION);
+            reply.entry(&fs.config.git_ttl, &fs.attr(&record), generation(&record));
           }
           Ok(None) => {
             fs.bump(|s| s.negative_lookups += 1);
@@ -1864,7 +1902,7 @@ impl Filesystem for GfsFilesystem {
             .expect("inode table")
             .insert_lookup(path, node);
           fs.bump(|s| s.lookups += 1);
-          reply.entry(&fs.config.ttl, &fs.attr(&record), GENERATION);
+          reply.entry(&fs.config.ttl, &fs.attr(&record), generation(&record));
         }
         Ok(None) => {
           fs.bump(|s| s.negative_lookups += 1);
@@ -2191,7 +2229,7 @@ impl Filesystem for GfsFilesystem {
             reply.created(
               &fs.config.git_ttl,
               &attr,
-              GENERATION,
+              generation(&record),
               FileHandle(handle),
               fuser::FopenFlags::FOPEN_NOFLUSH,
             )
@@ -2259,7 +2297,7 @@ impl Filesystem for GfsFilesystem {
           reply.created_passthrough(
             &fs.config.ttl,
             &attr,
-            GENERATION,
+            generation(&record),
             FileHandle(handle),
             fuser::FopenFlags::FOPEN_NOFLUSH,
             &backing.id,
@@ -2268,7 +2306,7 @@ impl Filesystem for GfsFilesystem {
         _ => reply.created(
           &fs.config.ttl,
           &attr,
-          GENERATION,
+          generation(&record),
           FileHandle(handle),
           fuser::FopenFlags::FOPEN_NOFLUSH,
         ),
@@ -2527,8 +2565,11 @@ impl Filesystem for GfsFilesystem {
   ) {
     // Nothing is buffered above the host filesystem: a write reaches the content
     // file inside the callback that carried it, so there is nothing to flush.
-    // Durability is `fsync`'s job, below.
-    reply.ok();
+    // Durability is `fsync`'s job, below. `ENOSYS` rather than success: the
+    // kernel then records that this filesystem has no `flush` and never sends
+    // another, which `FOPEN_NOFLUSH` alone does not achieve once the writeback
+    // cache is on (ADR 0016) -- measured as 40 µs back on every `close`.
+    reply.error(Errno::ENOSYS);
   }
 
   fn fsync(
@@ -2910,7 +2951,7 @@ impl Filesystem for GfsFilesystem {
           OsStr::from_bytes(&name),
           &ttl,
           &attr,
-          GENERATION,
+          generation(&record),
         ) {
           // The kernel did not take this entry, so the reference taken above
           // must be released or it leaks a record per full directory read.
@@ -3184,7 +3225,7 @@ impl Filesystem for GfsFilesystem {
           .git_mutate_entry(&path, |real| std::fs::create_dir(real))
           .await
         {
-          Ok(record) => reply.entry(&fs.config.git_ttl, &fs.attr(&record), GENERATION),
+          Ok(record) => reply.entry(&fs.config.git_ttl, &fs.attr(&record), generation(&record)),
           Err(errno) => {
             fs.bump(|s| s.errors += 1);
             reply.error(errno)
@@ -3208,7 +3249,7 @@ impl Filesystem for GfsFilesystem {
             .insert_lookup(path, Node::Overlay(Box::new(entry)));
           fs.bump(|s| s.lookups += 1);
           fs.touch_parent(&parent).await;
-          reply.entry(&fs.config.ttl, &fs.attr(&record), GENERATION);
+          reply.entry(&fs.config.ttl, &fs.attr(&record), generation(&record));
         }
         Err(e) => {
           fs.bump(|s| s.errors += 1);
@@ -3246,7 +3287,7 @@ impl Filesystem for GfsFilesystem {
           .git_mutate_entry(&path, move |real| std::os::unix::fs::symlink(&target, real))
           .await
         {
-          Ok(record) => reply.entry(&fs.config.git_ttl, &fs.attr(&record), GENERATION),
+          Ok(record) => reply.entry(&fs.config.git_ttl, &fs.attr(&record), generation(&record)),
           Err(errno) => {
             fs.bump(|s| s.errors += 1);
             reply.error(errno)
@@ -3274,7 +3315,7 @@ impl Filesystem for GfsFilesystem {
             .insert_lookup(path, Node::Overlay(Box::new(entry)));
           fs.bump(|s| s.lookups += 1);
           fs.touch_parent(&parent).await;
-          reply.entry(&fs.config.ttl, &fs.attr(&record), GENERATION);
+          reply.entry(&fs.config.ttl, &fs.attr(&record), generation(&record));
         }
         Err(e) => {
           fs.bump(|s| s.errors += 1);
@@ -3369,7 +3410,7 @@ impl Filesystem for GfsFilesystem {
         })
         .await
       {
-        Ok(record) => reply.entry(&fs.config.git_ttl, &fs.attr(&record), GENERATION),
+        Ok(record) => reply.entry(&fs.config.git_ttl, &fs.attr(&record), generation(&record)),
         Err(errno) => {
           fs.bump(|s| s.errors += 1);
           reply.error(errno)

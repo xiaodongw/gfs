@@ -491,6 +491,10 @@ pub struct MountRequest {
   /// clone's canonical path.
   #[serde(default)]
   pub local_clone: Option<PathBuf>,
+  /// Gather writes in the kernel's page cache (ADR 0016). Faster small
+  /// writes; a refused write is reported at `close` instead of `write(2)`.
+  #[serde(default)]
+  pub writeback_cache: bool,
 }
 
 /// What the CLI asks the `gfs-fuse` process, as opposed to one workspace.

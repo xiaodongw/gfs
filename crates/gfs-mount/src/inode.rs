@@ -33,7 +33,7 @@
 
 use std::collections::HashMap;
 
-use gfs_types::{BytePath, TreeEntryInfo};
+use gfs_types::{BytePath, EntryKind, TreeEntryInfo};
 
 use gfs_overlay::OverlayEntry;
 
@@ -74,6 +74,20 @@ impl Node {
   /// An overlay row carries its number in the journal, so it survives a daemon
   /// restart and a rename. Base entries have no opinion and take whatever the
   /// table's counter hands them.
+  /// A regular file, which is the one kind whose size the kernel owns under
+  /// writeback caching (see `Record::generation`).
+  pub fn is_regular_file(&self) -> bool {
+    match self {
+      Node::Base(entry) => matches!(entry.kind, EntryKind::Regular | EntryKind::Executable),
+      Node::Overlay(entry) => matches!(
+        entry.kind,
+        gfs_overlay::OverlayKind::Regular | gfs_overlay::OverlayKind::Executable
+      ),
+      Node::Git(meta) => meta.kind == fuser::FileType::RegularFile,
+      Node::Odb(node) => !node.is_dir(),
+    }
+  }
+
   pub fn preferred_ino(&self) -> Option<u64> {
     match self {
       Node::Overlay(entry) => Some(entry.ino),
@@ -87,6 +101,12 @@ pub struct Record {
   pub ino: u64,
   pub path: BytePath,
   pub node: Node,
+  /// The inode generation the kernel is told at lookup. Bumped when a regular
+  /// file's bytes change behind the kernel -- a re-pin -- because with the
+  /// writeback cache on, the kernel trusts its own size and mtime for a
+  /// regular file over anything `getattr` says, and only a new generation
+  /// makes it drop the inode and start over.
+  pub generation: u64,
   /// The kernel's outstanding lookup count. Decremented by `forget`.
   lookups: u64,
   /// Open file and directory handles. An inode is not dropped while any exist,
@@ -127,6 +147,7 @@ impl InodeTable {
         ino: ROOT_INO,
         path: BytePath::root(),
         node: Node::Base(root),
+        generation: 0,
         // The root is never forgotten by the kernel, and a `forget` for it would
         // otherwise be able to drop the record every other operation depends on.
         lookups: 1,
@@ -246,6 +267,7 @@ impl InodeTable {
       ino,
       path,
       node: node.clone(),
+      generation: 0,
       lookups: 0,
       opens: 0,
     });
@@ -337,6 +359,17 @@ impl InodeTable {
       .filter(|record| record.ino != ROOT_INO)
       .map(|record| (record.ino, record.path.clone()))
       .collect();
+    // Every regular file the kernel may hold comes back as a new inode: the
+    // pin has changed what its bytes are, and under writeback caching the
+    // kernel would otherwise keep the old size. Directories keep theirs, so
+    // a shell's working directory survives the switch.
+    for (ino, _) in &paths {
+      if let Some(record) = self.records.get_mut(ino) {
+        if record.node.is_regular_file() {
+          record.generation += 1;
+        }
+      }
+    }
     paths
       .into_iter()
       .filter_map(|(ino, path)| {
@@ -359,6 +392,29 @@ impl InodeTable {
         })
       })
       .collect()
+  }
+
+  /// A regular file the daemon rewrote behind the kernel outside a re-pin:
+  /// bump its generation and name the dentry to drop, if the kernel has it.
+  pub fn rewritten_behind_kernel(&mut self, path: &BytePath) -> Option<StaleEntry> {
+    let ino = *self.by_path.get(path.as_bytes())?;
+    let record = self.records.get_mut(&ino)?;
+    if !record.node.is_regular_file() {
+      return None;
+    }
+    record.generation += 1;
+    let bytes = path.as_bytes();
+    let slash = bytes.iter().rposition(|b| *b == b'/');
+    let (parent, name) = match slash {
+      Some(slash) => (&bytes[..slash], &bytes[slash + 1..]),
+      None => (&bytes[..0], bytes),
+    };
+    let parent = *self.by_path.get(parent)?;
+    Some(StaleEntry {
+      parent,
+      name: name.to_vec(),
+      ino,
+    })
   }
 
   /// Live records. Reported by `gfs inspect`, and the number that would grow

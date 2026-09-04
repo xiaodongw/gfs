@@ -556,7 +556,35 @@ impl Mount {
       },
       daemon_pid: std::process::id(),
     }
-    .store(&self.state_dir())
+    .store(&self.state_dir())?;
+    drop(current);
+    // `mount.json` is a regular file inside the passthrough `.git` tree, and
+    // this rewrote it behind the kernel; a kernel that has it cached must see
+    // a new inode, not the old size (writeback cache).
+    let path = gfs_types::BytePath::new(format!(
+      "{}/{}/mount.json",
+      crate::passthrough::GIT_DIR_NAME,
+      crate::passthrough::STATE_SUBDIR
+    ));
+    if let Some(stale) = self.fs.rewrote_behind_kernel(&path) {
+      let notifier = {
+        let session = self.session.lock().expect("fuse session");
+        session.as_ref().map(|s| s.notifier())
+      };
+      if let Some(notifier) = notifier {
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+          handle.spawn_blocking(move || {
+            use std::os::unix::ffi::OsStrExt;
+            let _ = notifier.inval_entry(
+              fuser::INodeNo(stale.parent),
+              std::ffi::OsStr::from_bytes(&stale.name),
+            );
+            let _ = notifier.inval_inode(fuser::INodeNo(stale.ino), 0, 0);
+          });
+        }
+      }
+    }
+    Ok(())
   }
 
   pub fn health(&self) -> LeaseHealth {

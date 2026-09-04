@@ -187,6 +187,12 @@ enum Command {
     /// How long to wait for the workspace to become usable.
     #[arg(long, default_value_t = 30)]
     timeout_seconds: u64,
+    /// Let the kernel gather writes and send them in large requests (ADR
+    /// 0016). Much faster for tools that write in small pieces; the price is
+    /// that a write the overlay refuses -- quota, a lost server -- is
+    /// reported when the file is closed, not when it is written.
+    #[arg(long)]
+    writeback_cache: bool,
   },
 
   /// Release the lease, unmount, and drop the workspace from its host.
@@ -845,6 +851,7 @@ fn do_mount(cli: &Cli, args: MountArgs) -> Result<()> {
     http_endpoint: Some(cli.http_endpoint.clone()),
     token: Some(cli.token.clone()),
     local_clone: args.local.clone(),
+    writeback_cache: args.writeback_cache,
   };
   let response = call_host(
     &socket,
@@ -883,6 +890,7 @@ struct MountArgs {
   overlay_quota: u64,
   foreground: bool,
   timeout_seconds: u64,
+  writeback_cache: bool,
 }
 
 fn print_report(report: &gfs_mount::control::MountReport) {
@@ -1281,12 +1289,14 @@ async fn main() -> Result<()> {
             overlay_quota: *overlay_quota,
             foreground: *foreground,
             timeout_seconds: *timeout_seconds,
+            writeback_cache: false,
           },
         )
       })?;
     }
 
     Command::Mount {
+      writeback_cache,
       repo,
       local,
       rev,
@@ -1315,6 +1325,7 @@ async fn main() -> Result<()> {
             overlay_quota: *overlay_quota,
             foreground: *foreground,
             timeout_seconds: *timeout_seconds,
+            writeback_cache: *writeback_cache,
           },
         )
       })?;

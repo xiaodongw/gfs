@@ -243,7 +243,10 @@ impl MountHost {
       local_clone: request.local_clone,
       revision_selector: request.revision_selector,
       cache_quota_bytes: request.cache_quota_bytes,
-      fs: self.config.fs.clone(),
+      fs: FsConfig {
+        writeback_cache: request.writeback_cache,
+        ..self.config.fs.clone()
+      },
       overlay: gfs_overlay::OverlayConfig {
         quota_bytes: request.overlay_quota_bytes,
         ..gfs_overlay::OverlayConfig::default()

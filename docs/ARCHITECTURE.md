@@ -179,6 +179,13 @@ every read, write and `mmap` on that descriptor itself. No `read` or `write`
 request reaches the daemon for such a file; what remains per file is `open`
 and `release`. Without the capability nothing changes.
 
+Writes can take the other kernel-side lever (ADR 0016, `--writeback-cache`, off by default because a refused write is then reported at `close`): the writeback cache
+gathers `write(2)` calls into pages and sends them in large requests at
+`close`, `fsync` or memory pressure. The kernel then owns the size and
+times of every regular file, so a re-pin — the one thing that changes a
+file's bytes without going through the kernel — hands out a new inode
+generation for every regular file the kernel may hold.
+
 ### The three client caches
 
 | cache | keyed by | scope | why that scope |
@@ -535,13 +542,14 @@ image installs on `PATH`.
 
 | for | read |
 | --- | --- |
-| why any of this is the way it is | [`adr/`](adr/) — fifteen decision records |
+| why any of this is the way it is | [`adr/`](adr/) — sixteen decision records |
 | the object authorization boundary | [ADR 0002](adr/0002-git-object-authorization-boundary.md) |
 | why the workspace carries a real ODB | [ADR 0009](adr/0009-raw-git-over-a-projected-object-store.md) |
 | why one folder, not two | [ADR 0011](adr/0011-single-mount-workspace.md) |
 | a workspace over a local clone, no server | [ADR 0013](adr/0013-local-mode.md), [`../benchmarks/local-mode.md`](../benchmarks/local-mode.md) |
 | why a round trip costs what it costs, and which ones are gone | [ADR 0014](adr/0014-answer-on-the-fuse-thread-and-let-the-kernel-keep-it.md) |
 | the kernel reading and writing files itself, and what that needs | [ADR 0015](adr/0015-kernel-passthrough.md), [`../benchmarks/fuse-levers.md`](../benchmarks/fuse-levers.md) |
+| gathered writes, and why a re-pin changes inode generations | [ADR 0016](adr/0016-writeback-cache.md) |
 | measured numbers, end to end | [`../benchmarks/agent-workflow.md`](../benchmarks/agent-workflow.md) |
 | the narrative version, with charts | [`overview.html`](overview.html) |
 | running it locally | [`../README.md`](../README.md), [`manual-test.md`](manual-test.md) |

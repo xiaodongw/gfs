@@ -732,3 +732,41 @@ async fn fsync_of_a_git_directory_syncs_the_real_directory_not_the_overlay() {
   })
   .await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_writeback_cache_gathers_small_writes_into_few_requests() {
+  // ADR 0016: with the flag on, 256 `write(2)` calls of 4 KiB reach the
+  // daemon as a handful of large requests, and the bytes are all there.
+  let backend = Backend::start("basic").await;
+  let mount = Mount::with_config(
+    &backend,
+    "main",
+    FsConfig {
+      writeback_cache: true,
+      ..FsConfig::default()
+    },
+  )
+  .await;
+  let path = mount.join("pieces.bin");
+  let (size, bytes) = on_fs(move || {
+    use std::io::Write;
+    let mut file = std::fs::File::create(&path).unwrap();
+    for i in 0..=255u8 {
+      file.write_all(&[i; 4096]).unwrap();
+    }
+    drop(file);
+    (
+      std::fs::metadata(&path).unwrap().len(),
+      std::fs::read(&path).unwrap(),
+    )
+  })
+  .await;
+  assert_eq!(size, 256 * 4096);
+  assert!(bytes
+    .chunks(4096)
+    .enumerate()
+    .all(|(i, c)| c.iter().all(|b| *b as usize == i)));
+  let stats = mount.fs.stats();
+  assert_eq!(stats.written_bytes, 256 * 4096, "{stats:?}");
+  assert!(stats.writes <= 64, "gathered, not one per call: {stats:?}");
+}
