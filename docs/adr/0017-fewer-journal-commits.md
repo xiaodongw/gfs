@@ -71,11 +71,13 @@ row had no such safety.
 
 ## Consequences
 
-- Per operation on a django local mount, without passthrough (wall time,
-  2 000 iterations): `create`+`close` 2 508 → 428 µs; `create`+4 KiB
-  `write`+`close` 2 354 → 598 µs; `mkdir` 448 → 353 µs; `unlink` 425 →
-  309 µs. Whole-suite numbers are in `benchmarks/fuse-levers.md` under the
-  "journal" columns.
+- Per operation on a django local mount, without passthrough, old and new
+  binary back to back (wall time, 2 000 iterations): `create`+`close`
+  2 350 → 416 µs; `create`+4 KiB `write`+`close` 2 624 → 668 µs; `mkdir`
+  456 → 321 µs; `unlink` 483 → 320 µs; `rename` 708 → 465 µs. Whole-suite numbers are in `benchmarks/fuse-levers.md` under the
+  "journal" columns: vscode `cp -r` of 10 225 files 29.4 → 8.9 s without
+  passthrough, and 26.1 → 6.4 s with passthrough and prewarm, where it
+  had been the one step not bounded by round trips.
 - A power loss after a create that was never fsynced can lose the file's
   bytes or the file itself. The open-time sweep reports a row whose content
   is missing rather than inventing an empty file; a short file is reported

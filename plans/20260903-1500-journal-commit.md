@@ -69,8 +69,8 @@ itself was 31 µs of that. Four changes, one commit, measured against
       `benchmarks/fuse-levers/` and merged: vscode `cp -r` 10 225 files
       29.4 → 8.9 s, `dd` 3.95 → 2.6 s, 4 KiB write 244 → 155 µs; reads and
       `git status` unchanged
-- [ ] passthrough + prewarm on this build: needs
-      `sudo setcap cap_sys_admin+ep target/release/gfs-fuse` again
+- [x] passthrough + prewarm on this build (setcap re-run): vscode `cp -r`
+      6.4 s, `dd` 0.87 s, 4 KiB write 51 µs, commit 3.6 s; the levers stack
 
 ## Where the rest of a create goes
 A create+close is still ~410 µs of daemon CPU for one 30 µs transaction

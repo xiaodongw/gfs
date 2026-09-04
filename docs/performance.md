@@ -171,29 +171,28 @@ shape of the answer. vscode is 17 926 files in a 2.8 GiB clone; django is
 | five vscode workspaces | 12.0 s, 1 490 MiB | 0.69 s, 12.8 MiB | — |
 
 **Using it** (vscode, from `fuse-levers.md`). "ADR 0014" is the build
-every lever was measured against; "best, pre-0017" is passthrough +
-prewarm on the ADR 0016 build; the two ADR 0017 columns are the current
-build without the capability. Passthrough on the current build is not yet
-measured (the rebuild dropped the capability):
+every lever was measured against; "best" is the current build with the
+capability set and `--prewarm`; "no cap" is the same build without the
+capability, which is what an unprivileged deployment gets:
 
-| step | native worktree | gfs, ADR 0014 | gfs, best, pre-0017 | gfs, ADR 0017 | gfs, ADR 0017 + prewarm | 0017+prewarm ÷ native |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| read 2 000 files, first time | 0.041 s | 0.746 s | 0.452 s | 0.758 s | 0.523 s | 13× |
-| read again | 0.040 s | 0.264 s | 0.273 s | 0.275 s | 0.275 s | 7× |
-| `rg` over the tree, first | 0.041 s | 0.654 s | 0.413 s | 0.693 s | 0.450 s | 11× |
-| `rg` again | 0.034 s | 0.158 s | 0.182 s | 0.162 s | 0.170 s | 5× |
-| 64 MiB in 4 KiB writes | 0.070 s | 3.950 s | 0.894 s | 2.585 s | 2.661 s | 38× |
-| `cp -r` 10 225 files in | 1.10 s | 29.4 s | 26.1 s | 8.86 s | 7.89 s | 7× |
-| read those files back | 0.20 s | 2.77 s | 1.80 s | 2.87 s | 3.05 s | 15× |
-| `git status` | 0.55 s | 0.73 s | 0.76 s | 0.78 s | 0.76 s | 1.4× |
-| `git add -A` + commit | 1.14 s | 4.92 s | 3.78 s | 4.90 s | 5.11 s | 4.5× |
-| `open`+`close`, one file | 2.7 µs | 63.5 µs | 65 µs | 64.3 µs | 64 µs | 24× |
-| one 4 KiB write | 3.0 µs | 244 µs | 52 µs | 155 µs | 163 µs | 54× |
+| step | native worktree | gfs, ADR 0014 | gfs, no cap (ADR 0017) | gfs, best (ADR 0017 + passthrough + prewarm) | best ÷ native |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| read 2 000 files, first time | 0.041 s | 0.746 s | 0.758 s | 0.491 s | 12× |
+| read again | 0.040 s | 0.264 s | 0.275 s | 0.280 s | 7× |
+| `rg` over the tree, first | 0.041 s | 0.654 s | 0.693 s | 0.404 s | 10× |
+| `rg` again | 0.034 s | 0.158 s | 0.162 s | 0.162 s | 5× |
+| 64 MiB in 4 KiB writes | 0.070 s | 3.950 s | 2.585 s | 0.871 s | 12× |
+| `cp -r` 10 225 files in | 1.10 s | 29.4 s | 8.86 s | 6.41 s | 5.8× |
+| read those files back | 0.20 s | 2.77 s | 2.87 s | 1.76 s | 9× |
+| `git status` | 0.55 s | 0.73 s | 0.78 s | 0.74 s | 1.4× |
+| `git add -A` + commit | 1.14 s | 4.92 s | 4.90 s | 3.62 s | 3.2× |
+| `open`+`close`, one file | 2.7 µs | 63.5 µs | 64.3 µs | 65 µs | 24× |
+| one 4 KiB write | 3.0 µs | 244 µs | 155 µs | 51 µs | 17× |
 
 The write path split: ADR 0017 removes the journal work behind every
-`create`, `release` and `write` (the `cp -r` row); passthrough removes the
-`write` request itself (the `dd` and 4 KiB rows). They are independent and
-should stack — the combined column is the one to run next.
+`create`, `release` and `write` (the `cp -r` row, 29.4 → 8.9 s on its
+own); passthrough removes the `write` request itself (the `dd` and 4 KiB
+rows). They stack: 6.4 s with both.
 
 **What each lever bought**, in isolation, on vscode:
 
