@@ -95,7 +95,8 @@ over the filesystem. The measured comparison with `git worktree add` and with
 the server mount is in [benchmarks/local-mode.md](benchmarks/local-mode.md).
 
 Three flags trade something for speed, measured in
-[benchmarks/fuse-levers.md](benchmarks/fuse-levers.md): `--prewarm` inflates
+[benchmarks/fuse-levers.md](benchmarks/fuse-levers.md) (how to repeat every
+measurement on another repository or machine: [docs/performance.md](docs/performance.md)): `--prewarm` inflates
 the tree into memory in the background so the first read is as fast as the
 second; `--writeback-cache` lets the kernel gather small writes (a refused
 write is then reported at `close`, not at `write`); and when `gfs-fuse`

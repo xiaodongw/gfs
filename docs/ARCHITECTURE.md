@@ -551,5 +551,6 @@ image installs on `PATH`.
 | the kernel reading and writing files itself, and what that needs | [ADR 0015](adr/0015-kernel-passthrough.md), [`../benchmarks/fuse-levers.md`](../benchmarks/fuse-levers.md) |
 | gathered writes, and why a re-pin changes inode generations | [ADR 0016](adr/0016-writeback-cache.md) |
 | measured numbers, end to end | [`../benchmarks/agent-workflow.md`](../benchmarks/agent-workflow.md) |
+| how to run every benchmark again, and the numbers today | [`performance.md`](performance.md) |
 | the narrative version, with charts | [`overview.html`](overview.html) |
 | running it locally | [`../README.md`](../README.md), [`manual-test.md`](manual-test.md) |
