@@ -78,3 +78,43 @@ and two round trips (~65 µs together). The remainder is our own code around
 the commit — resolve, blocking hop, republish, the row clone into the
 change list — and needs a CPU profile (`perf` is not installed here) rather
 than guesses.
+
+## Profile of the create path (2026-09-03, perf 7.0 on the WSL kernel)
+Recipe: build with `RUSTFLAGS="-C force-frame-pointers=yes"
+CARGO_PROFILE_RELEASE_DEBUG=1 CARGO_PROFILE_RELEASE_STRIP=none
+CARGO_TARGET_DIR=~/gfs-corpus/target-prof`, mount django locally from that
+binary, `perf record -F 4999 -g -p <daemon pid>` around a 20 000-iteration
+`open(O_CREAT)`+`close` loop, then `perf script -F comm,ip,sym,dso` folded
+by syscall and by owning frame (a flat report is useless here: the top
+symbol is 1.8 %). `/usr/bin/perf` from `linux-tools-generic` runs against
+the WSL kernel; `perf_event_paranoid=1` is enough for a process you own.
+
+Where a create+close's daemon cycles go (180 K samples, 542 µs/op under
+perf, 416 µs without):
+
+| bucket | share |
+| --- | ---: |
+| `Overlay::create_file` in total | 15 % |
+| — of which the `openat` of the content file (ext4 inode alloc) | 5 % |
+| — of which SQLite (`apply`, WAL `pwrite`) | 8 % |
+| tokio worker park/unpark, futex, `__schedule` | ~31 % |
+| fuser threads: kernel `fuse_dev_read` | 15 % |
+| fuser threads: parse, dispatch, `spawn`, `spawn_blocking` | ~13 % |
+| reply `writev` into `/dev/fuse` | ~5 % |
+| republish + inode table | 1.5 % |
+| `resolve_path`, `parent_touch`, `next_time`, `commit` bookkeeping | <0.5 % |
+
+So the daemon's own work is about 60 µs of the 416, and two thirds of the
+rest is thread hand-offs: each request goes fuser thread → `spawn` (wake
+a tokio worker) → `spawn_blocking` (wake a pool thread) → back to a worker
+→ reply, and every hop is a futex wake, a context switch and a park on a
+machine where the workers are otherwise idle. The remaining third is the
+kernel's `/dev/fuse` read and write cost, which is the round-trip floor
+ADR 0014 measured, attributed to the daemon's threads.
+
+What would move it: answer `create` and `release` for the overlay on the
+thread that has the request (the ADR 0014 pattern), or at least reply
+from the blocking thread instead of hopping back through a worker —
+each hop removed is on the order of 50–80 µs here. Not done: it changes
+the "nothing that waits on I/O on a FUSE thread" rule, since the WAL write
+can block on ext4, and wants its own decision.
