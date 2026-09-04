@@ -129,4 +129,6 @@ can block on ext4, and wants its own decision.
 - 16 FUSE threads: no gain on any serial row; first `rg` over vscode
   0.69 → 1.65 s in every mode (contention among parallel cold inflates).
 Decision: `mutations-inline` is the default with four threads (ADR 0003,
-amendment of 2026-09-03); `pool` and `all-inline` stay as knobs.
+amendment of 2026-09-03); `pool` and `all-inline` stay as knobs. With
+passthrough + prewarm on that default: vscode `cp -r` 5.8 s (6.4 before),
+`dd` 0.87 s, commit 3.9 s; the read side unchanged.

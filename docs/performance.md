@@ -171,23 +171,24 @@ shape of the answer. vscode is 17 926 files in a 2.8 GiB clone; django is
 | five vscode workspaces | 12.0 s, 1 490 MiB | 0.69 s, 12.8 MiB | — |
 
 **Using it** (vscode, from `fuse-levers.md`). "ADR 0014" is the build
-every lever was measured against; "best" is the current build with the
-capability set and `--prewarm`; "no cap" is the same build without the
-capability, which is what an unprivileged deployment gets:
+every lever was measured against; "best" is the current build (ADR 0017,
+mutations on the FUSE thread) with the capability set and `--prewarm`;
+"no cap" is the same build without the capability, which is what an
+unprivileged deployment gets:
 
-| step | native worktree | gfs, ADR 0014 | gfs, no cap (ADR 0017) | gfs, best (ADR 0017 + passthrough + prewarm) | best ÷ native |
+| step | native worktree | gfs, ADR 0014 | gfs, no cap | gfs, best | best ÷ native |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| read 2 000 files, first time | 0.041 s | 0.746 s | 0.758 s | 0.491 s | 12× |
-| read again | 0.040 s | 0.264 s | 0.275 s | 0.280 s | 7× |
-| `rg` over the tree, first | 0.041 s | 0.654 s | 0.693 s | 0.404 s | 10× |
-| `rg` again | 0.034 s | 0.158 s | 0.162 s | 0.162 s | 5× |
-| 64 MiB in 4 KiB writes | 0.070 s | 3.950 s | 2.585 s | 0.871 s | 12× |
-| `cp -r` 10 225 files in | 1.10 s | 29.4 s | 8.86 s | 6.41 s | 5.8× |
-| read those files back | 0.20 s | 2.77 s | 2.87 s | 1.76 s | 9× |
-| `git status` | 0.55 s | 0.73 s | 0.78 s | 0.74 s | 1.4× |
-| `git add -A` + commit | 1.14 s | 4.92 s | 4.90 s | 3.62 s | 3.2× |
-| `open`+`close`, one file | 2.7 µs | 63.5 µs | 64.3 µs | 65 µs | 24× |
-| one 4 KiB write | 3.0 µs | 244 µs | 155 µs | 51 µs | 17× |
+| read 2 000 files, first time | 0.041 s | 0.746 s | 0.865 s | 0.460 s | 11× |
+| read again | 0.040 s | 0.264 s | 0.280 s | 0.278 s | 7× |
+| `rg` over the tree, first | 0.041 s | 0.654 s | 0.691 s | 0.392 s | 10× |
+| `rg` again | 0.034 s | 0.158 s | 0.163 s | 0.163 s | 5× |
+| 64 MiB in 4 KiB writes | 0.070 s | 3.950 s | 1.912 s | 0.874 s | 12× |
+| `cp -r` 10 225 files in | 1.10 s | 29.4 s | 6.19 s | 5.79 s | 5.3× |
+| read those files back | 0.20 s | 2.77 s | 2.99 s | 1.82 s | 9× |
+| `git status` | 0.55 s | 0.73 s | 0.78 s | 0.84 s | 1.5× |
+| `git add -A` + commit | 1.14 s | 4.92 s | 4.89 s | 3.85 s | 3.4× |
+| `open`+`close`, one file | 2.7 µs | 63.5 µs | 64 µs | 67 µs | 25× |
+| one 4 KiB write | 3.0 µs | 244 µs | 107 µs | 56 µs | 19× |
 
 The write path split: ADR 0017 removes the journal work behind every
 `create`, `release` and `write` (the `cp -r` row, 29.4 → 8.9 s on its

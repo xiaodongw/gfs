@@ -60,61 +60,64 @@ The columns, in the order the commits landed:
   build: does answering overlay mutations on the FUSE thread instead of
   hopping through the runtime and the blocking pool pay, and does the
   fully blocking model with sixteen FUSE threads pay more.
+- **passthrough + prewarm + inline mutations** — the capability set and
+  `--prewarm` on the build where mutations on the FUSE thread are the
+  default: the best configuration today.
 
 <!-- merged tables begin -->
 ### vscode
 
 mount flags: native worktree   read-through: 2000 files under src/   largest blob: src/vs/base/test/node/uri.perf.data.txt (8874330 bytes)   copy: 10225 files
 
-| step | native worktree | baseline | passthrough code, no cap | passthrough, 4 096-entry cache | passthrough | + writeback cache | + prewarm | passthrough + prewarm | journal (ADR 0017) | journal + prewarm | passthrough + prewarm + journal | passthrough + journal | pool, 16 threads | mutations inline, 16 threads | all inline, 16 threads | mutations inline, 4 threads |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| mount | 2.488 s | 0.270 s | 0.226 s | 0.185 s | 0.194 s | 0.161 s | 0.170 s | 0.196 s | 0.292 s | 0.179 s | 0.166 s | 0.160 s | 0.294 s | 0.178 s | 0.174 s | 0.221 s |
-| prewarm (waited) | – | – | – | – | – | – | 0.373 s | 0.450 s | – | 0.442 s | 0.452 s | – | – | – | – | – |
-| read 2000 files, cold | 0.041 s | 0.746 s | 0.740 s | 0.671 s | 0.679 s | 0.733 s | 0.493 s | 0.452 s | 0.758 s | 0.523 s | 0.491 s | 0.652 s | 0.851 s | 0.777 s | 0.767 s | 0.865 s |
-| read again, warm | 0.040 s | 0.264 s | 0.265 s | 0.273 s | 0.274 s | 0.264 s | 0.263 s | 0.273 s | 0.275 s | 0.280 s | 0.280 s | 0.267 s | 0.276 s | 0.286 s | 0.278 s | 0.284 s |
-| `rg -F TODO`, first (1683 lines) | 0.041 s | 0.654 s | 0.634 s | 0.712 s | 0.617 s | 0.630 s | 0.399 s | 0.413 s | 0.693 s | 0.450 s | 0.404 s | 0.602 s | 1.672 s | 1.645 s | 1.634 s | 0.691 s |
-| `rg -F TODO`, second | 0.034 s | 0.158 s | 0.164 s | 0.658 s | 0.180 s | 0.174 s | 0.160 s | 0.182 s | 0.162 s | 0.177 s | 0.162 s | 0.161 s | 0.750 s | 0.745 s | 0.745 s | 0.173 s |
-| read largest blob, cold | 0.006 s | 0.006 s | 0.006 s | 0.044 s | 0.006 s | 0.006 s | 0.006 s | 0.007 s | 0.008 s | 0.008 s | 0.007 s | 0.006 s | 0.013 s | 0.006 s | 0.006 s | 0.007 s |
-| read largest blob, warm | 0.007 s | 0.005 s | 0.006 s | 0.006 s | 0.006 s | 0.006 s | 0.005 s | 0.006 s | 0.006 s | 0.007 s | 0.006 s | 0.005 s | 0.008 s | 0.005 s | 0.005 s | 0.007 s |
-| write 64 MiB, 4 KiB `dd` | 0.070 s | 3.950 s | 4.260 s | 0.893 s | 0.862 s | 0.854 s | 4.042 s | 0.894 s | 2.585 s | 2.661 s | 0.871 s | 0.837 s | 2.953 s | 1.817 s | 1.840 s | 1.912 s |
-| `cp -r` 10225 files in | 1.100 s | 29.383 s | 27.599 s | 25.813 s | 26.288 s | 28.899 s | 26.861 s | 26.060 s | 8.861 s | 7.886 s | 6.411 s | 6.213 s | 8.507 s | 6.020 s | 5.881 s | 6.190 s |
-| read the 64 MiB back | 0.009 s | 0.048 s | 0.075 s | 0.008 s | 0.009 s | 0.060 s | 0.057 s | 0.008 s | 0.062 s | 0.066 s | 0.010 s | 0.009 s | 0.058 s | 0.067 s | 0.058 s | 0.096 s |
-| read the copied files back | 0.202 s | 2.772 s | 2.799 s | 1.758 s | 1.796 s | 2.813 s | 2.812 s | 1.796 s | 2.865 s | 3.046 s | 1.761 s | 1.747 s | 2.926 s | 2.890 s | 3.139 s | 2.993 s |
-| `git status` after the writes | 0.549 s | 0.728 s | 0.717 s | 0.741 s | 0.789 s | 0.715 s | 0.727 s | 0.762 s | 0.782 s | 0.763 s | 0.744 s | 0.743 s | 0.796 s | 0.804 s | 1.089 s | 0.779 s |
-| `git add -A` + commit | 1.140 s | 4.919 s | 5.010 s | 3.864 s | 3.937 s | 4.923 s | 4.991 s | 3.782 s | 4.896 s | 5.113 s | 3.621 s | 3.630 s | 5.060 s | 5.228 s | 5.545 s | 4.891 s |
-| open+close, base blob | 2.7 µs | 63.5 µs | 63.7 µs | 64.5 µs | 64.9 µs | 63.3 µs | 62.9 µs | 65.3 µs | 64.3 µs | 65.0 µs | 64.8 µs | 65.1 µs | 65.8 µs | 69.0 µs | 69.6 µs | 64.1 µs |
-| open+read+close, base blob | 3.6 µs | 65.9 µs | 65.2 µs | 70.8 µs | 67.7 µs | 65.4 µs | 65.8 µs | 68.3 µs | 66.0 µs | 67.5 µs | 67.1 µs | 67.2 µs | 67.3 µs | 72.4 µs | 68.2 µs | 65.9 µs |
-| stat, cached | 1.8 µs | 1.8 µs | 1.9 µs | 1.9 µs | 1.9 µs | 1.9 µs | 1.9 µs | 2.0 µs | 1.9 µs | 1.8 µs | 1.9 µs | 1.9 µs | 1.9 µs | 1.9 µs | 1.9 µs | 1.9 µs |
-| write 4 KiB, overlay file | 3.0 µs | 244.1 µs | 249.1 µs | 50.9 µs | 52.2 µs | 52.3 µs | 249.1 µs | 51.6 µs | 154.8 µs | 163.0 µs | 50.6 µs | 52.4 µs | 161.4 µs | 116.9 µs | 119.0 µs | 107.2 µs |
-| open+close, overlay file | 2.7 µs | 72.1 µs | 72.6 µs | 81.6 µs | 82.3 µs | 73.4 µs | 73.2 µs | 79.7 µs | 74.5 µs | 77.5 µs | 79.3 µs | 87.7 µs | 76.0 µs | 77.9 µs | 75.9 µs | 74.8 µs |
-| open+read+close, overlay file | 5.0 µs | 216.2 µs | 219.7 µs | 84.6 µs | 87.3 µs | 221.9 µs | 220.8 µs | 86.1 µs | 220.9 µs | 236.4 µs | 87.0 µs | 88.7 µs | 230.0 µs | 242.2 µs | 245.1 µs | 225.8 µs |
+| step | native worktree | baseline | passthrough code, no cap | passthrough, 4 096-entry cache | passthrough | + writeback cache | + prewarm | passthrough + prewarm | journal (ADR 0017) | journal + prewarm | passthrough + prewarm + journal | passthrough + journal | pool, 16 threads | mutations inline, 16 threads | all inline, 16 threads | mutations inline, 4 threads | passthrough + prewarm + inline mutations |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| mount | 2.488 s | 0.270 s | 0.226 s | 0.185 s | 0.194 s | 0.161 s | 0.170 s | 0.196 s | 0.292 s | 0.179 s | 0.166 s | 0.160 s | 0.294 s | 0.178 s | 0.174 s | 0.221 s | 0.205 s |
+| prewarm (waited) | – | – | – | – | – | – | 0.373 s | 0.450 s | – | 0.442 s | 0.452 s | – | – | – | – | – | 0.449 s |
+| read 2000 files, cold | 0.041 s | 0.746 s | 0.740 s | 0.671 s | 0.679 s | 0.733 s | 0.493 s | 0.452 s | 0.758 s | 0.523 s | 0.491 s | 0.652 s | 0.851 s | 0.777 s | 0.767 s | 0.865 s | 0.460 s |
+| read again, warm | 0.040 s | 0.264 s | 0.265 s | 0.273 s | 0.274 s | 0.264 s | 0.263 s | 0.273 s | 0.275 s | 0.280 s | 0.280 s | 0.267 s | 0.276 s | 0.286 s | 0.278 s | 0.284 s | 0.279 s |
+| `rg -F TODO`, first (1683 lines) | 0.041 s | 0.654 s | 0.634 s | 0.712 s | 0.617 s | 0.630 s | 0.399 s | 0.413 s | 0.693 s | 0.450 s | 0.404 s | 0.602 s | 1.672 s | 1.645 s | 1.634 s | 0.691 s | 0.392 s |
+| `rg -F TODO`, second | 0.034 s | 0.158 s | 0.164 s | 0.658 s | 0.180 s | 0.174 s | 0.160 s | 0.182 s | 0.162 s | 0.177 s | 0.162 s | 0.161 s | 0.750 s | 0.745 s | 0.745 s | 0.173 s | 0.163 s |
+| read largest blob, cold | 0.006 s | 0.006 s | 0.006 s | 0.044 s | 0.006 s | 0.006 s | 0.006 s | 0.007 s | 0.008 s | 0.008 s | 0.007 s | 0.006 s | 0.013 s | 0.006 s | 0.006 s | 0.007 s | 0.006 s |
+| read largest blob, warm | 0.007 s | 0.005 s | 0.006 s | 0.006 s | 0.006 s | 0.006 s | 0.005 s | 0.006 s | 0.006 s | 0.007 s | 0.006 s | 0.005 s | 0.008 s | 0.005 s | 0.005 s | 0.007 s | 0.006 s |
+| write 64 MiB, 4 KiB `dd` | 0.070 s | 3.950 s | 4.260 s | 0.893 s | 0.862 s | 0.854 s | 4.042 s | 0.894 s | 2.585 s | 2.661 s | 0.871 s | 0.837 s | 2.953 s | 1.817 s | 1.840 s | 1.912 s | 0.874 s |
+| `cp -r` 10225 files in | 1.100 s | 29.383 s | 27.599 s | 25.813 s | 26.288 s | 28.899 s | 26.861 s | 26.060 s | 8.861 s | 7.886 s | 6.411 s | 6.213 s | 8.507 s | 6.020 s | 5.881 s | 6.190 s | 5.789 s |
+| read the 64 MiB back | 0.009 s | 0.048 s | 0.075 s | 0.008 s | 0.009 s | 0.060 s | 0.057 s | 0.008 s | 0.062 s | 0.066 s | 0.010 s | 0.009 s | 0.058 s | 0.067 s | 0.058 s | 0.096 s | 0.010 s |
+| read the copied files back | 0.202 s | 2.772 s | 2.799 s | 1.758 s | 1.796 s | 2.813 s | 2.812 s | 1.796 s | 2.865 s | 3.046 s | 1.761 s | 1.747 s | 2.926 s | 2.890 s | 3.139 s | 2.993 s | 1.821 s |
+| `git status` after the writes | 0.549 s | 0.728 s | 0.717 s | 0.741 s | 0.789 s | 0.715 s | 0.727 s | 0.762 s | 0.782 s | 0.763 s | 0.744 s | 0.743 s | 0.796 s | 0.804 s | 1.089 s | 0.779 s | 0.839 s |
+| `git add -A` + commit | 1.140 s | 4.919 s | 5.010 s | 3.864 s | 3.937 s | 4.923 s | 4.991 s | 3.782 s | 4.896 s | 5.113 s | 3.621 s | 3.630 s | 5.060 s | 5.228 s | 5.545 s | 4.891 s | 3.854 s |
+| open+close, base blob | 2.7 µs | 63.5 µs | 63.7 µs | 64.5 µs | 64.9 µs | 63.3 µs | 62.9 µs | 65.3 µs | 64.3 µs | 65.0 µs | 64.8 µs | 65.1 µs | 65.8 µs | 69.0 µs | 69.6 µs | 64.1 µs | 66.5 µs |
+| open+read+close, base blob | 3.6 µs | 65.9 µs | 65.2 µs | 70.8 µs | 67.7 µs | 65.4 µs | 65.8 µs | 68.3 µs | 66.0 µs | 67.5 µs | 67.1 µs | 67.2 µs | 67.3 µs | 72.4 µs | 68.2 µs | 65.9 µs | 69.5 µs |
+| stat, cached | 1.8 µs | 1.8 µs | 1.9 µs | 1.9 µs | 1.9 µs | 1.9 µs | 1.9 µs | 2.0 µs | 1.9 µs | 1.8 µs | 1.9 µs | 1.9 µs | 1.9 µs | 1.9 µs | 1.9 µs | 1.9 µs | 1.9 µs |
+| write 4 KiB, overlay file | 3.0 µs | 244.1 µs | 249.1 µs | 50.9 µs | 52.2 µs | 52.3 µs | 249.1 µs | 51.6 µs | 154.8 µs | 163.0 µs | 50.6 µs | 52.4 µs | 161.4 µs | 116.9 µs | 119.0 µs | 107.2 µs | 55.8 µs |
+| open+close, overlay file | 2.7 µs | 72.1 µs | 72.6 µs | 81.6 µs | 82.3 µs | 73.4 µs | 73.2 µs | 79.7 µs | 74.5 µs | 77.5 µs | 79.3 µs | 87.7 µs | 76.0 µs | 77.9 µs | 75.9 µs | 74.8 µs | 83.0 µs |
+| open+read+close, overlay file | 5.0 µs | 216.2 µs | 219.7 µs | 84.6 µs | 87.3 µs | 221.9 µs | 220.8 µs | 86.1 µs | 220.9 µs | 236.4 µs | 87.0 µs | 88.7 µs | 230.0 µs | 242.2 µs | 245.1 µs | 225.8 µs | 88.9 µs |
 
 ### django
 
 mount flags: native worktree   read-through: 2000 files under django/   largest blob: tests/gis_tests/data/rasters/raster.numpy.txt (709050 bytes)   copy: 3688 files
 
-| step | native worktree | baseline | passthrough code, no cap | passthrough, 4 096-entry cache | passthrough | + writeback cache | + prewarm | passthrough + prewarm | journal (ADR 0017) | journal + prewarm | passthrough + prewarm + journal | passthrough + journal | pool, 16 threads | mutations inline, 16 threads | all inline, 16 threads | mutations inline, 4 threads |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| mount | 1.300 s | 0.087 s | 0.091 s | 0.090 s | 0.095 s | 0.091 s | 0.084 s | 0.089 s | 0.094 s | 0.099 s | 0.085 s | 0.088 s | 0.111 s | 0.087 s | 0.102 s | 0.091 s |
-| prewarm (waited) | – | – | – | – | – | – | 0.129 s | 0.132 s | – | 0.135 s | 0.132 s | – | – | – | – | – |
-| read 2000 files, cold | 0.041 s | 0.695 s | 0.726 s | 0.638 s | 0.651 s | 0.709 s | 0.470 s | 0.432 s | 0.748 s | 0.509 s | 0.424 s | 0.640 s | 0.825 s | 0.741 s | 0.761 s | 0.721 s |
-| read again, warm | 0.040 s | 0.255 s | 0.269 s | 0.270 s | 0.272 s | 0.271 s | 0.259 s | 0.269 s | 0.264 s | 0.274 s | 0.267 s | 0.268 s | 0.271 s | 0.274 s | 0.272 s | 0.268 s |
-| `rg -F TODO`, first (35 lines) | 0.021 s | 0.218 s | 0.221 s | 0.248 s | 0.223 s | 0.228 s | 0.169 s | 0.168 s | 0.256 s | 0.192 s | 0.164 s | 0.209 s | 0.685 s | 0.694 s | 0.693 s | 0.224 s |
-| `rg -F TODO`, second | 0.018 s | 0.082 s | 0.083 s | 0.219 s | 0.090 s | 0.082 s | 0.082 s | 0.086 s | 0.086 s | 0.091 s | 0.084 s | 0.084 s | 0.373 s | 0.379 s | 0.375 s | 0.084 s |
-| read largest blob, cold | 0.006 s | 0.005 s | 0.005 s | 0.009 s | 0.006 s | 0.005 s | 0.005 s | 0.006 s | 0.006 s | 0.006 s | 0.006 s | 0.005 s | 0.005 s | 0.005 s | 0.007 s | 0.005 s |
-| read largest blob, warm | 0.005 s | 0.005 s | 0.005 s | 0.006 s | 0.006 s | 0.005 s | 0.005 s | 0.007 s | 0.006 s | 0.006 s | 0.005 s | 0.005 s | 0.005 s | 0.005 s | 0.006 s | 0.005 s |
-| write 64 MiB, 4 KiB `dd` | 0.072 s | 3.943 s | 3.970 s | 0.848 s | 0.861 s | 0.839 s | 4.029 s | 0.854 s | 2.522 s | 2.617 s | 0.839 s | 0.843 s | 2.565 s | 1.819 s | 1.927 s | 1.785 s |
-| `cp -r` 3688 files in | 0.788 s | 11.345 s | 10.345 s | 9.964 s | 10.095 s | 10.982 s | 10.238 s | 10.070 s | 3.390 s | 3.277 s | 2.723 s | 2.747 s | 3.330 s | 2.511 s | 2.477 s | 2.379 s |
-| read the 64 MiB back | 0.010 s | 0.049 s | 0.054 s | 0.009 s | 0.011 s | 0.053 s | 0.059 s | 0.009 s | 0.059 s | 0.068 s | 0.009 s | 0.009 s | 0.062 s | 0.056 s | 0.057 s | 0.056 s |
-| read the copied files back | 0.097 s | 1.335 s | 1.345 s | 1.008 s | 1.032 s | 1.356 s | 1.351 s | 1.012 s | 1.378 s | 1.412 s | 1.003 s | 1.021 s | 1.407 s | 1.441 s | 1.372 s | 1.374 s |
-| `git status` after the writes | 0.118 s | 0.448 s | 0.458 s | 0.469 s | 0.474 s | 0.451 s | 0.455 s | 0.470 s | 0.467 s | 0.486 s | 0.457 s | 0.480 s | 0.513 s | 0.533 s | 0.508 s | 0.464 s |
-| `git add -A` + commit | 1.063 s | 8.976 s | 9.002 s | 8.716 s | 8.813 s | 10.305 s | 9.029 s | 1.959 s | 2.557 s | 2.493 s | 1.941 s | 2.140 s | 2.445 s | 2.455 s | 2.375 s | 2.359 s |
-| open+close, base blob | 2.7 µs | 62.9 µs | 64.1 µs | 66.8 µs | 65.9 µs | 64.4 µs | 63.0 µs | 65.3 µs | 64.9 µs | 68.5 µs | 65.6 µs | 67.2 µs | 65.1 µs | 65.1 µs | 64.1 µs | 64.7 µs |
-| open+read+close, base blob | 3.5 µs | 66.3 µs | 65.6 µs | 68.6 µs | 70.8 µs | 66.3 µs | 64.8 µs | 67.5 µs | 66.5 µs | 67.3 µs | 67.8 µs | 70.0 µs | 66.1 µs | 66.7 µs | 65.6 µs | 67.1 µs |
-| stat, cached | 1.8 µs | 2.0 µs | 1.9 µs | 1.9 µs | 1.9 µs | 1.9 µs | 1.9 µs | 1.9 µs | 1.9 µs | 1.9 µs | 1.9 µs | 1.9 µs | 1.9 µs | 1.9 µs | 1.9 µs | 1.8 µs |
-| write 4 KiB, overlay file | 2.9 µs | 243.9 µs | 244.4 µs | 51.8 µs | 58.6 µs | 51.9 µs | 250.6 µs | 51.3 µs | 154.5 µs | 160.4 µs | 51.5 µs | 52.9 µs | 157.8 µs | 115.4 µs | 108.4 µs | 105.5 µs |
-| open+close, overlay file | 2.7 µs | 72.7 µs | 73.1 µs | 78.9 µs | 86.0 µs | 73.0 µs | 73.6 µs | 81.9 µs | 76.4 µs | 77.0 µs | 79.3 µs | 82.8 µs | 73.8 µs | 75.2 µs | 73.6 µs | 73.3 µs |
-| open+read+close, overlay file | 5.1 µs | 218.4 µs | 219.9 µs | 85.7 µs | 87.5 µs | 223.5 µs | 220.9 µs | 88.2 µs | 244.6 µs | 238.9 µs | 84.4 µs | 87.2 µs | 240.5 µs | 241.4 µs | 223.8 µs | 229.2 µs |
+| step | native worktree | baseline | passthrough code, no cap | passthrough, 4 096-entry cache | passthrough | + writeback cache | + prewarm | passthrough + prewarm | journal (ADR 0017) | journal + prewarm | passthrough + prewarm + journal | passthrough + journal | pool, 16 threads | mutations inline, 16 threads | all inline, 16 threads | mutations inline, 4 threads | passthrough + prewarm + inline mutations |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| mount | 1.300 s | 0.087 s | 0.091 s | 0.090 s | 0.095 s | 0.091 s | 0.084 s | 0.089 s | 0.094 s | 0.099 s | 0.085 s | 0.088 s | 0.111 s | 0.087 s | 0.102 s | 0.091 s | 0.093 s |
+| prewarm (waited) | – | – | – | – | – | – | 0.129 s | 0.132 s | – | 0.135 s | 0.132 s | – | – | – | – | – | 0.136 s |
+| read 2000 files, cold | 0.041 s | 0.695 s | 0.726 s | 0.638 s | 0.651 s | 0.709 s | 0.470 s | 0.432 s | 0.748 s | 0.509 s | 0.424 s | 0.640 s | 0.825 s | 0.741 s | 0.761 s | 0.721 s | 0.445 s |
+| read again, warm | 0.040 s | 0.255 s | 0.269 s | 0.270 s | 0.272 s | 0.271 s | 0.259 s | 0.269 s | 0.264 s | 0.274 s | 0.267 s | 0.268 s | 0.271 s | 0.274 s | 0.272 s | 0.268 s | 0.281 s |
+| `rg -F TODO`, first (35 lines) | 0.021 s | 0.218 s | 0.221 s | 0.248 s | 0.223 s | 0.228 s | 0.169 s | 0.168 s | 0.256 s | 0.192 s | 0.164 s | 0.209 s | 0.685 s | 0.694 s | 0.693 s | 0.224 s | 0.178 s |
+| `rg -F TODO`, second | 0.018 s | 0.082 s | 0.083 s | 0.219 s | 0.090 s | 0.082 s | 0.082 s | 0.086 s | 0.086 s | 0.091 s | 0.084 s | 0.084 s | 0.373 s | 0.379 s | 0.375 s | 0.084 s | 0.091 s |
+| read largest blob, cold | 0.006 s | 0.005 s | 0.005 s | 0.009 s | 0.006 s | 0.005 s | 0.005 s | 0.006 s | 0.006 s | 0.006 s | 0.006 s | 0.005 s | 0.005 s | 0.005 s | 0.007 s | 0.005 s | 0.006 s |
+| read largest blob, warm | 0.005 s | 0.005 s | 0.005 s | 0.006 s | 0.006 s | 0.005 s | 0.005 s | 0.007 s | 0.006 s | 0.006 s | 0.005 s | 0.005 s | 0.005 s | 0.005 s | 0.006 s | 0.005 s | 0.007 s |
+| write 64 MiB, 4 KiB `dd` | 0.072 s | 3.943 s | 3.970 s | 0.848 s | 0.861 s | 0.839 s | 4.029 s | 0.854 s | 2.522 s | 2.617 s | 0.839 s | 0.843 s | 2.565 s | 1.819 s | 1.927 s | 1.785 s | 0.906 s |
+| `cp -r` 3688 files in | 0.788 s | 11.345 s | 10.345 s | 9.964 s | 10.095 s | 10.982 s | 10.238 s | 10.070 s | 3.390 s | 3.277 s | 2.723 s | 2.747 s | 3.330 s | 2.511 s | 2.477 s | 2.379 s | 2.364 s |
+| read the 64 MiB back | 0.010 s | 0.049 s | 0.054 s | 0.009 s | 0.011 s | 0.053 s | 0.059 s | 0.009 s | 0.059 s | 0.068 s | 0.009 s | 0.009 s | 0.062 s | 0.056 s | 0.057 s | 0.056 s | 0.012 s |
+| read the copied files back | 0.097 s | 1.335 s | 1.345 s | 1.008 s | 1.032 s | 1.356 s | 1.351 s | 1.012 s | 1.378 s | 1.412 s | 1.003 s | 1.021 s | 1.407 s | 1.441 s | 1.372 s | 1.374 s | 1.045 s |
+| `git status` after the writes | 0.118 s | 0.448 s | 0.458 s | 0.469 s | 0.474 s | 0.451 s | 0.455 s | 0.470 s | 0.467 s | 0.486 s | 0.457 s | 0.480 s | 0.513 s | 0.533 s | 0.508 s | 0.464 s | 0.484 s |
+| `git add -A` + commit | 1.063 s | 8.976 s | 9.002 s | 8.716 s | 8.813 s | 10.305 s | 9.029 s | 1.959 s | 2.557 s | 2.493 s | 1.941 s | 2.140 s | 2.445 s | 2.455 s | 2.375 s | 2.359 s | 2.031 s |
+| open+close, base blob | 2.7 µs | 62.9 µs | 64.1 µs | 66.8 µs | 65.9 µs | 64.4 µs | 63.0 µs | 65.3 µs | 64.9 µs | 68.5 µs | 65.6 µs | 67.2 µs | 65.1 µs | 65.1 µs | 64.1 µs | 64.7 µs | 66.0 µs |
+| open+read+close, base blob | 3.5 µs | 66.3 µs | 65.6 µs | 68.6 µs | 70.8 µs | 66.3 µs | 64.8 µs | 67.5 µs | 66.5 µs | 67.3 µs | 67.8 µs | 70.0 µs | 66.1 µs | 66.7 µs | 65.6 µs | 67.1 µs | 68.9 µs |
+| stat, cached | 1.8 µs | 2.0 µs | 1.9 µs | 1.9 µs | 1.9 µs | 1.9 µs | 1.9 µs | 1.9 µs | 1.9 µs | 1.9 µs | 1.9 µs | 1.9 µs | 1.9 µs | 1.9 µs | 1.9 µs | 1.8 µs | 2.0 µs |
+| write 4 KiB, overlay file | 2.9 µs | 243.9 µs | 244.4 µs | 51.8 µs | 58.6 µs | 51.9 µs | 250.6 µs | 51.3 µs | 154.5 µs | 160.4 µs | 51.5 µs | 52.9 µs | 157.8 µs | 115.4 µs | 108.4 µs | 105.5 µs | 56.3 µs |
+| open+close, overlay file | 2.7 µs | 72.7 µs | 73.1 µs | 78.9 µs | 86.0 µs | 73.0 µs | 73.6 µs | 81.9 µs | 76.4 µs | 77.0 µs | 79.3 µs | 82.8 µs | 73.8 µs | 75.2 µs | 73.6 µs | 73.3 µs | 82.8 µs |
+| open+read+close, overlay file | 5.1 µs | 218.4 µs | 219.9 µs | 85.7 µs | 87.5 µs | 223.5 µs | 220.9 µs | 88.2 µs | 244.6 µs | 238.9 µs | 84.4 µs | 87.2 µs | 240.5 µs | 241.4 µs | 223.8 µs | 229.2 µs | 89.7 µs |
 <!-- merged tables end -->
 
 ## What the numbers say
@@ -172,19 +175,19 @@ nothing from inflating seventeen thousand.
 no copy of the tree; from there every operation costs more than ext4, by
 an amount that is now almost entirely round trips per file, not bytes:
 
-| vscode | native | passthrough + prewarm, pre-0017 | passthrough + prewarm + journal | ratio now |
-| --- | ---: | ---: | ---: | ---: |
-| read 2 000 files, first time | 0.041 s | 0.452 s | 0.491 s | 12× |
-| read again | 0.040 s | 0.273 s | 0.280 s | 7× |
-| `rg` over the tree, first | 0.041 s | 0.413 s | 0.404 s | 10× |
-| `rg` again | 0.034 s | 0.182 s | 0.162 s | 5× |
-| 64 MiB in 4 KiB writes | 0.070 s | 0.894 s | 0.871 s | 12× |
-| `cp -r` 10 225 files in | 1.10 s | 26.1 s | 6.41 s | 5.8× |
-| read those files back | 0.20 s | 1.80 s | 1.76 s | 9× |
-| `git status` | 0.55 s | 0.76 s | 0.74 s | 1.4× |
-| `git add -A` + commit | 1.14 s | 3.78 s | 3.62 s | 3.2× |
-| open+close | 2.7 µs | 65 µs | 65 µs | 24× |
-| 4 KiB write | 3.0 µs | 52 µs | 51 µs | 17× |
+| vscode | native | passthrough + prewarm, pre-0017 | + journal (ADR 0017) | + inline mutations | ratio now |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| read 2 000 files, first time | 0.041 s | 0.452 s | 0.491 s | 0.460 s | 11× |
+| read again | 0.040 s | 0.273 s | 0.280 s | 0.278 s | 7× |
+| `rg` over the tree, first | 0.041 s | 0.413 s | 0.404 s | 0.392 s | 10× |
+| `rg` again | 0.034 s | 0.182 s | 0.162 s | 0.163 s | 5× |
+| 64 MiB in 4 KiB writes | 0.070 s | 0.894 s | 0.871 s | 0.874 s | 12× |
+| `cp -r` 10 225 files in | 1.10 s | 26.1 s | 6.41 s | 5.79 s | 5.3× |
+| read those files back | 0.20 s | 1.80 s | 1.76 s | 1.82 s | 9× |
+| `git status` | 0.55 s | 0.76 s | 0.74 s | 0.84 s | 1.5× |
+| `git add -A` + commit | 1.14 s | 3.78 s | 3.62 s | 3.85 s | 3.4× |
+| open+close | 2.7 µs | 65 µs | 65 µs | 67 µs | 25× |
+| 4 KiB write | 3.0 µs | 52 µs | 51 µs | 56 µs | 19× |
 
 Per file, ext4 answers an `open`+`close` in 2.7 µs and the mount in 65 µs:
 two kernel round trips at this machine's 16–25 µs floor plus the daemon's
@@ -247,4 +250,7 @@ passthrough (0.85 ms without), of which the journal transaction is 30 µs
 and the two round trips about 65 µs; the remainder is daemon CPU in the
 create and release paths. The two levers stack as expected: ADR 0017 alone
 takes the copy from 29.4 s to 8.9 s, passthrough on top to 6.2 s, and the
-64 MiB `dd` is passthrough's alone (2.6 s → 0.84 s).
+64 MiB `dd` is passthrough's alone (2.6 s → 0.84 s). Mutations on the
+FUSE thread take the copy a further 6.4 → 5.8 s with passthrough (8.9 →
+6.2 s without): under passthrough the per-file `write` request was already
+gone, so only the `create` and `release` hops were left to save.
