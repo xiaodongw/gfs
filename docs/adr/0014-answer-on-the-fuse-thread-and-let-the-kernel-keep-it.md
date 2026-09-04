@@ -88,7 +88,9 @@ is local mode's.
   taken there, the inode table is touched there, an overlay resolve happens
   there. None of it blocks on I/O; ADR 0003's measurement — one blocked
   callback serializes the mount — still governs what may go in that prefix,
-  and `spawn_blocking` remains the way to a syscall.
+  and `spawn_blocking` remains the way to anything that waits for real.
+  (ADR 0003's 2026-09-03 amendment moved the overlay's own mutations into
+  the prefix: an `openat` and a buffered WAL write are not a wait.)
 - **The kernel holds state the daemon must invalidate.** A re-pin sends
   `inval_inode` for every record it moves, not only `inval_entry`. Anything
   new that changes content or a listing without going through the kernel —

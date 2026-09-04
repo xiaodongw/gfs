@@ -164,7 +164,10 @@ Two things about *how* a request is answered matter as much as what answers
 it (ADR 0014). Each handler's future is polled once on the FUSE thread that
 read the request, inside the runtime's context, and handed to the runtime
 only if it has to wait — so a cache hit is answered by the thread that
-received it, and a fetch is the only thing that crosses to a worker. And the
+received it, and so is an overlay mutation (a `create` is an `openat` and a
+buffered journal write, and the two thread hops it used to cross were half
+its cost; ADR 0003's 2026-09-03 amendment), and a fetch is the only thing
+that crosses to a worker. And the
 kernel is told what a pinned commit cannot change: a base blob's pages stay
 cached across opens (`FOPEN_KEEP_CACHE`), a directory's listing stays cached
 across `opendir` calls (`FOPEN_CACHE_DIR`), and `close` sends no `flush`.

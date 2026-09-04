@@ -202,6 +202,7 @@ rows). They stack: 6.4 s with both.
 | `--writeback-cache` (ADR 0016) | nothing; opt-in | 4 KiB write 244 → 52 µs; the `dd` 3.95 → 0.85 s | everything else; a refused write is reported at `close` |
 | `--prewarm` | nothing; local mode | cold read of 2 000 files 0.75 → 0.49 s; first `rg` 0.65 → 0.40 s, for 0.38 s of background inflate | warm anything |
 | the journal (ADR 0017) | nothing; always on | `cp -r` 10 225 files 29.4 → 8.9 s; 4 KiB write 244 → 155 µs; `dd` 3.95 → 2.6 s; `create`+`close` 2 350 → 416 µs | reads, `git status`, per-open rows |
+| mutations on the FUSE thread (ADR 0003, 2026-09-03 amendment) | nothing; default | `cp -r` 8.9 → 6.2 s; 4 KiB write 155 → 107 µs; `dd` 2.6 → 1.9 s; `create`+`close` 413 → 330 µs wall, 406 → 225 µs CPU | reads, `git status`, commit; 16 FUSE threads make cold parallel reads worse |
 
 Passthrough and the writeback cache do not combine: the kernel grants
 neither when asked for both, and the daemon drops the writeback request

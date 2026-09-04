@@ -343,3 +343,46 @@ hop and a wait. Each handler's future is now polled once on the FUSE thread
 inside the runtime's context and handed to the runtime only if it returns
 pending. The measurement in section 3 still governs what may run in that
 synchronous prefix: nothing that waits on I/O.
+
+## Amendment, 2026-09-03: an overlay mutation completes on the FUSE thread
+
+"Nothing that waits on I/O" was applied to the overlay's journal as well as
+to the network, so a `create` crossed to the blocking pool and back: FUSE
+thread → runtime worker → pool thread → worker → reply. A perf profile of
+the create path after [ADR 0017](0017-fewer-journal-commits.md) put 15 % of
+the daemon's cycles in the overlay and about half in those hand-offs — each
+one a futex wake, a context switch and a park, on workers that are idle
+between requests.
+
+The overlay's mutations are one `openat` and one buffered write into the
+WAL, tens of microseconds, and they do not wait on anything the daemon does
+not own: the journal runs at `synchronous = NORMAL` and the content store
+no longer fsyncs (ADR 0017). They now run on the FUSE thread that took the
+request (`Gfs::mutation`): `create`, `mkdir`, `symlink`, `unlink`, `rmdir`,
+`rename`, `setattr`, `write` through the daemon, and the `release` that
+commits a written row. Measured on the vscode corpus without passthrough:
+`create`+`close` 413 → 330 µs wall and 406 → 225 µs daemon CPU, `cp -r` of
+10 225 files 8.9 → 6.2 s, a 4 KiB write 155 → 107 µs; reads, `git status`
+and the commit unchanged
+([`benchmarks/fuse-levers.md`](../../benchmarks/fuse-levers.md), the
+dispatch columns).
+
+What stays on the pool is what can wait for real: a server fetch, a copy-up
+that streams a whole blob, a cold inflate, an `fsync`, the passthrough
+`.git` I/O. Section 3's argument is about those, and it is untouched.
+
+Two things were measured and rejected with it. The fully blocking model —
+every handler on the FUSE thread, sixteen event-loop threads, no hop at
+all — matched the mutation-only change on every row within noise: in local
+mode there is no other hop worth removing, and it caps concurrency at the
+thread count for the fetches section 3 is about. And sixteen FUSE threads,
+in every dispatch mode, took the first `rg` over vscode from 0.69 s to
+1.65 s: sixteen cold inflates at once contend on the blob cache and libgit2
+where four did not. The thread count stays at four.
+
+The price accepted: an ext4 stall on the WAL write — its own journal
+commit, writeback pressure — parks the FUSE thread for the stall's length
+rather than a pool thread. With four threads that is a quarter of the
+mount's request intake for a few milliseconds, not the mount. `gfs mount
+--dispatch pool` restores the previous behaviour; `--dispatch all-inline`
+and `--fuse-threads` remain for experiments.

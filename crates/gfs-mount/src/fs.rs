@@ -21,10 +21,14 @@
 //! reply handle onto the tokio runtime and returns immediately. `fuser` 0.18 makes
 //! this possible: the reply handles are `Send`, and the trait takes `&self`.
 //!
-//! The overlay is local SQLite rather than network, but it is still blocking
-//! work, and a copy-up streams a whole blob. Every overlay mutation therefore
-//! runs on a blocking pool through `Gfs::blocking`, which keeps the same rule
-//! for the same reason.
+//! The overlay is local SQLite rather than network. Its mutations — one
+//! `openat`, one buffered WAL write, a few tens of microseconds — run on the
+//! FUSE thread that took the request (`Gfs::mutation`, ADR 0003's 2026-09-03
+//! amendment): the two thread hops they used to cross were half of a
+//! `create`'s cost, and a rare ext4 stall parks one of four threads rather
+//! than the mount. What can wait for real — a fetch, a copy-up that streams a
+//! whole blob, a cold inflate, an `fsync` — still goes to the blocking pool
+//! through `Gfs::blocking`, for the reason the table gives.
 //!
 //! # Four worlds, routed by subtree
 //!
@@ -89,20 +93,22 @@ fn generation(record: &Record) -> Generation {
 
 /// Where the work behind a request runs, after ADR 0003 and ADR 0014.
 ///
-/// `Pool` is the rule those ADRs set: a handler's synchronous prefix runs on
-/// the FUSE thread, and anything that may wait on I/O goes to the blocking
-/// pool. `MutationsInline` runs the overlay's journal and content-file work
-/// (create, mkdir, symlink, unlink, rmdir, rename, setattr, write, the
-/// release of a local writer) on the FUSE thread too: one `openat` and one
-/// buffered WAL write, a few tens of microseconds, at the price that an ext4
-/// stall parks that thread. `AllInline` runs every `Gfs::blocking` call on
+/// `MutationsInline`, the default since ADR 0003's 2026-09-03 amendment, runs
+/// the overlay's journal and content-file work (create, mkdir, symlink,
+/// unlink, rmdir, rename, setattr, write, the release of a local writer) on
+/// the FUSE thread that took the request: one `openat` and one buffered WAL
+/// write, a few tens of microseconds, at the price that an ext4 stall parks
+/// that thread. Anything that may wait for real still goes to the blocking
+/// pool. `Pool` is the rule before the amendment: every overlay mutation
+/// crosses to the pool too. `AllInline` runs every `Gfs::blocking` call on
 /// the FUSE thread, which is the fully blocking model ADR 0003 measured
-/// against; it caps concurrency at the FUSE thread count.
+/// against; it caps concurrency at the FUSE thread count and is kept as an
+/// experiment knob.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Dispatch {
-  #[default]
   Pool,
+  #[default]
   MutationsInline,
   AllInline,
 }
@@ -195,7 +201,7 @@ pub struct FsConfig {
 impl Default for FsConfig {
   fn default() -> Self {
     FsConfig {
-      dispatch: Dispatch::Pool,
+      dispatch: Dispatch::MutationsInline,
       // One hour. The commit is immutable, so the only cost of a long TTL is
       // memory the kernel is free to reclaim, and the benefit is the metadata
       // sweep that never reaches the network.

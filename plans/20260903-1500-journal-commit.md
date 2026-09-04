@@ -128,5 +128,5 @@ can block on ext4, and wants its own decision.
   other hop worth removing).
 - 16 FUSE threads: no gain on any serial row; first `rg` over vscode
   0.69 → 1.65 s in every mode (contention among parallel cold inflates).
-Recommendation: `mutations-inline` with the default thread count, as an
-amendment to ADR 0003/0014; not the blocking model.
+Decision: `mutations-inline` is the default with four threads (ADR 0003,
+amendment of 2026-09-03); `pool` and `all-inline` stay as knobs.

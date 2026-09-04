@@ -205,10 +205,12 @@ enum Command {
     /// unless given; an experiment knob.
     #[arg(long)]
     fuse_threads: Option<usize>,
-    /// Where a handler's blocking work runs: `pool` (the default), or
-    /// `mutations-inline` / `all-inline` to run overlay work on the FUSE
-    /// thread that took the request. An experiment knob; see ADR 0003.
-    #[arg(long, default_value = "pool")]
+    /// Where a handler's blocking work runs: `mutations-inline` (the
+    /// default: overlay mutations on the FUSE thread that took the request,
+    /// everything that may wait on the pool), `pool` (every mutation on the
+    /// pool too), or `all-inline` (the fully blocking model). An experiment
+    /// knob; see ADR 0003's 2026-09-03 amendment.
+    #[arg(long, default_value = "mutations-inline")]
     dispatch: gfs_mount::fs::Dispatch,
   },
 
