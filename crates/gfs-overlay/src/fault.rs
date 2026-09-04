@@ -31,12 +31,12 @@ use std::sync::OnceLock;
 /// The boundaries a crash can land on. Each is a real ordering step, not a
 /// convenient place to put a hook.
 pub mod point {
-  /// Bytes written into the staging file, not yet fsynced.
+  /// Bytes written into the staging file, which is not yet complete.
   pub const CONTENT_STAGED: &str = "content-staged";
-  /// Staging file fsynced, not yet renamed into place.
+  /// Staging file complete, not yet renamed into place.
   pub const CONTENT_SYNCED: &str = "content-synced";
-  /// Content published and its directory fsynced; the journal does not yet
-  /// reference it. This is the orphan case.
+  /// Content published under its id; the journal does not yet reference it.
+  /// This is the orphan case.
   pub const CONTENT_PUBLISHED: &str = "content-published";
   /// Inside the journal transaction, before the commit.
   pub const JOURNAL_UNCOMMITTED: &str = "journal-uncommitted";

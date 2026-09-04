@@ -140,12 +140,22 @@ alone. The recipe that found every result in
   after, which separates "the daemon worked" from "the daemon waited";
 - the kernel's request stream: start `gfs-fuse` by hand with
   `RUST_LOG=info,fuser=debug` and count request kinds between two marks —
-  the CLI-spawned daemon's log does not carry it.
+  the CLI-spawned daemon's log does not carry it;
+- for a before/after of one change, build the previous commit in a
+  worktree with its own `CARGO_TARGET_DIR` and run the same loop against
+  both `gfs`/`gfs-fuse` pairs back to back, on the same clone, minutes
+  apart — the ADR 0017 numbers were taken that way, because a probe
+  written on a different day has a different shape.
 
 Traps: `ptrace` attach to the daemon is refused (`yama=1`); a daemon started
 under `strace` cannot mount (setuid `fusermount3`); a shell command that
 times out kills the daemon it spawned and leaks `refs/gfs/mounts/*` anchors
-in the clone — delete them with `git update-ref -d`.
+in the clone — delete them with `git update-ref -d`; a host socket under a
+long scratch path fails with "path must be shorter than SUN_LEN", so put
+the work directory under `~/gfs-corpus`; `gfs unmount` leaves the host
+process running, and a host from before a rebuild still serves the old
+binary on its socket — list them with `pgrep -af '^.*/gfs-fuse --socket'`
+and kill them before a run.
 
 ## The numbers on 2026-09-03
 
@@ -160,22 +170,30 @@ shape of the answer. vscode is 17 926 files in a 2.8 GiB clone; django is
 | one vscode workspace | 2.31 s, 298 MiB | 0.17 s, 2.8 MiB | 0.23 s, 3.2 MiB + 62 MiB cache |
 | five vscode workspaces | 12.0 s, 1 490 MiB | 0.69 s, 12.8 MiB | — |
 
-**Using it** (vscode, from `fuse-levers.md`; "best" is passthrough +
-prewarm):
+**Using it** (vscode, from `fuse-levers.md`). "ADR 0014" is the build
+every lever was measured against; "best, pre-0017" is passthrough +
+prewarm on the ADR 0016 build; the two ADR 0017 columns are the current
+build without the capability. Passthrough on the current build is not yet
+measured (the rebuild dropped the capability):
 
-| step | native worktree | gfs, ADR 0014 | gfs, best | best ÷ native |
-| --- | ---: | ---: | ---: | ---: |
-| read 2 000 files, first time | 0.041 s | 0.746 s | 0.452 s | 11× |
-| read again | 0.040 s | 0.264 s | 0.273 s | 7× |
-| `rg` over the tree, first | 0.041 s | 0.654 s | 0.413 s | 10× |
-| `rg` again | 0.034 s | 0.158 s | 0.182 s | 5× |
-| 64 MiB in 4 KiB writes | 0.070 s | 3.950 s | 0.894 s | 13× |
-| `cp -r` 10 225 files in | 1.10 s | 29.4 s | 26.1 s | 24× |
-| read those files back | 0.20 s | 2.77 s | 1.80 s | 9× |
-| `git status` | 0.55 s | 0.73 s | 0.76 s | 1.4× |
-| `git add -A` + commit | 1.14 s | 4.92 s | 3.78 s | 3.3× |
-| `open`+`close`, one file | 2.7 µs | 63.5 µs | 65 µs | 24× |
-| one 4 KiB write | 3.0 µs | 244 µs | 52 µs | 17× |
+| step | native worktree | gfs, ADR 0014 | gfs, best, pre-0017 | gfs, ADR 0017 | gfs, ADR 0017 + prewarm | 0017+prewarm ÷ native |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| read 2 000 files, first time | 0.041 s | 0.746 s | 0.452 s | 0.758 s | 0.523 s | 13× |
+| read again | 0.040 s | 0.264 s | 0.273 s | 0.275 s | 0.275 s | 7× |
+| `rg` over the tree, first | 0.041 s | 0.654 s | 0.413 s | 0.693 s | 0.450 s | 11× |
+| `rg` again | 0.034 s | 0.158 s | 0.182 s | 0.162 s | 0.170 s | 5× |
+| 64 MiB in 4 KiB writes | 0.070 s | 3.950 s | 0.894 s | 2.585 s | 2.661 s | 38× |
+| `cp -r` 10 225 files in | 1.10 s | 29.4 s | 26.1 s | 8.86 s | 7.89 s | 7× |
+| read those files back | 0.20 s | 2.77 s | 1.80 s | 2.87 s | 3.05 s | 15× |
+| `git status` | 0.55 s | 0.73 s | 0.76 s | 0.78 s | 0.76 s | 1.4× |
+| `git add -A` + commit | 1.14 s | 4.92 s | 3.78 s | 4.90 s | 5.11 s | 4.5× |
+| `open`+`close`, one file | 2.7 µs | 63.5 µs | 65 µs | 64.3 µs | 64 µs | 24× |
+| one 4 KiB write | 3.0 µs | 244 µs | 52 µs | 155 µs | 163 µs | 54× |
+
+The write path split: ADR 0017 removes the journal work behind every
+`create`, `release` and `write` (the `cp -r` row); passthrough removes the
+`write` request itself (the `dd` and 4 KiB rows). They are independent and
+should stack — the combined column is the one to run next.
 
 **What each lever bought**, in isolation, on vscode:
 
@@ -184,6 +202,7 @@ prewarm):
 | passthrough (ADR 0015) | `CAP_SYS_ADMIN` on `gfs-fuse` | 4 KiB write 244 → 52 µs; overlay reopen+read 216 → 87 µs; 64 MiB read-back 48 → 9 ms; commit 4.9 → 3.9 s | warm base-blob reads (already page-cache hits); `cp -r` |
 | `--writeback-cache` (ADR 0016) | nothing; opt-in | 4 KiB write 244 → 52 µs; the `dd` 3.95 → 0.85 s | everything else; a refused write is reported at `close` |
 | `--prewarm` | nothing; local mode | cold read of 2 000 files 0.75 → 0.49 s; first `rg` 0.65 → 0.40 s, for 0.38 s of background inflate | warm anything |
+| the journal (ADR 0017) | nothing; always on | `cp -r` 10 225 files 29.4 → 8.9 s; 4 KiB write 244 → 155 µs; `dd` 3.95 → 2.6 s; `create`+`close` 2 350 → 416 µs | reads, `git status`, per-open rows |
 
 Passthrough and the writeback cache do not combine: the kernel grants
 neither when asked for both, and the daemon drops the writeback request
@@ -191,9 +210,10 @@ when it has passthrough.
 
 **Where the remaining time is.** Per file read: two kernel round trips
 (`open`, `release`) at the machine's 16–25 µs floor, which is the 10× on
-whole-tree reads. Per file written by a tool like `cp`: about 2.6 ms, none
-of it in `write` — the journal commit on each `create` and `release`. That
-is the next lever and it lives in the overlay, not in FUSE.
+whole-tree reads. Per file written by a tool like `cp`: about 0.85 ms
+after ADR 0017, of which the one journal transaction is 30 µs and the two
+round trips about 65 µs; the rest is daemon CPU in the `create` and
+`release` paths, which wants a CPU profile rather than another lever.
 
 ## Reading a result
 

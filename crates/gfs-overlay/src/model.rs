@@ -492,30 +492,30 @@ impl Op {
       hash % (crate::OVERLAY_INO_BASE - 2) + 2
     };
 
+    let parent_for = |path: &BytePath| {
+      let parent = crate::parent_of(path);
+      crate::Parent::new(ino_for(&parent), base.facts(&parent))
+    };
+
     let result = match self {
       Op::CreateFile(path) => overlay
         .create_file(
           path,
           base.facts(path),
-          parent_facts(base, path),
+          parent_for(path),
           ino_for(path),
           false,
         )
         .map(|_| ()),
       Op::Mkdir(path) => overlay
-        .mkdir(
-          path,
-          base.facts(path),
-          parent_facts(base, path),
-          ino_for(path),
-        )
+        .mkdir(path, base.facts(path), parent_for(path), ino_for(path))
         .map(|_| ()),
       Op::Symlink(path, target) => overlay
         .symlink(
           path,
           target,
           base.facts(path),
-          parent_facts(base, path),
+          parent_for(path),
           ino_for(path),
         )
         .map(|_| ()),
@@ -528,10 +528,10 @@ impl Op {
       Op::SetExecutable(path, executable) => overlay
         .set_executable(path, base.facts(path), ino_for(path), *executable)
         .map(|_| ()),
-      Op::Unlink(path) => overlay.remove(path, base.facts(path), false, true),
+      Op::Unlink(path) => overlay.remove(path, base.facts(path), parent_for(path), false, true),
       Op::Rmdir(path) => {
         let empty = overlay.merged_dir_is_empty(path, &base.child_names(path));
-        overlay.remove(path, base.facts(path), true, empty)
+        overlay.remove(path, base.facts(path), parent_for(path), true, empty)
       }
       Op::Rename(from, to) => {
         let empty = overlay.merged_dir_is_empty(to, &base.child_names(to));
@@ -539,9 +539,10 @@ impl Op {
           from,
           ino_for(from),
           base.facts(from),
+          parent_for(from),
           to,
           base.facts(to),
-          parent_facts(base, to),
+          parent_for(to),
           &base.descendants(from),
           empty,
           false,
@@ -550,10 +551,6 @@ impl Op {
     };
     result.map_err(|e| e.condition)
   }
-}
-
-fn parent_facts(base: &BaseTree, path: &BytePath) -> Option<BaseFacts> {
-  base.facts(&crate::parent_of(path))
 }
 
 /// Copy up a path so it can be written, which is what the FUSE layer does on the

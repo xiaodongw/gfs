@@ -9,7 +9,9 @@
 use std::io::Read;
 
 use gfs_overlay::model::{test_binding, test_snapshot_time, BaseTree};
-use gfs_overlay::{BaseFacts, Condition, Content, Overlay, OverlayConfig, Resolution, Source};
+use gfs_overlay::{
+  BaseFacts, Condition, Content, Overlay, OverlayConfig, Parent, Resolution, Source,
+};
 use gfs_types::{BytePath, EntryKind, HashAlgorithm, ObjectId, Timestamp};
 
 fn path(s: &str) -> BytePath {
@@ -38,7 +40,7 @@ fn a_created_file_survives_a_restart_with_its_bytes_and_its_inode() {
   let (ino, size) = {
     let overlay = open(tmp.path());
     overlay
-      .create_file(&path("new.txt"), None, None, 100, false)
+      .create_file(&path("new.txt"), None, Parent::default(), 100, false)
       .unwrap();
     overlay.write_at(&path("new.txt"), 0, b"hello").unwrap();
     let entry = overlay.get(&path("new.txt")).unwrap();
@@ -89,7 +91,13 @@ fn deleting_a_base_directory_costs_one_row_and_hides_the_whole_subtree() {
   let overlay = open(tmp.path());
   let base = base();
   overlay
-    .remove(&path("src"), base.facts(&path("src")), true, true)
+    .remove(
+      &path("src"),
+      base.facts(&path("src")),
+      Parent::default(),
+      true,
+      true,
+    )
     .unwrap();
   assert_eq!(overlay.stats().entries, 1);
   assert_eq!(overlay.stats().whiteouts, 1);
@@ -125,7 +133,7 @@ fn the_quota_short_writes_rather_than_endangering_what_is_already_there() {
     },
   );
   overlay
-    .create_file(&path("a.txt"), None, None, 101, false)
+    .create_file(&path("a.txt"), None, Parent::default(), 101, false)
     .unwrap();
   assert_eq!(
     overlay.write_at(&path("a.txt"), 0, &[b'x'; 10]).unwrap(),
@@ -158,7 +166,7 @@ fn content_a_crash_left_unreferenced_is_collected_on_the_next_open() {
   {
     let overlay = open(tmp.path());
     overlay
-      .create_file(&path("keep.txt"), None, None, 102, false)
+      .create_file(&path("keep.txt"), None, Parent::default(), 102, false)
       .unwrap();
     overlay.write_at(&path("keep.txt"), 0, b"kept").unwrap();
     // What a crash between "content published" and "journal committed" leaves:
@@ -191,7 +199,7 @@ fn an_overlay_from_another_commit_is_refused_rather_than_merged() {
   {
     let overlay = open(tmp.path());
     overlay
-      .create_file(&path("a.txt"), None, None, 101, false)
+      .create_file(&path("a.txt"), None, Parent::default(), 101, false)
       .unwrap();
   }
   let other = gfs_overlay::Binding {
@@ -231,7 +239,7 @@ fn an_empty_overlay_left_behind_is_rebound_rather_than_refused() {
   )
   .expect("an edit-free overlay adopts the moved base");
   overlay
-    .create_file(&path("a.txt"), None, None, 101, false)
+    .create_file(&path("a.txt"), None, Parent::default(), 101, false)
     .unwrap();
   drop(overlay);
 
@@ -291,8 +299,8 @@ fn every_overlay_timestamp_is_newer_than_the_base_even_with_a_skewed_clock() {
   let mut previous = future;
   for index in 0..8 {
     let name = format!("f{index}.txt");
-    let entry = overlay
-      .create_file(&path(&name), None, None, 200 + index, false)
+    let (entry, _) = overlay
+      .create_file(&path(&name), None, Parent::default(), 200 + index, false)
       .unwrap();
     assert!(
       entry.mtime > future,
@@ -313,8 +321,14 @@ fn every_overlay_timestamp_is_newer_than_the_base_even_with_a_skewed_clock() {
     OverlayConfig::default(),
   )
   .unwrap();
-  let entry = overlay
-    .create_file(&path("after-restart.txt"), None, None, 300, false)
+  let (entry, _) = overlay
+    .create_file(
+      &path("after-restart.txt"),
+      None,
+      Parent::default(),
+      300,
+      false,
+    )
     .unwrap();
   assert!(entry.mtime > previous, "the clock survived the restart");
 }
@@ -324,7 +338,7 @@ fn an_explicit_timestamp_below_the_floor_is_clamped() {
   let tmp = tempfile::tempdir().unwrap();
   let overlay = open(tmp.path());
   overlay
-    .create_file(&path("a.txt"), None, None, 101, false)
+    .create_file(&path("a.txt"), None, Parent::default(), 101, false)
     .unwrap();
   let entry = overlay
     .set_times(
@@ -347,9 +361,10 @@ fn renaming_a_base_directory_moves_metadata_and_fetches_nothing() {
       &path("src"),
       400,
       base.facts(&path("src")),
+      Parent::default(),
       &path("lib"),
       None,
-      None,
+      Parent::default(),
       &base.descendants(&path("src")),
       true,
       false,
@@ -385,9 +400,10 @@ fn a_rename_larger_than_the_configured_bound_is_refused() {
       &path("src"),
       400,
       base.facts(&path("src")),
+      Parent::default(),
       &path("lib"),
       None,
-      None,
+      Parent::default(),
       &[
         base.descendants(&path("src"))[0].clone(),
         base.descendants(&path("src"))[0].clone(),
@@ -406,7 +422,7 @@ fn a_symlink_is_never_copied_into_a_content_file() {
   let tmp = tempfile::tempdir().unwrap();
   let overlay = open(tmp.path());
   overlay
-    .symlink(&path("l"), b"README.md", None, None, 103)
+    .symlink(&path("l"), b"README.md", None, Parent::default(), 103)
     .unwrap();
   let error = overlay
     .materialize(&path("l"), None, 1, Source::Empty)
@@ -427,4 +443,81 @@ fn a_gitlink_cannot_be_modified_through_the_overlay() {
     .adopt(&path("sub"), Some(facts), 9)
     .expect_err("a submodule is not overlay content");
   assert_eq!(error.condition, Condition::NotPermitted);
+}
+
+#[test]
+fn a_row_left_behind_by_an_unsettled_write_is_corrected_from_its_content_file() {
+  // A write moves the row in memory only; the descriptor's release commits it.
+  // A process that dies between the two leaves the journal behind the file,
+  // and the next open must believe the file.
+  let tmp = tempfile::tempdir().unwrap();
+  let (created_mtime, id) = {
+    let overlay = open(tmp.path());
+    let (entry, _) = overlay
+      .create_file(&path("late.txt"), None, Parent::default(), 100, false)
+      .unwrap();
+    let id = entry.content.local_id().unwrap();
+    overlay.settle_content(id).unwrap();
+    overlay.write_at(&path("late.txt"), 0, b"hello").unwrap();
+    assert_eq!(overlay.get(&path("late.txt")).unwrap().size, 5);
+    (entry.mtime, id)
+  };
+
+  let overlay = open(tmp.path());
+  let entry = overlay.get(&path("late.txt")).unwrap();
+  assert_eq!(entry.content.local_id(), Some(id));
+  assert_eq!(entry.size, 5, "the size comes from the content file");
+  assert!(
+    entry.mtime > created_mtime,
+    "the file was written after the row was committed, and the row says so"
+  );
+  drop(overlay);
+
+  // The correction was committed, not merely applied in memory.
+  let overlay = open(tmp.path());
+  assert_eq!(overlay.get(&path("late.txt")).unwrap().size, 5);
+}
+
+#[test]
+fn creating_under_a_base_directory_adopts_and_touches_the_parent_in_one_transaction() {
+  let tmp = tempfile::tempdir().unwrap();
+  let overlay = open(tmp.path());
+  let base = base();
+  let before = overlay.sequence();
+  let (child, _) = overlay
+    .create_file(
+      &path("src/new.rs"),
+      None,
+      Parent::new(77, base.facts(&path("src"))),
+      101,
+      false,
+    )
+    .unwrap();
+  assert_eq!(overlay.sequence(), before + 1, "one transaction, not two");
+
+  let parent = overlay
+    .get(&path("src"))
+    .expect("the base directory was adopted");
+  assert_eq!(parent.ino, 77, "under the caller's inode number");
+  assert!(!parent.opaque, "its base children still show through");
+  assert_eq!(parent.mtime, child.mtime);
+  assert_eq!(
+    overlay.resolve(&path("src/main.rs")),
+    Resolution::Base,
+    "adopting the parent hid nothing"
+  );
+
+  // Removing the child touches the same row again, still in one transaction.
+  let before = overlay.sequence();
+  overlay
+    .remove(
+      &path("src/new.rs"),
+      None,
+      Parent::new(77, base.facts(&path("src"))),
+      false,
+      true,
+    )
+    .unwrap();
+  assert_eq!(overlay.sequence(), before + 1);
+  assert!(overlay.get(&path("src")).unwrap().mtime > parent.mtime);
 }

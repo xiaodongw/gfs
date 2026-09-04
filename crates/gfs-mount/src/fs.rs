@@ -61,7 +61,8 @@ use fuser::{
   OpenFlags, Request,
 };
 use gfs_overlay::{
-  BaseDescendant, BaseFacts, Overlay, OverlayEntry, OverlayError, OverlayKind, Resolution, Source,
+  BaseDescendant, BaseFacts, Overlay, OverlayEntry, OverlayError, OverlayKind, Parent, Resolution,
+  Source,
 };
 use gfs_types::error::{ErrorCode, GfsError};
 use gfs_types::{BytePath, EntryKind, ObjectId, Timestamp, TreeEntryInfo};
@@ -1315,7 +1316,6 @@ impl Gfs {
     .map_err(overlay_as_service_error)
   }
 
-  /// Refresh a record from the overlay and return its attributes.
   // -------------------------------------------------------------------------
   // Kernel passthrough
   // -------------------------------------------------------------------------
@@ -2267,15 +2267,14 @@ impl Filesystem for GfsFilesystem {
       // Git records exactly one permission bit, so that is the one this reads.
       let executable = mode & !umask & 0o111 != 0;
       let overlay = fs.overlay();
-      let parent_base = Gfs::parent_base(&parent);
+      let dir = Parent::new(parent.ino, Gfs::parent_base(&parent));
       let target = path.clone();
       let ino = fs.number_for(&path);
-      let created = Gfs::blocking(move || {
-        overlay.create_file(&target, resolved.base, parent_base, ino, executable)
-      })
-      .await;
-      let entry = match created {
-        Ok(entry) => entry,
+      let created =
+        Gfs::blocking(move || overlay.create_file(&target, resolved.base, dir, ino, executable))
+          .await;
+      let (entry, file) = match created {
+        Ok(created) => created,
         Err(e) => {
           fs.bump(|s| s.errors += 1);
           return reply.error(errno_of_overlay(&e));
@@ -2283,10 +2282,6 @@ impl Filesystem for GfsFilesystem {
       };
       let Some(id) = entry.content.local_id() else {
         return reply.error(Errno::EIO);
-      };
-      let file = match fs.overlay().content_store().open_write(id) {
-        Ok(file) => file,
-        Err(e) => return reply.error(errno_of_overlay(&e)),
       };
 
       let record = fs
@@ -2306,7 +2301,7 @@ impl Filesystem for GfsFilesystem {
         s.lookups += 1;
         s.opens += 1;
       });
-      fs.touch_parent(&parent).await;
+      fs.republish_parent(&parent);
       match &*state {
         FileState::Kernel { backing, .. } => {
           fs.bump(|s| s.passthrough_opens += 1);
@@ -2563,6 +2558,30 @@ impl Filesystem for GfsFilesystem {
             return;
           }
           fs.release_backing(backing);
+        }
+        // A descriptor the daemon served writes for: the row's size and mtime
+        // moved in memory on each write and are committed once, here.
+        FileState::Local {
+          content_id,
+          writable: true,
+          ..
+        } => {
+          let content_id = *content_id;
+          self.spawn(async move {
+            let overlay = fs.overlay();
+            match Gfs::blocking(move || overlay.settle_content(content_id)).await {
+              Ok(Some(entry)) => {
+                let path = entry.path.clone();
+                fs.republish(&path, entry);
+              }
+              Ok(None) => {}
+              Err(e) => tracing::warn!(error = %e, "settling a written file's row failed"),
+            }
+            drop(state);
+            fs.inodes.lock().expect("inode table").close(ino.0);
+            reply.ok();
+          });
+          return;
         }
         _ => {}
       }
@@ -3253,10 +3272,10 @@ impl Filesystem for GfsFilesystem {
         Err(e) => return reply.error(errno_of(&e)),
       };
       let overlay = fs.overlay();
-      let parent_base = Gfs::parent_base(&parent);
+      let dir = Parent::new(parent.ino, Gfs::parent_base(&parent));
       let target = path.clone();
       let ino = fs.number_for(&path);
-      match Gfs::blocking(move || overlay.mkdir(&target, resolved.base, parent_base, ino)).await {
+      match Gfs::blocking(move || overlay.mkdir(&target, resolved.base, dir, ino)).await {
         Ok(entry) => {
           let record = fs
             .inodes
@@ -3264,7 +3283,7 @@ impl Filesystem for GfsFilesystem {
             .expect("inode table")
             .insert_lookup(path, Node::Overlay(Box::new(entry)));
           fs.bump(|s| s.lookups += 1);
-          fs.touch_parent(&parent).await;
+          fs.republish_parent(&parent);
           reply.entry(&fs.config.ttl, &fs.attr(&record), generation(&record));
         }
         Err(e) => {
@@ -3315,13 +3334,11 @@ impl Filesystem for GfsFilesystem {
         Err(e) => return reply.error(errno_of(&e)),
       };
       let overlay = fs.overlay();
-      let parent_base = Gfs::parent_base(&parent);
+      let dir = Parent::new(parent.ino, Gfs::parent_base(&parent));
       let link_path = path.clone();
       let ino = fs.number_for(&path);
-      match Gfs::blocking(move || {
-        overlay.symlink(&link_path, &target, resolved.base, parent_base, ino)
-      })
-      .await
+      match Gfs::blocking(move || overlay.symlink(&link_path, &target, resolved.base, dir, ino))
+        .await
       {
         Ok(entry) => {
           let record = fs
@@ -3330,7 +3347,7 @@ impl Filesystem for GfsFilesystem {
             .expect("inode table")
             .insert_lookup(path, Node::Overlay(Box::new(entry)));
           fs.bump(|s| s.lookups += 1);
-          fs.touch_parent(&parent).await;
+          fs.republish_parent(&parent);
           reply.entry(&fs.config.ttl, &fs.attr(&record), generation(&record));
         }
         Err(e) => {
@@ -3637,60 +3654,31 @@ impl Gfs {
     };
     let overlay = self.overlay();
     let target = path.clone();
-    Self::blocking(move || overlay.remove(&target, resolved.base, expect_dir, empty))
+    let dir = Parent::new(parent.ino, Gfs::parent_base(&parent));
+    Self::blocking(move || overlay.remove(&target, resolved.base, dir, expect_dir, empty))
       .await
       .map_err(|e| errno_of_overlay(&e))?;
-    self.touch_parent(&parent).await;
+    self.republish_parent(&parent);
     Ok(())
   }
 
-  /// Advance a directory's mtime and ctime after an entry appeared in it or left.
+  /// Put a parent directory's new timestamps where `getattr` will find them.
   ///
-  /// POSIX requires it and pjdfstest checks it (`rmdir/00`, `symlink/00`).
-  /// Without it a directory reported the pinned commit's snapshot time forever,
-  /// and a build system or watcher keyed on directory mtime — the ordinary way to
-  /// notice that something appeared in a directory — saw nothing change.
+  /// The overlay advanced them in the same transaction as the child's row
+  /// (`gfs_overlay::Parent`); this only republishes the row into the inode
+  /// table, which is what `getattr` and `lookup` answer from. Without it a
+  /// directory reported the pinned commit's snapshot time forever, and a build
+  /// system or watcher keyed on directory mtime -- the ordinary way to notice
+  /// that something appeared in a directory -- saw nothing change.
   ///
-  /// Best-effort on purpose. The mutation itself has already committed and
-  /// succeeded; failing the syscall because its parent's timestamp could not be
-  /// recorded would turn a cosmetic loss into a broken write. A crash between the
-  /// two commits leaves the child present with a stale parent time, which is the
-  /// same thing every filesystem that does not journal the two together does.
-  ///
-  /// The mount root goes through [`gfs_overlay::Overlay::touch_root`] rather
-  /// than through a row: it has no base facts to adopt from, and giving the
-  /// empty path an overlay row would create a second spelling of the root for
-  /// every resolver that walks ancestors. Its times live in the journal's meta
-  /// table and [`Gfs::attr`] applies them.
-  async fn touch_parent(&self, parent: &Record) {
-    if parent.node.is_git() || parent.node.is_odb() {
-      // A real directory's mtime advances by itself; the projection has none.
+  /// The root has no row; its times live in the journal's meta table and
+  /// [`Gfs::attr`] reads them on every call.
+  fn republish_parent(&self, parent: &Record) {
+    if parent.node.is_git() || parent.node.is_odb() || parent.path.is_empty() {
       return;
     }
-    if parent.path.is_empty() {
-      let overlay = self.overlay();
-      if let Err(e) = Self::blocking(move || overlay.touch_root(None)).await {
-        tracing::debug!(error = %e, "could not advance the mount root's timestamps");
-      }
-      return;
-    }
-    let overlay = self.overlay();
-    let path = parent.path.clone();
-    let base = Gfs::parent_base(parent);
-    let ino = parent.ino;
-    match Self::blocking(move || overlay.touch_directory(&path, base, ino)).await {
-      // Republished, not merely committed. `getattr` is answered inline from the
-      // inode table and never consults the overlay, so a row the table does not
-      // know about is a timestamp nothing will ever report -- which is what made
-      // the first attempt at this look like it had done nothing at all.
-      Ok(entry) => {
-        self.republish(&parent.path, entry);
-      }
-      Err(e) => tracing::debug!(
-        path = %parent.path.escaped(),
-        error = %e,
-        "could not advance the parent directory's timestamps"
-      ),
+    if let Some(entry) = self.overlay().get(&parent.path) {
+      self.republish(&parent.path, entry);
     }
   }
 
@@ -3799,7 +3787,8 @@ impl Gfs {
     };
 
     let overlay = self.overlay();
-    let to_parent_base = Gfs::parent_base(&to_parent);
+    let from_dir = Parent::new(from_parent.ino, Gfs::parent_base(&from_parent));
+    let to_dir = Parent::new(to_parent.ino, Gfs::parent_base(&to_parent));
     let (from_path, to_path) = (from.clone(), to.clone());
     let from_base = source.base.clone();
     let to_base = target.base.clone();
@@ -3809,9 +3798,10 @@ impl Gfs {
         &from_path,
         from_ino,
         from_base,
+        from_dir,
         &to_path,
         to_base,
-        to_parent_base,
+        to_dir,
         &descendants,
         to_empty,
         no_replace,
@@ -3840,12 +3830,10 @@ impl Gfs {
           .refresh(ino, Node::Overlay(Box::new(entry)));
       }
     }
-    // Both ends: the entry left one directory and arrived in another. When the
-    // rename is within a single directory they are the same record and the
-    // second touch is a no-op update of the row the first one wrote.
-    self.touch_parent(&from_parent).await;
+    // Both ends: the entry left one directory and arrived in another.
+    self.republish_parent(&from_parent);
     if to_parent.path != from_parent.path {
-      self.touch_parent(&to_parent).await;
+      self.republish_parent(&to_parent);
     }
     Ok(())
   }

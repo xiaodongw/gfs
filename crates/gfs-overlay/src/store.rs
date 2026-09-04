@@ -8,19 +8,31 @@
 //! state — which is the difference between a recovery routine that can be
 //! reasoned about and one that guesses.
 //!
-//! The publication sequence, in the order PLAN.md M3.1 specifies:
+//! The publication sequence:
 //!
 //! ```text
 //!   write  files/tmp/<n>          content, not yet reachable
-//!   fsync  files/tmp/<n>          the bytes are on the device
 //!   rename files/tmp/<n> -> files/<shard>/<id>
-//!   fsync  files/<shard>          the name is on the device
 //!   commit the journal transaction that references <id>
 //! ```
 //!
-//! A crash anywhere before the last step leaves either a temporary file or an
-//! unreferenced content file. Both are collected on the next open, and neither
-//! was ever visible through the mount.
+//! A crash of the *daemon* anywhere before the last step leaves either a
+//! temporary file or an unreferenced content file. Both are collected on the
+//! next open, and neither was ever visible through the mount.
+//!
+//! # What is not fsynced, and why
+//!
+//! Nothing here calls `fsync` on its own. The journal runs at
+//! `synchronous = NORMAL` ([`crate::journal`]), which promises that every
+//! acknowledged mutation survives the daemon dying and makes no promise about
+//! the host dying; fsyncing every content file made the bytes stricter than the
+//! row that names them, at about 1.5 ms of waiting per created file. So the
+//! store remembers what it published and [`ContentStore::sync_published`] —
+//! reached through [`crate::Overlay::sync`], which is what `fsync(2)` on the
+//! mount calls — forces the files and then their shard directories out. After
+//! a power loss a row can name a file that is short or missing; the sweep
+//! reports a missing file rather than inventing an empty one, and a short file
+//! is what POSIX gives any file that was never fsynced.
 //!
 //! # Sharding
 //!
@@ -32,6 +44,8 @@
 use std::collections::HashSet;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 use crate::error::{OverlayError, Result};
 
@@ -107,6 +121,9 @@ impl SweepReport {
 #[derive(Clone, Debug)]
 pub struct ContentStore {
   root: PathBuf,
+  /// Which shard directories this process has already made. One `mkdir` per
+  /// shard per process instead of a `create_dir_all` probe per publish.
+  shards: Arc<[AtomicBool; 256]>,
 }
 
 impl ContentStore {
@@ -114,7 +131,26 @@ impl ContentStore {
     let root = state_dir.join(FILES_DIR);
     std::fs::create_dir_all(root.join(TEMP_DIR))
       .map_err(|e| OverlayError::io(format!("creating the overlay content store: {e}")))?;
-    Ok(ContentStore { root })
+    Ok(ContentStore {
+      root,
+      shards: Arc::new([const { AtomicBool::new(false) }; 256]),
+    })
+  }
+
+  fn shard_of(&self, id: u64) -> PathBuf {
+    self.root.join(format!("{:02x}", id & 0xff))
+  }
+
+  /// The shard directory for `id`, created on first use.
+  fn ensure_shard(&self, id: u64) -> Result<PathBuf> {
+    let shard = self.shard_of(id);
+    let flag = &self.shards[(id & 0xff) as usize];
+    if !flag.load(Ordering::Relaxed) {
+      std::fs::create_dir_all(&shard)
+        .map_err(|e| OverlayError::io(format!("creating an overlay content shard: {e}")))?;
+      flag.store(true, Ordering::Relaxed);
+    }
+    Ok(shard)
   }
 
   pub fn root(&self) -> &Path {
@@ -122,10 +158,7 @@ impl ContentStore {
   }
 
   pub fn path_of(&self, id: u64) -> PathBuf {
-    self
-      .root
-      .join(format!("{:02x}", id & 0xff))
-      .join(id.to_string())
+    self.shard_of(id).join(id.to_string())
   }
 
   pub fn stage(&self, token: u64) -> Result<Staged> {
@@ -140,37 +173,66 @@ impl ContentStore {
     })
   }
 
-  /// fsync, rename, fsync the directory. See the module docs for why the order
-  /// is not negotiable.
+  /// Rename the staged file into place. No fsync: see the module docs.
   pub fn publish(&self, mut staged: Staged, id: u64) -> Result<u64> {
     let size = staged.written;
-    staged
-      .file
-      .sync_all()
-      .map_err(|e| OverlayError::io(format!("syncing staged overlay content: {e}")))?;
     crate::fault::trip(crate::fault::point::CONTENT_SYNCED);
-    let target = self.path_of(id);
-    let shard = target.parent().expect("a sharded path has a parent");
-    std::fs::create_dir_all(shard)
-      .map_err(|e| OverlayError::io(format!("creating an overlay content shard: {e}")))?;
-    std::fs::rename(&staged.path, &target)
+    self.ensure_shard(id)?;
+    std::fs::rename(&staged.path, self.path_of(id))
       .map_err(|e| OverlayError::io(format!("publishing overlay content: {e}")))?;
     // Disarmed rather than forgotten: `mem::forget` would leak the descriptor,
     // and the descriptor has to close. Dropping `staged` at the end of this
     // function now closes the file without removing the name it no longer owns.
     staged.armed = false;
-    sync_dir(shard)?;
     crate::fault::trip(crate::fault::point::CONTENT_PUBLISHED);
     Ok(size)
   }
 
-  /// An empty content file, published without staging bytes.
+  /// An empty content file, created in place and returned open for writing.
   ///
-  /// The `O_TRUNC` path: PLAN.md M3.2 requires that replacing a whole file does
-  /// not fetch the old one, and an empty file has nothing to stage.
-  pub fn create_empty(&self, id: u64) -> Result<()> {
-    let staged = self.stage(id)?;
-    self.publish(staged, id)?;
+  /// The `O_TRUNC` path and every `create`: PLAN.md M3.2 requires that
+  /// replacing a whole file does not fetch the old one, and an empty file has
+  /// nothing to stage. `create_new` rather than `create`: an id is never
+  /// reused, so a name already there is a bug worth failing on.
+  pub fn create_empty(&self, id: u64) -> Result<std::fs::File> {
+    self.ensure_shard(id)?;
+    let file = std::fs::OpenOptions::new()
+      .read(true)
+      .write(true)
+      .create_new(true)
+      .open(self.path_of(id))
+      .map_err(|e| OverlayError::io(format!("creating overlay content {id}: {e}")))?;
+    crate::fault::trip(crate::fault::point::CONTENT_PUBLISHED);
+    Ok(file)
+  }
+
+  /// Force published content onto the device: each file, then each shard
+  /// directory a file was renamed into, in that order so a name never
+  /// outlives its bytes.
+  ///
+  /// An id whose file is gone is skipped: it was removed after it was
+  /// published, and there is nothing left to make durable.
+  pub fn sync_published(&self, ids: impl IntoIterator<Item = u64>) -> Result<()> {
+    let mut shards = HashSet::new();
+    for id in ids {
+      match std::fs::File::open(self.path_of(id)) {
+        Ok(file) => {
+          file
+            .sync_all()
+            .map_err(|e| OverlayError::io(format!("syncing overlay content {id}: {e}")))?;
+          shards.insert(id & 0xff);
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+          return Err(OverlayError::io(format!(
+            "opening overlay content {id} to sync it: {e}"
+          )))
+        }
+      }
+    }
+    for shard in shards {
+      sync_dir(&self.shard_of(shard))?;
+    }
     Ok(())
   }
 

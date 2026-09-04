@@ -32,6 +32,14 @@
 //! repository, which is what makes holding all of it affordable — a monorepo has
 //! millions of paths and a job changes thousands.
 //!
+//! The one exception is a `write`. Its bytes are already in the content file,
+//! so the row's size and mtime move in memory only and the content id is
+//! marked dirty; the row is committed once, when the descriptor is released
+//! ([`Overlay::settle_content`]) or on `sync`. A daemon that dies with a dirty
+//! row leaves a journal row behind the file, and the next open reads the
+//! file's size and mtime back into the row — the file is the truth for the
+//! two fields it holds.
+//!
 //! # Ordering
 //!
 //! Content is published before the journal row that names it, and released after
@@ -157,6 +165,44 @@ pub struct BaseDescendant {
   pub symlink_target: Option<Vec<u8>>,
 }
 
+/// The directory a name is created in or removed from, as the caller resolved it.
+///
+/// POSIX advances a directory's mtime and ctime when an entry appears in it or
+/// leaves, and pjdfstest's `rmdir/00` and `symlink/00` check exactly that. The
+/// overlay records the bump in the same transaction as the child's row, which
+/// needs two things only the caller knows about a base-only directory: its
+/// inode number (the caller owns the live inode table, and adopting the
+/// directory under a fresh number would change its identity under anything
+/// holding it open) and what the pinned commit has there. `base` is also what
+/// the existence check for the parent consults, as before.
+///
+/// The root is described by an empty parent path and needs neither field: its
+/// times live in the journal's meta table ([`Overlay::touch_root`]).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Parent {
+  pub ino: u64,
+  pub base: Option<BaseFacts>,
+}
+
+impl Parent {
+  pub fn new(ino: u64, base: Option<BaseFacts>) -> Self {
+    Parent { ino, base }
+  }
+}
+
+/// What a mutation does to its parent directory's timestamps, decided while the
+/// transaction is being assembled.
+enum ParentTouch {
+  /// The root, whose times are two meta rows.
+  Root,
+  /// A directory row to write: the existing one with new times, or an adopted
+  /// base directory.
+  Row(Box<OverlayEntry>),
+  /// Nothing to record: the parent is unknown to the overlay and the caller
+  /// could not say what the base has there.
+  Nothing,
+}
+
 /// Drop a content id's owner only if it is still the path being removed.
 ///
 /// A rename is one transaction of `Put(new)` then `Delete(old)`, and both mention
@@ -194,6 +240,11 @@ struct Inner {
   vanished_overflow: bool,
   /// The mount root's times, once something has changed in it.
   root_times: Option<(Timestamp, Timestamp)>,
+  /// Content ids whose in-memory row is ahead of the journal: written to since
+  /// the row was last committed. See [`Overlay::settle_content`].
+  dirty: HashSet<u64>,
+  /// Content ids published since the last [`Overlay::sync`], not yet fsynced.
+  unsynced: HashSet<u64>,
   /// Committed transactions since this process opened the overlay. The
   /// fsmonitor token carries it so the token advances when the filesystem
   /// changes, which is what the v2 protocol asks of it.
@@ -254,20 +305,70 @@ impl Overlay {
     let journal = Journal::open(&state_dir.join(journal::OVERLAY_DB_FILE), binding)?;
     let store = ContentStore::open(store_root)?;
 
-    let loaded = journal.load()?;
+    let mut journal = journal;
+    let mut loaded = journal.load()?;
     let referenced: HashSet<u64> = loaded.iter().filter_map(|e| e.content.local_id()).collect();
     let recovery = store.sweep(&referenced)?;
-    let local_bytes = store.total_bytes(&referenced);
 
-    let mut entries = BTreeMap::new();
-    let mut children: HashMap<Vec<u8>, BTreeSet<Vec<u8>>> = HashMap::new();
-    let mut by_content: HashMap<u64, Vec<u8>> = HashMap::new();
+    let next_ino = journal.next_ino()?.max(OVERLAY_INO_BASE);
+    let next_content_id = journal.next_content_id()?.max(1);
+    let (vanished, vanished_overflow) = journal.vanished()?;
+    let root_times = journal.root_times()?;
+
     // The clock never runs backwards across a restart. Seeded from the highest
     // time any surviving entry carries, so a mutation after recovery is still
     // newer than every mutation before it even if the host clock moved back.
     let mut clock = snapshot_time;
-    for entry in loaded {
+    for entry in &loaded {
       clock = clock.max(entry.mtime).max(entry.ctime);
+    }
+    if let Some((mtime, ctime)) = root_times {
+      clock = clock.max(mtime).max(ctime);
+    }
+
+    // The content file is the truth for a local row's size and mtime: a write
+    // moves them in memory and the row catches up at release, so a process
+    // that died between the two left the row behind. Read them back here, in
+    // one transaction, before anything is served from the rows.
+    let mut local_bytes = 0u64;
+    let mut corrections = Vec::new();
+    for entry in &mut loaded {
+      let Some(id) = entry.content.local_id() else {
+        continue;
+      };
+      let Ok(meta) = std::fs::metadata(store.path_of(id)) else {
+        // Reported by the sweep as missing content; nothing to correct from.
+        continue;
+      };
+      local_bytes += meta.len();
+      let file_mtime = meta
+        .modified()
+        .map(Timestamp::from_system_time)
+        .map(|t| gfs_types::time::clamp_requested_overlay_time(t, snapshot_time))
+        .unwrap_or(entry.mtime);
+      if meta.len() != entry.size || file_mtime > entry.mtime {
+        clock = gfs_types::time::overlay_time(Timestamp::now(), snapshot_time, Some(clock));
+        entry.size = meta.len();
+        entry.mtime = entry.mtime.max(file_mtime);
+        entry.ctime = clock;
+        corrections.push(Change::Put(entry.clone()));
+      }
+    }
+    if !corrections.is_empty() {
+      journal.apply(
+        &corrections,
+        &crate::journal::VanishedDelta::default(),
+        vanished_overflow,
+        next_ino,
+        next_content_id,
+        None,
+      )?;
+    }
+
+    let mut entries = BTreeMap::new();
+    let mut children: HashMap<Vec<u8>, BTreeSet<Vec<u8>>> = HashMap::new();
+    let mut by_content: HashMap<u64, Vec<u8>> = HashMap::new();
+    for entry in loaded {
       children
         .entry(entry.parent().into_bytes())
         .or_default()
@@ -276,14 +377,6 @@ impl Overlay {
         by_content.insert(id, entry.path.as_bytes().to_vec());
       }
       entries.insert(entry.path.as_bytes().to_vec(), entry);
-    }
-
-    let next_ino = journal.next_ino()?.max(OVERLAY_INO_BASE);
-    let next_content_id = journal.next_content_id()?.max(1);
-    let (vanished, vanished_overflow) = journal.vanished()?;
-    let root_times = journal.root_times()?;
-    if let Some((mtime, ctime)) = root_times {
-      clock = clock.max(mtime).max(ctime);
     }
 
     Ok(Overlay {
@@ -300,6 +393,8 @@ impl Overlay {
         vanished_overflow,
         root_times,
         sequence: 0,
+        dirty: HashSet::new(),
+        unsynced: HashSet::new(),
       }),
       store,
       config,
@@ -353,12 +448,23 @@ impl Overlay {
     }
   }
 
-  /// Force every committed mutation onto stable storage.
+  /// Force every acknowledged mutation onto stable storage.
   ///
-  /// What `fsync(2)` against the mount reaches. Content files are synced by
-  /// their handles; this is the journal's half.
+  /// What `fsync(2)` against the mount reaches, in the order the store's
+  /// invariant needs: rows that are only in memory are committed, the content
+  /// files published since the last sync are fsynced along with their shard
+  /// directories, and then the journal is checkpointed. Content before
+  /// journal, so a power loss between the two cannot leave a row naming bytes
+  /// that never reached the device.
   pub fn sync(&self) -> Result<()> {
-    self.lock().journal.sync()
+    let mut inner = self.lock();
+    self.settle_all(&mut inner)?;
+    let unsynced: Vec<u64> = inner.unsynced.drain().collect();
+    if let Err(e) = self.store.sync_published(unsynced.iter().copied()) {
+      inner.unsynced.extend(unsynced);
+      return Err(e);
+    }
+    inner.journal.sync()
   }
 
   /// Point this overlay at a new base commit, discarding every edit.
@@ -383,6 +489,8 @@ impl Overlay {
     inner.vanished_overflow = false;
     inner.root_times = None;
     inner.sequence += 1;
+    inner.dirty.clear();
+    inner.unsynced.clear();
     let _ = self.store.sweep(&HashSet::new());
     Ok(())
   }
@@ -437,8 +545,7 @@ impl Overlay {
     let mtime = mtime
       .map(|t| gfs_types::time::clamp_requested_overlay_time(t, self.snapshot_time))
       .unwrap_or(now);
-    inner.journal.set_root_times(mtime, now)?;
-    inner.root_times = Some((mtime, now));
+    self.commit(&mut inner, Vec::new(), Vec::new(), Some((mtime, now)))?;
     Ok((mtime, now))
   }
 
@@ -556,7 +663,16 @@ impl Overlay {
   // -------------------------------------------------------------------------
 
   /// Commit a change set: journal first, memory second, released content last.
-  fn commit(&self, inner: &mut Inner, changes: Vec<Change>, release: Vec<u64>) -> Result<()> {
+  ///
+  /// `root_times`, when given, are the mount root's new timestamps and travel
+  /// in the same transaction.
+  fn commit(
+    &self,
+    inner: &mut Inner,
+    changes: Vec<Change>,
+    release: Vec<u64>,
+    root_times: Option<(Timestamp, Timestamp)>,
+  ) -> Result<()> {
     // What this transaction does to the vanished set, decided before it is
     // applied so the journal writes both halves together.
     let delta = crate::journal::VanishedDelta::of(&changes);
@@ -568,7 +684,11 @@ impl Overlay {
       overflow,
       inner.next_ino,
       inner.next_content_id,
+      root_times,
     )?;
+    if let Some(times) = root_times {
+      inner.root_times = Some(times);
+    }
     if overflow {
       inner.vanished.clear();
       inner.vanished_overflow = true;
@@ -595,6 +715,8 @@ impl Overlay {
           if let Some(id) = entry.content.local_id() {
             inner.local_bytes = inner.local_bytes.saturating_add(entry.size);
             inner.by_content.insert(id, entry.path.as_bytes().to_vec());
+            // The row the journal now holds is the one memory holds.
+            inner.dirty.remove(&id);
           }
           inner
             .children
@@ -610,6 +732,7 @@ impl Overlay {
             if let Some(id) = previous.content.local_id() {
               inner.local_bytes = inner.local_bytes.saturating_sub(previous.size);
               release_content(&mut inner.by_content, id, path.as_bytes());
+              inner.dirty.remove(&id);
             }
             if let Some(set) = inner.children.get_mut(previous.parent().as_bytes()) {
               set.remove(&previous.name());
@@ -622,9 +745,158 @@ impl Overlay {
     // failed transaction would leave a live row pointing at nothing, which is
     // the one direction the store's invariant does not allow.
     for id in release {
+      inner.unsynced.remove(&id);
       let _ = self.store.remove(id);
     }
     Ok(())
+  }
+
+  /// The change a mutation under `path` makes to its parent's timestamps.
+  ///
+  /// Mirrors what adopting the directory and then setting its times did as two
+  /// transactions: an overlay row gets new times; a base-only directory is
+  /// adopted with the caller's inode number and the base facts, not opaque, so
+  /// its base children keep showing through; the root is two meta rows.
+  fn parent_touch(
+    inner: &mut Inner,
+    path: &BytePath,
+    parent: &Parent,
+    now: Timestamp,
+  ) -> ParentTouch {
+    let dir = parent_of(path);
+    if dir.is_empty() {
+      return ParentTouch::Root;
+    }
+    match merge::resolve(&inner.entries, &dir) {
+      Resolution::Overlay(entry) if entry.present && entry.kind.is_dir() => {
+        ParentTouch::Row(Box::new(OverlayEntry {
+          mtime: now,
+          ctime: now,
+          ..*entry
+        }))
+      }
+      Resolution::Overlay(_) | Resolution::Absent => ParentTouch::Nothing,
+      Resolution::Base => {
+        let Some(facts) = parent.base.as_ref() else {
+          return ParentTouch::Nothing;
+        };
+        let Some(kind) = OverlayKind::from_entry_kind(facts.kind).filter(|k| k.is_dir()) else {
+          return ParentTouch::Nothing;
+        };
+        ParentTouch::Row(Box::new(OverlayEntry {
+          path: dir,
+          present: true,
+          kind,
+          opaque: false,
+          ino: Self::adopt_ino(inner, parent.ino),
+          content: Content::None,
+          symlink_target: None,
+          size: facts.size,
+          mtime: now,
+          ctime: now,
+          renamed_from: None,
+          base: Some(facts.clone()),
+        }))
+      }
+    }
+  }
+
+  /// Fold a parent touch into a transaction being assembled.
+  fn push_touch(
+    touch: ParentTouch,
+    changes: &mut Vec<Change>,
+    root_times: &mut Option<(Timestamp, Timestamp)>,
+    now: Timestamp,
+  ) {
+    match touch {
+      ParentTouch::Root => *root_times = Some((now, now)),
+      ParentTouch::Row(entry) => changes.push(Change::Put(*entry)),
+      ParentTouch::Nothing => {}
+    }
+  }
+
+  /// Replace a row in memory only, keeping the byte accounting straight. The
+  /// path and content id are unchanged, so the children and content indexes
+  /// need nothing.
+  fn replace_in_memory(inner: &mut Inner, updated: OverlayEntry) {
+    let key = updated.path.as_bytes().to_vec();
+    if let Some(previous) = inner.entries.get(&key) {
+      if previous.content.local_id().is_some() {
+        inner.local_bytes = inner.local_bytes.saturating_sub(previous.size);
+      }
+    }
+    if updated.content.local_id().is_some() {
+      inner.local_bytes = inner.local_bytes.saturating_add(updated.size);
+    }
+    inner.entries.insert(key, updated);
+  }
+
+  /// Record that a content file changed underneath its row: size and mtime
+  /// move in memory, the id is marked dirty, and the sequence advances so the
+  /// fsmonitor token changes. Nothing is journaled here.
+  fn note_written(
+    &self,
+    inner: &mut Inner,
+    entry: OverlayEntry,
+    size: u64,
+    mtime: Option<Timestamp>,
+  ) {
+    let now = self.next_time(inner);
+    let updated = OverlayEntry {
+      size,
+      mtime: mtime.unwrap_or(now),
+      ctime: now,
+      ..entry
+    };
+    if let Some(id) = updated.content.local_id() {
+      inner.dirty.insert(id);
+    }
+    inner.sequence += 1;
+    Self::replace_in_memory(inner, updated);
+  }
+
+  /// Commit the in-memory row for a dirty content id. `None` when no row names
+  /// the content any more (unlinked while open), `Some(row)` otherwise, whether
+  /// or not anything needed committing.
+  fn settle_locked(&self, inner: &mut Inner, content_id: u64) -> Result<Option<OverlayEntry>> {
+    let Some(entry) = inner
+      .by_content
+      .get(&content_id)
+      .and_then(|path| inner.entries.get(path.as_slice()))
+      .cloned()
+    else {
+      inner.dirty.remove(&content_id);
+      return Ok(None);
+    };
+    if inner.dirty.contains(&content_id) {
+      self.commit(
+        &mut *inner,
+        vec![Change::Put(entry.clone())],
+        Vec::new(),
+        None,
+      )?;
+    }
+    Ok(Some(entry))
+  }
+
+  /// Commit every dirty row in one transaction.
+  fn settle_all(&self, inner: &mut Inner) -> Result<()> {
+    if inner.dirty.is_empty() {
+      return Ok(());
+    }
+    let changes: Vec<Change> = inner
+      .dirty
+      .iter()
+      .filter_map(|id| inner.by_content.get(id))
+      .filter_map(|path| inner.entries.get(path.as_slice()))
+      .cloned()
+      .map(Change::Put)
+      .collect();
+    inner.dirty.clear();
+    if changes.is_empty() {
+      return Ok(());
+    }
+    self.commit(inner, changes, Vec::new(), None)
   }
 
   fn next_time(&self, inner: &mut Inner) -> Timestamp {
@@ -706,18 +978,19 @@ impl Overlay {
     }
   }
 
-  /// Create an empty regular file.
+  /// Create an empty regular file, returned with its content file open for
+  /// reading and writing. The parent's timestamps move in the same transaction.
   pub fn create_file(
     &self,
     path: &BytePath,
     base: Option<BaseFacts>,
-    parent_base: Option<BaseFacts>,
+    parent: Parent,
     ino: u64,
     executable: bool,
-  ) -> Result<OverlayEntry> {
+  ) -> Result<(OverlayEntry, std::fs::File)> {
     path_condition(path)?;
     let mut inner = self.lock();
-    Self::check_parent(&inner, path, parent_base.as_ref())?;
+    Self::check_parent(&inner, path, parent.base.as_ref())?;
     if Self::existing(&inner, path, base.as_ref()).is_some() {
       return Err(OverlayError::exists(path.escaped()));
     }
@@ -725,7 +998,8 @@ impl Overlay {
 
     let ino = Self::adopt_ino(&mut inner, ino);
     let content_id = Self::allocate_content_id(&mut inner);
-    self.store.create_empty(content_id)?;
+    let file = self.store.create_empty(content_id)?;
+    inner.unsynced.insert(content_id);
     let now = self.next_time(&mut inner);
     let entry = OverlayEntry {
       path: path.clone(),
@@ -745,20 +1019,24 @@ impl Overlay {
       renamed_from: None,
       base,
     };
-    self.commit(&mut inner, vec![Change::Put(entry.clone())], Vec::new())?;
-    Ok(entry)
+    let mut changes = vec![Change::Put(entry.clone())];
+    let mut root_times = None;
+    let touch = Self::parent_touch(&mut inner, path, &parent, now);
+    Self::push_touch(touch, &mut changes, &mut root_times, now);
+    self.commit(&mut inner, changes, Vec::new(), root_times)?;
+    Ok((entry, file))
   }
 
   pub fn mkdir(
     &self,
     path: &BytePath,
     base: Option<BaseFacts>,
-    parent_base: Option<BaseFacts>,
+    parent: Parent,
     ino: u64,
   ) -> Result<OverlayEntry> {
     path_condition(path)?;
     let mut inner = self.lock();
-    Self::check_parent(&inner, path, parent_base.as_ref())?;
+    Self::check_parent(&inner, path, parent.base.as_ref())?;
     if Self::existing(&inner, path, base.as_ref()).is_some() {
       return Err(OverlayError::exists(path.escaped()));
     }
@@ -781,7 +1059,11 @@ impl Overlay {
       renamed_from: None,
       base,
     };
-    self.commit(&mut inner, vec![Change::Put(entry.clone())], Vec::new())?;
+    let mut changes = vec![Change::Put(entry.clone())];
+    let mut root_times = None;
+    let touch = Self::parent_touch(&mut inner, path, &parent, now);
+    Self::push_touch(touch, &mut changes, &mut root_times, now);
+    self.commit(&mut inner, changes, Vec::new(), root_times)?;
     Ok(entry)
   }
 
@@ -790,7 +1072,7 @@ impl Overlay {
     path: &BytePath,
     target: &[u8],
     base: Option<BaseFacts>,
-    parent_base: Option<BaseFacts>,
+    parent: Parent,
     ino: u64,
   ) -> Result<OverlayEntry> {
     path_condition(path)?;
@@ -798,7 +1080,7 @@ impl Overlay {
       return Err(OverlayError::invalid("a symlink target must be non-empty"));
     }
     let mut inner = self.lock();
-    Self::check_parent(&inner, path, parent_base.as_ref())?;
+    Self::check_parent(&inner, path, parent.base.as_ref())?;
     if Self::existing(&inner, path, base.as_ref()).is_some() {
       return Err(OverlayError::exists(path.escaped()));
     }
@@ -820,7 +1102,11 @@ impl Overlay {
       renamed_from: None,
       base,
     };
-    self.commit(&mut inner, vec![Change::Put(entry.clone())], Vec::new())?;
+    let mut changes = vec![Change::Put(entry.clone())];
+    let mut root_times = None;
+    let touch = Self::parent_touch(&mut inner, path, &parent, now);
+    Self::push_touch(touch, &mut changes, &mut root_times, now);
+    self.commit(&mut inner, changes, Vec::new(), root_times)?;
     Ok(entry)
   }
 
@@ -899,6 +1185,7 @@ impl Overlay {
     };
     self.check_quota(&inner, size)?;
     self.store.publish(staged, content_id)?;
+    inner.unsynced.insert(content_id);
 
     let now = self.next_time(&mut inner);
     let entry = OverlayEntry {
@@ -920,7 +1207,7 @@ impl Overlay {
       .and_then(|e| e.content.local_id())
       .into_iter()
       .collect();
-    self.commit(&mut inner, vec![Change::Put(entry.clone())], release)?;
+    self.commit(&mut inner, vec![Change::Put(entry.clone())], release, None)?;
     Ok(entry)
   }
 
@@ -929,6 +1216,9 @@ impl Overlay {
   /// A short write is a real answer, not a failure: it is what a POSIX write
   /// against a filesystem approaching its limit returns, and it is what keeps a
   /// quota from endangering the edits already in the overlay.
+  ///
+  /// Nothing is journaled: the row moves in memory and is committed by
+  /// [`Overlay::settle_content`] or [`Overlay::sync`].
   pub fn write_at(&self, path: &BytePath, offset: u64, data: &[u8]) -> Result<usize> {
     use std::os::unix::fs::FileExt;
 
@@ -970,14 +1260,7 @@ impl Overlay {
       .map_err(|e| OverlayError::io(format!("writing {}: {e}", path.escaped())))?;
 
     let size = entry.size.max(offset.saturating_add(written as u64));
-    let now = self.next_time(&mut inner);
-    let updated = OverlayEntry {
-      size,
-      mtime: now,
-      ctime: now,
-      ..entry
-    };
-    self.commit(&mut inner, vec![Change::Put(updated)], Vec::new())?;
+    self.note_written(&mut inner, entry, size, None);
     Ok(written)
   }
 
@@ -1030,20 +1313,13 @@ impl Overlay {
 
     if let Some(entry) = entry {
       let size = entry.size.max(offset.saturating_add(written as u64));
-      let now = self.next_time(&mut inner);
-      let updated = OverlayEntry {
-        size,
-        mtime: now,
-        ctime: now,
-        ..entry
-      };
-      self.commit(&mut inner, vec![Change::Put(updated)], Vec::new())?;
+      self.note_written(&mut inner, entry, size, None);
     }
     Ok(written)
   }
 
   /// Record what a content file reached while the kernel wrote it directly
-  /// (FUSE passthrough): the row catches up when the descriptor closes.
+  /// (FUSE passthrough), and commit the row: the passthrough release.
   ///
   /// Not a quota check -- the bytes are already on disk -- but the accounting
   /// moves with the row, so the next write through the daemon sees them.
@@ -1063,18 +1339,18 @@ impl Overlay {
     else {
       return Ok(None);
     };
-    if entry.size == size && entry.mtime == mtime {
-      return Ok(Some(entry));
+    if entry.size != size || entry.mtime != mtime {
+      self.note_written(&mut inner, entry, size, Some(mtime));
     }
-    let now = self.next_time(&mut inner);
-    let updated = OverlayEntry {
-      size,
-      mtime,
-      ctime: now,
-      ..entry
-    };
-    self.commit(&mut inner, vec![Change::Put(updated.clone())], Vec::new())?;
-    Ok(Some(updated))
+    self.settle_locked(&mut inner, content_id)
+  }
+
+  /// Commit the row for content written through the daemon: the release of a
+  /// descriptor the daemon served writes for. Cheap when nothing was written.
+  /// `None` when no row names the content any more (unlinked while open).
+  pub fn settle_content(&self, content_id: u64) -> Result<Option<OverlayEntry>> {
+    let mut inner = self.lock();
+    self.settle_locked(&mut inner, content_id)
   }
 
   /// Set a materialized file's length.
@@ -1110,7 +1386,12 @@ impl Overlay {
       ctime: now,
       ..entry
     };
-    self.commit(&mut inner, vec![Change::Put(updated.clone())], Vec::new())?;
+    self.commit(
+      &mut inner,
+      vec![Change::Put(updated.clone())],
+      Vec::new(),
+      None,
+    )?;
     Ok(updated)
   }
 
@@ -1164,7 +1445,12 @@ impl Overlay {
       renamed_from: None,
       base: Some(facts),
     };
-    self.commit(&mut inner, vec![Change::Put(entry.clone())], Vec::new())?;
+    self.commit(
+      &mut inner,
+      vec![Change::Put(entry.clone())],
+      Vec::new(),
+      None,
+    )?;
     Ok(entry)
   }
 
@@ -1198,7 +1484,12 @@ impl Overlay {
       ctime: now,
       ..entry
     };
-    self.commit(&mut inner, vec![Change::Put(updated.clone())], Vec::new())?;
+    self.commit(
+      &mut inner,
+      vec![Change::Put(updated.clone())],
+      Vec::new(),
+      None,
+    )?;
     Ok(updated)
   }
 
@@ -1226,40 +1517,17 @@ impl Overlay {
       ctime: now,
       ..entry
     };
-    self.commit(&mut inner, vec![Change::Put(updated.clone())], Vec::new())?;
+    self.commit(
+      &mut inner,
+      vec![Change::Put(updated.clone())],
+      Vec::new(),
+      None,
+    )?;
     Ok(updated)
   }
 
-  /// Record that a directory's contents changed.
-  ///
-  /// POSIX requires a directory's `mtime` and `ctime` to advance when an entry is
-  /// created or removed in it, and pjdfstest's `rmdir/00` and `symlink/00` check
-  /// exactly that. Before this, a mount reported the pinned commit's sanitized
-  /// snapshot time for a directory forever, however much a job changed inside it
-  /// — so a build system or watcher that keys on directory mtime, which is the
-  /// ordinary way to notice "something appeared in here", saw nothing.
-  ///
-  /// This adopts the directory into the overlay if it was base-only. That costs
-  /// one journal row per directory a job writes into, bounded by the job's edit
-  /// set rather than the repository, and it is invisible downstream:
-  /// [`Status`] skips directory rows outright because Git records no
-  /// directories, so an adopted parent produces no change, no diff hunk, and
-  /// nothing in an export.
-  ///
-  /// The caller supplies `ino` because a base directory's inode number belongs to
-  /// the client's inode table; allocating a fresh one here would change the
-  /// directory's identity underneath anything holding it open.
-  pub fn touch_directory(
-    &self,
-    path: &BytePath,
-    base: Option<BaseFacts>,
-    ino: u64,
-  ) -> Result<OverlayEntry> {
-    self.set_times(path, base, ino, None)
-  }
-
   /// Remove a path: a whiteout when the base has one there, a plain delete when
-  /// it does not.
+  /// it does not. The parent's timestamps move in the same transaction.
   ///
   /// `merged_is_empty` is only consulted for a directory, and only the caller can
   /// compute it, because only the caller can page the base listing.
@@ -1267,6 +1535,7 @@ impl Overlay {
     &self,
     path: &BytePath,
     base: Option<BaseFacts>,
+    parent: Parent,
     expect_dir: bool,
     merged_is_empty: bool,
   ) -> Result<()> {
@@ -1352,23 +1621,29 @@ impl Overlay {
       // meaning exactly "a base entry is deleted".
       None => changes.push(Change::Delete(path.clone())),
     }
-    self.commit(&mut inner, changes, release)
+    let now = self.next_time(&mut inner);
+    let mut root_times = None;
+    let touch = Self::parent_touch(&mut inner, path, &parent, now);
+    Self::push_touch(touch, &mut changes, &mut root_times, now);
+    self.commit(&mut inner, changes, release, root_times)
   }
 
   /// Rename within the mount.
   ///
   /// A file rename is metadata only. A directory rename materializes the base
   /// subtree as rows that still point at base blobs — see the crate docs on why
-  /// that is preferred to an overlayfs-style redirect.
+  /// that is preferred to an overlayfs-style redirect. Both parents' timestamps
+  /// move in the same transaction.
   #[allow(clippy::too_many_arguments)]
   pub fn rename(
     &self,
     from: &BytePath,
     from_ino: u64,
     from_base: Option<BaseFacts>,
+    from_parent: Parent,
     to: &BytePath,
     to_base: Option<BaseFacts>,
-    to_parent_base: Option<BaseFacts>,
+    to_parent: Parent,
     from_descendants: &[BaseDescendant],
     to_merged_is_empty: bool,
     no_replace: bool,
@@ -1388,7 +1663,7 @@ impl Overlay {
     }
 
     let mut inner = self.lock();
-    Self::check_parent(&inner, to, to_parent_base.as_ref())?;
+    Self::check_parent(&inner, to, to_parent.base.as_ref())?;
     let source_row = inner.entries.get(from.as_bytes()).cloned();
     let source_kind = Self::existing(&inner, from, from_base.as_ref())
       .ok_or_else(|| OverlayError::no_entry(from.escaped()))?;
@@ -1589,7 +1864,16 @@ impl Overlay {
       None => changes.push(Change::Delete(from.clone())),
     }
 
-    self.commit(&mut inner, changes, release)
+    // Both ends: the entry left one directory and arrived in another. Within a
+    // single directory that is one touch, not two rows for one path.
+    let mut root_times = None;
+    let touch = Self::parent_touch(&mut inner, from, &from_parent, now);
+    Self::push_touch(touch, &mut changes, &mut root_times, now);
+    if parent_of(from) != parent_of(to) {
+      let touch = Self::parent_touch(&mut inner, to, &to_parent, now);
+      Self::push_touch(touch, &mut changes, &mut root_times, now);
+    }
+    self.commit(&mut inner, changes, release, root_times)
   }
 }
 

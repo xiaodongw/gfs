@@ -30,7 +30,19 @@
 //! `FULL` would fsync on every metadata operation. The catalog uses it because a
 //! lease that survives the process but not the machine lets `gc` prune a live
 //! mount's objects; the overlay's exposure is one job's uncommitted edits, and
-//! POSIX already says those need an `fsync` to be durable.
+//! POSIX already says those need an `fsync` to be durable. The content store
+//! makes the same promise the same way ([`crate::store`]): no fsync per file,
+//! everything forced out together by `sync`.
+//!
+//! # What a commit costs, and what is not committed
+//!
+//! One transaction is about 30 µs of SQLite on a warm machine, so the journal
+//! keeps the count down rather than the engine fast: statements are prepared
+//! once, the allocator counters are rewritten only when they moved, the parent
+//! directory's timestamp travels in the child's transaction, and a `write`
+//! commits nothing at all — the row's size and mtime catch up when the
+//! descriptor is released ([`crate::Overlay::settle_content`]), and recovery
+//! reads them off the content file for a row that never caught up.
 
 use std::path::Path;
 
@@ -129,6 +141,10 @@ pub struct Binding {
 
 pub struct Journal {
   conn: Connection,
+  /// The allocator values the meta table holds, so [`Journal::apply`] can skip
+  /// rewriting them when nothing was allocated.
+  persisted_next_ino: u64,
+  persisted_next_content_id: u64,
 }
 
 impl std::fmt::Debug for Journal {
@@ -142,8 +158,14 @@ impl Journal {
     let conn = Connection::open(path).map_err(db)?;
     configure(&conn)?;
     migrate(&conn)?;
-    let journal = Journal { conn };
+    let mut journal = Journal {
+      conn,
+      persisted_next_ino: 0,
+      persisted_next_content_id: 0,
+    };
     journal.bind(binding)?;
+    journal.persisted_next_ino = journal.next_ino()?;
+    journal.persisted_next_content_id = journal.next_content_id()?;
     Ok(journal)
   }
 
@@ -237,11 +259,9 @@ impl Journal {
   pub fn set_meta(&self, key: &str, value: &str) -> Result<()> {
     self
       .conn
-      .execute(
-        "INSERT INTO meta (key, value) VALUES (?1, ?2)
-         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-        (key, value),
-      )
+      .prepare_cached(UPSERT_META)
+      .map_err(db)?
+      .execute((key, value))
       .map_err(db)?;
     Ok(())
   }
@@ -280,11 +300,6 @@ impl Journal {
       (Some(m), None) => Ok(Some((m, m))),
       _ => Ok(None),
     }
-  }
-
-  pub fn set_root_times(&self, mtime: Timestamp, ctime: Timestamp) -> Result<()> {
-    self.set_meta("root_mtime", &format_time(mtime))?;
-    self.set_meta("root_ctime", &format_time(ctime))
   }
 
   /// The remembered vanished paths, and whether the set overflowed its cap.
@@ -353,7 +368,10 @@ impl Journal {
   ///
   /// `vanished` and `overflow` travel with them for the same reason: the set of
   /// deletions the fsmonitor hook still has to report is only useful if it
-  /// cannot disagree with the rows.
+  /// cannot disagree with the rows. `root_times`, when given, are the mount
+  /// root's new timestamps — a create or delete directly in the root advances
+  /// them in the same transaction as the row it adds or removes.
+  #[allow(clippy::too_many_arguments)]
   pub fn apply(
     &mut self,
     changes: &[Change],
@@ -361,15 +379,16 @@ impl Journal {
     overflow: bool,
     next_ino: u64,
     next_content_id: u64,
+    root_times: Option<(Timestamp, Timestamp)>,
   ) -> Result<()> {
     let tx = self.conn.transaction().map_err(db)?;
     for change in changes {
       match change {
         Change::Put(entry) => {
           let row = Row::of(entry);
-          tx.execute(
-            INSERT,
-            rusqlite::params![
+          tx.prepare_cached(INSERT)
+            .map_err(db)?
+            .execute(rusqlite::params![
               row.path,
               row.parent,
               row.present,
@@ -389,12 +408,13 @@ impl Journal {
               row.base_oid,
               row.base_mode,
               row.base_size,
-            ],
-          )
-          .map_err(db)?;
+            ])
+            .map_err(db)?;
         }
         Change::Delete(path) => {
-          tx.execute("DELETE FROM entries WHERE path = ?1", [path.as_bytes()])
+          tx.prepare_cached("DELETE FROM entries WHERE path = ?1")
+            .map_err(db)?
+            .execute([path.as_bytes()])
             .map_err(db)?;
         }
       }
@@ -404,36 +424,50 @@ impl Journal {
       // keeping the names would only cost space for a set that is already
       // superseded.
       tx.execute("DELETE FROM vanished", []).map_err(db)?;
-      tx.execute(
-        "INSERT INTO meta (key, value) VALUES ('vanished_overflow', '1')
-         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-        [],
-      )
-      .map_err(db)?;
+      tx.prepare_cached(UPSERT_META)
+        .map_err(db)?
+        .execute(("vanished_overflow", "1"))
+        .map_err(db)?;
     } else {
       for path in &vanished.returned {
-        tx.execute("DELETE FROM vanished WHERE path = ?1", [path])
+        tx.prepare_cached("DELETE FROM vanished WHERE path = ?1")
+          .map_err(db)?
+          .execute([path])
           .map_err(db)?;
       }
       for path in &vanished.gone {
-        tx.execute("INSERT OR IGNORE INTO vanished (path) VALUES (?1)", [path])
+        tx.prepare_cached("INSERT OR IGNORE INTO vanished (path) VALUES (?1)")
+          .map_err(db)?
+          .execute([path])
           .map_err(db)?;
       }
     }
-    tx.execute(
-      "INSERT INTO meta (key, value) VALUES ('next_ino', ?1)
-       ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-      [next_ino.to_string()],
-    )
-    .map_err(db)?;
-    tx.execute(
-      "INSERT INTO meta (key, value) VALUES ('next_content_id', ?1)
-       ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-      [next_content_id.to_string()],
-    )
-    .map_err(db)?;
+    if next_ino != self.persisted_next_ino {
+      tx.prepare_cached(UPSERT_META)
+        .map_err(db)?
+        .execute(("next_ino", next_ino.to_string()))
+        .map_err(db)?;
+    }
+    if next_content_id != self.persisted_next_content_id {
+      tx.prepare_cached(UPSERT_META)
+        .map_err(db)?
+        .execute(("next_content_id", next_content_id.to_string()))
+        .map_err(db)?;
+    }
+    if let Some((mtime, ctime)) = root_times {
+      tx.prepare_cached(UPSERT_META)
+        .map_err(db)?
+        .execute(("root_mtime", format_time(mtime)))
+        .map_err(db)?;
+      tx.prepare_cached(UPSERT_META)
+        .map_err(db)?
+        .execute(("root_ctime", format_time(ctime)))
+        .map_err(db)?;
+    }
     crate::fault::trip(crate::fault::point::JOURNAL_UNCOMMITTED);
     tx.commit().map_err(db)?;
+    self.persisted_next_ino = next_ino;
+    self.persisted_next_content_id = next_content_id;
     crate::fault::trip(crate::fault::point::JOURNAL_COMMITTED);
     Ok(())
   }
@@ -539,6 +573,9 @@ const SELECT_ALL: &str =
   "SELECT path, parent, present, kind, opaque, ino, content_kind, content_id, \
    content_oid, symlink_target, size, mtime_secs, mtime_nanos, ctime_secs, ctime_nanos, \
    renamed_from, base_oid, base_mode, base_size FROM entries";
+
+const UPSERT_META: &str = "INSERT INTO meta (key, value) VALUES (?1, ?2) \
+   ON CONFLICT(key) DO UPDATE SET value = excluded.value";
 
 const INSERT: &str = "INSERT OR REPLACE INTO entries (path, parent, present, kind, opaque, ino, \
    content_kind, content_id, content_oid, symlink_target, size, mtime_secs, mtime_nanos, \

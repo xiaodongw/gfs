@@ -18,7 +18,7 @@
 use std::path::PathBuf;
 
 use gfs_overlay::model::{test_binding, test_snapshot_time};
-use gfs_overlay::{Overlay, OverlayConfig, Source};
+use gfs_overlay::{Overlay, OverlayConfig, Parent, Source};
 use gfs_types::BytePath;
 
 fn main() {
@@ -49,10 +49,14 @@ fn main() {
     // second lands on an overlay that already has one acknowledged mutation.
     "create" => {
       let (target, bytes) = (&rest[0], rest[1].as_bytes());
-      overlay
-        .create_file(&path(target), None, None, 0, false)
+      let (entry, _file) = overlay
+        .create_file(&path(target), None, Parent::default(), 0, false)
         .expect("create");
       overlay.write_at(&path(target), 0, bytes).expect("write");
+      // What a descriptor's release does: the write itself commits nothing.
+      overlay
+        .settle_content(entry.content.local_id().expect("local content"))
+        .expect("settle");
     }
     // A copy-up, which is the boundary set that moves real content bytes. The
     // base facts are synthesized from the bytes themselves: the overlay only
@@ -81,9 +85,10 @@ fn main() {
           &path(&rest[0]),
           0,
           None,
+          Parent::default(),
           &path(&rest[1]),
           None,
-          None,
+          Parent::default(),
           &[],
           true,
           false,
@@ -92,7 +97,7 @@ fn main() {
     }
     "remove" => {
       overlay
-        .remove(&path(&rest[0]), None, false, true)
+        .remove(&path(&rest[0]), None, Parent::default(), false, true)
         .expect("remove");
     }
     // No mutation: just report what recovery found and what the overlay holds.

@@ -424,6 +424,16 @@ what it hid. Every row is held in memory and mirrored to SQLite — reads never
 touch the database — which is affordable because the row count is bounded by
 what one job edits, not by the size of the repository.
 
+A name change is one transaction, and it carries the parent directory's
+timestamp bump with it (ADR 0017). A `write` is none: the row's size and
+mtime move in memory and are committed once when the descriptor is released,
+and recovery reads them back off the content file for a row that never
+caught up. Nothing is fsynced per file; `fsync(2)` on the mount forces the
+content files published since the last sync and then the journal, in that
+order. The journal has always promised survival of the daemon dying, not of
+the host dying, and the content store now makes the same promise the same
+way.
+
 `gfs status` reads that journal directly, which is why it costs ~10 ms against
 ~70 ms for `git status` on a warm tree and no full-tree walk at all.
 
@@ -542,7 +552,7 @@ image installs on `PATH`.
 
 | for | read |
 | --- | --- |
-| why any of this is the way it is | [`adr/`](adr/) — sixteen decision records |
+| why any of this is the way it is | [`adr/`](adr/) — seventeen decision records |
 | the object authorization boundary | [ADR 0002](adr/0002-git-object-authorization-boundary.md) |
 | why the workspace carries a real ODB | [ADR 0009](adr/0009-raw-git-over-a-projected-object-store.md) |
 | why one folder, not two | [ADR 0011](adr/0011-single-mount-workspace.md) |
@@ -550,6 +560,7 @@ image installs on `PATH`.
 | why a round trip costs what it costs, and which ones are gone | [ADR 0014](adr/0014-answer-on-the-fuse-thread-and-let-the-kernel-keep-it.md) |
 | the kernel reading and writing files itself, and what that needs | [ADR 0015](adr/0015-kernel-passthrough.md), [`../benchmarks/fuse-levers.md`](../benchmarks/fuse-levers.md) |
 | gathered writes, and why a re-pin changes inode generations | [ADR 0016](adr/0016-writeback-cache.md) |
+| why a create is one transaction and a write is none | [ADR 0017](adr/0017-fewer-journal-commits.md) |
 | measured numbers, end to end | [`../benchmarks/agent-workflow.md`](../benchmarks/agent-workflow.md) |
 | how to run every benchmark again, and the numbers today | [`performance.md`](performance.md) |
 | the narrative version, with charts | [`overview.html`](overview.html) |
