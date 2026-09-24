@@ -108,6 +108,56 @@ gfs diff HEAD~3..HEAD
 gfs blame src/flask/cli.py -L 40,80
 ```
 
+## Local mode — no server at all
+
+`gfs mount --local` mounts a workspace straight from a clone already on this
+machine (ADR 0013). No `start-server.sh`, no lease, no shims: the clone's
+object store is borrowed the way `git worktree` borrows it, but the tree is
+presented lazily instead of copied. Only `fuse3` and `git` are needed.
+
+```sh
+# Append, don't prepend: local mode wants the stock git/grep/find/rg, not the
+# shims. `gfs` finds `gfs-fuse` beside itself, so nothing else needs PATH.
+export PATH="$PATH:$PWD/gfs-bundle/bin"
+
+git clone https://github.com/pallets/flask.git ~/src/flask   # any clone works
+
+gfs mount --local ~/src/flask --rev main --workspace ~/work/change-1
+gfs mount --local ~/src/flask --rev main --workspace ~/work/change-2
+cd ~/work/change-1
+
+git status
+git log --oneline -10
+grep -rn 'def route' src | head      # stock grep over the mount, no network
+echo "a change" >> README.md
+git commit -am "a change"
+git push origin HEAD:my-change        # the clone is `origin`
+git -C ~/src/flask log --oneline -1 my-change
+
+gfs inspect                           # same report as a server mount
+cd ~ && gfs unmount --workspace ~/work/change-1
+```
+
+Things worth checking:
+
+- **Acquire is cheap.** Each `gfs mount --local` should come back in well
+  under a second and leave a few MiB on disk (`du -sh ~/work/change-1/.git`),
+  where `git worktree add` copies the whole tree.
+- **`--prewarm`** inflates the pinned tree's blobs into memory in the
+  background after the mount is up, so first reads cost what second reads do.
+  Up to 256 MiB; `gfs inspect` reports progress.
+- **The pin is guarded.** While a workspace is mounted,
+  `git -C ~/src/flask for-each-ref refs/gfs/mounts/` shows its anchor, and
+  `git gc` in the clone is safe. Unmount deletes the anchor.
+- **Pushing onto the clone's checked-out branch is refused** by Git — push to
+  a new branch name, as above.
+- **A workspace is bound to its clone** by absolute path; moving or deleting
+  `~/src/flask` under a live workspace breaks it.
+- **LFS files show as pointers**, as with `GIT_LFS_SKIP_SMUDGE=1`.
+
+Teardown is `gfs unmount --workspace <path>` per workspace, then
+`gfs daemon stop` once nothing is mounted.
+
 ## Browse it over WebDAV
 
 The same server speaks read-only WebDAV at `/dav/` — no `gfs`, no `git`,
