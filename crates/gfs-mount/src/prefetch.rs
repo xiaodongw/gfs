@@ -202,6 +202,14 @@ pub struct Prefetcher {
   /// A sender clone parked in this map would leave them waiting forever on a
   /// fetch that is never coming.
   inflight: Mutex<HashMap<Vec<u8>, tokio::sync::watch::Receiver<u64>>>,
+  /// Roots whose walk stopped at its entry bound.
+  ///
+  /// A walk always starts from its root's first entry, so claiming one of these
+  /// again — or any ancestor of one — replays the prefix already cached and
+  /// stops at the same place. Without this, a walker larger than the bound (a
+  /// `git status` or gitstatusd over universe) re-fired the root walk every few
+  /// seconds forever, and every listing miss under it waited out each replay.
+  truncated: Mutex<Vec<Vec<u8>>>,
 }
 
 impl Prefetcher {
@@ -210,6 +218,7 @@ impl Prefetcher {
       walk: Mutex::new(WalkDetector::new(walk_threshold)),
       reads: Mutex::new(ReadDetector::default()),
       inflight: Mutex::new(HashMap::new()),
+      truncated: Mutex::new(Vec::new()),
     }
   }
 
@@ -246,8 +255,18 @@ impl Prefetcher {
       .observe(path, threshold, Instant::now())
   }
 
-  /// Claim a subtree, or decline because one covering it is already running.
+  /// Claim a subtree, or decline because one covering it is already running,
+  /// or because walking it again would only replay a walk that hit its bound.
   fn claim(&self, root: &BytePath) -> Option<tokio::sync::watch::Sender<u64>> {
+    if self
+      .truncated
+      .lock()
+      .expect("prefetch")
+      .iter()
+      .any(|done| covers(root.as_bytes(), done))
+    {
+      return None;
+    }
     let mut inflight = self.inflight.lock().expect("prefetch");
     inflight.retain(|_, progress| progress.has_changed().is_ok());
     if inflight
@@ -259,6 +278,14 @@ impl Prefetcher {
     let (sender, receiver) = tokio::sync::watch::channel(0);
     inflight.insert(root.as_bytes().to_vec(), receiver);
     Some(sender)
+  }
+
+  fn mark_truncated(&self, root: &BytePath) {
+    self
+      .truncated
+      .lock()
+      .expect("prefetch")
+      .push(root.as_bytes().to_vec());
   }
 
   fn release(&self, root: &BytePath) {
@@ -356,6 +383,7 @@ pub fn spawn_subtree(
             fetched,
             "subtree prefetch reached its entry bound; the rest lists per directory"
           );
+          pinned.prefetch.mark_truncated(&root);
         }
         break;
       }

@@ -442,8 +442,13 @@ impl Mount {
       // Nothing crosses a network in local mode, so there is nothing for the
       // hydration budget to bound and nothing for the read detector to fetch
       // ahead of — blobs are served from memory, not copied into the cache.
+      // Nor for the walk detector to batch: a local listing is one libgit2
+      // call, and a walk prefetch is a serial traversal every miss under it
+      // waits on — on universe, gitstatusd's 32 threads and an `ls` behind one
+      // core, where listing per directory runs on all of them.
       config.fs.hydration_budget_bytes = 0;
       config.fs.read_prefetch_threshold = 0;
+      config.fs.walk_prefetch_threshold = 0;
     }
     // Recovery ordering (ADR 0011, load-bearing): lazy-unmount whatever a dead
     // daemon left over the workspace, *then* open the real `.git`, then mount.

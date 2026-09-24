@@ -69,6 +69,15 @@ use crate::source::{
 /// clones on one host stay well inside a developer machine's memory.
 pub const BLOB_MEMORY_BYTES: u64 = 256 * 1024 * 1024;
 
+/// Bytes of decoded trees kept per clone.
+///
+/// Every listing, lookup, and index build decodes trees, and a miss is a pack
+/// lookup and an inflate. The server-sized default (2 MiB) held 5 695 of
+/// universe's ~370k trees, so a first `git status` decoded nearly every tree
+/// it touched twice or more. This holds all of them with room to spare, once
+/// per clone rather than per workspace.
+const TREE_CACHE_BYTES: usize = 256 * 1024 * 1024;
+
 /// How long a local search may run before it reports itself truncated.
 ///
 /// Generous against the overlay scanner's five seconds, because this is the
@@ -104,11 +113,7 @@ impl LocalRepository {
         format!("no clone at {}: {e}", clone.display()),
       )
     })?;
-    let repo = Libgit2Repository::open(
-      &clone,
-      limits::DEFAULT_REPO_HANDLES,
-      limits::DEFAULT_TREE_CACHE_ENTRIES * 512,
-    )?;
+    let repo = Libgit2Repository::open(&clone, limits::DEFAULT_REPO_HANDLES, TREE_CACHE_BYTES)?;
     let objects = repo.objects_directory()?;
     let repository_id = repository_id_for(&clone);
     Ok(Arc::new(LocalRepository {
