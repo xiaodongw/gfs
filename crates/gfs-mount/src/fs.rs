@@ -196,6 +196,14 @@ pub struct FsConfig {
   /// refused write is reported -- at `close`, not at `write(2)` -- and a
   /// program that ignores `close`'s result loses the bytes silently.
   pub writeback_cache: bool,
+  /// SPIKE (plans/20260924-2322-local-mode-universe-gap.md): answer `open`
+  /// with `ENOSYS`, so the kernel (5.1+) stops sending `open` and `release`
+  /// for the whole mount and opens every file with `FOPEN_KEEP_CACHE`. Reads
+  /// then arrive with no handle and are served by inode. Writes through a
+  /// descriptor opened this way are refused (`EBADF`); `create` still
+  /// returns a handle. Measures what the per-open round trips cost; not a
+  /// mode to run a workspace in.
+  pub zero_message_open: bool,
 }
 
 impl Default for FsConfig {
@@ -250,6 +258,7 @@ impl Default for FsConfig {
       // turn it off to make a workload fit.
       hydration_budget_bytes: 1 << 30,
       writeback_cache: false,
+      zero_message_open: false,
     }
   }
 }
@@ -1261,6 +1270,77 @@ impl Gfs {
   /// one attached to every metadata lookup would usually expire unused; and when
   /// the blob is already cached, no ticket -- and no round trip -- is needed at
   /// all, which is what makes a warm reopen free.
+  /// SPIKE: a `read` with no handle, under [`FsConfig::zero_message_open`].
+  ///
+  /// The kernel opened the file without asking, so the state `open` would
+  /// have built is built here, per request, from the inode alone. Base bytes
+  /// come from the same place `open` gets them (memory in local mode, the
+  /// cache otherwise); overlay and `.git` files are reopened per request,
+  /// which is fine for measuring reads of the pinned tree and nothing else.
+  async fn read_unopened(&self, ino: u64, offset: u64, size: u32, reply: fuser::ReplyData) {
+    let Some(record) = self.record(ino) else {
+      return reply.error(Errno::ESTALE);
+    };
+    let range = |len: usize| {
+      let start = (offset as usize).min(len);
+      let end = start.saturating_add(size as usize).min(len);
+      self.bump(|s| {
+        s.reads += 1;
+        s.read_bytes += (end - start) as u64;
+      });
+      start..end
+    };
+    let base_oid = match &record.node {
+      Node::Base(entry) if matches!(entry.kind, EntryKind::Regular | EntryKind::Executable) => {
+        Some(entry.oid.clone())
+      }
+      Node::Overlay(entry) if entry.content.local_id().is_none() => {
+        entry.content.base_oid().cloned()
+      }
+      _ => None,
+    };
+    let file = if let Some(oid) = base_oid {
+      match self.open_blob(&blob_path(&record), &oid).await {
+        Ok(OpenedBlob::Memory(bytes)) => return reply.data(&bytes[range(bytes.len())]),
+        Ok(OpenedBlob::File(file)) => file,
+        Err(e) => return reply.error(errno_of(&e)),
+      }
+    } else {
+      match &record.node {
+        Node::Overlay(entry) => {
+          let Some(id) = entry.content.local_id() else {
+            return reply.error(Errno::EIO);
+          };
+          match self.overlay().content_store().open_read(id) {
+            Ok(file) => file,
+            Err(e) => return reply.error(errno_of_overlay(&e)),
+          }
+        }
+        Node::Git(_) => {
+          let Some(rel) = git_rel(&record.path) else {
+            return reply.error(Errno::ESTALE);
+          };
+          match std::fs::File::open(self.git.real(rel)) {
+            Ok(file) => file,
+            Err(e) => return reply.error(errno_io(&e)),
+          }
+        }
+        _ => return reply.error(Errno::EIO),
+      }
+    };
+    let mut buffer = vec![0u8; size as usize];
+    match file.read_at(&mut buffer, offset) {
+      Ok(read) => {
+        self.bump(|s| {
+          s.reads += 1;
+          s.read_bytes += read as u64;
+        });
+        reply.data(&buffer[..read])
+      }
+      Err(e) => reply.error(errno_io(&e)),
+    }
+  }
+
   async fn open_blob(&self, path: &BytePath, oid: &ObjectId) -> Result<OpenedBlob, GfsError> {
     // Evidence for the read detector, taken whether or not the blob is cached:
     // what makes a directory look read-through is which files a job asked for,
@@ -2118,6 +2198,11 @@ impl Filesystem for GfsFilesystem {
   }
 
   fn open(&self, _req: &Request, ino: INodeNo, flags: OpenFlags, reply: fuser::ReplyOpen) {
+    if self.fs.config.zero_message_open {
+      // The kernel records that this filesystem has no `open` and never sends
+      // another (nor a `release`); see `FsConfig::zero_message_open`.
+      return reply.error(Errno::ENOSYS);
+    }
     let fs = Arc::clone(&self.fs);
     let writable = flags.acc_mode() != OpenAccMode::O_RDONLY;
     let truncating = flags.0 & libc::O_TRUNC != 0;
@@ -2396,7 +2481,7 @@ impl Filesystem for GfsFilesystem {
   fn read(
     &self,
     _req: &Request,
-    _ino: INodeNo,
+    ino: INodeNo,
     fh: FileHandle,
     offset: u64,
     size: u32,
@@ -2407,6 +2492,9 @@ impl Filesystem for GfsFilesystem {
     let fs = Arc::clone(&self.fs);
     let state = fs.files.lock().expect("file handles").get(&fh.0).cloned();
     let Some(state) = state else {
+      if fs.config.zero_message_open && fh.0 == 0 {
+        return self.spawn(async move { fs.read_unopened(ino.0, offset, size, reply).await });
+      }
       return reply.error(Errno::EBADF);
     };
     self.spawn(async move {

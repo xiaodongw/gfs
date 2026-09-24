@@ -66,6 +66,12 @@ struct Args {
   /// bytes, so a metered link is a reason to disable it.
   #[arg(long, env = "GFS_READ_PREFETCH_THRESHOLD", default_value_t = FsConfig::default().read_prefetch_threshold)]
   read_prefetch_threshold: usize,
+
+  /// SPIKE: answer `open` with `ENOSYS` so the kernel stops sending `open`
+  /// and `release`. Measures what per-open round trips cost; writes through
+  /// existing files are refused while it is on. See `FsConfig::zero_message_open`.
+  #[arg(long, env = "GFS_ZERO_MESSAGE_OPEN")]
+  zero_message_open: bool,
 }
 
 #[tokio::main]
@@ -88,6 +94,7 @@ async fn main() -> Result<()> {
       hydration_budget_bytes: args.hydration_budget,
       walk_prefetch_threshold: args.walk_prefetch_threshold,
       read_prefetch_threshold: args.read_prefetch_threshold,
+      zero_message_open: args.zero_message_open,
       ..FsConfig::default()
     },
     odb_residency_bytes: args.odb_residency_budget,
