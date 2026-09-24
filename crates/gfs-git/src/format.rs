@@ -54,16 +54,36 @@ impl FormatVerdict {
   }
 }
 
-/// The `extensions.*` keys whose meaning is known.
+/// The `extensions.*` keys whose meaning is known, split the way Git's own
+/// `setup.c` splits them.
 ///
-/// `compatobjectformat` and `objectformat` are read and then judged by
-/// [`verdict`]; being *known* is not the same as being *supported*.
-const KNOWN_EXTENSIONS: &[&str] = &[
-  "extensions.objectformat",
-  "extensions.refstorage",
+/// Git honours the first group even at `repositoryformatversion` 0, for
+/// historical reasons. The rest are "v1-only": Git refuses a version-0
+/// repository that carries one, and so does [`verdict`].
+///
+/// `compatobjectformat`, `objectformat` and `partialclone` are read and then
+/// judged by [`verdict`]; being *known* is not the same as being *supported*.
+/// The others change neither the object store nor the ref store, which is all
+/// GFS reads: `worktreeconfig` adds a per-worktree config file (`git
+/// sparse-checkout` turns it on, so developer clones carry it),
+/// `relativeworktrees` stores worktree links as relative paths, and
+/// `preciousobjects` forbids pruning, which GFS never does.
+const V0_EXTENSIONS: &[&str] = &[
   "extensions.noop",
-  "extensions.compatobjectformat",
+  "extensions.preciousobjects",
+  "extensions.partialclone",
+  "extensions.worktreeconfig",
 ];
+const V1_ONLY_EXTENSIONS: &[&str] = &[
+  "extensions.objectformat",
+  "extensions.compatobjectformat",
+  "extensions.refstorage",
+  "extensions.relativeworktrees",
+];
+
+fn is_one_of(name: &str, set: &[&str]) -> bool {
+  set.iter().any(|k| name.eq_ignore_ascii_case(k))
+}
 
 /// Read the on-disk format from a repository's config, without opening it as a
 /// repository.
@@ -153,22 +173,25 @@ pub fn verdict(format: &RepositoryFormat) -> FormatVerdict {
     };
   }
 
-  for (name, value) in &format.extensions {
-    if !KNOWN_EXTENSIONS
-      .iter()
-      .any(|k| name.eq_ignore_ascii_case(k))
-    {
-      return FormatVerdict::Rejected {
-        reason: format!(
-          "unrecognized repository extension {name}={value}; an unknown extension \
-           means an unknown on-disk meaning"
-        ),
-      };
-    }
+  // Checked at every version, because Git honours it at every version: a
+  // partial clone's missing objects are fetched on demand from a promisor
+  // remote, and libgit2 has no promisor support, so a read of one simply
+  // fails -- a partial view by construction.
+  if let Some((_, remote)) = format
+    .extensions
+    .iter()
+    .find(|(n, _)| n.eq_ignore_ascii_case("extensions.partialclone"))
+  {
+    return FormatVerdict::Rejected {
+      reason: format!(
+        "partial clone (promisor remote {remote:?}): objects filtered out at clone \
+         time are not on disk, and libgit2 cannot fetch them on demand; use a \
+         full clone, made without `--filter`"
+      ),
+    };
   }
 
   // `repositoryformatversion` above 1 is a format this Git does not define.
-  // Version 1 is required for any `extensions.*` to be honoured at all.
   if format.repository_format_version > 1 {
     return FormatVerdict::Rejected {
       reason: format!(
@@ -176,6 +199,36 @@ pub fn verdict(format: &RepositoryFormat) -> FormatVerdict {
         format.repository_format_version
       ),
     };
+  }
+
+  // Git's own rule, so GFS refuses exactly the repositories Git refuses: at
+  // version 1 an unknown extension is an error; at version 0 unknown
+  // extensions are ignored (they were never promised to mean anything), but a
+  // v1-only one is an error, because a v0 repository claiming it is
+  // contradictory.
+  for (name, value) in &format.extensions {
+    let known_at_v0 = is_one_of(name, V0_EXTENSIONS);
+    let v1_only = is_one_of(name, V1_ONLY_EXTENSIONS);
+    let rejected = if format.repository_format_version == 1 {
+      !known_at_v0 && !v1_only
+    } else {
+      v1_only
+    };
+    if rejected {
+      return FormatVerdict::Rejected {
+        reason: if v1_only {
+          format!(
+            "repository format version is 0, but v1-only extension {name}={value} \
+             is set; Git refuses this repository too"
+          )
+        } else {
+          format!(
+            "unrecognized repository extension {name}={value}; an unknown extension \
+             means an unknown on-disk meaning"
+          )
+        },
+      };
+    }
   }
 
   FormatVerdict::Supported
@@ -267,9 +320,52 @@ mod tests {
   }
 
   #[test]
+  fn extensions_that_leave_objects_and_refs_alone_are_supported() {
+    // `git sparse-checkout` sets `worktreeConfig`; a developer clone used in
+    // local mode must not be refused for it. Git writes the key camel-cased.
+    for name in [
+      "extensions.worktreeConfig",
+      "extensions.relativeWorktrees",
+      "extensions.preciousObjects",
+    ] {
+      assert!(
+        verdict(&format_with(&[(name, "true")], 1)).is_supported(),
+        "{name}"
+      );
+    }
+  }
+
+  #[test]
   fn an_unknown_extension_is_rejected_rather_than_ignored() {
     let v = verdict(&format_with(&[("extensions.futurething", "1")], 1));
     assert!(!v.is_supported());
+  }
+
+  #[test]
+  fn version_0_follows_git_ignoring_unknown_and_refusing_v1_only_extensions() {
+    // Measured against Git 2.53: `git status` succeeds for the first, and
+    // fails "repo version is 0, but v1-only extension found" for the second.
+    assert!(verdict(&format_with(&[("extensions.futurething", "1")], 0)).is_supported());
+    assert!(verdict(&format_with(&[("extensions.worktreeConfig", "true")], 0)).is_supported());
+    let v = verdict(&format_with(&[("extensions.relativeWorktrees", "true")], 0));
+    let FormatVerdict::Rejected { reason } = v else {
+      panic!("a v1-only extension at version 0 must be rejected");
+    };
+    assert!(reason.contains("v1-only"), "reason was: {reason}");
+  }
+
+  #[test]
+  fn a_partial_clone_is_rejected_at_any_version_and_says_why() {
+    for version in [0, 1] {
+      let v = verdict(&format_with(
+        &[("extensions.partialClone", "origin")],
+        version,
+      ));
+      let FormatVerdict::Rejected { reason } = v else {
+        panic!("a partial clone must be rejected at version {version}");
+      };
+      assert!(reason.contains("--filter"), "reason was: {reason}");
+    }
   }
 
   #[test]

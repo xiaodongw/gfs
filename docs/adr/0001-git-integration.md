@@ -97,7 +97,10 @@ Packaging obligations:
 | `reftable` ref backend | **Rejected at ingest** | libgit2 1.9.6: `unsupported extension name extensions.refstorage` |
 | SHA-1 objects | Supported | measured |
 | SHA-256 objects | **Rejected at ingest** | see ADR consequence below |
-| unrecognized `extensions.*` | **Rejected at ingest** | an unknown extension means unknown on-disk meaning |
+| `worktreeConfig`, `relativeWorktrees`, `preciousObjects` | Supported | known to libgit2 1.9.6; touch neither objects nor refs (2026-09-24) |
+| `partialClone` | **Rejected at ingest**, any version | filtered objects are not on disk; libgit2 has no promisor fetch (2026-09-24) |
+| unrecognized `extensions.*`, format version 1 | **Rejected at ingest** | an unknown extension means unknown on-disk meaning |
+| unrecognized `extensions.*`, format version 0 | Ignored | Git's own rule: v0 never promised extensions meant anything; a v1-only extension at v0 is rejected, as Git rejects it (2026-09-24) |
 
 Rejection happens at mirror creation, in `gitrepo::verdict`, and is validated
 against stock Git's `rev-parse --show-ref-format` / `--show-object-format`. The
