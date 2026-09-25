@@ -1447,8 +1447,8 @@ impl GitRepository for Libgit2Repository {
       .map(|n| n.get())
       .unwrap_or(1)
       .min(self.pool.max_handles());
-    let chunk_size = (deferred.len() + num_threads - 1) / num_threads;
-    let pool = Arc::clone(&self.pool);
+    let _chunk_size = (deferred.len() + num_threads - 1) / num_threads;
+    let _pool = Arc::clone(&self.pool);
 
     let mut sizes: Vec<u64> = Vec::with_capacity(deferred.len());
 
@@ -1507,7 +1507,7 @@ impl GitRepository for Libgit2Repository {
 
     // Now collect all sizes: index > git subprocess > libgit2 fallback
     let header_start = std::time::Instant::now();
-    for (i, entry) in deferred.iter().enumerate() {
+    for (_i, entry) in deferred.iter().enumerate() {
       let size = if entry.mode == mode::GITLINK {
         0u64
       } else if let Some(&sz) = index_sizes.get(&entry.oid) {
