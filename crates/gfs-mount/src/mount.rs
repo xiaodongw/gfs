@@ -1227,10 +1227,12 @@ impl Mount {
   /// The token is `gfs:<generation>:<sequence>`. Only the generation decides a
   /// rescan — a repin discards or re-bases the overlay, which changes what an
   /// *unlisted* path means, so a token from another generation forces the one
-  /// full rescan that re-grounds Git. The sequence carries the overlay's
-  /// committed-change count so that the token advances when the workspace
-  /// changes, which is what the v2 protocol asks of it; it does not narrow the
-  /// answer, which stays cumulative for the generation.
+  /// full rescan that re-grounds Git.
+  ///
+  /// When the caller's token is from this generation and the overlay can answer
+  /// for that sequence, only paths changed after the caller's sequence are
+  /// returned (delta answer). Otherwise, the full list is returned (and a full
+  /// rescan if the vanished set overflowed or the token is from another generation).
   pub async fn fsmonitor_changes(
     &self,
     caller_token: &str,
@@ -1242,38 +1244,114 @@ impl Mount {
     };
     let generation_token = format!("gfs:{generation}");
     let algorithm = commit.algorithm();
-    // One trip to the blocking pool for all three: the overlay's lock is held
-    // across content I/O by a concurrent copy-up, and waiting for it on a
-    // reactor thread would stall every other request on the daemon.
-    let (status, vanished, vanished_overflow, sequence) = tokio::task::spawn_blocking(move || {
-      let status = overlay.status(algorithm);
-      let (vanished, overflow) = overlay.vanished();
-      (status, vanished, overflow, overlay.sequence())
-    })
-    .await
-    .map_err(|e| GfsError::internal(format!("the fsmonitor task failed: {e}")))?;
+    let caller_token = caller_token.to_string();
+
+    // Parse the caller's token to extract the sequence.
+    let caller_sequence = if caller_token.starts_with(&format!("{generation_token}:")) {
+      caller_token
+        .strip_prefix(&format!("{generation_token}:"))
+        .and_then(|s| s.parse::<u64>().ok())
+    } else {
+      None
+    };
+
+    // One trip to the blocking pool to gather overlay state.
+    let (status, all_vanished, vanished_overflow, sequence, delta_result) =
+      tokio::task::spawn_blocking(move || {
+        let status = overlay.status(algorithm);
+        let (all_vanished, overflow) = overlay.vanished();
+        let seq = overlay.sequence();
+        // Try to compute delta if the caller's token is from this generation.
+        let delta = if let Some(caller_seq) = caller_sequence {
+          overlay
+            .changes_since(caller_seq)
+            .ok()
+            .flatten()
+        } else {
+          None
+        };
+        (status, all_vanished, overflow, seq, delta)
+      })
+      .await
+      .map_err(|e| GfsError::internal(format!("the fsmonitor task failed: {e}")))?;
     let status = status.map_err(crate::fs::overlay_as_service_error)?;
+
     let token = format!("{generation_token}:{sequence}");
-    // The names were dropped at the cap, so no list can be complete any more.
-    let full_rescan =
-      !caller_token.starts_with(&format!("{generation_token}:")) || vanished_overflow;
-    let mut paths = Vec::with_capacity(status.changes.len() * 2);
-    for change in &status.changes {
-      paths.push(String::from_utf8_lossy(change.path.as_bytes()).into_owned());
-      // A rename changed both names: the new one exists, the old one is gone,
-      // and Git must re-stat both.
-      if let Some(from) = &change.from {
-        paths.push(String::from_utf8_lossy(from.as_bytes()).into_owned());
+
+    // Decide whether to return a delta or full answer.
+    let (paths, full_rescan) = if let Some((delta_entries, delta_vanished)) = delta_result {
+      // Delta answer: only paths changed since the caller's sequence.
+      if vanished_overflow {
+        // Overflow means we can't trust the delta anymore; fall back to full.
+        let mut all_paths = Vec::with_capacity(status.changes.len() * 2 + all_vanished.len());
+        for change in &status.changes {
+          all_paths.push(String::from_utf8_lossy(change.path.as_bytes()).into_owned());
+          if let Some(from) = &change.from {
+            all_paths.push(String::from_utf8_lossy(from.as_bytes()).into_owned());
+          }
+        }
+        for dir in &status.directory_deletions {
+          all_paths.push(format!("{}/", String::from_utf8_lossy(dir.as_bytes())));
+        }
+        for path in &all_vanished {
+          all_paths.push(String::from_utf8_lossy(path.as_bytes()).into_owned());
+        }
+        (all_paths, true)
+      } else {
+        // Return only the delta paths.
+        let mut delta_paths = Vec::with_capacity(delta_entries.len() * 2 + delta_vanished.len());
+
+        // Add delta entries that are still present in status.
+        for entry_path in &delta_entries {
+          // Check if this entry is in the status changes.
+          if let Some(change) = status.changes.iter().find(|c| &c.path == entry_path) {
+            delta_paths.push(String::from_utf8_lossy(change.path.as_bytes()).into_owned());
+            // If it's a rename, also add the old name.
+            if let Some(from) = &change.from {
+              delta_paths.push(String::from_utf8_lossy(from.as_bytes()).into_owned());
+            }
+          } else {
+            // Check if it's a directory deletion.
+            if let Some(dir) = status.directory_deletions.iter().find(|d| *d == entry_path) {
+              delta_paths.push(format!("{}/", String::from_utf8_lossy(dir.as_bytes())));
+            } else if !status.changes.iter().any(|c| &c.path == entry_path) {
+              // Path was changed but is no longer in status - might be deleted
+              // Just add it as-is for Git to re-stat
+              delta_paths.push(String::from_utf8_lossy(entry_path.as_bytes()).into_owned());
+            }
+          }
+        }
+
+        // Add vanished paths that changed.
+        for path in &delta_vanished {
+          delta_paths.push(String::from_utf8_lossy(path.as_bytes()).into_owned());
+        }
+
+        (delta_paths, false)
       }
-    }
-    for dir in &status.directory_deletions {
-      // Git's protocol: a trailing slash marks a directory whose contents all
-      // changed.
-      paths.push(format!("{}/", String::from_utf8_lossy(dir.as_bytes())));
-    }
-    for path in &vanished {
-      paths.push(String::from_utf8_lossy(path.as_bytes()).into_owned());
-    }
+    } else {
+      // Full answer (caller's token is from another generation or sequence is invalid).
+      let mut full_paths = Vec::with_capacity(status.changes.len() * 2 + all_vanished.len());
+      for change in &status.changes {
+        full_paths.push(String::from_utf8_lossy(change.path.as_bytes()).into_owned());
+        // A rename changed both names: the new one exists, the old one is gone,
+        // and Git must re-stat both.
+        if let Some(from) = &change.from {
+          full_paths.push(String::from_utf8_lossy(from.as_bytes()).into_owned());
+        }
+      }
+      for dir in &status.directory_deletions {
+        // Git's protocol: a trailing slash marks a directory whose contents all
+        // changed.
+        full_paths.push(format!("{}/", String::from_utf8_lossy(dir.as_bytes())));
+      }
+      for path in &all_vanished {
+        full_paths.push(String::from_utf8_lossy(path.as_bytes()).into_owned());
+      }
+      let full_rescan = !caller_token.starts_with(&format!("{generation_token}:")) || vanished_overflow;
+      (full_paths, full_rescan)
+    };
+
     Ok(crate::control::FsMonitorAnswer {
       token,
       paths,

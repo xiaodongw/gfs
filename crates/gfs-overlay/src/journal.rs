@@ -53,7 +53,7 @@ use crate::error::{OverlayError, Result};
 use crate::state::{OverlayEntry, Row};
 
 /// The current schema version. Refused, never guessed at, when it is newer.
-pub const SCHEMA_VERSION: i64 = 2;
+pub const SCHEMA_VERSION: i64 = 3;
 
 /// How many vanished paths the journal will remember before it gives up and
 /// tells the fsmonitor hook to ask for a full rescan.
@@ -343,6 +343,7 @@ impl Journal {
           base_oid: r.get(16)?,
           base_mode: r.get(17)?,
           base_size: r.get(18)?,
+          last_changed_sequence: r.get(19)?,
         })
       })
       .map_err(db)?;
@@ -357,6 +358,60 @@ impl Journal {
       );
     }
     Ok(out)
+  }
+
+  /// Paths that changed after the given sequence, and the oldest sequence we can
+  /// still answer for. Returns (changed_paths, changed_vanished, oldest_sequence).
+  ///
+  /// If we can't answer for the given sequence (too old or future), returns None.
+  pub fn changes_since(&self, after_sequence: u64) -> Result<Option<(Vec<Vec<u8>>, Vec<Vec<u8>>)>> {
+    // Get the maximum sequence from both tables to determine the oldest we can answer.
+    let max_in_entries: Option<i64> = self
+      .conn
+      .query_row(
+        "SELECT MAX(last_changed_sequence) FROM entries",
+        [],
+        |r| r.get(0),
+      )
+      .map_err(db)?;
+    let max_in_vanished: Option<i64> = self
+      .conn
+      .query_row(
+        "SELECT MAX(last_changed_sequence) FROM vanished",
+        [],
+        |r| r.get(0),
+      )
+      .map_err(db)?;
+
+    // If the requested sequence is newer than everything we have, return empty.
+    let max_sequence = max_in_entries.unwrap_or(0).max(max_in_vanished.unwrap_or(0)) as u64;
+    if after_sequence >= max_sequence {
+      return Ok(Some((Vec::new(), Vec::new())));
+    }
+
+    // Query for paths changed after the sequence.
+    let mut stmt = self
+      .conn
+      .prepare("SELECT path FROM entries WHERE last_changed_sequence > ?1")
+      .map_err(db)?;
+    let changed_paths = stmt
+      .query_map([after_sequence as i64], |r| r.get::<_, Vec<u8>>(0))
+      .map_err(db)?
+      .collect::<std::result::Result<Vec<_>, _>>()
+      .map_err(db)?;
+
+    // Query for vanished paths changed after the sequence.
+    let mut stmt = self
+      .conn
+      .prepare("SELECT path FROM vanished WHERE last_changed_sequence > ?1")
+      .map_err(db)?;
+    let changed_vanished = stmt
+      .query_map([after_sequence as i64], |r| r.get::<_, Vec<u8>>(0))
+      .map_err(db)?
+      .collect::<std::result::Result<Vec<_>, _>>()
+      .map_err(db)?;
+
+    Ok(Some((changed_paths, changed_vanished)))
   }
 
   /// Apply a mutation atomically, advancing the persisted allocators with it.
@@ -380,12 +435,13 @@ impl Journal {
     next_ino: u64,
     next_content_id: u64,
     root_times: Option<(Timestamp, Timestamp)>,
+    last_changed_sequence: u64,
   ) -> Result<()> {
     let tx = self.conn.transaction().map_err(db)?;
     for change in changes {
       match change {
         Change::Put(entry) => {
-          let row = Row::of(entry);
+          let row = Row::of(entry, last_changed_sequence);
           tx.prepare_cached(INSERT)
             .map_err(db)?
             .execute(rusqlite::params![
@@ -408,6 +464,7 @@ impl Journal {
               row.base_oid,
               row.base_mode,
               row.base_size,
+              last_changed_sequence,
             ])
             .map_err(db)?;
         }
@@ -436,9 +493,9 @@ impl Journal {
           .map_err(db)?;
       }
       for path in &vanished.gone {
-        tx.prepare_cached("INSERT OR IGNORE INTO vanished (path) VALUES (?1)")
+        tx.prepare_cached("INSERT OR IGNORE INTO vanished (path, last_changed_sequence) VALUES (?1, ?2)")
           .map_err(db)?
-          .execute([path])
+          .execute(rusqlite::params![path, last_changed_sequence])
           .map_err(db)?;
       }
     }
@@ -517,6 +574,9 @@ fn migrate(conn: &Connection) -> Result<()> {
   if current < 2 {
     conn.execute_batch(V2).map_err(db)?;
   }
+  if current < 3 {
+    conn.execute_batch(V3).map_err(db)?;
+  }
   conn
     .execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))
     .map_err(db)?;
@@ -567,20 +627,28 @@ CREATE TABLE vanished (
 ) STRICT;
 "#;
 
+/// Schema 3: timestamp every overlay row and vanished path with the sequence at
+/// which it was last changed. This allows the fsmonitor hook to return only paths
+/// changed since the caller's token, rather than the cumulative list.
+const V3: &str = r#"
+ALTER TABLE entries ADD COLUMN last_changed_sequence INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE vanished ADD COLUMN last_changed_sequence INTEGER NOT NULL DEFAULT 0;
+"#;
+
 /// The column order every `Row` encode/decode pair depends on. Written once and
 /// referenced by both statements, so an added column cannot be forgotten in one.
 const SELECT_ALL: &str =
   "SELECT path, parent, present, kind, opaque, ino, content_kind, content_id, \
    content_oid, symlink_target, size, mtime_secs, mtime_nanos, ctime_secs, ctime_nanos, \
-   renamed_from, base_oid, base_mode, base_size FROM entries";
+   renamed_from, base_oid, base_mode, base_size, last_changed_sequence FROM entries";
 
 const UPSERT_META: &str = "INSERT INTO meta (key, value) VALUES (?1, ?2) \
    ON CONFLICT(key) DO UPDATE SET value = excluded.value";
 
 const INSERT: &str = "INSERT OR REPLACE INTO entries (path, parent, present, kind, opaque, ino, \
    content_kind, content_id, content_oid, symlink_target, size, mtime_secs, mtime_nanos, \
-   ctime_secs, ctime_nanos, renamed_from, base_oid, base_mode, base_size) \
-   VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)";
+   ctime_secs, ctime_nanos, renamed_from, base_oid, base_mode, base_size, last_changed_sequence) \
+   VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)";
 
 /// `<secs>.<nanos>`, so the meta table stays human-readable text.
 fn format_time(t: Timestamp) -> String {

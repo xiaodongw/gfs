@@ -362,6 +362,7 @@ impl Overlay {
         next_ino,
         next_content_id,
         None,
+        0, // Recovery corrections use sequence 0
       )?;
     }
 
@@ -521,6 +522,21 @@ impl Overlay {
     )
   }
 
+  /// Paths that changed since the given sequence, used for delta fsmonitor answers.
+  ///
+  /// Returns `None` if we can't answer for this sequence (too old, future, or overflow).
+  /// Returns `Some((changed_entries, changed_vanished))` otherwise.
+  pub fn changes_since(&self, after_sequence: u64) -> Result<Option<(Vec<BytePath>, Vec<BytePath>)>> {
+    let inner = self.lock();
+    let result = inner.journal.changes_since(after_sequence)?;
+    Ok(result.map(|(entries, vanished)| {
+      (
+        entries.into_iter().map(BytePath::new).collect(),
+        vanished.into_iter().map(BytePath::new).collect(),
+      )
+    }))
+  }
+
   /// The mount root's times, or `None` while the snapshot time still describes
   /// it. See [`Overlay::touch_root`].
   pub fn root_times(&self) -> Option<(Timestamp, Timestamp)> {
@@ -678,6 +694,9 @@ impl Overlay {
     let delta = crate::journal::VanishedDelta::of(&changes);
     let overflow = inner.vanished_overflow
       || inner.vanished.len() + delta.gone.len() > crate::journal::VANISHED_LIMIT;
+    // Increment the sequence first so the rows are stamped with the new sequence.
+    inner.sequence += 1;
+    let current_sequence = inner.sequence;
     inner.journal.apply(
       &changes,
       &delta,
@@ -685,6 +704,7 @@ impl Overlay {
       inner.next_ino,
       inner.next_content_id,
       root_times,
+      current_sequence,
     )?;
     if let Some(times) = root_times {
       inner.root_times = Some(times);
@@ -700,7 +720,6 @@ impl Overlay {
         inner.vanished.insert(path);
       }
     }
-    inner.sequence += 1;
     for change in &changes {
       match change {
         Change::Put(entry) => {
