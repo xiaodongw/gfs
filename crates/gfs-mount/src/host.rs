@@ -249,13 +249,13 @@ impl MountHost {
         let mut fs_config = self.config.fs.clone();
         fs_config.writeback_cache = request.writeback_cache;
         fs_config.dispatch = request.dispatch;
-        // Enable zero-message open by default for local-mode mounts. This avoids
-        // the per-open round trip cost on the local commit, which is immutable and
-        // cheap to access in-process. The daemon-level flag can force it on for all
-        // mounts (local and remote) for testing/profiling.
-        if is_local {
-          fs_config.zero_message_open = true;
-        }
+        // Zero-message open stays opt-in (`gfs-fuse --zero-message-open`). Once
+        // `open` answers ENOSYS the kernel sends no `release` for any file on
+        // the connection -- created ones included -- so written rows are never
+        // settled and created files' handles are never dropped, and an
+        // unlinked or renamed-over file that is still open has no descriptor
+        // keeping its bytes. See the plan's Phase C for what making it the
+        // local default still needs.
         fs_config
       },
       overlay: gfs_overlay::OverlayConfig {

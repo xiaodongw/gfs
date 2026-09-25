@@ -83,8 +83,18 @@ phase 0 was measured and not kept: a larger listing cache (see Decisions).
   fixture clone opens no directory and agrees with its own uncached answer,
   pristine and with a reported change.
 
-**Later phases**: the full zero-message-open refactor (including zero-message
-`opendir`), profiling warm `git status` and commit.
+**Phase C — zero-message open** (built; opt-in, not the local default)
+* `open` and `opendir` answer ENOSYS when `FsConfig::zero_message_open` is set
+  (`gfs-fuse --zero-message-open`); `init` then does not ask for
+  `FUSE_ATOMIC_O_TRUNC`, so `O_TRUNC` arrives as `setattr(size=0)`. Reads,
+  writes, and `readdir` without a handle are served by inode
+  (`read_unopened`, `write_unopened`, a `DirState` built per `readdir`).
+  `GFS_TEST_ZERO_MESSAGE_OPEN=true` forces it on for every mount the test
+  harness creates.
+* Not built, and why it stays opt-in: see Decisions.
+
+**Not done**: profiling warm `git status` (~2 s) and commit (~6 s), and the
+206 vs 121 MiB index size question.
 
 ## Decisions
 
@@ -175,6 +185,23 @@ phase 0 was measured and not kept: a larger listing cache (see Decisions).
   EWAH buffer and the claim that FSMN alone bought nothing (never measured —
   it takes the sweep from 13.8 s to 0.4 s), and a placeholder UNTR function.
 
+* **Zero-message open stays opt-in.** Built as briefed except for the parts
+  that replace what `release` and open descriptors did, and those decide it:
+  once `open` answers ENOSYS the kernel sends no `release` for *any* file on
+  the connection (`fuse_file_put` checks the connection's `no_open`), created
+  files included. So (a) a created file's daemon handle and descriptor are
+  never dropped — a `cp -r` of enough files runs the daemon out of
+  descriptors; (b) a written overlay row's size and mtime, committed once at
+  `release`, are never committed, leaving durability to the unsettled-row
+  recovery whose test already fails on `main`; (c) an unlinked-but-open
+  overlay file has no descriptor keeping its content: measured, a read after
+  unlink returns EIO once its pages leave the page cache; (d) a `.git` file
+  renamed over while open (Git's lockfile protocol; gitstatusd mmaps the
+  index) is read by path, so the old inode would serve the new file's bytes.
+  What the default needs: settle on write or on the journal's consumers,
+  drop created handles on `forget`, and park a descriptor for an unlinked or
+  replaced file until the kernel forgets its inode.
+
 ## Details
 
 * **Spike result, universe, fresh mount** (`--zero-message-open` vs default;
@@ -239,3 +266,14 @@ phase 0 was measured and not kept: a larger listing cache (see Decisions).
   trailer over 225 MiB; the tree pass over 1.32M entries the rest, after
   replacing a per-component map lookup that took it to 0.72 s). Taken: it
   buys ~60 s on the first status. A cache miss is 6.9 s.
+
+* **Phase C probe, universe, `--zero-message-open`** (`/tmp/gfsinv/probe.py`):
+  `O_TRUNC` over a base file and over an overlay file, append, write-then-read
+  before close, in-place overwrite, read of a base file after unlink, and
+  `git status`/`git diff` (identical to the uncached answer) all pass; read of
+  an overlay file after unlink fails with EIO once its pages are dropped
+  (`posix_fadvise(DONTNEED)` before the unlink). With the mode forced on, the
+  `gfs-mount` suite has 3 failures beyond the known ones, all remote-mode
+  open-time semantics: `a_spent_hydration_budget_refuses_the_open_with_edquot`,
+  `a_second_read_of_the_same_blob_costs_nothing`,
+  `losing_the_server_fails_a_copy_up_without_damaging_the_overlay`.
