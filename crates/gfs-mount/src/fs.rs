@@ -1341,6 +1341,110 @@ impl Gfs {
     }
   }
 
+  /// PHASE C: a `write` with no handle, under [`FsConfig::zero_message_open`].
+  /// Handle writes to unopened files by finding the inode state, copying up
+  /// if needed, and writing to the appropriate location.
+  async fn write_unopened(&self, ino: u64, offset: u64, data: &[u8], reply: fuser::ReplyWrite) {
+    let Some(record) = self.record(ino) else {
+      return reply.error(Errno::ESTALE);
+    };
+
+    // `.git` files are written directly with no overlay.
+    if let Node::Git(meta) = &record.node {
+      if meta.kind != fuser::FileType::RegularFile {
+        return reply.error(Errno::EISDIR);
+      }
+      let Some(rel) = git_rel(&record.path).map(<[u8]>::to_vec) else {
+        return reply.error(Errno::ESTALE);
+      };
+      let git = Arc::clone(&self.git);
+      let data = data.to_vec();
+      match tokio::task::spawn_blocking(move || {
+        let file = std::fs::OpenOptions::new()
+          .write(true)
+          .open(git.real(&rel))?;
+        file.write_at(&data, offset)
+      })
+      .await
+      {
+        Ok(Ok(n)) => {
+          self.bump(|s| {
+            s.writes += 1;
+            s.written_bytes += n as u64;
+          });
+          reply.written(n as u32)
+        }
+        Ok(Err(e)) => {
+          self.bump(|s| s.errors += 1);
+          reply.error(errno_io(&e))
+        }
+        Err(_) => reply.error(Errno::EIO),
+      }
+      return;
+    }
+
+    // Projection is read-only.
+    if record.node.is_odb() {
+      return reply.error(Errno::EROFS);
+    }
+
+    // Handle base and overlay files via copy-up and overlay write.
+    match self.copy_up(&record, false).await {
+      Ok(entry) => {
+        let Some(id) = entry.content.local_id() else {
+          return reply.error(Errno::EIO);
+        };
+        match self.overlay().content_store().open_write(id) {
+          Ok(file) => {
+            let overlay = self.overlay();
+            let data = data.to_vec();
+            match self
+              .mutation(move || overlay.write_content(id, &file, offset, &data))
+              .await
+            {
+              Ok(written) => {
+                self.bump(|s| {
+                  s.writes += 1;
+                  s.written_bytes += written as u64;
+                });
+                // Update the record's size.
+                if let Some(record) = self.record(ino) {
+                  match self.overlay().get(&record.path) {
+                    Some(entry) => {
+                      self.republish(&record.path, entry);
+                    }
+                    None => {
+                      if let Node::Overlay(entry) = &record.node {
+                        let grown = OverlayEntry {
+                          size: entry.size.max(offset.saturating_add(written as u64)),
+                          ..(**entry).clone()
+                        };
+                        self.inodes
+                          .lock()
+                          .expect("inode table")
+                          .refresh(ino, Node::Overlay(Box::new(grown)));
+                      }
+                    }
+                  }
+                }
+                reply.written(written as u32);
+              }
+              Err(e) => {
+                self.bump(|s| s.errors += 1);
+                reply.error(errno_of_overlay(&e));
+              }
+            }
+          }
+          Err(e) => reply.error(errno_of_overlay(&e)),
+        }
+      }
+      Err(e) => {
+        self.bump(|s| s.errors += 1);
+        reply.error(errno_of(&e));
+      }
+    }
+  }
+
   async fn open_blob(&self, path: &BytePath, oid: &ObjectId) -> Result<OpenedBlob, GfsError> {
     // Evidence for the read detector, taken whether or not the blob is cached:
     // what makes a directory look read-through is which files a job asked for,
@@ -1923,16 +2027,22 @@ impl Filesystem for GfsFilesystem {
     // M3.2's `O_TRUNC` bullet exists to avoid -- and `std::fs::File::create` is
     // the single most common way an agent replaces a file.
     //
+    // With zero-message open enabled, the kernel never sends `open`, so
+    // `ATOMIC_O_TRUNC` cannot be used: `setattr(size = 0)` becomes the only
+    // path, which the handler below is already careful not to fetch either.
+    //
     // Requested rather than required: a kernel that refuses it still works, and
     // the `setattr(size = 0)` path below is careful not to fetch either.
-    if config
-      .add_capabilities(fuser::InitFlags::FUSE_ATOMIC_O_TRUNC)
-      .is_err()
-    {
-      tracing::warn!(
-        "the kernel refused FUSE_ATOMIC_O_TRUNC; replacing a file will copy its \
-         old contents up before discarding them"
-      );
+    if !self.fs.config.zero_message_open {
+      if config
+        .add_capabilities(fuser::InitFlags::FUSE_ATOMIC_O_TRUNC)
+        .is_err()
+      {
+        tracing::warn!(
+          "the kernel refused FUSE_ATOMIC_O_TRUNC; replacing a file will copy its \
+           old contents up before discarding them"
+        );
+      }
     }
     // Kernel passthrough: the kernel reads and writes a backing file the
     // daemon registers at `open`, and no `read` or `write` request is made.
@@ -2588,6 +2698,10 @@ impl Filesystem for GfsFilesystem {
     let fs = Arc::clone(&self.fs);
     let state = fs.files.lock().expect("file handles").get(&fh.0).cloned();
     let Some(state) = state else {
+      if fs.config.zero_message_open && fh.0 == 0 {
+        let data = data.to_vec();
+        return self.spawn(async move { fs.write_unopened(ino.0, offset, &data, reply).await });
+      }
       return reply.error(Errno::EBADF);
     };
     let data = data.to_vec();
@@ -2899,6 +3013,12 @@ impl Filesystem for GfsFilesystem {
   }
 
   fn opendir(&self, _req: &Request, ino: INodeNo, _flags: OpenFlags, reply: fuser::ReplyOpen) {
+    if self.fs.config.zero_message_open {
+      // The kernel records that this filesystem has no `opendir` and never sends
+      // another (nor a `releasedir`); readdir arrives with fh=0. See the init()
+      // comment on zero_message_open.
+      return reply.error(Errno::ENOSYS);
+    }
     let Some(record) = self.fs.record(ino.0) else {
       return reply.error(Errno::ESTALE);
     };
@@ -3007,9 +3127,73 @@ impl Filesystem for GfsFilesystem {
     mut reply: fuser::ReplyDirectory,
   ) {
     let fs = Arc::clone(&self.fs);
-    let state = fs.dirs.lock().expect("dir handles").get(&fh.0).cloned();
-    let Some(state) = state else {
-      return reply.error(Errno::EBADF);
+    let state = if fs.config.zero_message_open && fh.0 == 0 {
+      // Under zero-message opendir, the kernel never sent opendir, so build
+      // the directory state from the inode now.
+      let Some(record) = fs.record(ino.0) else {
+        return reply.error(Errno::ESTALE);
+      };
+      let mut state = DirState {
+        path: record.path.clone(),
+        children: Vec::new(),
+        complete: false,
+        git_pending: None,
+      };
+      match &record.node {
+        Node::Git(meta) => {
+          if !meta.is_dir() {
+            return reply.error(Errno::ENOTDIR);
+          }
+          let Some(rel) = git_rel(&record.path).map(<[u8]>::to_vec) else {
+            return reply.error(Errno::ESTALE);
+          };
+          state.git_pending = Some(rel);
+        }
+        Node::Odb(node) => {
+          if !node.is_dir() {
+            return reply.error(Errno::ENOTDIR);
+          }
+          let rel = git_rel(&record.path)
+            .and_then(odb_rel)
+            .unwrap_or_default()
+            .to_vec();
+          state.children = fs
+            .git
+            .odb_children(&rel)
+            .into_iter()
+            .map(|(name, node)| Child::Odb { name, node })
+            .collect();
+          state.complete = true;
+        }
+        Node::Overlay(entry) if entry.kind.is_dir() => {}
+        Node::Overlay(_) => return reply.error(Errno::ENOTDIR),
+        Node::Base(entry) => match entry.kind {
+          EntryKind::Gitlink => state.complete = true,
+          EntryKind::Directory => {
+            if ino.0 == ROOT_INO {
+              state.children.push(Child::Git {
+                name: GIT_DIR_NAME.as_bytes().to_vec(),
+                meta: GitMeta {
+                  kind: fuser::FileType::Directory,
+                  size: 0,
+                  perm: 0o755,
+                  nlink: 2,
+                  mtime: std::time::UNIX_EPOCH,
+                  ctime: std::time::UNIX_EPOCH,
+                },
+              });
+            }
+          }
+          _ => return reply.error(Errno::ENOTDIR),
+        },
+      }
+      Arc::new(tokio::sync::Mutex::new(state))
+    } else {
+      let state = fs.dirs.lock().expect("dir handles").get(&fh.0).cloned();
+      let Some(state) = state else {
+        return reply.error(Errno::EBADF);
+      };
+      state
     };
     self.spawn(async move {
       let mut state = state.lock().await;
@@ -3168,6 +3352,12 @@ impl Filesystem for GfsFilesystem {
     _flags: OpenFlags,
     reply: fuser::ReplyEmpty,
   ) {
+    if self.fs.config.zero_message_open && fh.0 == 0 {
+      // Under zero-message opendir, the kernel never sent opendir and will
+      // not send releasedir, so this is unreachable. Returning ok() anyway
+      // for robustness.
+      return reply.ok();
+    }
     self.fs.dirs.lock().expect("dir handles").remove(&fh.0);
     self.fs.inodes.lock().expect("inode table").close(ino.0);
     reply.ok();

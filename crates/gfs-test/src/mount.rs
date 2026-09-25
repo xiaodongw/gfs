@@ -202,10 +202,15 @@ impl Mount {
   pub async fn with_configs(
     backend: &Backend,
     revision: &str,
-    config: FsConfig,
+    mut config: FsConfig,
     overlay_config: OverlayConfig,
   ) -> Mount {
     Mount::require_fuse();
+    // Test mode: force zero-message open on if env var is set. This exercises
+    // the zero-message code path in the test suite.
+    if std::env::var("GFS_TEST_ZERO_MESSAGE_OPEN").ok().map(|v| v == "true") == Some(true) {
+      config.zero_message_open = true;
+    }
     let mut grpc = backend.grpc_client().await;
     let mut request = tonic::Request::new(v1::CreateMountRequest {
       repository_id: backend.repo_id.as_str().to_owned(),

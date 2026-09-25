@@ -223,6 +223,7 @@ impl MountHost {
       ));
     }
 
+    let is_local = request.local_clone.is_some();
     let spec = MountSpec {
       workspace: absolute(&request.workspace)?,
       cache_dir: absolute(&request.cache_dir)?,
@@ -235,7 +236,7 @@ impl MountHost {
       token: request.token.unwrap_or_else(|| self.config.token.clone()),
       // In local mode the identity comes from the clone, once it is opened;
       // the placeholder is replaced in `mount` before anything reads it.
-      repository_id: if request.local_clone.is_some() {
+      repository_id: if is_local {
         RepositoryId::parse("local-pending")?
       } else {
         RepositoryId::parse(&request.repository_id)?
@@ -244,10 +245,17 @@ impl MountHost {
       prewarm: request.prewarm,
       revision_selector: request.revision_selector,
       cache_quota_bytes: request.cache_quota_bytes,
-      fs: FsConfig {
-        writeback_cache: request.writeback_cache,
-        dispatch: request.dispatch,
-        ..self.config.fs.clone()
+      fs: {
+        let mut fs_config = self.config.fs.clone();
+        fs_config.writeback_cache = request.writeback_cache;
+        fs_config.dispatch = request.dispatch;
+        // Enable zero-message open by default for local-mode mounts. This avoids
+        // the per-open round trip cost on the local commit, which is immutable and
+        // cheap to access in-process.
+        if is_local {
+          fs_config.zero_message_open = true;
+        }
+        fs_config
       },
       overlay: gfs_overlay::OverlayConfig {
         quota_bytes: request.overlay_quota_bytes,
