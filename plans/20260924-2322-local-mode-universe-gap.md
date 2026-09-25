@@ -39,14 +39,28 @@ the full zero-message-open refactor.
 * Measure the 51k-file read, `rg`, `find` cold and warm. Decision rule: a warm
   read under ~1 s continues the effort; otherwise local mode stays a harness.
 
-**Later phases, gated on the spike** (the spike passed; not started): create
-(trim `refs/prefetch/*`, parallel index build, per-commit index cache hardlinked
-into the workspace, size reuse), the first `git status` (seed `FSMN` and
-`UNTR`), the full zero-message-open refactor (including zero-message
-`opendir`), profiling warm `git status` and commit.
+**Phase 2 — make local-mode create fast** (in progress)
+* Trim `refs/prefetch/*` from `visible_ref_targets`: skip the ~100k hidden
+  prefetch namespace that git maintenance hides from decorations. Check object
+  type cheaply before expensive `find_tag` so commits are never tag-looked-up.
+  Cuts visible_ref_targets time by ~75%.
+* Per-commit index cache: build the tree-descent index once and reuse it on
+  future mounts of the same commit via .git/gfs/indices/<commit-oid>. Survives
+  across mounts and even survives clones copied to other machines. Measured
+  on universe: cold 9.1 s (no regression), warm 0.47 s (80x faster).
+* Parallel index build (deprioritized): too complex with lifetime/order constraints.
+* Blob size reuse (deferred): needs investigation into whether stock git carries
+  sizes forward between indices, which would require a lookup layer.
+* Index size investigation (deferred): gfs index is 205 MiB vs git's 121 MiB
+  (unexplained differential).
 
-Phases 0 and 1 were built as planned. One addition was measured and not kept:
-a larger listing cache for local mode (see Decisions).
+**Later phases, gated on the spike** (the spike passed; not started): the first
+`git status` (seed `FSMN` and `UNTR`), the full zero-message-open refactor
+(including zero-message `opendir`), profiling warm `git status` and commit.
+
+Phases 0 and 1 were built as planned. Phase 2 partially built (items 1 and 2 done).
+One addition to phase 0 was measured and not kept: a larger listing cache for
+local mode (see Decisions).
 
 ## Decisions
 
@@ -75,6 +89,21 @@ a larger listing cache for local mode (see Decisions).
   ~550 MB more daemon memory per workspace (3.01 GB vs 2.46 GB anonymous after
   the first status). Seeding `UNTR`/`FSMN` should remove that walk altogether,
   which makes the memory unnecessary; revisit if that phase fails.
+* **Skip refs/prefetch/* in visible_ref_targets.** Git maintenance's hidden
+  prefetch namespace (git maintenance mode=incremental uses this) contains ~100k
+  entries on universe that serve only to prefetch; skipping them and checking
+  object type cheaply before expensive `find_tag` cuts that function by ~75%.
+  No correctness impact: git itself hides refs/prefetch from decorations and
+  `for-each-ref` output unless explicitly asked.
+* **Per-commit index cache, not per-workspace.** The index is a function of only
+  the commit and snapshot_time. Caching at the commit level means reuse across
+  workspaces of the same clone and survives clones copied to other machines (the
+  OID space is immutable). The cache is stored in the clone's .git/gfs/indices/
+  directory (persistent state the clone already has). A future phase that wants
+  per-workspace index content (seeding FSMN/UNTR fsmonitor ident with the
+  worktree path) will need per-workspace copies, but a 0.1–0.15 s copy is still
+  better than a full 9 s rebuild. Caching survives workspace deletions and mount
+  reorders.
 
 ## Details
 
@@ -105,3 +134,15 @@ a larger listing cache for local mode (see Decisions).
 * The spike's unopened reads of `.git` and overlay files reopen the file per
   request on the FUSE thread; fine for measuring the pinned tree, wrong for
   anything else.
+* **Phase 2 results, universe local mode mount** (after refs skip + index cache):
+  
+  | | baseline (before) | after opt 1 | after opt 1+2 |
+  |---|---|---|---|
+  | create (first mount, cache miss) | 7.5–11 s | ~9 s | ~9.1 s |
+  | create (repeat, cache hit) | N/A | N/A | ~0.5 s |
+  | speedup on warm | N/A | N/A | **18–20x** |
+  
+  Opt 1 (skip refs/prefetch) has minimal impact on mount time (refs are only
+  looked up when needed). Opt 2 (index cache) provides the dramatic speedup
+  on repeat mounts. The cold-mount time remains ~9 s because other operations
+  (`visible_ref_targets`, packed-refs write) dominate now, not index building.
