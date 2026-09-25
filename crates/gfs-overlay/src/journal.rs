@@ -360,12 +360,9 @@ impl Journal {
     Ok(out)
   }
 
-  /// Paths that changed after the given sequence, and the oldest sequence we can
-  /// still answer for. Returns (changed_paths, changed_vanished, oldest_sequence).
-  ///
-  /// If we can't answer for the given sequence (too old or future), returns None.
-  pub fn changes_since(&self, after_sequence: u64) -> Result<Option<(Vec<Vec<u8>>, Vec<Vec<u8>>)>> {
-    // Get the maximum sequence from both tables to determine the oldest we can answer.
+  /// The maximum sequence number stored in the journal (entries and vanished).
+  /// Used to initialize the overlay's sequence on open for monotonicity across restarts.
+  pub fn max_sequence(&self) -> Result<u64> {
     let max_in_entries: Option<i64> = self
       .conn
       .query_row(
@@ -383,10 +380,16 @@ impl Journal {
       )
       .map_err(db)?;
 
-    // If the requested sequence is newer than everything we have, return empty.
-    let max_sequence = max_in_entries.unwrap_or(0).max(max_in_vanished.unwrap_or(0)) as u64;
+    Ok(max_in_entries.unwrap_or(0).max(max_in_vanished.unwrap_or(0)) as u64)
+  }
+
+  /// Paths that changed after the given sequence.
+  /// If we can't answer for the given sequence (caller is from the future), returns None.
+  pub fn changes_since(&self, after_sequence: u64) -> Result<Option<(Vec<Vec<u8>>, Vec<Vec<u8>>)>> {
+    // Get the maximum sequence to detect if the caller is from the future.
+    let max_sequence = self.max_sequence()?;
     if after_sequence >= max_sequence {
-      return Ok(Some((Vec::new(), Vec::new())));
+      return Ok(None); // Caller is from the future or at the end; can't answer.
     }
 
     // Query for paths changed after the sequence.

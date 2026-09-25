@@ -247,8 +247,13 @@ struct Inner {
   unsynced: HashSet<u64>,
   /// Committed transactions since this process opened the overlay. The
   /// fsmonitor token carries it so the token advances when the filesystem
-  /// changes, which is what the v2 protocol asks of it.
+  /// changes, which is what the v2 protocol asks of it. Initialized to the
+  /// max persisted sequence at open, ensuring monotonicity across restarts.
   sequence: u64,
+  /// In-memory sequence stamps for paths: tracks the sequence at which each
+  /// path's row was last modified in memory (for unsettled writes). Used by
+  /// fsmonitor to report changes that haven't been settled yet.
+  in_memory_sequence: HashMap<Vec<u8>, u64>,
 }
 
 pub struct Overlay {
@@ -315,6 +320,11 @@ impl Overlay {
     let (vanished, vanished_overflow) = journal.vanished()?;
     let root_times = journal.root_times()?;
 
+    // Initialize sequence from max persisted sequence for monotonicity across restarts.
+    // Recovery corrections will use a sequence above this.
+    let max_persisted_sequence = journal.max_sequence()?;
+    let recovery_sequence = max_persisted_sequence + 1;
+
     // The clock never runs backwards across a restart. Seeded from the highest
     // time any surviving entry carries, so a mutation after recovery is still
     // newer than every mutation before it even if the host clock moved back.
@@ -362,7 +372,7 @@ impl Overlay {
         next_ino,
         next_content_id,
         None,
-        0, // Recovery corrections use sequence 0
+        recovery_sequence,
       )?;
     }
 
@@ -393,9 +403,10 @@ impl Overlay {
         vanished: vanished.into_iter().collect(),
         vanished_overflow,
         root_times,
-        sequence: 0,
+        sequence: recovery_sequence,
         dirty: HashSet::new(),
         unsynced: HashSet::new(),
+        in_memory_sequence: HashMap::new(),
       }),
       store,
       config,
@@ -523,18 +534,39 @@ impl Overlay {
   }
 
   /// Paths that changed since the given sequence, used for delta fsmonitor answers.
+  /// Reads in-memory sequence stamps (for unsettled writes) merged with persisted state.
   ///
-  /// Returns `None` if we can't answer for this sequence (too old, future, or overflow).
+  /// Returns `None` if we can't answer for this sequence (from the future or overflow).
   /// Returns `Some((changed_entries, changed_vanished))` otherwise.
   pub fn changes_since(&self, after_sequence: u64) -> Result<Option<(Vec<BytePath>, Vec<BytePath>)>> {
     let inner = self.lock();
-    let result = inner.journal.changes_since(after_sequence)?;
-    Ok(result.map(|(entries, vanished)| {
-      (
-        entries.into_iter().map(BytePath::new).collect(),
-        vanished.into_iter().map(BytePath::new).collect(),
-      )
-    }))
+    let mut changed_entries = Vec::new();
+    let mut changed_vanished = Vec::new();
+
+    // Check in-memory sequence stamps: paths with in-memory stamps > after_sequence.
+    for (path, stamp) in &inner.in_memory_sequence {
+      if *stamp > after_sequence {
+        changed_entries.push(BytePath::new(path.clone()));
+      }
+    }
+
+    // Query database for persisted changes. If journal returns None, we can't answer.
+    if let Some((db_entries, db_vanished)) = inner.journal.changes_since(after_sequence)? {
+      for entry in db_entries {
+        let path = BytePath::new(entry);
+        // Skip if already in changed_entries from in-memory (in-memory takes precedence).
+        if !changed_entries.contains(&path) {
+          changed_entries.push(path);
+        }
+      }
+      for path in db_vanished {
+        changed_vanished.push(BytePath::new(path));
+      }
+      Ok(Some((changed_entries, changed_vanished)))
+    } else {
+      // Journal can't answer (caller from future, etc.); fall back to full answer.
+      Ok(None)
+    }
   }
 
   /// The mount root's times, or `None` while the snapshot time still describes
@@ -852,7 +884,8 @@ impl Overlay {
 
   /// Record that a content file changed underneath its row: size and mtime
   /// move in memory, the id is marked dirty, and the sequence advances so the
-  /// fsmonitor token changes. Nothing is journaled here.
+  /// fsmonitor token changes. The in-memory sequence stamp is updated so
+  /// `changes_since` reports this write even before settle. Nothing is journaled here.
   fn note_written(
     &self,
     inner: &mut Inner,
@@ -871,6 +904,8 @@ impl Overlay {
       inner.dirty.insert(id);
     }
     inner.sequence += 1;
+    let path_key = updated.path.as_bytes().to_vec();
+    inner.in_memory_sequence.insert(path_key, inner.sequence);
     Self::replace_in_memory(inner, updated);
   }
 

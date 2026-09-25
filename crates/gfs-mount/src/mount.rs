@@ -1278,78 +1278,58 @@ impl Mount {
 
     let token = format!("{generation_token}:{sequence}");
 
-    // Decide whether to return a delta or full answer.
-    let (paths, full_rescan) = if let Some((delta_entries, delta_vanished)) = delta_result {
-      // Delta answer: only paths changed since the caller's sequence.
-      if vanished_overflow {
-        // Overflow means we can't trust the delta anymore; fall back to full.
-        let mut all_paths = Vec::with_capacity(status.changes.len() * 2 + all_vanished.len());
-        for change in &status.changes {
-          all_paths.push(String::from_utf8_lossy(change.path.as_bytes()).into_owned());
-          if let Some(from) = &change.from {
-            all_paths.push(String::from_utf8_lossy(from.as_bytes()).into_owned());
-          }
-        }
-        for dir in &status.directory_deletions {
-          all_paths.push(format!("{}/", String::from_utf8_lossy(dir.as_bytes())));
-        }
-        for path in &all_vanished {
-          all_paths.push(String::from_utf8_lossy(path.as_bytes()).into_owned());
-        }
-        (all_paths, true)
-      } else {
-        // Return only the delta paths.
-        let mut delta_paths = Vec::with_capacity(delta_entries.len() * 2 + delta_vanished.len());
-
-        // Add delta entries that are still present in status.
-        for entry_path in &delta_entries {
-          // Check if this entry is in the status changes.
-          if let Some(change) = status.changes.iter().find(|c| &c.path == entry_path) {
-            delta_paths.push(String::from_utf8_lossy(change.path.as_bytes()).into_owned());
-            // If it's a rename, also add the old name.
-            if let Some(from) = &change.from {
-              delta_paths.push(String::from_utf8_lossy(from.as_bytes()).into_owned());
-            }
-          } else {
-            // Check if it's a directory deletion.
-            if let Some(dir) = status.directory_deletions.iter().find(|d| *d == entry_path) {
-              delta_paths.push(format!("{}/", String::from_utf8_lossy(dir.as_bytes())));
-            } else if !status.changes.iter().any(|c| &c.path == entry_path) {
-              // Path was changed but is no longer in status - might be deleted
-              // Just add it as-is for Git to re-stat
-              delta_paths.push(String::from_utf8_lossy(entry_path.as_bytes()).into_owned());
-            }
-          }
-        }
-
-        // Add vanished paths that changed.
-        for path in &delta_vanished {
-          delta_paths.push(String::from_utf8_lossy(path.as_bytes()).into_owned());
-        }
-
-        (delta_paths, false)
-      }
-    } else {
-      // Full answer (caller's token is from another generation or sequence is invalid).
-      let mut full_paths = Vec::with_capacity(status.changes.len() * 2 + all_vanished.len());
+    // Helper to build paths list from status changes, directory deletions, and vanished set.
+    let build_paths = |changed_set: Option<&std::collections::HashSet<Vec<u8>>>| -> Vec<String> {
+      let mut paths = Vec::new();
       for change in &status.changes {
-        full_paths.push(String::from_utf8_lossy(change.path.as_bytes()).into_owned());
-        // A rename changed both names: the new one exists, the old one is gone,
-        // and Git must re-stat both.
+        let path_bytes = change.path.as_bytes();
+        if let Some(set) = changed_set {
+          if !set.contains(path_bytes) {
+            continue;
+          }
+        }
+        paths.push(String::from_utf8_lossy(path_bytes).into_owned());
+        // A rename changed both names: the new one exists, the old one is gone.
         if let Some(from) = &change.from {
-          full_paths.push(String::from_utf8_lossy(from.as_bytes()).into_owned());
+          if changed_set.is_none() || changed_set.unwrap().contains(from.as_bytes()) {
+            paths.push(String::from_utf8_lossy(from.as_bytes()).into_owned());
+          }
         }
       }
       for dir in &status.directory_deletions {
-        // Git's protocol: a trailing slash marks a directory whose contents all
-        // changed.
-        full_paths.push(format!("{}/", String::from_utf8_lossy(dir.as_bytes())));
+        let dir_bytes = dir.as_bytes();
+        if changed_set.is_none() || changed_set.unwrap().contains(dir_bytes) {
+          paths.push(format!("{}/", String::from_utf8_lossy(dir_bytes)));
+        }
       }
       for path in &all_vanished {
-        full_paths.push(String::from_utf8_lossy(path.as_bytes()).into_owned());
+        if changed_set.is_none() || changed_set.unwrap().contains(path.as_bytes()) {
+          paths.push(String::from_utf8_lossy(path.as_bytes()).into_owned());
+        }
       }
+      paths
+    };
+
+    // Decide whether to return a delta or full answer.
+    let (paths, full_rescan) = if let Some((delta_entries, delta_vanished)) = delta_result {
+      if vanished_overflow {
+        // Overflow: fall back to full answer.
+        (build_paths(None), true)
+      } else {
+        // Build a set of changed paths for O(1) lookup.
+        let mut changed = std::collections::HashSet::new();
+        for entry in &delta_entries {
+          changed.insert(entry.as_bytes().to_vec());
+        }
+        for vanished in &delta_vanished {
+          changed.insert(vanished.as_bytes().to_vec());
+        }
+        (build_paths(Some(&changed)), false)
+      }
+    } else {
+      // Full answer (caller token from another generation or sequence from future).
       let full_rescan = !caller_token.starts_with(&format!("{generation_token}:")) || vanished_overflow;
-      (full_paths, full_rescan)
+      (build_paths(None), full_rescan)
     };
 
     Ok(crate::control::FsMonitorAnswer {
