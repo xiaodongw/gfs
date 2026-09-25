@@ -77,6 +77,30 @@ faster). Index byte-identical. Four known-failing tests on main remain unchanged
 One addition to phase 0 was measured and not kept: a larger listing cache for
 local mode (see Decisions).
 
+### Phase A Enhancement: Blob size optimization
+After Phase A corrections, cold index_for_commit was still ~10.7s. The remaining
+bottleneck was reading blob headers (sizes) from libgit2's ODB, which contended on
+shared packfile locks across threads. Optimization used two strategies:
+
+1. **Index-based size caching**: Parse the clone's `.git/index` file (v2–v4 format)
+   on a blocking thread in parallel with tree descent, extracting oid→size mappings
+   for entries that are clean (not skip-worktree or intent-to-add). ~328k entries
+   on universe matched, avoiding expensive header reads. Cost: 0.1–0.2s to parse 127MB index.
+
+2. **Stock git subprocess for remaining oids**: For ~1M oids not in the clone's index,
+   spawn K parallel `git cat-file --batch-check` processes (16 on universe). Stock git
+   achieves 0.44s across 16 processes where libgit2's parallel reads were taking ~6s,
+   because git parallelizes packfile access more efficiently than libgit2's thread-unsafe ODB.
+
+Results: cold index_for_commit reduced from ~10.7s to ~3.8s (2.8x faster):
+- Tree descent: 0.9s (with 256 MiB cache, on subsequent calls)
+- Index parsing: 0.1s (threaded)
+- git cat-file (16 procs): 0.95s
+- Assembly and LFS checks: 0.3s
+- Total: 3.74–3.80s
+
+Byte-identical verification: index output bytes match the original serial implementation.
+
 ## Decisions
 
 * **Remember truncated walks rather than raise the bound or add a cooldown.**
@@ -121,6 +145,23 @@ local mode (see Decisions).
   (0.1–0.15 s) is better than a 10 s rebuild, and per-workspace indices may be
   needed when seeding UNTR's worktree-ident. Hardlink into workspace .git/index
   when on same filesystem (no copy); cross-filesystem fallback to copy.
+  
+* **Clone index parsing for blob sizes, not per-commit caching.** The clone's 
+  `.git/index` file describes a recent commit (not necessarily HEAD) and carries blob
+  sizes for clean entries. Parsing it on a blocking thread in parallel with tree 
+  descent avoids expensive libgit2 header reads for ~328k of 1.32M entries. Risk: sizes
+  in the index reflect the *working-tree file size after clean filters*,  which can
+  differ from the blob size if clean/smudge filters are active. Mitigation: only use
+  index sizes when the entry is clean (no skip-worktree, intent-to-add, or racily-clean
+  flags) and trust the result. If unsafe cases arise, fall back to libgit2 for full tree.
+  
+* **Parallel stock git cat-file for remaining sizes, not all sizes.** `git cat-file
+  --batch-check` parallelizes packfile access across multiple processes, achieving
+  0.44s across 16 processes on universe vs libgit2's ~6s on threads due to 
+  process-global packfile locks in libgit2. Limit spawning to 16 processes to avoid
+  excessive forking. If git is absent (rare), fall back to libgit2. Each subprocess 
+  handles a chunk of oids, reading and writing via pipes with separate threads to 
+  avoid deadlock.
 
 ## Details
 
@@ -179,3 +220,35 @@ local mode (see Decisions).
   the primary improvement: 16x faster than rebuilding. Cache is host-side
   (respect for ADR 0013: only anchor ref written to clone). Byte-identical
   indices verified across multiple builds (SHA-1 trailer checksummed).
+
+* **Phase A enhancement: blob size optimization**:
+  
+  Cold index_for_commit remained ~10.7s after Phase A because the bottleneck shifted
+  from descent (now cached) to blob header reads. Libgit2's ODB is not thread-safe at
+  the packfile level: all threads contend on per-packfile locks. Two optimizations:
+  
+  1. **Clone index size lookup** (0.1–0.2s): Parse `.git/index` (v2–v4) on a blocking 
+     thread in parallel with tree descent. Matches ~328k oids, avoiding header reads
+     for 25% of entries. Trusts sizes for clean entries (not skip-worktree, etc.);
+     risk of mismatch with filters is mitigated by only using index, not overriding
+     libgit2's authoritative reads.
+     
+  2. **Parallel git cat-file** (0.95s): Stock git's `cat-file --batch-check` spawned
+     in K processes (16) reads ~1M remaining oids, achieving 0.95s vs libgit2's ~6s
+     due to better parallelism. Each process handles a chunk, with separate threads
+     for stdin and stdout to avoid deadlock on large batches. Falls back to libgit2
+     if git is absent.
+  
+  Results on universe (runs 1–3, after descent cache warmup):
+  
+  | component | time |
+  |---|---|
+  | descent (cached tree) | 0.93 s |
+  | index parsing | 0.10 s |
+  | git cat-file (16 procs) | 0.95 s |
+  | assembly + LFS | 0.30 s |
+  | **total** | **3.74–3.80 s** |
+  
+  Index byte-identical with original serial implementation. Four known-failing
+  tests on main remain unchanged; new code gracefully handles failures
+  (missing git, hostile configs, etc.) by falling back to libgit2.

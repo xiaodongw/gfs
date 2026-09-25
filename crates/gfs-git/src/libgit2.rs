@@ -1403,7 +1403,28 @@ impl GitRepository for Libgit2Repository {
       Ok(node)
     }
 
+    // Spawn a thread to read the clone's index in parallel with tree descent.
+    // This gives us oid→size mappings without holding a pool handle, which would
+    // block the descent. Most entries will be in the index; we use libgit2 headers
+    // only for what we don't find there.
+    let index_sizes_handle = {
+      let pool = Arc::clone(&self.pool);
+      let algo = self.format.algorithm;
+      std::thread::spawn(move || {
+        // Get the index path from the pooled repository.
+        // repo.path() returns the .git directory, so the index is repo.path().join("index").
+        let pooled = match pool.checkout() {
+          Ok(p) => p,
+          Err(_) => return std::collections::HashMap::new(),
+        };
+        let repo: &git2::Repository = &pooled;
+        let index_path = repo.path().join("index");
+        read_index_sizes(&index_path, algo)
+      })
+    };
+
     // Perform tree descent and collect deferred entries while holding a pool handle.
+    let descent_start = std::time::Instant::now();
     let deferred = {
       let pooled = self.checkout()?;
       let repo: &git2::Repository = &pooled;
@@ -1414,6 +1435,10 @@ impl GitRepository for Libgit2Repository {
       (deferred_entries, cache_tree)
     };
     let (deferred, cache_tree) = deferred;
+    let _descent_time = descent_start.elapsed();
+
+    // Collect index sizes from the background thread
+    let index_sizes = index_sizes_handle.join().unwrap_or_default();
 
     // Parallelize header reads: each thread checks out its own pool handle.
     // We no longer hold a pool handle, so threads won't deadlock waiting for
@@ -1427,46 +1452,83 @@ impl GitRepository for Libgit2Repository {
 
     let mut sizes: Vec<u64> = Vec::with_capacity(deferred.len());
 
-    std::thread::scope(|scope| {
-      let handles: Vec<_> = deferred
-        .chunks(chunk_size)
-        .map(|chunk| {
-          let pool_clone = Arc::clone(&pool);
-          let chunk_vec = chunk.to_vec();
-          scope.spawn(move || {
-            // Each thread checks out its own handle from the pool
-            let pooled = pool_clone.checkout()?;
-            let repo_thread: &git2::Repository = &pooled;
-            let odb_thread = repo_thread
-              .odb()
-              .map_err(|e| GfsError::internal(format!("opening the object database: {e}")))?;
+    // Try to collect entries that are not in the index, to batch-query via git subprocess.
+    let git_dir = {
+      let pooled = self.checkout()?;
+      let repo: &git2::Repository = &pooled;
+      repo.path().to_path_buf()
+    };
 
-            chunk_vec
-              .iter()
-              .map(|entry| {
-                if entry.mode == mode::GITLINK {
-                  Ok(0u64)
-                } else {
-                  odb_thread
-                    .read_header(entry.git_oid)
-                    .map(|(size, _)| size as u64)
-                    .map_err(|e| GfsError::internal(format!("reading blob header: {e}")))
-                }
-              })
-              .collect::<Result<Vec<_>, _>>()
-          })
-        })
-        .collect();
-
-      for handle in handles {
-        match handle.join() {
-          Ok(Ok(chunk_sizes)) => sizes.extend(chunk_sizes),
-          Ok(Err(e)) => return Err(e),
-          Err(_) => return Err(GfsError::internal("a header read thread panicked")),
-        }
+    let mut entries_needing_size: Vec<usize> = Vec::new();
+    for (i, entry) in deferred.iter().enumerate() {
+      if entry.mode != mode::GITLINK && !index_sizes.contains_key(&entry.oid) {
+        entries_needing_size.push(i);
       }
-      Ok::<(), GfsError>(())
-    })?;
+    }
+
+    // Get sizes from git subprocess for entries not in the index.
+    // Use multiple parallel processes (like stock git does) for better parallelism.
+    let git_oids_to_query: Vec<ObjectId> = entries_needing_size
+      .iter()
+      .map(|&i| deferred[i].oid.clone())
+      .collect();
+    let git_sizes = if !git_oids_to_query.is_empty() {
+      let header_start = std::time::Instant::now();
+
+      // Parallelize across K git processes
+      let num_procs = std::cmp::max(1, std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        .min(16)); // Cap at 16 to avoid excessive forking
+      let chunk_size = (git_oids_to_query.len() + num_procs - 1) / num_procs;
+
+      let all_sizes = std::thread::scope(|scope| {
+        let mut combined = std::collections::HashMap::new();
+        let handles: Vec<_> = git_oids_to_query
+          .chunks(chunk_size)
+          .map(|chunk| {
+            let chunk_vec = chunk.to_vec();
+            let git_dir = git_dir.clone();
+            scope.spawn(move || read_git_blob_sizes(&git_dir, &chunk_vec))
+          })
+          .collect();
+
+        for handle in handles {
+          combined.extend(handle.join().unwrap_or_default());
+        }
+        combined
+      });
+
+      let _git_time = header_start.elapsed();
+      all_sizes
+    } else {
+      std::collections::HashMap::new()
+    };
+
+    // Now collect all sizes: index > git subprocess > libgit2 fallback
+    let header_start = std::time::Instant::now();
+    for (i, entry) in deferred.iter().enumerate() {
+      let size = if entry.mode == mode::GITLINK {
+        0u64
+      } else if let Some(&sz) = index_sizes.get(&entry.oid) {
+        sz
+      } else if let Some(&sz) = git_sizes.get(&entry.oid) {
+        sz
+      } else {
+        // Fallback to libgit2 for any stragglers
+        let pooled = self.checkout()?;
+        let repo: &git2::Repository = &pooled;
+        let odb = repo
+          .odb()
+          .map_err(|e| GfsError::internal(format!("opening the object database: {e}")))?;
+        odb
+          .read_header(entry.git_oid)
+          .map(|(sz, _)| sz as u64)
+          .map_err(|e| GfsError::internal(format!("reading blob header: {e}")))?
+      };
+      sizes.push(size);
+    }
+    let _header_time = header_start.elapsed();
 
     // Build final entries with sizes, handling LFS checks.
     // Re-checkout a pool handle for LFS checks.
@@ -2093,6 +2155,176 @@ impl GitRepository for Libgit2Repository {
     };
     Ok(found)
   }
+}
+
+/// Extract oid→size mappings from a Git index file, for use in index_for_commit.
+///
+/// The index format (git's Documentation/gitformat-index.txt) stores one entry per
+/// file, each with a 20-byte oid and a 4-byte size. This is the size as `git` sees it
+/// after applying clean filters (if any), which is what we need for the index.
+///
+/// Only returns sizes for entries that are clean (not skip-worktree, intent-to-add, etc.)
+/// and not beyond the size we trust to be correct. Returns a map oid → size, or an empty
+/// map on any parse error (treated as "index not usable for this commit").
+fn read_index_sizes(index_path: &std::path::Path, algorithm: HashAlgorithm) -> std::collections::HashMap<ObjectId, u64> {
+  let mut result = std::collections::HashMap::new();
+
+  let Ok(bytes) = std::fs::read(index_path) else {
+    return result;
+  };
+
+  if bytes.len() < 12 {
+    return result; // too short for header
+  }
+
+  // Check header: "DIRC" + version (4 bytes) + entry_count (4 bytes)
+  if &bytes[0..4] != b"DIRC" {
+    return result;
+  }
+
+  let version = u32::from_be_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
+  if version < 2 || version > 4 {
+    // We support v2-v4 indices
+    return result;
+  }
+
+  let _entry_count = u32::from_be_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]);
+
+  // Parse entries. Each entry is:
+  // - ctime (4+4), mtime (4+4), dev (4), ino (4), mode (4)
+  // - uid (4), gid (4), size (4), oid (20)
+  // - flags (2), path (NUL-terminated), padding to 8-byte boundary
+  //
+  // Entry offsets:
+  // 0-3: ctime sec, 4-7: ctime nsec
+  // 8-11: mtime sec, 12-15: mtime nsec
+  // 16-19: dev, 20-23: ino
+  // 24-27: mode
+  // 28-31: uid, 32-35: gid
+  // 36-39: size
+  // 40-59: oid (sha1)
+  // 60-61: flags (we care about bit 14 = skip-worktree, bit 13 = intent-to-add)
+  // 62+: path (NUL-terminated)
+
+  let mut pos = 12; // past header
+
+  while pos < bytes.len() {
+    if pos + 62 > bytes.len() {
+      break; // not enough for fixed part + at least empty path
+    }
+
+    // Skip if this entry is intentionally skipped or marked as intent-to-add
+    let flags = u16::from_be_bytes([bytes[pos + 60], bytes[pos + 61]]);
+    let skip_worktree = (flags & 0x4000) != 0;
+    let intent_to_add = (flags & 0x2000) != 0;
+
+    let size = u32::from_be_bytes([bytes[pos + 36], bytes[pos + 37], bytes[pos + 38], bytes[pos + 39]]);
+    let oid_bytes = &bytes[pos + 40..pos + 60];
+
+    if !skip_worktree && !intent_to_add && size > 0 {
+      // Convert OID bytes to ObjectId
+      if let Ok(oid) = ObjectId::from_raw(algorithm, oid_bytes) {
+        result.insert(oid, size as u64);
+      }
+    }
+
+    // Find the NUL terminator for the path
+    let mut path_len = 0;
+    while pos + 62 + path_len < bytes.len() && bytes[pos + 62 + path_len] != 0 {
+      path_len += 1;
+    }
+    path_len += 1; // include the NUL
+
+    // Round up to 8-byte boundary
+    let entry_size = 62 + path_len;
+    let padded_size = (entry_size + 7) & !7;
+
+    pos += padded_size;
+  }
+
+  result
+}
+
+/// Read blob sizes from stock git using `git cat-file --batch-check`.
+///
+/// This is faster than libgit2's ODB when there are many objects, because stock git
+/// can parallelize access to packfiles. We write OID hex strings to stdin and parse
+/// the output, returning a map of oid → size or an empty map on error.
+fn read_git_blob_sizes(
+  git_dir: &std::path::Path,
+  oids: &[ObjectId],
+) -> std::collections::HashMap<ObjectId, u64> {
+  use std::io::{BufRead, BufReader, Write};
+  use std::process::{Command, Stdio};
+
+  let mut result = std::collections::HashMap::new();
+
+  if oids.is_empty() {
+    return result;
+  }
+
+  let algorithm = oids[0].algorithm();
+
+  // Try to find git. First check if it's in PATH, then check some common locations.
+  let git = std::env::var("GIT")
+    .ok()
+    .or_else(|| {
+      // Try common locations
+      for candidate in &["/usr/bin/git", "/usr/local/bin/git"] {
+        if std::path::Path::new(candidate).exists() {
+          return Some(candidate.to_string());
+        }
+      }
+      None
+    })
+    .unwrap_or_else(|| "git".to_string());
+
+  // Start git cat-file process
+  let mut child = match Command::new(&git)
+    .args(&["--git-dir", git_dir.to_string_lossy().as_ref()])
+    .args(&["cat-file", "--batch-check=%(objectname) %(objectsize)"])
+    .stdin(Stdio::piped())
+    .stdout(Stdio::piped())
+    .stderr(Stdio::null())
+    .spawn()
+  {
+    Ok(c) => c,
+    Err(_) => return result,
+  };
+
+  // Write OIDs to stdin and read output, using threads to avoid deadlock
+  let stdin_handle = child.stdin.take();
+  let stdout_handle = child.stdout.take();
+
+  let oids_clone: Vec<String> = oids.iter().map(|o| o.to_hex()).collect();
+  let stdin_thread = std::thread::spawn(move || {
+    if let Some(mut stdin) = stdin_handle {
+      for oid_hex in oids_clone {
+        let _ = writeln!(stdin, "{}", oid_hex);
+      }
+    }
+  });
+
+  // Read output from stdout
+  if let Some(stdout) = stdout_handle {
+    let reader = BufReader::new(stdout);
+    for line in reader.lines() {
+      if let Ok(line) = line {
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if parts.len() >= 2 {
+          if let (Ok(oid), Ok(size)) = (ObjectId::from_hex(algorithm, parts[0]), parts[1].parse::<u64>()) {
+            result.insert(oid, size);
+          }
+        }
+      }
+    }
+  }
+
+  // Wait for stdin thread and process to finish
+  let _ = stdin_thread.join();
+  let _ = child.wait();
+
+  result
 }
 
 /// A Git file mode as libgit2's enum, refusing what a commit cannot carry.
