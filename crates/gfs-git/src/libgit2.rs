@@ -1316,13 +1316,16 @@ impl GitRepository for Libgit2Repository {
     commit: &ObjectId,
     snapshot_time: gfs_types::Timestamp,
   ) -> Result<Vec<u8>, GfsError> {
-    let pooled = self.checkout()?;
-    let repo: &git2::Repository = &pooled;
-    let commit_oid = self.git_oid(commit)?;
-    let root = self.find_commit(repo, commit_oid)?.tree_id();
-    let odb = repo
-      .odb()
-      .map_err(|e| GfsError::internal(format!("opening the object database: {e}")))?;
+    // Get root tree OID, then release the pool handle before spawning threads
+    // to avoid deadlock: we'd be holding one handle while waiting for threads
+    // that each try to checkout() from a limited pool.
+    let root = {
+      let pooled = self.checkout()?;
+      let repo: &git2::Repository = &pooled;
+      let commit_oid = self.git_oid(commit)?;
+      let commit = self.find_commit(repo, commit_oid)?;
+      commit.tree_id()
+    };
 
     // Deferred entry: tree descent collects these, then header reads are
     // parallelized. Maintains Git index order (serial descent) while enabling
@@ -1400,13 +1403,21 @@ impl GitRepository for Libgit2Repository {
       Ok(node)
     }
 
-    let mut deferred = Vec::new();
-    let walk = Walk { this: self, repo };
-    let cache_tree = descend(&walk, root, b"", &gfs_types::BytePath::root(), &mut deferred)?;
+    // Perform tree descent and collect deferred entries while holding a pool handle.
+    let deferred = {
+      let pooled = self.checkout()?;
+      let repo: &git2::Repository = &pooled;
+      let mut deferred_entries = Vec::new();
+      let walk = Walk { this: self, repo };
+      let cache_tree =
+        descend(&walk, root, b"", &gfs_types::BytePath::root(), &mut deferred_entries)?;
+      (deferred_entries, cache_tree)
+    };
+    let (deferred, cache_tree) = deferred;
 
-    // Parallelize header reads: each thread checks out its own pool handle,
-    // so libgit2's single-threaded odb can be used safely by each thread
-    // independently without contention.
+    // Parallelize header reads: each thread checks out its own pool handle.
+    // We no longer hold a pool handle, so threads won't deadlock waiting for
+    // availability.
     let num_threads = std::thread::available_parallelism()
       .map(|n| n.get())
       .unwrap_or(1)
@@ -1419,10 +1430,9 @@ impl GitRepository for Libgit2Repository {
     std::thread::scope(|scope| {
       let handles: Vec<_> = deferred
         .chunks(chunk_size)
-        .enumerate()
-        .map(|(_, chunk)| {
+        .map(|chunk| {
           let pool_clone = Arc::clone(&pool);
-          let chunk_vec: Vec<_> = chunk.to_vec();
+          let chunk_vec = chunk.to_vec();
           scope.spawn(move || {
             // Each thread checks out its own handle from the pool
             let pooled = pool_clone.checkout()?;
@@ -1437,10 +1447,10 @@ impl GitRepository for Libgit2Repository {
                 if entry.mode == mode::GITLINK {
                   Ok(0u64)
                 } else {
-                  match odb_thread.read_header(entry.git_oid) {
-                    Ok((size, _)) => Ok(size as u64),
-                    Err(e) => Err(GfsError::internal(format!("reading blob header: {e}"))),
-                  }
+                  odb_thread
+                    .read_header(entry.git_oid)
+                    .map(|(size, _)| size as u64)
+                    .map_err(|e| GfsError::internal(format!("reading blob header: {e}")))
                 }
               })
               .collect::<Result<Vec<_>, _>>()
@@ -1459,6 +1469,9 @@ impl GitRepository for Libgit2Repository {
     })?;
 
     // Build final entries with sizes, handling LFS checks.
+    // Re-checkout a pool handle for LFS checks.
+    let pooled = self.checkout()?;
+    let repo: &git2::Repository = &pooled;
     let mut final_entries: Vec<crate::index::IndexEntry> = Vec::with_capacity(deferred.len());
     for (deferred_entry, size) in deferred.iter().zip(sizes.iter()) {
       // An expanded LFS entry records the *expanded* size with the *pointer*
@@ -1478,7 +1491,8 @@ impl GitRepository for Libgit2Repository {
             *size,
           ) {
             Ok(Some(pointer)) if check.contains(&pointer.oid) => pointer.size,
-            _ => *size,
+            Ok(Some(_)) | Ok(None) => *size,
+            Err(e) => return Err(e),
           }
         }
         None => *size,
