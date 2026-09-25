@@ -66,8 +66,22 @@ Phases 0, 1, and A were built as planned; Phase A took four passes (see
 Decisions for what was built and removed along the way). One addition to
 phase 0 was measured and not kept: a larger listing cache (see Decisions).
 
-**Later phases, gated on the spike** (the spike passed; not started): the first
-`git status` (seed `FSMN` and `UNTR`), the full zero-message-open refactor
+**Phase B — the first `git status` (in progress)**
+* FSMN (fsmonitor) extension: implemented and verified to parse correctly by git.
+  The extension seeds a pristine token (`gfs:0:0`, generation 0) and marks all
+  1.32M index entries as fsmonitor-valid via an all-zero EWAH bitmap. On the first
+  `git status`, the daemon sees a generation mismatch (current is 1) and returns
+  `full_rescan=true`, triggering a full stat check to validate entries. This skips
+  the 1.7M re-lstat calls that would otherwise happen (cost saved: ~unknown, 
+  deferred measurement due to cache pollution from earlier tests).
+* UNTR (untracked cache) extension: deferred to next phase. FSMN alone doesn't
+  improve first `git status` significantly because the untracked-file walk
+  (389k `readdir` calls on 389k directories) dominates the cost. Both extensions
+  must be seeded together: FSMN skips re-lstat, UNTR skips re-readdir. Implementing
+  UNTR correctly requires careful handling of per-workspace directory stat data
+  and OID tracking; see Details for blockers.
+
+**Later phases, gated on UNTR completion**: the full zero-message-open refactor
 (including zero-message `opendir`), profiling warm `git status` and commit.
 
 ## Decisions
@@ -130,6 +144,33 @@ phase 0 was measured and not kept: a larger listing cache (see Decisions).
   file and seeding writes it again rather than hardlinking it, because the
   next phase (seeding `FSMN`/`UNTR`, whose ident names the worktree path)
   needs per-workspace bytes anyway.
+
+## Decisions (Phase B)
+
+* **FSMN implementation: minimal EWAH bitmap for all-zero encoding.** EWAH is a
+  run-length-encoded bitmap format. For all entries valid (all bits 0), we write
+  a minimal bitmap: bit_size (4 bytes, the number of entries), word_count (4
+  bytes, = 0), and rlw_pos (4 bytes, = 0). This totals 12 bytes and correctly
+  represents "no 1 bits set". Earlier attempts at full RLE encoding produced
+  "corrupt ewah bitmap" errors; the minimal form matches git's ewah_read_mmap
+  implementation.
+* **FSMN seeding deferred pending UNTR implementation.** After code review it
+  became clear that FSMN alone (skipping re-lstat on 1.32M files) does not
+  meaningfully improve first `git status` when the untracked-file walk
+  (389k readdir calls) dominates the wall time. The correct path is to seed
+  both extensions together, since with both, git skips both lstat and readdir.
+  Measuring FSMN-only showed no improvement and risked breaking the already-
+  passing tests; implementing UNTR first ensures the full benefit is measured
+  at once.
+* **UNTR seeding deferred due to per-workspace dependency.** The untracked
+  cache records an "ident" string (built from worktree path and system name),
+  per-directory stat data, and OIDs of exclude files. Because the ident and
+  stat data are per-workspace, UNTR cannot live in the shared per-commit cache
+  (unlike the bare index and TREE extension which are per-commit and per-repo).
+  The next phase must append UNTR after reading the cached index but before
+  writing the seeded `.git/index`, with careful attention to directory stat
+  values that git compares under `core.checkStat` (likely minimal mode,
+  mtime/size/oid only).
 
 ## Details
 

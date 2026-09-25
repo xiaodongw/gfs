@@ -294,19 +294,18 @@ impl LocalRepository {
       return Ok(bytes);
     }
 
-    let mut index = self
-      .repo
-      .index_for_commit(commit.clone(), snapshot_time)
-      .await?;
-
-    // Seed the fsmonitor extension so the first `git status` doesn't need to
-    // re-lstat every file. The token `gfs:0:0` indicates a pristine index
-    // from before the mount (generation 0), so the first fsmonitor call will
-    // see a generation mismatch and trigger a full stat to validate everything.
-    let num_entries = u32::from_be_bytes([index[8], index[9], index[10], index[11]]) as usize;
-    index = gfs_git::index::append_fsmonitor_extension(&index, num_entries, "gfs:0:0")?;
-
-    let index = Arc::new(index);
+    let index = Arc::new(
+      self
+        .repo
+        .index_for_commit(commit.clone(), snapshot_time)
+        .await?,
+    );
+    // TODO: Phase B continuation - seed FSMN and UNTR extensions.
+    // FSMN alone (without UNTR) doesn't improve first `git status` because the
+    // untracked-file walk (389k readdir calls) dominates the cost. The FSMN
+    // extension will skip re-lstat but git must still re-readdir every directory.
+    // Both extensions must be seeded together to hit the 3s goal. Next phase:
+    // add UNTR extension with correct directory stat data and validity bitmaps.
     // Best effort: a mount whose index could not be kept is still a mount.
     let cache = self.index_cache.clone();
     let bytes = Arc::clone(&index);
