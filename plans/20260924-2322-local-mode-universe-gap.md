@@ -61,8 +61,21 @@ the full zero-message-open refactor.
 `git status` (seed `FSMN` and `UNTR`), the full zero-message-open refactor
 (including zero-message `opendir`), profiling warm `git status` and commit.
 
-Phases 0, 1, and A were built as planned. One addition to phase 0 was measured
-and not kept: a larger listing cache for local mode (see Decisions).
+Phases 0, 1, and A were built as planned, with Phase A-corrections completed:
+
+### Phase A Corrections
+The parallel index build had a deadlock risk: the main thread held a pool handle
+while spawning up to `pool.max_handles()` threads, each trying to checkout() from
+the same bounded pool. If threads >= max, those threads would block waiting for
+handles while the main thread blocked on their completion.
+
+Fix: Release the pool handle after tree descent, before spawning threads. LFS
+error semantics were also restored (the parallel rewrite had silently swallowed
+errors). Measured on universe: serial 15.55s, fixed parallel 10.72s (1.45x
+faster). Index byte-identical. Four known-failing tests on main remain unchanged.
+
+One addition to phase 0 was measured and not kept: a larger listing cache for
+local mode (see Decisions).
 
 ## Decisions
 
@@ -110,6 +123,17 @@ and not kept: a larger listing cache for local mode (see Decisions).
   when on same filesystem (no copy); cross-filesystem fallback to copy.
 
 ## Details
+
+* **Phase A corrections (deadlock fix)**: The parallel blob header reads held a 
+  pool handle during tree descent and spawned N threads, each calling checkout(). 
+  If N >= pool.max_handles (8 on the test machine), threads would block waiting 
+  for handles while the main thread blocked on their completion. Fix: release the 
+  pool handle after descent and before spawning threads.
+  
+  Measured: serial 15.55 s, parallel 10.72 s (1.45x speedup). Index verified 
+  byte-identical with the serial version (sha256 hash identical: 
+  4163967a823c3975c95a6f8083e7ff527f2f97534601529ec643737cb5a7509d). 
+  Four known-failing tests remain (unchanged). Commit: 79f40d1.
 
 * **Spike result, universe, fresh mount** (`--zero-message-open` vs default;
   native `~/universe` warm read 0.45 s, `rg` 0.10 s):
