@@ -321,9 +321,8 @@ impl Overlay {
     let root_times = journal.root_times()?;
 
     // Initialize sequence from max persisted sequence for monotonicity across restarts.
-    // Recovery corrections will use a sequence above this.
+    // Recovery corrections (if any) will use a sequence above this.
     let max_persisted_sequence = journal.max_sequence()?;
-    let recovery_sequence = max_persisted_sequence + 1;
 
     // The clock never runs backwards across a restart. Seeded from the highest
     // time any surviving entry carries, so a mutation after recovery is still
@@ -365,6 +364,7 @@ impl Overlay {
       }
     }
     if !corrections.is_empty() {
+      // Recovery corrections use a sequence above the max persisted to ensure they're reported.
       journal.apply(
         &corrections,
         &crate::journal::VanishedDelta::default(),
@@ -372,7 +372,7 @@ impl Overlay {
         next_ino,
         next_content_id,
         None,
-        recovery_sequence,
+        max_persisted_sequence + 1,
       )?;
     }
 
@@ -403,7 +403,7 @@ impl Overlay {
         vanished: vanished.into_iter().collect(),
         vanished_overflow,
         root_times,
-        sequence: recovery_sequence,
+        sequence: max_persisted_sequence,
         dirty: HashSet::new(),
         unsynced: HashSet::new(),
         in_memory_sequence: HashMap::new(),
