@@ -204,6 +204,35 @@ phase 0 was measured and not kept: a larger listing cache (see Decisions).
 
 ## Details
 
+* **Performance summary, universe.** gfs numbers are this box (1.32M files,
+  32 cores, kernel 5.4, no FUSE passthrough); btrfs-worktree and Quicktree are
+  the comparison page's numbers, measured on a different box (Arca, 1.16M
+  files), so read them as magnitudes, not a like-for-like race. "native" means
+  a plain kernel-filesystem read, which both of those serve at (page author did
+  not benchmark the read/`rg`/`find` rows separately). "—" is not measured.
+
+  | | gfs before | gfs now, default | gfs now, `--zero-message-open` | btrfs-worktree | Quicktree |
+  |---|---|---|---|---|---|
+  | create a worktree | 8–12 s | 6.0 s miss / **1.6 s** cached | 6.1 / 1.6 s | **0.22 s** | 2.45 s |
+  | first `git status` | 55–65 s | **4.1 s** | 4.0 s | ~10 s | ~0.1 s (sparse cone) |
+  | `git status` after | 1.9–2.2 s | 2.0 s | 1.9 s | 2.62 s | **0.08 s** cone / 16.55 s whole repo |
+  | `ls` root while gitstatusd scans | 7.5 s (felt like ~40 s) | 0.02 s | 0.04 s | — | — |
+  | gitstatusd returns an answer | never (>600 s) | 14.6 s | 17.6 s | — | — |
+  | read `webapp/web` 51k files, cold | 7.6–8.6 s | 8.7 s | 8.2 s | — | — |
+  | same, warm | 6.9 s | 6.9 s | **1.0 s** | native ~0.49 s | native ~0.49 s |
+  | `rg -F TODO webapp/web`, 2nd | 0.75 s | 0.69 s | **0.10 s** | native ~0.10 s | native ~0.10 s |
+  | `find spark -type f`, 2nd | 0.69 s | 0.19 s | 0.11 s | native ~0.50 s | native ~0.50 s |
+  | remove a worktree | — | 1.8 s (unmount) | — | 1.95 s (32 s if diverged) | 1.22 s |
+  | extra disk per worktree | ~225 MB (`.git`) | ~225 MB | ~225 MB | ~0 until written (CoW) | 576 MB (cone) |
+  | tracks edits anywhere | yes | yes | yes | yes | only inside the cone |
+
+  gfs now sits between the other two on create (under Quicktree, above
+  btrfs-worktree's snapshot) and beats btrfs-worktree on both the first and
+  warm `git status`. Quicktree's 0.08 s status is its sparse cone only; through
+  the whole-repo overlay view it is 16.55 s. Reads are still gfs's weak point
+  by default (6.9 s vs ~0.5 s native); only the opt-in no-`open` mode closes
+  it, and it is not safe as the default yet (see Phase C in Decisions).
+
 * **Spike result, universe, fresh mount** (`--zero-message-open` vs default;
   native `~/universe` warm read 0.45 s, `rg` 0.10 s):
 
