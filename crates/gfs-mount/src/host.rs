@@ -251,7 +251,8 @@ impl MountHost {
         fs_config.dispatch = request.dispatch;
         // Enable zero-message open by default for local-mode mounts. This avoids
         // the per-open round trip cost on the local commit, which is immutable and
-        // cheap to access in-process.
+        // cheap to access in-process. The daemon-level flag can force it on for all
+        // mounts (local and remote) for testing/profiling.
         if is_local {
           fs_config.zero_message_open = true;
         }
