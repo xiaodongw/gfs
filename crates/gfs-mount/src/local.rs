@@ -300,13 +300,9 @@ impl LocalRepository {
         .index_for_commit(commit.clone(), snapshot_time)
         .await?,
     );
-    // TODO: Phase B continuation - seed FSMN and UNTR extensions.
-    // FSMN alone (without UNTR) doesn't improve first `git status` because the
-    // untracked-file walk (389k readdir calls) dominates the cost. The FSMN
-    // extension will skip re-lstat but git must still re-readdir every directory.
-    // Both extensions must be seeded together to hit the 3s goal. Next phase:
-    // add UNTR extension with correct directory stat data and validity bitmaps.
     // Best effort: a mount whose index could not be kept is still a mount.
+    // The file stays pristine; each workspace's caches are added at seed time
+    // (`gitdir::seed_git_dir`), because their ident names the worktree.
     let cache = self.index_cache.clone();
     let bytes = Arc::clone(&index);
     let stored = tokio::task::spawn_blocking(move || cache.put(&commit_hex, &bytes)).await;

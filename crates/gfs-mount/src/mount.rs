@@ -562,6 +562,7 @@ impl Mount {
       facts: &resolved.facts,
       index: index.as_deref(),
       preserve_local_head: local_commits.is_some(),
+      workspace: Some(&config.workspace),
     })?;
     let fs = Gfs::new(
       Arc::clone(&resolved.pin.client),
@@ -934,6 +935,7 @@ impl Mount {
       facts: &resolved.facts,
       index: Some(&index),
       preserve_local_head: false,
+      workspace: Some(&self.config.workspace),
     })?;
 
     // The one overlay, re-pointed in place. One SQLite transaction, so a

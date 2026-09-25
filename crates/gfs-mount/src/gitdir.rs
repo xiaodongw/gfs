@@ -146,6 +146,119 @@ pub struct SeedSpec<'a> {
   /// that would strand them. The caller passes `index: None` alongside, for the
   /// same reason — the on-disk index describes the local `HEAD`, not the pin.
   pub preserve_local_head: bool,
+  /// The worktree, when the index should carry the caches Git builds on a
+  /// workspace's first `git status` (see [`workspace_caches`]). `None` seeds
+  /// the index as it came.
+  pub workspace: Option<&'a std::path::Path>,
+}
+
+/// What [`gfs_git::index::with_workspace_caches`] needs about this workspace,
+/// owned.
+#[derive(Debug)]
+pub struct SeededCaches {
+  ident: String,
+  dir_flags: u32,
+  info_exclude: Option<[u8; 20]>,
+  excludes_file: Option<[u8; 20]>,
+  token: String,
+}
+
+impl SeededCaches {
+  fn borrow(&self) -> gfs_git::index::WorkspaceCaches<'_> {
+    gfs_git::index::WorkspaceCaches {
+      ident: &self.ident,
+      dir_flags: self.dir_flags,
+      info_exclude: self.info_exclude,
+      excludes_file: self.excludes_file,
+      fsmonitor_token: &self.token,
+    }
+  }
+}
+
+/// The facts Git keys its untracked cache and fsmonitor state on, read the
+/// way Git reads them: the worktree's realpath and the kernel name for the
+/// ident, `status.showUntrackedFiles` for the flags, the blob IDs of
+/// `info/exclude` and `core.excludesFile` (default `$XDG_CONFIG_HOME/git/ignore`),
+/// and the daemon's token for this generation (`gfs:<generation>:`, the
+/// prefix `Mount::fsmonitor_changes` accepts).
+///
+/// `None` when Git's configuration cannot be read, and then nothing is
+/// seeded: a guess here is only ever a slower first status, but there is no
+/// reason to write a cache already known to be discarded.
+fn workspace_caches(
+  git_dir: &std::path::Path,
+  workspace: &std::path::Path,
+  generation: u64,
+) -> Option<SeededCaches> {
+  let worktree = workspace.canonicalize().ok()?;
+  // `uname(2)`'s sysname, which Linux also publishes here; the ident is
+  // compared as a string, so the two must agree exactly.
+  let sysname = std::fs::read_to_string("/proc/sys/kernel/ostype").ok()?;
+  let sysname = sysname.trim_end();
+
+  let config = std::process::Command::new("git")
+    .arg("--git-dir")
+    .arg(git_dir)
+    .args([
+      "config",
+      "--type=path",
+      "--get-regexp",
+      "^(status\\.showuntrackedfiles|core\\.excludesfile)$",
+    ])
+    .env_remove("GIT_DIR")
+    .env_remove("GIT_CONFIG")
+    .env_remove("GIT_CONFIG_PARAMETERS")
+    .stdin(std::process::Stdio::null())
+    .stderr(std::process::Stdio::null())
+    .output()
+    .ok()?;
+  // Exit 1 is "no such key", which is an answer: every default applies.
+  if !config.status.success() && config.status.code() != Some(1) {
+    return None;
+  }
+  let (mut show_untracked, mut excludes_file) = (None, None);
+  for line in String::from_utf8_lossy(&config.stdout).lines() {
+    match line.split_once(' ') {
+      Some(("status.showuntrackedfiles", value)) => show_untracked = Some(value.to_owned()),
+      Some(("core.excludesfile", value)) => excludes_file = Some(value.into()),
+      _ => {}
+    }
+  }
+  let excludes_file: std::path::PathBuf = match excludes_file {
+    Some(path) => path,
+    None => {
+      let base = match std::env::var_os("XDG_CONFIG_HOME").filter(|v| !v.is_empty()) {
+        Some(xdg) => std::path::PathBuf::from(xdg),
+        None => std::path::PathBuf::from(std::env::var_os("HOME")?).join(".config"),
+      };
+      base.join("git/ignore")
+    }
+  };
+  // Git's own rule (dir.c `add_patterns`): a missing file has a null ID, an
+  // empty one the empty blob's, and anything else is hashed *with a newline
+  // appended* -- Git terminates the buffer before it hashes it. A mismatch
+  // here invalidates the whole cache, so it has to be exact.
+  let blob = |path: &std::path::Path| {
+    std::fs::read(path).ok().map(|mut content| {
+      if !content.is_empty() {
+        content.push(b'\n');
+      }
+      gfs_git::index::blob_id(&content)
+    })
+  };
+
+  Some(SeededCaches {
+    ident: format!("Location {}, system {sysname}", worktree.display()),
+    dir_flags: if show_untracked.as_deref() == Some("all") {
+      0
+    } else {
+      // DIR_SHOW_OTHER_DIRECTORIES | DIR_HIDE_EMPTY_DIRECTORIES
+      (1 << 1) | (1 << 2)
+    },
+    info_exclude: blob(&git_dir.join("info/exclude")),
+    excludes_file: blob(&excludes_file),
+    token: format!("gfs:{generation}:0"),
+  })
 }
 
 /// Replace a seeded file by rename, never by truncation.
@@ -391,8 +504,16 @@ pub fn seed_git_dir(spec: &SeedSpec<'_>) -> Result<(), gfs_types::error::GfsErro
   write_packed_refs(dir, facts).map_err(|e| io("packed-refs", e))?;
 
   if let Some(index) = spec.index {
+    // With the fsmonitor hook in place, the first `git status` can start
+    // from the state it would otherwise spend a full walk building.
+    let seeded = match (fsmonitor.is_some(), spec.workspace) {
+      (true, Some(workspace)) => workspace_caches(dir, workspace, facts.generation)
+        .and_then(|caches| gfs_git::index::with_workspace_caches(index, &caches.borrow())),
+      _ => None,
+    };
     // Atomic above all for the *index*: this is the file gitstatusd mmaps.
-    write_atomic(&dir.join("index"), index).map_err(|e| io("index", e))?;
+    write_atomic(&dir.join("index"), seeded.as_deref().unwrap_or(index))
+      .map_err(|e| io("index", e))?;
   }
 
   // The same machine-readable facts the synthesized surface carried, now inside
@@ -599,6 +720,7 @@ mod tests {
       facts: &facts(Some("refs/heads/main")),
       index: None,
       preserve_local_head: false,
+      workspace: None,
     })
     .unwrap();
 
@@ -641,6 +763,7 @@ mod tests {
       facts: &facts(Some("refs/heads/main")),
       index: None,
       preserve_local_head: false,
+      workspace: None,
     })
     .unwrap();
     let before = std::fs::read_to_string(git.join("packed-refs")).unwrap();
@@ -652,6 +775,7 @@ mod tests {
       facts: &unanswered,
       index: None,
       preserve_local_head: false,
+      workspace: None,
     })
     .unwrap();
     assert_eq!(
@@ -679,6 +803,7 @@ mod tests {
       facts: &facts(Some("refs/heads/main")),
       index: Some(&big),
       preserve_local_head: false,
+      workspace: None,
     })
     .unwrap();
 
@@ -692,6 +817,7 @@ mod tests {
       facts: &facts(Some("refs/heads/main")),
       index: Some(b"tiny"),
       preserve_local_head: false,
+      workspace: None,
     })
     .unwrap();
 
@@ -726,6 +852,7 @@ mod tests {
       facts: &facts(Some("refs/heads/main")),
       index: None,
       preserve_local_head: false,
+      workspace: None,
     })
     .unwrap();
 
@@ -748,6 +875,7 @@ mod tests {
       facts: &facts(Some("refs/heads/main")),
       index: None,
       preserve_local_head: false,
+      workspace: None,
     })
     .unwrap();
     assert_eq!(
@@ -766,6 +894,7 @@ mod tests {
       facts: &facts(Some("refs/tags/v1")),
       index: None,
       preserve_local_head: false,
+      workspace: None,
     })
     .unwrap();
     assert_eq!(
@@ -786,6 +915,7 @@ mod tests {
       facts: &facts(Some("refs/heads/main")),
       index: None,
       preserve_local_head: false,
+      workspace: None,
     })
     .unwrap();
     let local = "cd".repeat(20);
@@ -796,6 +926,7 @@ mod tests {
       facts: &facts(Some("refs/heads/main")),
       index: None,
       preserve_local_head: true,
+      workspace: None,
     })
     .unwrap();
     assert_eq!(
@@ -827,6 +958,7 @@ mod tests {
       facts: &facts(None),
       index: None,
       preserve_local_head: false,
+      workspace: None,
     })
     .unwrap();
     assert_eq!(seeded_commit(&git).unwrap(), "ab".repeat(20));

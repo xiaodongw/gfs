@@ -66,23 +66,25 @@ Phases 0, 1, and A were built as planned; Phase A took four passes (see
 Decisions for what was built and removed along the way). One addition to
 phase 0 was measured and not kept: a larger listing cache (see Decisions).
 
-**Phase B — the first `git status` (in progress)**
-* FSMN (fsmonitor) extension: implemented and verified to parse correctly by git.
-  The extension seeds a pristine token (`gfs:0:0`, generation 0) and marks all
-  1.32M index entries as fsmonitor-valid via an all-zero EWAH bitmap. On the first
-  `git status`, the daemon sees a generation mismatch (current is 1) and returns
-  `full_rescan=true`, triggering a full stat check to validate entries. This skips
-  the 1.7M re-lstat calls that would otherwise happen (cost saved: ~unknown, 
-  deferred measurement due to cache pollution from earlier tests).
-* UNTR (untracked cache) extension: deferred to next phase. FSMN alone doesn't
-  improve first `git status` significantly because the untracked-file walk
-  (389k `readdir` calls on 389k directories) dominates the cost. Both extensions
-  must be seeded together: FSMN skips re-lstat, UNTR skips re-readdir. Implementing
-  UNTR correctly requires careful handling of per-workspace directory stat data
-  and OID tracking; see Details for blockers.
+**Phase B — the first `git status`** (complete)
+* Measured split of a fresh universe workspace's first status: the `lstat`
+  sweep of 1.32M entries 13.8 s (`status -uno`), the untracked walk 61 s
+  (390 354 `opendir`s). Both are state Git builds once and writes back.
+* `seed_git_dir` now appends both to the index it seeds, per workspace
+  (`gfs_git::index::with_workspace_caches`), when the fsmonitor hook is
+  installed: `FSMN` v2 with the token `gfs:<generation>:0` and an all-valid
+  dirty bitmap, and `UNTR` with every tree directory valid, no untracked
+  entries, each directory's `.gitignore` blob ID, the ident Git computes
+  (`Location <worktree realpath>, system <sysname>`), the `dir_flags`
+  `status.showUntrackedFiles` implies, and the blob IDs of `info/exclude` and
+  `core.excludesFile` as Git hashes them. The shared per-commit cache file stays
+  pristine; the extensions and a new trailer are added at seed time.
+* Smoke test `crates/gfs-mount/tests/seeded_caches.rs`: stock Git on a seeded
+  fixture clone opens no directory and agrees with its own uncached answer,
+  pristine and with a reported change.
 
-**Later phases, gated on UNTR completion**: the full zero-message-open refactor
-(including zero-message `opendir`), profiling warm `git status` and commit.
+**Later phases**: the full zero-message-open refactor (including zero-message
+`opendir`), profiling warm `git status` and commit.
 
 ## Decisions
 
@@ -145,32 +147,33 @@ phase 0 was measured and not kept: a larger listing cache (see Decisions).
   next phase (seeding `FSMN`/`UNTR`, whose ident names the worktree path)
   needs per-workspace bytes anyway.
 
-## Decisions (Phase B)
-
-* **FSMN implementation: minimal EWAH bitmap for all-zero encoding.** EWAH is a
-  run-length-encoded bitmap format. For all entries valid (all bits 0), we write
-  a minimal bitmap: bit_size (4 bytes, the number of entries), word_count (4
-  bytes, = 0), and rlw_pos (4 bytes, = 0). This totals 12 bytes and correctly
-  represents "no 1 bits set". Earlier attempts at full RLE encoding produced
-  "corrupt ewah bitmap" errors; the minimal form matches git's ewah_read_mmap
-  implementation.
-* **FSMN seeding deferred pending UNTR implementation.** After code review it
-  became clear that FSMN alone (skipping re-lstat on 1.32M files) does not
-  meaningfully improve first `git status` when the untracked-file walk
-  (389k readdir calls) dominates the wall time. The correct path is to seed
-  both extensions together, since with both, git skips both lstat and readdir.
-  Measuring FSMN-only showed no improvement and risked breaking the already-
-  passing tests; implementing UNTR first ensures the full benefit is measured
-  at once.
-* **UNTR seeding deferred due to per-workspace dependency.** The untracked
-  cache records an "ident" string (built from worktree path and system name),
-  per-directory stat data, and OIDs of exclude files. Because the ident and
-  stat data are per-workspace, UNTR cannot live in the shared per-commit cache
-  (unlike the bare index and TREE extension which are per-commit and per-repo).
-  The next phase must append UNTR after reading the cached index but before
-  writing the seeded `.git/index`, with careful attention to directory stat
-  values that git compares under `core.checkStat` (likely minimal mode,
-  mtime/size/oid only).
+* **Seed the caches rather than make the walk cheaper.** The walk is ~4 FUSE
+  round trips per directory; zero-message `opendir` would halve it and still
+  leave ~30 s on universe. Only the untracked cache removes it.
+* **Why the seeded caches cannot make `git status` lie** (read against Git
+  2.54's `dir.c` and `fsmonitor.c`): Git trusts a valid untracked-cache
+  directory without `lstat` only after a successful, non-trivial fsmonitor
+  answer, and applies that answer first, invalidating the directory of every
+  path it names. The daemon's answer is every overlay change relative to the
+  pin — not a delta — or `/` for a token of another generation, after which
+  Git compares each directory's recorded stat data (zero here, so never a
+  match) and re-reads it. Every other seeded value — the exclude-file IDs, each
+  directory's `.gitignore` ID, the ident, the flags — is compared with what is
+  there now, and a mismatch invalidates. So a wrong value costs a walk, never
+  an answer; the matrix below checks the answers.
+* **Hash exclude files the way Git does.** Git appends a newline before hashing
+  a file it reads from disk (`add_patterns`); the first seeded version hashed
+  the bytes as they are, the `core.excludesFile` ID never matched, and Git
+  invalidated the whole cache — correct output, full 63 s walk.
+* **The directory tree comes from the index, not from gitignore evaluation.**
+  Git records no node for an ignored directory holding tracked files (403 on
+  universe: `.claude/`, `.vscode/`, `logs/`, …) because its walk never enters
+  one. The seeded cache carries them anyway; Git never looks them up and drops
+  them when it writes the index back. Evaluating ignore rules to match exactly
+  would add a second gitignore implementation for no gain.
+* **Discarded from the first pass at this phase**: an FSMN helper with an empty
+  EWAH buffer and the claim that FSMN alone bought nothing (never measured —
+  it takes the sweep from 13.8 s to 0.4 s), and a placeholder UNTR function.
 
 ## Details
 
@@ -213,3 +216,26 @@ phase 0 was measured and not kept: a larger listing cache (see Decisions).
   byte-identical (`cmp`), and every one of the 1 326 149 sizes in it matches
   `git ls-tree -r -l HEAD`. `git status` in each mounted workspace reports no
   changes; `git log -1` names the pinned commit.
+
+* **Phase B results, universe** (fresh workspace, private daemon; each first
+  status compared with `git -c core.fsmonitor=false -c core.untrackedCache=false
+  status --porcelain=v2` run right after):
+
+  | case | first `git status` before | after | `opendir` | same answer |
+  |---|---|---|---|---|
+  | pristine | 64.6 s | 3.9–4.4 s | 587 (was 390 354) | yes |
+  | base file modified | 65.4 s | 4.2 s | 588 | yes |
+  | base file deleted | 66.2 s | 4.3 s | 588 | yes |
+  | new top-level file | 67.2 s | 4.2–4.3 s | 588 | yes |
+  | new file in new nested dirs | 66.7 s | 4.1–4.3 s | 592 | yes |
+  | new file under an ignore rule | 65.4 s | 4.3 s | 590 | yes |
+  | `.gitignore` edited to un-ignore | 67.6 s | 5.6 s | 7 081 | yes |
+
+  The remaining 587 `opendir`s are the directories under the 16 whose
+  `.gitignore` Git re-validates (`gitignore-invalidation:16`); not chased.
+  The `lstat` sweep alone went from 13.8 s to 0.4 s (FSMN).
+* Cost: create on a cache hit 1.0 s → 1.4–1.6 s, which misses the 1.3 s target.
+  Seeding one universe workspace is 0.52 s (0.14 s of it the new SHA-1
+  trailer over 225 MiB; the tree pass over 1.32M entries the rest, after
+  replacing a per-component map lookup that took it to 0.72 s). Taken: it
+  buys ~60 s on the first status. A cache miss is 6.9 s.
