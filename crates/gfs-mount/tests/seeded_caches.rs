@@ -64,13 +64,13 @@ fn seed(ws: &std::path::Path, xdg: &std::path::Path, changed: &[&str]) {
           gfs_git::index::blob_id(&c)
         }),
       excludes_file: None,
-      fsmonitor_token: "gfs:1:0",
+      fsmonitor_token: "gfs:1:1:0",
     },
   )
   .expect("an index gfs wrote can carry the caches");
   std::fs::write(ws.join(".git/index"), seeded).unwrap();
 
-  let mut answer = String::from("printf 'gfs:1:1\\0");
+  let mut answer = String::from("printf 'gfs:1:1:1\\0");
   for path in changed {
     answer.push_str(&format!("{path}\\0"));
   }

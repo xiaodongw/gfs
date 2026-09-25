@@ -36,14 +36,22 @@ Each step is done by one subagent, sequentially (steps 1 and 2 both touch the
 overlay journal), and each ends with a build, the smoke tests, a measurement
 on universe with a private daemon, and a commit on `main`.
 
-**Step 1 — delta fsmonitor answers** ✓ DONE
-* Stamp every overlay row, and every vanished path, with the overlay sequence
-  at its last mutation (persisted, so a daemon restart keeps answering deltas).
-* `fsmonitor_changes(token)`: for a token of this generation with a sequence
-  the overlay can still answer for, return only paths stamped after it; a
-  token from another generation, an unparseable one, one from the future, or
-  one older than what is retained keeps today's behaviour (full list or full
-  rescan).
+**Step 1 — delta fsmonitor answers** ✓ REPLACED
+* Token format: `gfs:<generation>:<instance>:<sequence>`. Instance identifies
+  the opened overlay in this process, persisted in the journal's meta table and
+  incremented on every `Overlay::open`.
+* Stamps in memory only (cleared on rebind): path -> sequence map of the last
+  mutation in this instance. commit() stamps all Put/Delete changes and paths
+  entering vanished; note_written() stamps write-time mutations.
+* `fsmonitor_changes(token)`: parse generation+instance+sequence from token. If
+  instance matches current and sequence <= current, return paths with stamps >
+  caller_sequence (raw, not filtered through status). Otherwise return full list.
+  Vanished overflow also triggers full answer with rescan flag.
+* No persisted sequence columns: schema reverted from v3 to v2; removed
+  journal.max_sequence, journal.changes_since, and the build_paths filtering.
+* Sequence starts at 0 per instance (not persisted), incremented by commit() and
+  note_written(). Daemon restart with new instance_id forces a full answer from
+  a pre-restart token.
 * Target: warm `git status` in a workspace with a few edits does not rewrite
   the index when nothing changed (8.5 s → ~2.5 s).
 
@@ -82,14 +90,19 @@ on universe with a private daemon, and a commit on `main`.
 
 ## Decisions
 
-* **Step 1 sequence stamping**: every row and vanished path is stamped with the
-  overlay sequence at which it was last changed. The sequence is incremented
-  *before* the journal.apply() call to ensure rows are stamped with the
-  committed sequence. Write-time sequence increments (note_written) advance the
-  fsmonitor token so Git sees the change immediately, but the row is stamped
-  when it's settled/committed later. Recovery corrections at open-time use
-  sequence 0 to indicate pre-existing state. Sequence 0 from the seeded token
-  means "since the pin" (everything).
+* **Step 1 sequence stamping (replaced design)**: Stamps live in memory only,
+  not persisted to the database. The previous attempt persisted them to schema
+  v3, which caused two critical bugs: (a) `changes_since` returned None when
+  caller_seq >= max_persisted, forcing a full answer and index rewrite on
+  no-change status; (b) restarting incremented instance_id after the caller had
+  already parsed an old token, so pre-restart tokens could be stale mid-flight.
+  The new design: instance_id distinguishes process restarts; sequence counter
+  per instance starts at 0 (not persisted, so any pre-restart token is from
+  before or from a different instance). Stamps map path -> sequence tracks
+  mutations in this instance only, cleared on rebind. This avoids both bugs: a
+  restart with different instance_id forces a full answer; no stamped paths from
+  a previous instance exist to cause a stale token answer. The map is bounded by
+  paths touched in this instance (typically much smaller than the journal).
 
 * **`gfs switch` replaces `git switch`; it does not run before it.** Re-pinning
   first and then running `git switch` fails: the index still describes the old
@@ -113,14 +126,26 @@ on universe with a private daemon, and a commit on `main`.
 
 ## Details
 
-* **Step 1 results and critical fixes**:
-  - Initial implementation: Schema v3, sequence stamping, delta fsmonitor query.
-  - Fixed 2 critical correctness bugs:
-    1. **Persist sequence across daemon restart**: Initialize from max persisted sequence on open. Recovery corrections use sequence+1.
-    2. **In-memory write stamping**: Track unsettled writes in HashMap, updated by note_written(). Changes_since merges in-memory+persisted.
-  - Fixed sequence initialization: Start at max_persisted (matching seeded token seq 0) for byte-identical token on no-change status.
-  - Performance: Replaced O(n·m) delta matching with HashSet for O(1) lookup; factored duplicate path list logic.
-  - All seeded_caches tests pass; universe measurement started (sequence tracking confirmed, full correctness validation in progress).
+* **Step 1 implementation (replaced)**:
+  - Previous attempt (commits f1417e0, 7682ab8, 4c67982, 4d01df6): Schema v3,
+    persisted sequence in entries/vanished, journal.changes_since. Abandoned due
+    to bugs: changes_since returns None on no-change (full answer + index
+    rewrite); restart sequence edge case (token from previous process instance);
+    filtering through status.changes (dropping valid paths). Removed 56 lines of
+    dead code.
+  - New implementation:
+    * Token `gfs:<gen>:<instance>:<seq>` with instance from journal meta table,
+      incremented on every `Overlay::open()` (using next_instance_id).
+    * In-memory stamps: HashMap<path, sequence>, cleared on rebind. Stamp all
+      Put/Delete in commit(), all writes in note_written().
+    * fsmonitor_changes: parse token, check instance match. Return raw stamped
+      paths (no status filtering). On mismatch or vanished overflow, compute
+      status and return full list.
+    * Schema reverted from v3 to v2: removed last_changed_sequence columns from
+      entries and vanished tables. Removed journal.max_sequence and
+      journal.changes_since (no longer called).
+  - Tests: all seeded_caches pass (3/3); workspace_git (11/11); local & mutations
+    pass except pre-existing failure (a_recreated_directory_does_not_show_the_base_children_it_replaced).
 
 * Traces and probes: `GIT_TRACE2_PERF` on `git status` / `git switch` in a
   private workspace (`GFS_HOST_SOCKET=/tmp/gfsb/host.sock`, workspace

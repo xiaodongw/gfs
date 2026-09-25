@@ -247,13 +247,20 @@ struct Inner {
   unsynced: HashSet<u64>,
   /// Committed transactions since this process opened the overlay. The
   /// fsmonitor token carries it so the token advances when the filesystem
-  /// changes, which is what the v2 protocol asks of it. Initialized to the
-  /// max persisted sequence at open, ensuring monotonicity across restarts.
+  /// changes, which is what the v2 protocol asks of it. Initialized to 0 at
+  /// open, incremented with each mutation (commit or note_written).
   sequence: u64,
-  /// In-memory sequence stamps for paths: tracks the sequence at which each
-  /// path's row was last modified in memory (for unsettled writes). Used by
-  /// fsmonitor to report changes that haven't been settled yet.
-  in_memory_sequence: HashMap<Vec<u8>, u64>,
+  /// An identifier for this opened overlay instance, persisted in the journal's
+  /// meta table and incremented on each Overlay::open. Used in the fsmonitor
+  /// token to distinguish a restart: if the instance differs from what the
+  /// caller's token carries, the caller is from a previous process instance
+  /// and gets a full answer.
+  instance_id: u64,
+  /// In-memory sequence stamps for every path touched in this instance.
+  /// Maps path -> the sequence at which it was last mutated (via commit or
+  /// note_written). The fsmonitor hook uses these stamps to return only paths
+  /// changed since the caller's sequence. Stamps are cleared on rebind/reset.
+  stamps: HashMap<Vec<u8>, u64>,
 }
 
 pub struct Overlay {
@@ -317,12 +324,9 @@ impl Overlay {
 
     let next_ino = journal.next_ino()?.max(OVERLAY_INO_BASE);
     let next_content_id = journal.next_content_id()?.max(1);
+    let instance_id = journal.next_instance_id()?;
     let (vanished, vanished_overflow) = journal.vanished()?;
     let root_times = journal.root_times()?;
-
-    // Initialize sequence from max persisted sequence for monotonicity across restarts.
-    // Recovery corrections (if any) will use a sequence above this.
-    let max_persisted_sequence = journal.max_sequence()?;
 
     // The clock never runs backwards across a restart. Seeded from the highest
     // time any surviving entry carries, so a mutation after recovery is still
@@ -364,7 +368,7 @@ impl Overlay {
       }
     }
     if !corrections.is_empty() {
-      // Recovery corrections use a sequence above the max persisted to ensure they're reported.
+      // Recovery corrections are the first mutations in this instance.
       journal.apply(
         &corrections,
         &crate::journal::VanishedDelta::default(),
@@ -372,7 +376,6 @@ impl Overlay {
         next_ino,
         next_content_id,
         None,
-        max_persisted_sequence + 1,
       )?;
     }
 
@@ -403,10 +406,11 @@ impl Overlay {
         vanished: vanished.into_iter().collect(),
         vanished_overflow,
         root_times,
-        sequence: max_persisted_sequence,
+        sequence: 0,
+        instance_id,
         dirty: HashSet::new(),
         unsynced: HashSet::new(),
-        in_memory_sequence: HashMap::new(),
+        stamps: HashMap::new(),
       }),
       store,
       config,
@@ -436,6 +440,15 @@ impl Overlay {
 
   pub fn snapshot_time(&self) -> Timestamp {
     self.snapshot_time
+  }
+
+  /// The instance ID for this opened overlay.
+  ///
+  /// Persisted in the journal's meta table and incremented on each open.
+  /// Used in the fsmonitor token to detect restarts: a different instance_id
+  /// means the caller is from a previous process instance.
+  pub fn instance_id(&self) -> u64 {
+    self.lock().instance_id
   }
 
   fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
@@ -500,7 +513,9 @@ impl Overlay {
     inner.vanished.clear();
     inner.vanished_overflow = false;
     inner.root_times = None;
-    inner.sequence += 1;
+    // Reset sequence to 0 and clear stamps for the new binding.
+    inner.sequence = 0;
+    inner.stamps.clear();
     inner.dirty.clear();
     inner.unsynced.clear();
     let _ = self.store.sweep(&HashSet::new());
@@ -538,34 +553,31 @@ impl Overlay {
   ///
   /// Returns `None` if we can't answer for this sequence (from the future or overflow).
   /// Returns `Some((changed_entries, changed_vanished))` otherwise.
+  /// Paths changed (stamped) after the given sequence in this overlay instance.
+  ///
+  /// Returns the set of paths with stamps > after_sequence. Since stamps are
+  /// kept in memory only and reset on rebind, a sequence not from this instance
+  /// will find no stamps and return None (prompting the caller to check the
+  /// instance_id and fall back to a full answer).
   pub fn changes_since(&self, after_sequence: u64) -> Result<Option<(Vec<BytePath>, Vec<BytePath>)>> {
     let inner = self.lock();
-    let mut changed_entries = Vec::new();
-    let mut changed_vanished = Vec::new();
+    let mut changed = Vec::new();
 
-    // Check in-memory sequence stamps: paths with in-memory stamps > after_sequence.
-    for (path, stamp) in &inner.in_memory_sequence {
+    // Collect all paths with stamps > after_sequence.
+    for (path, stamp) in &inner.stamps {
       if *stamp > after_sequence {
-        changed_entries.push(BytePath::new(path.clone()));
+        changed.push(BytePath::new(path.clone()));
       }
     }
 
-    // Query database for persisted changes. If journal returns None, we can't answer.
-    if let Some((db_entries, db_vanished)) = inner.journal.changes_since(after_sequence)? {
-      for entry in db_entries {
-        let path = BytePath::new(entry);
-        // Skip if already in changed_entries from in-memory (in-memory takes precedence).
-        if !changed_entries.contains(&path) {
-          changed_entries.push(path);
-        }
-      }
-      for path in db_vanished {
-        changed_vanished.push(BytePath::new(path));
-      }
-      Ok(Some((changed_entries, changed_vanished)))
-    } else {
-      // Journal can't answer (caller from future, etc.); fall back to full answer.
+    // If no stamps are found after the sequence, return None (caller is likely
+    // from before any mutations in this instance).
+    if changed.is_empty() && after_sequence > 0 {
       Ok(None)
+    } else {
+      // Return the changed paths. Separate into entries and vanished is not
+      // needed here since we only care about the path list for fsmonitor.
+      Ok(Some((changed, Vec::new())))
     }
   }
 
@@ -736,7 +748,6 @@ impl Overlay {
       inner.next_ino,
       inner.next_content_id,
       root_times,
-      current_sequence,
     )?;
     if let Some(times) = root_times {
       inner.root_times = Some(times);
@@ -748,13 +759,17 @@ impl Overlay {
       for path in &delta.returned {
         inner.vanished.remove(path);
       }
-      for path in delta.gone {
-        inner.vanished.insert(path);
+      for path in &delta.gone {
+        // Stamp the path as it enters vanished.
+        inner.stamps.insert(path.clone(), current_sequence);
+        inner.vanished.insert(path.clone());
       }
     }
     for change in &changes {
       match change {
         Change::Put(entry) => {
+          // Stamp this path as modified.
+          inner.stamps.insert(entry.path.as_bytes().to_vec(), current_sequence);
           if let Some(previous) = inner.entries.get(entry.path.as_bytes()) {
             if let Some(id) = previous.content.local_id() {
               inner.local_bytes = inner.local_bytes.saturating_sub(previous.size);
@@ -779,6 +794,8 @@ impl Overlay {
             .insert(entry.path.as_bytes().to_vec(), entry.clone());
         }
         Change::Delete(path) => {
+          // Stamp this path as modified.
+          inner.stamps.insert(path.as_bytes().to_vec(), current_sequence);
           if let Some(previous) = inner.entries.remove(path.as_bytes()) {
             if let Some(id) = previous.content.local_id() {
               inner.local_bytes = inner.local_bytes.saturating_sub(previous.size);
@@ -905,7 +922,7 @@ impl Overlay {
     }
     inner.sequence += 1;
     let path_key = updated.path.as_bytes().to_vec();
-    inner.in_memory_sequence.insert(path_key, inner.sequence);
+    inner.stamps.insert(path_key, inner.sequence);
     Self::replace_in_memory(inner, updated);
   }
 

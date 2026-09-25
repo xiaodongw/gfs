@@ -563,6 +563,7 @@ impl Mount {
       index: index.as_deref(),
       preserve_local_head: local_commits.is_some(),
       workspace: Some(&config.workspace),
+      instance_id: overlay.instance_id(),
     })?;
     let fs = Gfs::new(
       Arc::clone(&resolved.pin.client),
@@ -936,6 +937,7 @@ impl Mount {
       index: Some(&index),
       preserve_local_head: false,
       workspace: Some(&self.config.workspace),
+      instance_id: self.overlay.instance_id(),
     })?;
 
     // The one overlay, re-pointed in place. One SQLite transaction, so a
@@ -1233,6 +1235,13 @@ impl Mount {
   /// for that sequence, only paths changed after the caller's sequence are
   /// returned (delta answer). Otherwise, the full list is returned (and a full
   /// rescan if the vanished set overflowed or the token is from another generation).
+  /// Answer Git's fsmonitor v2 hook with changed paths.
+  ///
+  /// The token format is `gfs:<generation>:<instance>:<sequence>`. If the caller's
+  /// token has the same generation and instance ID as this process, and the sequence
+  /// is <= current, returns only paths with stamps > caller_sequence (delta answer).
+  /// Otherwise returns the full cumulative list (to trigger a full rescan if needed).
+  /// The vanished set overflowing also triggers a full rescan.
   pub async fn fsmonitor_changes(
     &self,
     caller_token: &str,
@@ -1242,94 +1251,80 @@ impl Mount {
       let current = self.current.lock().expect("current pin");
       (current.commit.clone(), current.epoch)
     };
-    let generation_token = format!("gfs:{generation}");
     let algorithm = commit.algorithm();
     let caller_token = caller_token.to_string();
 
-    // Parse the caller's token to extract the sequence.
-    let caller_sequence = if caller_token.starts_with(&format!("{generation_token}:")) {
-      caller_token
-        .strip_prefix(&format!("{generation_token}:"))
-        .and_then(|s| s.parse::<u64>().ok())
-    } else {
-      None
-    };
-
-    // One trip to the blocking pool to gather overlay state.
-    let (status, all_vanished, vanished_overflow, sequence, delta_result) =
+    // Gather overlay state in one blocking pool trip.
+    let (instance_id, sequence, delta_result, vanished_overflow) =
       tokio::task::spawn_blocking(move || {
-        let status = overlay.status(algorithm);
-        let (all_vanished, overflow) = overlay.vanished();
+        let instance = overlay.instance_id();
         let seq = overlay.sequence();
-        // Try to compute delta if the caller's token is from this generation.
-        let delta = if let Some(caller_seq) = caller_sequence {
-          overlay
-            .changes_since(caller_seq)
-            .ok()
-            .flatten()
-        } else {
-          None
-        };
-        (status, all_vanished, overflow, seq, delta)
+        // Try to compute delta if the caller's token structure matches.
+        let delta = Self::parse_fsmonitor_token(&caller_token, generation, instance)
+          .and_then(|caller_seq| overlay.changes_since(caller_seq).ok().flatten());
+        let (_, overflow) = overlay.vanished();
+        (instance, seq, delta, overflow)
       })
       .await
       .map_err(|e| GfsError::internal(format!("the fsmonitor task failed: {e}")))?;
-    let status = status.map_err(crate::fs::overlay_as_service_error)?;
 
-    let token = format!("{generation_token}:{sequence}");
+    let token = format!("gfs:{generation}:{instance_id}:{sequence}");
 
-    // Helper to build paths list from status changes, directory deletions, and vanished set.
-    let build_paths = |changed_set: Option<&std::collections::HashSet<Vec<u8>>>| -> Vec<String> {
-      let mut paths = Vec::new();
-      for change in &status.changes {
-        let path_bytes = change.path.as_bytes();
-        if let Some(set) = changed_set {
-          if !set.contains(path_bytes) {
-            continue;
-          }
-        }
-        paths.push(String::from_utf8_lossy(path_bytes).into_owned());
-        // A rename changed both names: the new one exists, the old one is gone.
-        if let Some(from) = &change.from {
-          if changed_set.is_none() || changed_set.unwrap().contains(from.as_bytes()) {
+    // Decide whether to return a delta or full answer.
+    let (paths, full_rescan) = if let Some((delta_entries, _)) = delta_result {
+      if vanished_overflow {
+        // Overflow: fall back to full answer with rescan.
+        let status = tokio::task::spawn_blocking({
+          let overlay = Arc::clone(&self.overlay);
+          move || overlay.status(algorithm)
+        })
+        .await
+        .map_err(|e| GfsError::internal(format!("the status task failed: {e}")))?
+        .map_err(crate::fs::overlay_as_service_error)?;
+
+        let mut paths = Vec::new();
+        for change in &status.changes {
+          paths.push(String::from_utf8_lossy(change.path.as_bytes()).into_owned());
+          if let Some(from) = &change.from {
             paths.push(String::from_utf8_lossy(from.as_bytes()).into_owned());
           }
         }
-      }
-      for dir in &status.directory_deletions {
-        let dir_bytes = dir.as_bytes();
-        if changed_set.is_none() || changed_set.unwrap().contains(dir_bytes) {
-          paths.push(format!("{}/", String::from_utf8_lossy(dir_bytes)));
+        for dir in &status.directory_deletions {
+          paths.push(format!("{}/", String::from_utf8_lossy(dir.as_bytes())));
         }
-      }
-      for path in &all_vanished {
-        if changed_set.is_none() || changed_set.unwrap().contains(path.as_bytes()) {
-          paths.push(String::from_utf8_lossy(path.as_bytes()).into_owned());
-        }
-      }
-      paths
-    };
-
-    // Decide whether to return a delta or full answer.
-    let (paths, full_rescan) = if let Some((delta_entries, delta_vanished)) = delta_result {
-      if vanished_overflow {
-        // Overflow: fall back to full answer.
-        (build_paths(None), true)
+        (paths, true)
       } else {
-        // Build a set of changed paths for O(1) lookup.
-        let mut changed = std::collections::HashSet::new();
-        for entry in &delta_entries {
-          changed.insert(entry.as_bytes().to_vec());
-        }
-        for vanished in &delta_vanished {
-          changed.insert(vanished.as_bytes().to_vec());
-        }
-        (build_paths(Some(&changed)), false)
+        // Delta answer: return stamped paths directly.
+        let paths: Vec<String> = delta_entries
+          .iter()
+          .map(|p| String::from_utf8_lossy(p.as_bytes()).into_owned())
+          .collect();
+        (paths, false)
       }
     } else {
-      // Full answer (caller token from another generation or sequence from future).
-      let full_rescan = !caller_token.starts_with(&format!("{generation_token}:")) || vanished_overflow;
-      (build_paths(None), full_rescan)
+      // Full answer: either token from different generation/instance or sequence
+      // from the future. Need to fetch status and all paths.
+      let status = tokio::task::spawn_blocking({
+        let overlay = Arc::clone(&self.overlay);
+        move || overlay.status(algorithm)
+      })
+      .await
+      .map_err(|e| GfsError::internal(format!("the status task failed: {e}")))?
+      .map_err(crate::fs::overlay_as_service_error)?;
+
+      let mut paths = Vec::new();
+      for change in &status.changes {
+        paths.push(String::from_utf8_lossy(change.path.as_bytes()).into_owned());
+        if let Some(from) = &change.from {
+          paths.push(String::from_utf8_lossy(from.as_bytes()).into_owned());
+        }
+      }
+      for dir in &status.directory_deletions {
+        paths.push(format!("{}/", String::from_utf8_lossy(dir.as_bytes())));
+      }
+
+      let full_rescan = vanished_overflow;
+      (paths, full_rescan)
     };
 
     Ok(crate::control::FsMonitorAnswer {
@@ -1337,6 +1332,28 @@ impl Mount {
       paths,
       full_rescan,
     })
+  }
+
+  /// Parse the fsmonitor token and extract the caller's sequence if valid.
+  ///
+  /// Token format: `gfs:<generation>:<instance>:<sequence>`
+  /// Returns Some(caller_sequence) if the generation and instance match the current
+  /// process, None otherwise (prompting a full answer).
+  fn parse_fsmonitor_token(token: &str, current_generation: u64, current_instance: u64) -> Option<u64> {
+    let parts: Vec<&str> = token.split(':').collect();
+    if parts.len() != 4 || parts[0] != "gfs" {
+      return None;
+    }
+    let generation = parts[1].parse::<u64>().ok()?;
+    let instance = parts[2].parse::<u64>().ok()?;
+    let sequence = parts[3].parse::<u64>().ok()?;
+
+    // Only answer delta if generation and instance match.
+    if generation == current_generation && instance == current_instance {
+      Some(sequence)
+    } else {
+      None
+    }
   }
 
   pub async fn status(&self) -> Result<crate::control::StatusReport, GfsError> {

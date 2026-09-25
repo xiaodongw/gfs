@@ -150,6 +150,9 @@ pub struct SeedSpec<'a> {
   /// workspace's first `git status` (see [`workspace_caches`]). `None` seeds
   /// the index as it came.
   pub workspace: Option<&'a std::path::Path>,
+  /// The instance ID for this overlay. Used in the fsmonitor token to distinguish
+  /// this process instance from previous ones.
+  pub instance_id: u64,
 }
 
 /// What [`gfs_git::index::with_workspace_caches`] needs about this workspace,
@@ -179,8 +182,8 @@ impl SeededCaches {
 /// way Git reads them: the worktree's realpath and the kernel name for the
 /// ident, `status.showUntrackedFiles` for the flags, the blob IDs of
 /// `info/exclude` and `core.excludesFile` (default `$XDG_CONFIG_HOME/git/ignore`),
-/// and the daemon's token for this generation (`gfs:<generation>:`, the
-/// prefix `Mount::fsmonitor_changes` accepts).
+/// and the daemon's token for this instance (`gfs:<generation>:<instance>:0`,
+/// the prefix `Mount::fsmonitor_changes` accepts).
 ///
 /// `None` when Git's configuration cannot be read, and then nothing is
 /// seeded: a guess here is only ever a slower first status, but there is no
@@ -189,6 +192,7 @@ fn workspace_caches(
   git_dir: &std::path::Path,
   workspace: &std::path::Path,
   generation: u64,
+  instance_id: u64,
 ) -> Option<SeededCaches> {
   let worktree = workspace.canonicalize().ok()?;
   // `uname(2)`'s sysname, which Linux also publishes here; the ident is
@@ -257,7 +261,7 @@ fn workspace_caches(
     },
     info_exclude: blob(&git_dir.join("info/exclude")),
     excludes_file: blob(&excludes_file),
-    token: format!("gfs:{generation}:0"),
+    token: format!("gfs:{generation}:{instance_id}:0"),
   })
 }
 
@@ -507,7 +511,7 @@ pub fn seed_git_dir(spec: &SeedSpec<'_>) -> Result<(), gfs_types::error::GfsErro
     // With the fsmonitor hook in place, the first `git status` can start
     // from the state it would otherwise spend a full walk building.
     let seeded = match (fsmonitor.is_some(), spec.workspace) {
-      (true, Some(workspace)) => workspace_caches(dir, workspace, facts.generation)
+      (true, Some(workspace)) => workspace_caches(dir, workspace, facts.generation, spec.instance_id)
         .and_then(|caches| gfs_git::index::with_workspace_caches(index, &caches.borrow())),
       _ => None,
     };
@@ -721,6 +725,7 @@ mod tests {
       index: None,
       preserve_local_head: false,
       workspace: None,
+      instance_id: 0,
     })
     .unwrap();
 
@@ -764,6 +769,7 @@ mod tests {
       index: None,
       preserve_local_head: false,
       workspace: None,
+      instance_id: 0,
     })
     .unwrap();
     let before = std::fs::read_to_string(git.join("packed-refs")).unwrap();
@@ -776,6 +782,7 @@ mod tests {
       index: None,
       preserve_local_head: false,
       workspace: None,
+      instance_id: 0,
     })
     .unwrap();
     assert_eq!(
@@ -804,6 +811,7 @@ mod tests {
       index: Some(&big),
       preserve_local_head: false,
       workspace: None,
+      instance_id: 0,
     })
     .unwrap();
 
@@ -818,6 +826,7 @@ mod tests {
       index: Some(b"tiny"),
       preserve_local_head: false,
       workspace: None,
+      instance_id: 0,
     })
     .unwrap();
 
@@ -853,6 +862,7 @@ mod tests {
       index: None,
       preserve_local_head: false,
       workspace: None,
+      instance_id: 0,
     })
     .unwrap();
 
@@ -876,6 +886,7 @@ mod tests {
       index: None,
       preserve_local_head: false,
       workspace: None,
+      instance_id: 0,
     })
     .unwrap();
     assert_eq!(
@@ -895,6 +906,7 @@ mod tests {
       index: None,
       preserve_local_head: false,
       workspace: None,
+      instance_id: 0,
     })
     .unwrap();
     assert_eq!(
@@ -916,6 +928,7 @@ mod tests {
       index: None,
       preserve_local_head: false,
       workspace: None,
+      instance_id: 0,
     })
     .unwrap();
     let local = "cd".repeat(20);
@@ -927,6 +940,7 @@ mod tests {
       index: None,
       preserve_local_head: true,
       workspace: None,
+      instance_id: 0,
     })
     .unwrap();
     assert_eq!(
@@ -959,6 +973,7 @@ mod tests {
       index: None,
       preserve_local_head: false,
       workspace: None,
+      instance_id: 0,
     })
     .unwrap();
     assert_eq!(seeded_commit(&git).unwrap(), "ab".repeat(20));

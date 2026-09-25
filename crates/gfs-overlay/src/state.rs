@@ -255,7 +255,6 @@ pub(crate) struct Row {
   pub base_oid: Option<String>,
   pub base_mode: Option<i64>,
   pub base_size: Option<i64>,
-  pub last_changed_sequence: i64,
 }
 
 pub(crate) const CONTENT_NONE: i64 = 0;
@@ -263,7 +262,7 @@ pub(crate) const CONTENT_LOCAL: i64 = 1;
 pub(crate) const CONTENT_BASE: i64 = 2;
 
 impl Row {
-  pub fn of(entry: &OverlayEntry, last_changed_sequence: u64) -> Row {
+  pub fn of(entry: &OverlayEntry) -> Row {
     let (content_kind, content_id, content_oid) = match &entry.content {
       Content::None => (CONTENT_NONE, None, None),
       Content::Local(id) => (CONTENT_LOCAL, Some(*id as i64), None),
@@ -289,7 +288,6 @@ impl Row {
       base_oid: entry.base.as_ref().map(|b| b.oid.to_qualified()),
       base_mode: entry.base.as_ref().map(|b| i64::from(b.kind.as_mode())),
       base_size: entry.base.as_ref().map(|b| b.size as i64),
-      last_changed_sequence: last_changed_sequence as i64,
     }
   }
 
@@ -392,7 +390,7 @@ mod tests {
         size: 41,
       }),
     };
-    let decoded = Row::of(&entry, 0).decode().unwrap();
+    let decoded = Row::of(&entry).decode().unwrap();
     assert_eq!(decoded, entry);
   }
 
@@ -416,6 +414,6 @@ mod tests {
         size: 10,
       }),
     };
-    assert_eq!(Row::of(&entry, 0).decode().unwrap(), entry);
+    assert_eq!(Row::of(&entry).decode().unwrap(), entry);
   }
 }
