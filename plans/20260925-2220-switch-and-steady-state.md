@@ -113,14 +113,14 @@ on universe with a private daemon, and a commit on `main`.
 
 ## Details
 
-* **Step 1 results**: Implementation complete and all tests pass. Schema
-  version bumped to 3 with ALTER TABLE migrations for entries and vanished
-  tables. Row struct extended with last_changed_sequence field. Overlay
-  and Journal now track sequence stamps on every mutation. fsmonitor_changes
-  parses caller token and returns delta answers when the sequence is from the
-  current generation and within the overlay's history. Fallback to full
-  answers for other generations or sequence overflow. Smoke test added that
-  verifies correctness against uncached `git status` across multiple edits.
+* **Step 1 results and critical fixes**:
+  - Initial implementation: Schema v3, sequence stamping, delta fsmonitor query.
+  - Fixed 2 critical correctness bugs:
+    1. **Persist sequence across daemon restart**: Initialize from max persisted sequence on open. Recovery corrections use sequence+1.
+    2. **In-memory write stamping**: Track unsettled writes in HashMap, updated by note_written(). Changes_since merges in-memory+persisted.
+  - Fixed sequence initialization: Start at max_persisted (matching seeded token seq 0) for byte-identical token on no-change status.
+  - Performance: Replaced O(n·m) delta matching with HashSet for O(1) lookup; factored duplicate path list logic.
+  - All seeded_caches tests pass; universe measurement started (sequence tracking confirmed, full correctness validation in progress).
 
 * Traces and probes: `GIT_TRACE2_PERF` on `git status` / `git switch` in a
   private workspace (`GFS_HOST_SOCKET=/tmp/gfsb/host.sock`, workspace
