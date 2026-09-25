@@ -86,115 +86,88 @@ const TREE_CACHE_BYTES: usize = 256 * 1024 * 1024;
 /// is worse than one that says it stopped.
 const SEARCH_TIME_BUDGET: Duration = Duration::from_secs(120);
 
-/// LRU cache for built indices. Keeps up to 8 most recent by mtime.
+/// Built indexes kept per clone, most recently used first.
+///
+/// One is 206 MiB on universe and takes seconds to build, while a mount of a
+/// commit already built only has to read it back. Eight covers a developer
+/// moving between a handful of branches without letting the directory grow
+/// with every commit ever mounted.
+const INDEX_CACHE_ENTRIES: usize = 8;
+
+/// Built indexes on disk, one file per commit, under the host's cache
+/// directory -- never in the clone, which local mode writes nothing into but
+/// its anchor refs.
+///
+/// Every operation is plain filesystem work, safe to run from several mounts
+/// at once: a file appears whole by rename or not at all, a reader verifies
+/// what it reads, and eviction counts what is on disk rather than what this
+/// process wrote, so the bound holds across daemon restarts.
+#[derive(Clone, Debug)]
 struct IndexCache {
-  /// Base directory: ~/.cache/gfs/indices/
-  base_dir: PathBuf,
-  /// Cached metadata: (repo_id, commit_hex) -> mtime
-  entries: BTreeMap<(String, String), SystemTime>,
-  max_entries: usize,
+  dir: PathBuf,
 }
 
 impl IndexCache {
-  fn new(base_dir: PathBuf) -> Self {
-    IndexCache {
-      base_dir,
-      entries: BTreeMap::new(),
-      max_entries: 8,
+  fn path(&self, commit_hex: &str) -> PathBuf {
+    self.dir.join(format!("{commit_hex}.index"))
+  }
+
+  /// A cached index whose trailer checks out, touched so eviction keeps it.
+  /// Anything else -- absent, truncated, corrupt -- is a miss, and a corrupt
+  /// file is removed so the next build replaces it.
+  fn get(&self, commit_hex: &str) -> Option<Vec<u8>> {
+    let path = self.path(commit_hex);
+    let bytes = std::fs::read(&path).ok()?;
+    if !verify_index_sha1(&bytes) {
+      let _ = std::fs::remove_file(&path);
+      return None;
     }
+    if let Ok(file) = std::fs::File::options().write(true).open(&path) {
+      let _ = file.set_modified(SystemTime::now());
+    }
+    Some(bytes)
   }
 
-  /// Returns the path for a cached index file.
-  fn cache_path(&self, repo_id: &RepositoryId, commit_hex: &str) -> PathBuf {
-    self
-      .base_dir
-      .join(repo_id.as_str())
-      .join(format!("{}.index", commit_hex))
-  }
-
-  /// Ensure cache directory exists.
-  fn ensure_dir(&self, repo_id: &RepositoryId) -> Result<(), std::io::Error> {
-    let repo_dir = self.base_dir.join(repo_id.as_str());
-    std::fs::create_dir_all(&repo_dir)?;
+  /// Store an index: written whole to a file only this writer names, synced,
+  /// then renamed into place, so no reader ever sees a partial index -- one
+  /// reused as `.git/index` would make `git status` report every file deleted.
+  fn put(&self, commit_hex: &str, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    std::fs::create_dir_all(&self.dir)?;
+    let nanos = SystemTime::now()
+      .duration_since(std::time::UNIX_EPOCH)
+      .map(|d| d.as_nanos())
+      .unwrap_or_default();
+    let temp = self
+      .dir
+      .join(format!(".{commit_hex}.{}.{nanos}.tmp", std::process::id()));
+    let written = (|| {
+      let mut file = std::fs::File::create(&temp)?;
+      file.write_all(bytes)?;
+      file.sync_all()?;
+      std::fs::rename(&temp, self.path(commit_hex))
+    })();
+    if written.is_err() {
+      let _ = std::fs::remove_file(&temp);
+    }
+    written?;
+    self.evict();
     Ok(())
   }
 
-  /// Get cached index, updating mtime on hit.
-  fn get(&self, repo_id: &RepositoryId, commit_hex: &str) -> Option<Vec<u8>> {
-    let path = self.cache_path(repo_id, commit_hex);
-    std::fs::read(&path).ok()
-  }
-
-  /// Write index with crash-safe semantics: temp file + fsync + rename.
-  fn put(
-    &mut self,
-    repo_id: &RepositoryId,
-    commit_hex: &str,
-    index_bytes: &[u8],
-  ) -> Result<(), GfsError> {
-    self.ensure_dir(repo_id).map_err(|e| {
-      GfsError::internal(format!("creating index cache dir: {e}"))
-    })?;
-
-    let path = self.cache_path(repo_id, commit_hex);
-    let temp_path = path.with_extension("tmp");
-
-    // Write to temp file with fsync.
-    std::fs::write(&temp_path, index_bytes).map_err(|e| {
-      GfsError::internal(format!("writing index cache temp: {e}"))
-    })?;
-
-    // Fsync the temp file (best effort).
-    if let Ok(file) = std::fs::File::open(&temp_path) {
-      let _ = file.sync_all();
-    }
-
-    // Atomic rename.
-    std::fs::rename(&temp_path, &path).map_err(|e| {
-      GfsError::internal(format!("renaming index cache: {e}"))
-    })?;
-
-    // Update mtime tracking for LRU.
-    if let Ok(mtime) = std::fs::metadata(&path)
-      .and_then(|m| m.modified())
-    {
-      self.entries.insert(
-        (repo_id.to_string(), commit_hex.to_string()),
-        mtime,
-      );
-    }
-
-    // Evict oldest if over limit.
-    self.evict_lru(repo_id);
-
-    Ok(())
-  }
-
-  /// Evict least-recently-used entries if over limit.
-  fn evict_lru(&mut self, repo_id: &RepositoryId) {
-    // Collect entries for this repo: (commit_hex, mtime)
-    let mut repo_entries: Vec<(String, SystemTime)> = self
-      .entries
-      .iter()
-      .filter(|((r, _), _)| r == repo_id.as_str())
-      .map(|((_, c), mtime)| (c.clone(), *mtime))
+  /// Keep the most recently used [`INDEX_CACHE_ENTRIES`], by mtime.
+  fn evict(&self) {
+    let Ok(listing) = std::fs::read_dir(&self.dir) else {
+      return;
+    };
+    let mut cached: Vec<(SystemTime, PathBuf)> = listing
+      .filter_map(Result::ok)
+      .filter(|e| e.path().extension().is_some_and(|x| x == "index"))
+      .filter_map(|e| Some((e.metadata().ok()?.modified().ok()?, e.path())))
       .collect();
-
-    if repo_entries.len() > self.max_entries {
-      // Sort by mtime, keep newest.
-      repo_entries.sort_by_key(|(_, mtime)| *mtime);
-
-      let to_evict = repo_entries.len() - self.max_entries;
-      for (i, (commit_hex, _)) in repo_entries.iter().enumerate() {
-        if i >= to_evict {
-          break;
-        }
-        let path = self.cache_path(repo_id, commit_hex);
-        let _ = std::fs::remove_file(&path);
-        self
-          .entries
-          .remove(&(repo_id.to_string(), commit_hex.clone()));
-      }
+    cached.sort_by_key(|(modified, _)| std::cmp::Reverse(*modified));
+    for (_, path) in cached.into_iter().skip(INDEX_CACHE_ENTRIES) {
+      let _ = std::fs::remove_file(path);
     }
   }
 }
@@ -206,7 +179,7 @@ pub struct LocalRepository {
   objects: PathBuf,
   repo: AsyncRepository,
   blobs: Mutex<BlobMemory>,
-  index_cache: Mutex<IndexCache>,
+  index_cache: IndexCache,
 }
 
 impl std::fmt::Debug for LocalRepository {
@@ -219,26 +192,23 @@ impl std::fmt::Debug for LocalRepository {
 }
 
 impl LocalRepository {
-  /// Open a clone. Blocking: libgit2 opens its handles here.
-  pub fn open(clone: &Path) -> Result<Arc<Self>, GfsError> {
+  /// Open a clone. Blocking: libgit2 opens its handles here. Built indexes
+  /// are kept under `cache_dir`, beside the per-repository state the blob
+  /// cache and the odb projection keep there.
+  pub fn open(clone: &Path, cache_dir: &Path) -> Result<Arc<Self>, GfsError> {
     let clone = clone.canonicalize().map_err(|e| {
       GfsError::new(
         ErrorCode::NotFound,
         format!("no clone at {}: {e}", clone.display()),
       )
     })?;
-    let repo = Libgit2Repository::open(&clone, limits::DEFAULT_REPO_HANDLES, TREE_CACHE_BYTES)?;
+    let repo = Libgit2Repository::open(&clone, limits::DEFAULT_REPO_HANDLES, TREE_CACHE_BYTES)?
+      .with_git_size_lookup();
     let objects = repo.objects_directory()?;
     let repository_id = repository_id_for(&clone);
 
-    // Index cache lives in ~/.cache/gfs/indices/<repo-id>/, keyed by commit OID.
-    // This location is correct for all repository types (bare, linked, regular clones)
-    // and survives clones copied to other machines (since OID space is immutable).
-    let cache_dir = if let Ok(cache_root) = std::env::var("XDG_CACHE_HOME") {
-      PathBuf::from(cache_root).join("gfs/indices")
-    } else {
-      let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-      PathBuf::from(home).join(".cache/gfs/indices")
+    let index_cache = IndexCache {
+      dir: cache_dir.join(repository_id.as_str()).join("indices"),
     };
 
     Ok(Arc::new(LocalRepository {
@@ -247,7 +217,7 @@ impl LocalRepository {
       objects,
       repo: AsyncRepository::new(Arc::new(repo), limits::DEFAULT_REPO_HANDLES),
       blobs: Mutex::new(BlobMemory::new(BLOB_MEMORY_BYTES)),
-      index_cache: Mutex::new(IndexCache::new(cache_dir)),
+      index_cache,
     }))
   }
 
@@ -306,59 +276,38 @@ impl LocalRepository {
     })
   }
 
-  /// Build or retrieve a cached index for a commit.
-  ///
-  /// Indices are cached on disk keyed by commit OID and repository ID.
-  /// The cache survives across mounts and even survives clones copied to
-  /// other machines (since the OID space is immutable). Reads are verified
-  /// for a valid SHA-1 trailer; failures are treated as cache misses.
+  /// The index for a commit: the cached one when it verifies, otherwise built
+  /// and cached. The file work runs on blocking threads with no lock held, so
+  /// a 206 MiB read never stalls a runtime worker or another mount.
   pub async fn cached_index(
     &self,
     commit: &ObjectId,
     snapshot_time: Timestamp,
   ) -> Result<Vec<u8>, GfsError> {
     let commit_hex = commit.to_hex();
-
-    // Try to get from cache (verified on read).
+    let cache = self.index_cache.clone();
+    let key = commit_hex.clone();
+    if let Some(bytes) = tokio::task::spawn_blocking(move || cache.get(&key))
+      .await
+      .map_err(|e| GfsError::internal(format!("the index cache read failed: {e}")))?
     {
-      let cache = self.index_cache.lock().expect("index cache");
-      if let Some(bytes) = cache.get(&self.repository_id, &commit_hex) {
-        if verify_index_sha1(&bytes) {
-          tracing::debug!("reusing cached index for {}", &commit_hex);
-          return Ok(bytes);
-        }
-        // SHA-1 verification failed: treat as cache miss and remove bad entry.
-        drop(cache);
-        let cache_dir = if let Ok(cache_root) = std::env::var("XDG_CACHE_HOME") {
-          PathBuf::from(cache_root).join("gfs/indices")
-        } else {
-          let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-          PathBuf::from(home).join(".cache/gfs/indices")
-        };
-        let bad_path = cache_dir
-          .join(self.repository_id.as_str())
-          .join(format!("{}.index", commit_hex));
-        let _ = std::fs::remove_file(&bad_path);
-      }
+      return Ok(bytes);
     }
 
-    // Build the index.
-    let index = self
-      .repo
-      .index_for_commit(commit.clone(), snapshot_time)
-      .await?;
-
-    // Try to cache it for next time. Failure doesn't fail the mount.
-    if let Err(e) = self
-      .index_cache
-      .lock()
-      .expect("index cache")
-      .put(&self.repository_id, &commit_hex, &index)
-    {
-      tracing::debug!("failed to cache index for {}: {e}", &commit_hex);
+    let index = Arc::new(
+      self
+        .repo
+        .index_for_commit(commit.clone(), snapshot_time)
+        .await?,
+    );
+    // Best effort: a mount whose index could not be kept is still a mount.
+    let cache = self.index_cache.clone();
+    let bytes = Arc::clone(&index);
+    let stored = tokio::task::spawn_blocking(move || cache.put(&commit_hex, &bytes)).await;
+    if let Ok(Err(e)) = &stored {
+      tracing::debug!("could not cache the index: {e}");
     }
-
-    Ok(index)
+    Ok(Arc::try_unwrap(index).unwrap_or_else(|shared| (*shared).clone()))
   }
 
   /// A blob's bytes, inflated once and shared.
@@ -886,23 +835,6 @@ fn verify_index_sha1(index_bytes: &[u8]) -> bool {
   use sha1::Digest;
   let hash = sha1::Sha1::digest(content);
   &hash[..] == trailer
-}
-
-/// Link or copy an index file into the workspace .git/index.
-/// Tries hardlink first (cross-filesystem), falls back to copy.
-pub fn link_or_copy_index(
-  cache_path: &Path,
-  workspace_index: &Path,
-) -> Result<(), GfsError> {
-  // Try hardlink first (same filesystem).
-  if std::fs::hard_link(cache_path, workspace_index).is_ok() {
-    return Ok(());
-  }
-
-  // Hardlink failed (cross-filesystem): copy instead.
-  std::fs::copy(cache_path, workspace_index)
-    .map_err(|e| GfsError::internal(format!("copying index: {e}")))?;
-  Ok(())
 }
 
 // ---------------------------------------------------------------------------

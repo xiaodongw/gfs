@@ -40,66 +40,35 @@ the full zero-message-open refactor.
   read under ~1 s continues the effort; otherwise local mode stays a harness.
 
 **Phase A — make local-mode create fast** (complete)
-* Trim `refs/prefetch/*` from `visible_ref_targets`: skip the ~100k hidden
-  prefetch namespace that git maintenance hides from decorations. Check object
-  type cheaply before expensive `find_tag` so commits are never tag-looked-up.
-  Cuts visible_ref_targets time by ~75%.
-* Per-commit index cache (host-side): build the tree-descent index once and
-  reuse it on future mounts via ~/.cache/gfs/indices/<repo-id>/<commit-oid>.
-  LRU eviction keeps 8 most recent indices. Survives clones copied to other
-  machines. Crash-safe writes with SHA-1 verification. Hardlink-or-copy into
-  workspace's .git/index. Measured on universe: cold ~10 s, warm 0.6 s (16x faster).
-* Parallel index build: deferred tree descent emits entries with sizes
-  collected in parallel. Each thread checks out its own pool handle to avoid
-  libgit2 thread-safety issues. Maintains Git's byte-wise path ordering.
-* Blob size reuse (deferred): needs investigation into whether stock git carries
-  sizes forward between indices, which would require a lookup layer.
-* Index size investigation (deferred): gfs index is 205 MiB vs git's 121 MiB
-  (unexplained differential).
+* Refs: `visible_ref_targets` skips `refs/prefetch/` (git maintenance's hidden
+  namespace, 100k of universe's 131k refs) and reads an object's type from its
+  header before paying `find_tag`, so only real tags are peeled.
+* Sizes without libgit2's locks: the tree descent emits entries in index order
+  with no size, then one pass fills every blob size. For a local clone
+  (`Libgit2Repository::with_git_size_lookup`) the pass asks stock Git: up to 16
+  `git cat-file --batch-check` processes, each over a contiguous slice, answers
+  checked for order, `GIT_NO_REPLACE_OBJECTS=1` and the `GIT_DIR` family
+  removed so the answer is the one libgit2 would give. If Git cannot be run the
+  pass falls back to in-process header reads across the handle pool (the path
+  server mode always uses), and an object Git calls missing is read in-process
+  so its error is unchanged.
+* A per-commit index cache under the host's cache directory,
+  `<cache_dir>/<repo-id>/indices/<commit>.index`, beside the odb projection's
+  per-repository state: at most 8 per clone by mtime (counted on disk, so the
+  bound survives restarts; a hit touches the file), written to a writer-unique
+  temp file, fsynced, renamed; the SHA-1 trailer is verified on every read and
+  a bad file is dropped. All file work on blocking threads with no lock held.
+* Deferred: reusing sizes from the clone's own `.git/index` (see Decisions),
+  hardlinking the cached file into the workspace, the 206 vs 121 MiB index size
+  question.
+
+Phases 0, 1, and A were built as planned; Phase A took four passes (see
+Decisions for what was built and removed along the way). One addition to
+phase 0 was measured and not kept: a larger listing cache (see Decisions).
 
 **Later phases, gated on the spike** (the spike passed; not started): the first
 `git status` (seed `FSMN` and `UNTR`), the full zero-message-open refactor
 (including zero-message `opendir`), profiling warm `git status` and commit.
-
-Phases 0, 1, and A were built as planned, with Phase A-corrections completed:
-
-### Phase A Corrections
-The parallel index build had a deadlock risk: the main thread held a pool handle
-while spawning up to `pool.max_handles()` threads, each trying to checkout() from
-the same bounded pool. If threads >= max, those threads would block waiting for
-handles while the main thread blocked on their completion.
-
-Fix: Release the pool handle after tree descent, before spawning threads. LFS
-error semantics were also restored (the parallel rewrite had silently swallowed
-errors). Measured on universe: serial 15.55s, fixed parallel 10.72s (1.45x
-faster). Index byte-identical. Four known-failing tests on main remain unchanged.
-
-One addition to phase 0 was measured and not kept: a larger listing cache for
-local mode (see Decisions).
-
-### Phase A Enhancement: Blob size optimization
-After Phase A corrections, cold index_for_commit was still ~10.7s. The remaining
-bottleneck was reading blob headers (sizes) from libgit2's ODB, which contended on
-shared packfile locks across threads. Optimization used two strategies:
-
-1. **Index-based size caching**: Parse the clone's `.git/index` file (v2–v4 format)
-   on a blocking thread in parallel with tree descent, extracting oid→size mappings
-   for entries that are clean (not skip-worktree or intent-to-add). ~328k entries
-   on universe matched, avoiding expensive header reads. Cost: 0.1–0.2s to parse 127MB index.
-
-2. **Stock git subprocess for remaining oids**: For ~1M oids not in the clone's index,
-   spawn K parallel `git cat-file --batch-check` processes (16 on universe). Stock git
-   achieves 0.44s across 16 processes where libgit2's parallel reads were taking ~6s,
-   because git parallelizes packfile access more efficiently than libgit2's thread-unsafe ODB.
-
-Results: cold index_for_commit reduced from ~10.7s to ~3.8s (2.8x faster):
-- Tree descent: 0.9s (with 256 MiB cache, on subsequent calls)
-- Index parsing: 0.1s (threaded)
-- git cat-file (16 procs): 0.95s
-- Assembly and LFS checks: 0.3s
-- Total: 3.74–3.80s
-
-Byte-identical verification: index output bytes match the original serial implementation.
 
 ## Decisions
 
@@ -128,53 +97,41 @@ Byte-identical verification: index output bytes match the original serial implem
   ~550 MB more daemon memory per workspace (3.01 GB vs 2.46 GB anonymous after
   the first status). Seeding `UNTR`/`FSMN` should remove that walk altogether,
   which makes the memory unnecessary; revisit if that phase fails.
-* **Skip refs/prefetch/* in visible_ref_targets.** Git maintenance's hidden
-  prefetch namespace (git maintenance mode=incremental uses this) contains ~100k
-  entries on universe that serve only to prefetch; skipping them and checking
-  object type cheaply before expensive `find_tag` cuts that function by ~75%.
-  No correctness impact: git itself hides refs/prefetch from decorations and
-  `for-each-ref` output unless explicitly asked.
-* **Per-commit index cache, host-side, not per-clone.** The index is a function
-  of only the commit and snapshot_time. Caching at the commit level means reuse
-  across workspaces and clones (OID space is immutable). Stored in
-  ~/.cache/gfs/indices/<repo-id>/<commit-oid> (host state, not clone), with
-  LRU eviction keeping 8 most recent per repository. Respects XDG_CACHE_HOME.
-  Crash-safe writes: temp file + fsync + rename. SHA-1 verification on read
-  (git index format trailer). Per-clone cache location (vs all clones' cache
-  in one place) chosen for cache-locality in future: a per-workspace copy
-  (0.1–0.15 s) is better than a 10 s rebuild, and per-workspace indices may be
-  needed when seeding UNTR's worktree-ident. Hardlink into workspace .git/index
-  when on same filesystem (no copy); cross-filesystem fallback to copy.
-  
-* **Clone index parsing for blob sizes, not per-commit caching.** The clone's 
-  `.git/index` file describes a recent commit (not necessarily HEAD) and carries blob
-  sizes for clean entries. Parsing it on a blocking thread in parallel with tree 
-  descent avoids expensive libgit2 header reads for ~328k of 1.32M entries. Risk: sizes
-  in the index reflect the *working-tree file size after clean filters*,  which can
-  differ from the blob size if clean/smudge filters are active. Mitigation: only use
-  index sizes when the entry is clean (no skip-worktree, intent-to-add, or racily-clean
-  flags) and trust the result. If unsafe cases arise, fall back to libgit2 for full tree.
-  
-* **Parallel stock git cat-file for remaining sizes, not all sizes.** `git cat-file
-  --batch-check` parallelizes packfile access across multiple processes, achieving
-  0.44s across 16 processes on universe vs libgit2's ~6s on threads due to 
-  process-global packfile locks in libgit2. Limit spawning to 16 processes to avoid
-  excessive forking. If git is absent (rare), fall back to libgit2. Each subprocess 
-  handles a chunk of oids, reading and writing via pipes with separate threads to 
-  avoid deadlock.
+* **Skip `refs/prefetch/*`.** Git hides the namespace from decorations; it
+  only feeds `git maintenance`'s background fetch. The workspace's
+  `packed-refs` no longer carries it either.
+* **Blob sizes from stock Git, not from more libgit2 threads.** libgit2 1.9.6
+  keeps packfiles in one process-wide cache shared by every repository handle
+  (`git_mwindow__pack_cache`, `mwindow.c`), and every header read takes that
+  pack's `p->lock` and `p->mwf.lock` (`pack.c`); universe's blobs sit in one
+  26 GiB pack, so threads take turns — 1.45x at best, measured. Separate
+  processes share nothing: `git cat-file --batch-check` does all 1.32M in
+  0.66 s over 8 processes, 0.44 s over 16. Considered and rejected: gitoxide
+  (a second Git implementation in the daemon for one pass), reading pack
+  headers ourselves (a pack/midx reader to maintain). Local mode only: Git is
+  already a prerequisite there, and server mode keeps its in-process path.
+* **Not the clone's `.git/index` for sizes.** A pass that parsed it was built
+  and removed: an index records the working-tree file's size after smudge,
+  eol conversion and `ident` expansion, which is not the blob's size wherever
+  those apply; it read skip-worktree/intent-to-add from the wrong flag word
+  and desynchronized on the first extended-flags entry; and it bought ~0.2 s
+  on top of the subprocess pass. Revisit only with an attribute-aware filter.
+* **The in-process size pass cannot deadlock.** Each worker checks out one
+  handle and waits holding nothing, and the descent returns its handle before
+  the pass starts; the first parallel version held one while its threads
+  waited for the rest of the pool.
+* **The index cache lives with host state, bounded, verified.** A first
+  version wrote into the clone's `.git/gfs/` (breaking the rule that local
+  mode writes only its anchors into a clone, unbounded, and wrong for a bare
+  repository or a linked worktree) with a non-atomic write; a second moved it
+  to `$HOME/.cache` with an in-memory LRU that forgot files across restarts,
+  a shared temp name, and 206 MiB of I/O under a mutex on a runtime worker.
+  The shipped one is the shape described under Plan. The hit path reads the
+  file and seeding writes it again rather than hardlinking it, because the
+  next phase (seeding `FSMN`/`UNTR`, whose ident names the worktree path)
+  needs per-workspace bytes anyway.
 
 ## Details
-
-* **Phase A corrections (deadlock fix)**: The parallel blob header reads held a 
-  pool handle during tree descent and spawned N threads, each calling checkout(). 
-  If N >= pool.max_handles (8 on the test machine), threads would block waiting 
-  for handles while the main thread blocked on their completion. Fix: release the 
-  pool handle after descent and before spawning threads.
-  
-  Measured: serial 15.55 s, parallel 10.72 s (1.45x speedup). Index verified 
-  byte-identical with the serial version (sha256 hash identical: 
-  4163967a823c3975c95a6f8083e7ff527f2f97534601529ec643737cb5a7509d). 
-  Four known-failing tests remain (unchanged). Commit: 79f40d1.
 
 * **Spike result, universe, fresh mount** (`--zero-message-open` vs default;
   native `~/universe` warm read 0.45 s, `rg` 0.10 s):
@@ -203,52 +160,15 @@ Byte-identical verification: index output bytes match the original serial implem
 * The spike's unopened reads of `.git` and overlay files reopen the file per
   request on the FUSE thread; fine for measuring the pinned tree, wrong for
   anything else.
-* **Phase A results, universe local mode mount** (refs skip + host-side cache +
-  parallel header reads):
-  
-  | | baseline (before Phase A) | after Phase A |
-  |---|---|---|
-  | create (first mount, cache miss) | 7.5–11 s | ~10.0 s (3 runs: 10.56, 9.94, 10.01 s) |
-  | create (repeat, cache hit) | N/A | ~0.62 s |
-  | speedup on warm | N/A | **16–17x** |
-  | cache location | N/A | ~/.cache/gfs/indices/<repo-id>/ |
-  | cache bound | N/A | 8 most recent indices/repo |
-  
-  Cold-mount time is similar to baseline; parallel header reads with separate
-  pool handles show no significant speedup over serial (threading overhead ≈
-  performance gain from parallelism). Warm-mount reuse via hardlink/copy is
-  the primary improvement: 16x faster than rebuilding. Cache is host-side
-  (respect for ADR 0013: only anchor ref written to clone). Byte-identical
-  indices verified across multiple builds (SHA-1 trailer checksummed).
+* **Phase A results, universe** (1 326 149 entries, private daemon):
 
-* **Phase A enhancement: blob size optimization**:
-  
-  Cold index_for_commit remained ~10.7s after Phase A because the bottleneck shifted
-  from descent (now cached) to blob header reads. Libgit2's ODB is not thread-safe at
-  the packfile level: all threads contend on per-packfile locks. Two optimizations:
-  
-  1. **Clone index size lookup** (0.1–0.2s): Parse `.git/index` (v2–v4) on a blocking 
-     thread in parallel with tree descent. Matches ~328k oids, avoiding header reads
-     for 25% of entries. Trusts sizes for clean entries (not skip-worktree, etc.);
-     risk of mismatch with filters is mitigated by only using index, not overriding
-     libgit2's authoritative reads.
-     
-  2. **Parallel git cat-file** (0.95s): Stock git's `cat-file --batch-check` spawned
-     in K processes (16) reads ~1M remaining oids, achieving 0.95s vs libgit2's ~6s
-     due to better parallelism. Each process handles a chunk, with separate threads
-     for stdin and stdout to avoid deadlock on large batches. Falls back to libgit2
-     if git is absent.
-  
-  Results on universe (runs 1–3, after descent cache warmup):
-  
-  | component | time |
-  |---|---|
-  | descent (cached tree) | 0.93 s |
-  | index parsing | 0.10 s |
-  | git cat-file (16 procs) | 0.95 s |
-  | assembly + LFS | 0.30 s |
-  | **total** | **3.74–3.80 s** |
-  
-  Index byte-identical with original serial implementation. Four known-failing
-  tests on main remain unchanged; new code gracefully handles failures
-  (missing git, hostile configs, etc.) by falling back to libgit2.
+  | | before Phase A | after |
+  |---|---|---|
+  | `index_for_commit`, cold (fresh process) | 7.5–15 s | 4.6 s (in-process fallback path: 9.5 s) |
+  | create, cache miss | 7.5–11 s | 5.6 s fresh daemon, 3.6 s with the tree cache warm |
+  | create, cache hit | — | 1.0 s |
+
+  Correctness: the index built through Git and through libgit2 are
+  byte-identical (`cmp`), and every one of the 1 326 149 sizes in it matches
+  `git ls-tree -r -l HEAD`. `git status` in each mounted workspace reports no
+  changes; `git log -1` names the pinned commit.

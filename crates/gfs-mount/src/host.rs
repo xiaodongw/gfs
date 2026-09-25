@@ -297,7 +297,7 @@ impl MountHost {
 
     let (spec, backing) = match spec.local_clone.clone() {
       Some(clone) => {
-        let local = self.local_for(&clone).await?;
+        let local = self.local_for(&clone, &spec.cache_dir).await?;
         let spec = MountSpec {
           repository_id: local.repository_id().clone(),
           local_clone: Some(local.clone_path().to_path_buf()),
@@ -400,7 +400,11 @@ impl MountHost {
   /// The opened clone at a path (local mode), opening it if this is the first
   /// workspace to ask. Keyed by canonical path, so two spellings of one clone
   /// share one handle pool and one blob memory.
-  async fn local_for(&self, clone: &Path) -> Result<Arc<crate::local::LocalRepository>, GfsError> {
+  async fn local_for(
+    &self,
+    clone: &Path,
+    cache_dir: &Path,
+  ) -> Result<Arc<crate::local::LocalRepository>, GfsError> {
     let key = clone.canonicalize().map_err(|e| {
       GfsError::new(
         ErrorCode::NotFound,
@@ -419,7 +423,8 @@ impl MountHost {
     // that drops on insert.
     let opened = {
       let key = key.clone();
-      tokio::task::spawn_blocking(move || crate::local::LocalRepository::open(&key))
+      let cache_dir = cache_dir.to_path_buf();
+      tokio::task::spawn_blocking(move || crate::local::LocalRepository::open(&key, &cache_dir))
         .await
         .map_err(|e| GfsError::internal(format!("opening the clone: {e}")))??
     };
