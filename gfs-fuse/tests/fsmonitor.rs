@@ -181,9 +181,8 @@ async fn a_staged_file_that_is_then_deleted_is_reported_as_deleted() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_token_advances_when_the_workspace_changes() {
   // The v2 protocol asks the token to move when the filesystem does. It used to
-  // be a bare `gfs:<generation>`, constant for the life of the pin. The answer
-  // is still cumulative for the generation — a superset is what makes it safe —
-  // so only the generation decides a full rescan.
+  // be a bare `gfs:<generation>`, constant for the life of the pin. Only the
+  // generation decides a full rescan.
   install_hook_on_path();
   let backend = Backend::start("basic").await;
   let job = Job::start(&backend, "main").await;
@@ -229,4 +228,128 @@ async fn the_token_advances_when_the_workspace_changes() {
     paths.contains(&"src/main.rs".to_owned()),
     "and the change is named rather than rescanned: {paths:?}"
   );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_answer_is_a_delta_and_a_quiet_status_rewrites_nothing() {
+  // A cumulative answer names every overlay path on every call; Git then
+  // invalidates each one's untracked-cache directory and rewrites the whole
+  // index -- 236 MB on universe, every `git status`. The answer is only what
+  // changed since the caller's token, and nothing at all when nothing did.
+  install_hook_on_path();
+  let backend = Backend::start("basic").await;
+  let job = Job::start(&backend, "main").await;
+
+  let hook = job.workspace.join(".git/hooks/gfs-fsmonitor");
+  let ask = |token: &str| {
+    let out = std::process::Command::new(&hook)
+      .current_dir(&job.workspace)
+      .args(["2", token])
+      .output()
+      .unwrap();
+    let mut fields = out.stdout.split(|b| *b == 0);
+    let token = String::from_utf8_lossy(fields.next().unwrap_or_default()).into_owned();
+    let mut paths: Vec<String> = fields
+      .filter(|f| !f.is_empty())
+      .map(|f| String::from_utf8_lossy(f).into_owned())
+      .collect();
+    paths.sort();
+    (token, paths)
+  };
+
+  let ws = job.workspace.clone();
+  on_fs({
+    let ws = ws.clone();
+    move || std::fs::write(ws.join("src/main.rs"), b"fn main() { edited() }\n").unwrap()
+  })
+  .await;
+  let (t0, _) = ask("");
+  on_fs({
+    let ws = ws.clone();
+    move || std::fs::write(ws.join("new.txt"), b"new\n").unwrap()
+  })
+  .await;
+  let (t1, paths) = ask(&t0);
+  assert_eq!(paths, vec!["new.txt".to_owned()], "only what changed since t0");
+  let (t2, paths) = ask(&t1);
+  assert_eq!(t2, t1, "nothing changed: the same token, byte for byte");
+  assert!(paths.is_empty(), "{paths:?}");
+
+  // A write through a descriptor still open is reported before the close.
+  let (held, t3, paths) = on_fs({
+    let ws = ws.clone();
+    let hook = hook.clone();
+    let t2 = t2.clone();
+    move || {
+      use std::io::Write;
+      let mut held = std::fs::OpenOptions::new()
+        .append(true)
+        .open(ws.join("new.txt"))
+        .unwrap();
+      held.write_all(b"more\n").unwrap();
+      let out = std::process::Command::new(&hook)
+        .current_dir(&ws)
+        .args(["2", &t2])
+        .output()
+        .unwrap();
+      let mut fields = out.stdout.split(|b| *b == 0);
+      let token = String::from_utf8_lossy(fields.next().unwrap_or_default()).into_owned();
+      let paths: Vec<String> = fields
+        .filter(|f| !f.is_empty())
+        .map(|f| String::from_utf8_lossy(f).into_owned())
+        .collect();
+      (held, token, paths)
+    }
+  })
+  .await;
+  drop(held);
+  assert_ne!(t3, t2);
+  assert_eq!(paths, vec!["new.txt".to_owned()], "the unsettled write");
+
+  // A rename names both sides; a delete names what is gone.
+  on_fs({
+    let ws = ws.clone();
+    move || {
+      std::fs::rename(ws.join("src/main.rs"), ws.join("src/moved.rs")).unwrap();
+      std::fs::remove_file(ws.join("new.txt")).unwrap();
+    }
+  })
+  .await;
+  let (_, paths) = ask(&t3);
+  for expected in ["new.txt", "src/main.rs", "src/moved.rs"] {
+    assert!(paths.contains(&expected.to_owned()), "{expected} in {paths:?}");
+  }
+
+  // And through Git: a status after the changes writes the index, the next
+  // one -- nothing changed -- leaves it alone, and both tell the truth.
+  let (first, quiet, rewritten, plain) = on_fs(move || {
+    let identity = |ws: &std::path::Path| {
+      use std::os::unix::fs::MetadataExt;
+      let m = std::fs::metadata(ws.join(".git/index")).unwrap();
+      (m.ino(), m.mtime(), m.mtime_nsec())
+    };
+    let (ok, first) = git_in(&ws, &["status", "--porcelain"]);
+    assert!(ok, "{first}");
+    let before = identity(&ws);
+    let (ok, quiet) = git_in(&ws, &["status", "--porcelain"]);
+    assert!(ok, "{quiet}");
+    let rewritten = identity(&ws) != before;
+    let (ok, plain) = git_in(
+      &ws,
+      &[
+        "-c",
+        "core.fsmonitor=false",
+        "-c",
+        "core.untrackedCache=false",
+        "status",
+        "--porcelain",
+      ],
+    );
+    assert!(ok, "{plain}");
+    (first, quiet, rewritten, plain)
+  })
+  .await;
+  assert_eq!(first, plain);
+  assert_eq!(quiet, plain);
+  assert!(!rewritten, "a status with nothing new must not rewrite the index");
 }

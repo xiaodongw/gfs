@@ -548,37 +548,24 @@ impl Overlay {
     )
   }
 
-  /// Paths that changed since the given sequence, used for delta fsmonitor answers.
-  /// Reads in-memory sequence stamps (for unsettled writes) merged with persisted state.
+  /// Every path a mutation touched after sequence `after` in this instance,
+  /// and the sequence the answer is current to.
   ///
-  /// Returns `None` if we can't answer for this sequence (from the future or overflow).
-  /// Returns `Some((changed_entries, changed_vanished))` otherwise.
-  /// Paths changed (stamped) after the given sequence in this overlay instance.
-  ///
-  /// Returns the set of paths with stamps > after_sequence. Since stamps are
-  /// kept in memory only and reset on rebind, a sequence not from this instance
-  /// will find no stamps and return None (prompting the caller to check the
-  /// instance_id and fall back to a full answer).
-  pub fn changes_since(&self, after_sequence: u64) -> Result<Option<(Vec<BytePath>, Vec<BytePath>)>> {
+  /// Read under one lock, so a concurrent mutation lands either in the list or
+  /// after the returned sequence -- never between them. `None` when `after` is
+  /// ahead of this instance's sequence: the token was not issued here.
+  pub fn changes_since(&self, after: u64) -> Option<(u64, Vec<BytePath>)> {
     let inner = self.lock();
-    let mut changed = Vec::new();
-
-    // Collect all paths with stamps > after_sequence.
-    for (path, stamp) in &inner.stamps {
-      if *stamp > after_sequence {
-        changed.push(BytePath::new(path.clone()));
-      }
+    if after > inner.sequence {
+      return None;
     }
-
-    // If no stamps are found after the sequence, return None (caller is likely
-    // from before any mutations in this instance).
-    if changed.is_empty() && after_sequence > 0 {
-      Ok(None)
-    } else {
-      // Return the changed paths. Separate into entries and vanished is not
-      // needed here since we only care about the path list for fsmonitor.
-      Ok(Some((changed, Vec::new())))
-    }
+    let paths = inner
+      .stamps
+      .iter()
+      .filter(|(_, stamp)| **stamp > after)
+      .map(|(path, _)| BytePath::new(path.clone()))
+      .collect();
+    Some((inner.sequence, paths))
   }
 
   /// The mount root's times, or `None` while the snapshot time still describes

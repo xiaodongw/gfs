@@ -36,24 +36,21 @@ Each step is done by one subagent, sequentially (steps 1 and 2 both touch the
 overlay journal), and each ends with a build, the smoke tests, a measurement
 on universe with a private daemon, and a commit on `main`.
 
-**Step 1 — delta fsmonitor answers** ✓ REPLACED
-* Token format: `gfs:<generation>:<instance>:<sequence>`. Instance identifies
-  the opened overlay in this process, persisted in the journal's meta table and
-  incremented on every `Overlay::open`.
-* Stamps in memory only (cleared on rebind): path -> sequence map of the last
-  mutation in this instance. commit() stamps all Put/Delete changes and paths
-  entering vanished; note_written() stamps write-time mutations.
-* `fsmonitor_changes(token)`: parse generation+instance+sequence from token. If
-  instance matches current and sequence <= current, return paths with stamps >
-  caller_sequence (raw, not filtered through status). Otherwise return full list.
-  Vanished overflow also triggers full answer with rescan flag.
-* No persisted sequence columns: schema reverted from v3 to v2; removed
-  journal.max_sequence, journal.changes_since, and the build_paths filtering.
-* Sequence starts at 0 per instance (not persisted), incremented by commit() and
-  note_written(). Daemon restart with new instance_id forces a full answer from
-  a pre-restart token.
-* Target: warm `git status` in a workspace with a few edits does not rewrite
-  the index when nothing changed (8.5 s → ~2.5 s).
+**Step 1 — delta fsmonitor answers** (complete)
+* Token `gfs:<generation>:<instance>:<sequence>`. The instance is this opening
+  of the overlay (a counter in the journal's `meta`, bumped by every
+  `Overlay::open`); the sequence counts mutations in the instance.
+* Every path a mutation touches is stamped in memory with the sequence it
+  produced: `commit()`'s puts and deletes (both names of a rename), paths
+  entering `vanished`, and in-place writes (`note_written`), so a write through
+  a descriptor still open is reported before the close. Stamps are cleared on
+  rebind.
+* Same generation and instance: the answer is exactly the paths stamped after
+  the caller's sequence, read under one lock with the sequence it is current
+  to; with nothing new the token comes back byte-identical. Otherwise the
+  full list (overlay changes, directory deletions, vanished paths), with a full
+  rescan only for another generation or a vanished overflow, as before.
+* Smoke test `gfs-fuse/tests/fsmonitor.rs::the_answer_is_a_delta_and_a_quiet_status_rewrites_nothing`.
 
 **Step 2 — blob references instead of copies**
 * On settle (release/sync) of a content file, off the FUSE thread: hash it as
@@ -90,19 +87,16 @@ on universe with a private daemon, and a commit on `main`.
 
 ## Decisions
 
-* **Step 1 sequence stamping (replaced design)**: Stamps live in memory only,
-  not persisted to the database. The previous attempt persisted them to schema
-  v3, which caused two critical bugs: (a) `changes_since` returned None when
-  caller_seq >= max_persisted, forcing a full answer and index rewrite on
-  no-change status; (b) restarting incremented instance_id after the caller had
-  already parsed an old token, so pre-restart tokens could be stale mid-flight.
-  The new design: instance_id distinguishes process restarts; sequence counter
-  per instance starts at 0 (not persisted, so any pre-restart token is from
-  before or from a different instance). Stamps map path -> sequence tracks
-  mutations in this instance only, cleared on rebind. This avoids both bugs: a
-  restart with different instance_id forces a full answer; no stamped paths from
-  a previous instance exist to cause a stale token answer. The map is bounded by
-  paths touched in this instance (typically much smaller than the journal).
+* **Delta stamps live in memory, with an instance in the token.** Tried
+  first and replaced: a persisted per-row `last_changed_sequence` (schema v3)
+  answered from SQL. It broke three ways -- a caller at the newest stamp got
+  the full list, so a quiet status still rewrote the index; `note_written`
+  advanced the sequence without persisting, so a pre-restart token could be
+  ahead of post-restart stamps and hide edits; and the delta was filtered
+  through `status`, dropping stamped paths it does not list. An instance in the
+  token makes a restart a full answer (today's behaviour, always correct) and
+  lets the stamps be a plain in-memory map, with no SQL on the hook's path.
+  The cumulative answer is what this replaces.
 
 * **`gfs switch` replaces `git switch`; it does not run before it.** Re-pinning
   first and then running `git switch` fails: the index still describes the old
@@ -126,26 +120,21 @@ on universe with a private daemon, and a commit on `main`.
 
 ## Details
 
-* **Step 1 implementation (replaced)**:
-  - Previous attempt (commits f1417e0, 7682ab8, 4c67982, 4d01df6): Schema v3,
-    persisted sequence in entries/vanished, journal.changes_since. Abandoned due
-    to bugs: changes_since returns None on no-change (full answer + index
-    rewrite); restart sequence edge case (token from previous process instance);
-    filtering through status.changes (dropping valid paths). Removed 56 lines of
-    dead code.
-  - New implementation:
-    * Token `gfs:<gen>:<instance>:<seq>` with instance from journal meta table,
-      incremented on every `Overlay::open()` (using next_instance_id).
-    * In-memory stamps: HashMap<path, sequence>, cleared on rebind. Stamp all
-      Put/Delete in commit(), all writes in note_written().
-    * fsmonitor_changes: parse token, check instance match. Return raw stamped
-      paths (no status filtering). On mismatch or vanished overflow, compute
-      status and return full list.
-    * Schema reverted from v3 to v2: removed last_changed_sequence columns from
-      entries and vanished tables. Removed journal.max_sequence and
-      journal.changes_since (no longer called).
-  - Tests: all seeded_caches pass (3/3); workspace_git (11/11); local & mutations
-    pass except pre-existing failure (a_recreated_directory_does_not_show_the_base_children_it_replaced).
+* **Step 1 results, universe** (fresh private workspace, 3 edited or new
+  files; every answer compared with `git -c core.fsmonitor=false -c
+  core.untrackedCache=false status --porcelain=v2`, all identical):
+
+  | | before | after |
+  |---|---|---|
+  | status with nothing new since the last | index rewritten every time (+0.9 s fresh, +5.8 s in the long-lived workspace: 8.5 s) | **2.2 s**, no index write, 10-byte hook answer |
+  | first status after edits | — | 3.1 s (writes the index once) |
+  | statuses after a stock `git switch` (24.5k files) | 9.2, 6.0, 7.9 s … forever | 7.6 s (one 2.6 MB answer), 3.3 s, then **1.9 s** |
+
+* Tests: `gfs-fuse --test fsmonitor` 5/5; `gfs-overlay`, and `gfs-mount`
+  `seeded_caches`, `workspace_git`, `local`, `mutations` pass except the known
+  `overlay::a_row_left_behind_by_an_unsettled_write_is_corrected_from_its_content_file`.
+  A daemon restart is not covered by a test (the harness has no restart);
+  by construction it yields a full answer.
 
 * Traces and probes: `GIT_TRACE2_PERF` on `git status` / `git switch` in a
   private workspace (`GFS_HOST_SOCKET=/tmp/gfsb/host.sock`, workspace

@@ -1208,40 +1208,36 @@ impl Mount {
     self.repin().await
   }
 
-  /// The change set, from the journal alone.
   /// Answer the fsmonitor hook (ADR 0009).
   ///
   /// The contract with Git: return every path changed since the caller's
-  /// token, or tell it to rescan. The overlay journal is cumulative for a
-  /// generation, so the answer is *all* overlay-changed paths — a superset of
-  /// changes since any token in the generation, and a superset is always safe
-  /// because Git re-checks listed paths and trusts only the unlisted ones.
+  /// token, or tell it to rescan. A superset is always safe, because Git
+  /// re-checks listed paths and trusts only the unlisted ones -- but every
+  /// listed path costs Git an `lstat` and an untracked-cache invalidation, and
+  /// an invalidation makes Git rewrite the whole index. So the answer is a
+  /// delta whenever it can be.
   ///
-  /// **Plus the paths whose rows are gone.** `Status` is derived from the
-  /// journal's rows, and a file created and then deleted leaves none, so the
-  /// change set alone silently forgets it. Git's answer to a path it is not
-  /// told about is to trust what it already believed: `?? f.txt` for a file
-  /// that no longer exists, and — worse — a clean report for a staged path
-  /// that was deleted, because the index entry keeps its fsmonitor-valid flag
-  /// and is never `lstat`ed. [`gfs_overlay::Overlay::vanished`] keeps those
-  /// names for exactly this call.
+  /// The token is `gfs:<generation>:<instance>:<sequence>`:
   ///
-  /// The token is `gfs:<generation>:<sequence>`. Only the generation decides a
-  /// rescan — a repin discards or re-bases the overlay, which changes what an
-  /// *unlisted* path means, so a token from another generation forces the one
-  /// full rescan that re-grounds Git.
+  /// * **generation** -- a repin discards or re-bases the overlay, which
+  ///   changes what an *unlisted* path means, so a token from another
+  ///   generation forces the one full rescan that re-grounds Git.
+  /// * **instance** -- this opening of the overlay. The per-path stamps a delta
+  ///   is computed from live in memory, so a token from before a daemon
+  ///   restart cannot be answered as a delta and gets the full list.
+  /// * **sequence** -- the overlay's mutation count in this instance. Same
+  ///   generation and instance: the answer is exactly the paths stamped after
+  ///   it, and when nothing was, the token comes back byte-identical and Git
+  ///   has nothing to write.
   ///
-  /// When the caller's token is from this generation and the overlay can answer
-  /// for that sequence, only paths changed after the caller's sequence are
-  /// returned (delta answer). Otherwise, the full list is returned (and a full
-  /// rescan if the vanished set overflowed or the token is from another generation).
-  /// Answer Git's fsmonitor v2 hook with changed paths.
-  ///
-  /// The token format is `gfs:<generation>:<instance>:<sequence>`. If the caller's
-  /// token has the same generation and instance ID as this process, and the sequence
-  /// is <= current, returns only paths with stamps > caller_sequence (delta answer).
-  /// Otherwise returns the full cumulative list (to trigger a full rescan if needed).
-  /// The vanished set overflowing also triggers a full rescan.
+  /// The full list is every overlay change **plus the paths whose rows are
+  /// gone.** `Status` is derived from the journal's rows, and a file created
+  /// and then deleted leaves none, so the change set alone silently forgets
+  /// it. Git's answer to a path it is not told about is to trust what it
+  /// already believed: `?? f.txt` for a file that no longer exists, and --
+  /// worse -- a clean report for a staged path that was deleted, because the
+  /// index entry keeps its fsmonitor-valid flag and is never `lstat`ed.
+  /// [`gfs_overlay::Overlay::vanished`] keeps those names for exactly this.
   pub async fn fsmonitor_changes(
     &self,
     caller_token: &str,
@@ -1252,108 +1248,60 @@ impl Mount {
       (current.commit.clone(), current.epoch)
     };
     let algorithm = commit.algorithm();
-    let caller_token = caller_token.to_string();
+    let instance = overlay.instance_id();
+    let caller = parse_fsmonitor_token(caller_token);
+    let same_generation = caller.is_some_and(|(g, _, _)| g == generation);
+    let delta_from = caller
+      .filter(|&(g, i, _)| g == generation && i == instance)
+      .map(|(_, _, sequence)| sequence);
 
-    // Gather overlay state in one blocking pool trip.
-    let (instance_id, sequence, delta_result, vanished_overflow) =
-      tokio::task::spawn_blocking(move || {
-        let instance = overlay.instance_id();
-        let seq = overlay.sequence();
-        // Try to compute delta if the caller's token structure matches.
-        let delta = Self::parse_fsmonitor_token(&caller_token, generation, instance)
-          .and_then(|caller_seq| overlay.changes_since(caller_seq).ok().flatten());
-        let (_, overflow) = overlay.vanished();
-        (instance, seq, delta, overflow)
-      })
-      .await
-      .map_err(|e| GfsError::internal(format!("the fsmonitor task failed: {e}")))?;
-
-    let token = format!("gfs:{generation}:{instance_id}:{sequence}");
-
-    // Decide whether to return a delta or full answer.
-    let (paths, full_rescan) = if let Some((delta_entries, _)) = delta_result {
-      if vanished_overflow {
-        // Overflow: fall back to full answer with rescan.
-        let status = tokio::task::spawn_blocking({
-          let overlay = Arc::clone(&self.overlay);
-          move || overlay.status(algorithm)
-        })
-        .await
-        .map_err(|e| GfsError::internal(format!("the status task failed: {e}")))?
-        .map_err(crate::fs::overlay_as_service_error)?;
-
-        let mut paths = Vec::new();
-        for change in &status.changes {
-          paths.push(String::from_utf8_lossy(change.path.as_bytes()).into_owned());
-          if let Some(from) = &change.from {
-            paths.push(String::from_utf8_lossy(from.as_bytes()).into_owned());
-          }
+    // One trip to the blocking pool: the overlay's lock is held across content
+    // I/O by a concurrent copy-up, and waiting for it on a reactor thread
+    // would stall every other request on the daemon.
+    let answer = tokio::task::spawn_blocking(move || {
+      let (vanished, overflow) = overlay.vanished();
+      if !overflow {
+        if let Some((sequence, paths)) = delta_from.and_then(|after| overlay.changes_since(after)) {
+          let paths = paths
+            .iter()
+            .map(|p| String::from_utf8_lossy(p.as_bytes()).into_owned())
+            .collect();
+          return Ok((sequence, paths, false));
         }
-        for dir in &status.directory_deletions {
-          paths.push(format!("{}/", String::from_utf8_lossy(dir.as_bytes())));
-        }
-        (paths, true)
-      } else {
-        // Delta answer: return stamped paths directly.
-        let paths: Vec<String> = delta_entries
-          .iter()
-          .map(|p| String::from_utf8_lossy(p.as_bytes()).into_owned())
-          .collect();
-        (paths, false)
       }
-    } else {
-      // Full answer: either token from different generation/instance or sequence
-      // from the future. Need to fetch status and all paths.
-      let status = tokio::task::spawn_blocking({
-        let overlay = Arc::clone(&self.overlay);
-        move || overlay.status(algorithm)
-      })
-      .await
-      .map_err(|e| GfsError::internal(format!("the status task failed: {e}")))?
-      .map_err(crate::fs::overlay_as_service_error)?;
-
-      let mut paths = Vec::new();
+      // Read before the status, so a mutation racing this answer is either in
+      // the list or after the token: listed twice is fine, never missed.
+      let sequence = overlay.sequence();
+      let status = overlay.status(algorithm)?;
+      let mut paths = Vec::with_capacity(status.changes.len() * 2 + vanished.len());
       for change in &status.changes {
         paths.push(String::from_utf8_lossy(change.path.as_bytes()).into_owned());
+        // A rename changed both names: the new one exists, the old one is
+        // gone, and Git must re-stat both.
         if let Some(from) = &change.from {
           paths.push(String::from_utf8_lossy(from.as_bytes()).into_owned());
         }
       }
       for dir in &status.directory_deletions {
+        // Git's protocol: a trailing slash marks a directory whose contents
+        // all changed.
         paths.push(format!("{}/", String::from_utf8_lossy(dir.as_bytes())));
       }
-
-      let full_rescan = vanished_overflow;
-      (paths, full_rescan)
-    };
-
+      for path in &vanished {
+        paths.push(String::from_utf8_lossy(path.as_bytes()).into_owned());
+      }
+      // The names were dropped at the cap, so no list can be complete any more.
+      Ok((sequence, paths, !same_generation || overflow))
+    })
+    .await
+    .map_err(|e| GfsError::internal(format!("the fsmonitor task failed: {e}")))?
+    .map_err(crate::fs::overlay_as_service_error)?;
+    let (sequence, paths, full_rescan) = answer;
     Ok(crate::control::FsMonitorAnswer {
-      token,
+      token: format!("gfs:{generation}:{instance}:{sequence}"),
       paths,
       full_rescan,
     })
-  }
-
-  /// Parse the fsmonitor token and extract the caller's sequence if valid.
-  ///
-  /// Token format: `gfs:<generation>:<instance>:<sequence>`
-  /// Returns Some(caller_sequence) if the generation and instance match the current
-  /// process, None otherwise (prompting a full answer).
-  fn parse_fsmonitor_token(token: &str, current_generation: u64, current_instance: u64) -> Option<u64> {
-    let parts: Vec<&str> = token.split(':').collect();
-    if parts.len() != 4 || parts[0] != "gfs" {
-      return None;
-    }
-    let generation = parts[1].parse::<u64>().ok()?;
-    let instance = parts[2].parse::<u64>().ok()?;
-    let sequence = parts[3].parse::<u64>().ok()?;
-
-    // Only answer delta if generation and instance match.
-    if generation == current_generation && instance == current_instance {
-      Some(sequence)
-    } else {
-      None
-    }
   }
 
   pub async fn status(&self) -> Result<crate::control::StatusReport, GfsError> {
@@ -2496,6 +2444,17 @@ fn migrate_legacy_state(workspace: &Path, legacy: &Path) {
   );
 }
 
+/// `gfs:<generation>:<instance>:<sequence>`, or `None` for anything else --
+/// including the seeded index's token from before this format, which then
+/// gets the full answer.
+fn parse_fsmonitor_token(token: &str) -> Option<(u64, u64, u64)> {
+  let mut parts = token.strip_prefix("gfs:")?.split(':');
+  let generation = parts.next()?.parse().ok()?;
+  let instance = parts.next()?.parse().ok()?;
+  let sequence = parts.next()?.parse().ok()?;
+  parts.next().is_none().then_some((generation, instance, sequence))
+}
+
 #[cfg(test)]
 mod tests {
   use super::*;
@@ -2551,3 +2510,4 @@ mod tests {
     assert!(!legacy.exists(), "the legacy directory is gone");
   }
 }
+
