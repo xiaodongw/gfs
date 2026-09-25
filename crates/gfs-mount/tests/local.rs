@@ -4,6 +4,7 @@
 //! real `git clone` of a fixture. The host these run through is pointed at a
 //! closed port, so anything that reached for a server would fail loudly.
 
+use gfs_mount::control::{Request, Response};
 use gfs_mount::search::SearchRequest;
 use gfs_search::SearchOutcome;
 use gfs_test::mount::{on_fs, Job};
@@ -420,4 +421,53 @@ async fn a_checkout_back_to_the_pinned_commit_leaves_no_copies_behind() {
   .await;
   assert_eq!(status, oracle);
   assert_eq!(main_rs, b"fn main() { println!(\"bye\"); }\n");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn gfs_switch_resolves_branches_in_local_mode() {
+  // In local mode, `gfs switch` should resolve branches against the workspace
+  // and the clone without gateway contact.
+  let clone_dir = tempfile::tempdir().unwrap();
+  let clone = clone_dir.path().join("clone");
+  Job::clone_fixture("basic", &clone);
+
+  // Create a local branch in the clone to test switching to it
+  git_in(&clone, &["branch", "old", "v1.0"]);
+
+  let job = Job::local_from(&clone, "main", tempfile::tempdir().unwrap()).await;
+  let ws = job.workspace.clone();
+
+  // Initial state: on main
+  let initial_main_rs = on_fs({
+    let ws = ws.clone();
+    move || std::fs::read(ws.join("src/main.rs")).unwrap()
+  })
+  .await;
+  assert_eq!(initial_main_rs, b"fn main() { println!(\"bye\"); }\n");
+
+  // Switch to the clone-only branch "old" (which doesn't exist in workspace yet)
+  use gfs_mount::control::Request;
+  let Response::Refresh(refresh) = job
+    .call(Request::Switch {
+      selector: "old".to_owned(),
+      branch: None,
+      create: None,
+      start_point: None,
+    })
+    .await
+  else {
+    panic!("expected a refresh");
+  };
+
+  // After switching, verify the workspace shows the v1.0 content
+  let after_switch_main_rs = on_fs({
+    let ws = ws.clone();
+    move || std::fs::read(ws.join("src/main.rs")).unwrap()
+  })
+  .await;
+  assert_eq!(after_switch_main_rs, b"fn main() { println!(\"hi\"); }\n");
+  assert!(!refresh.unchanged, "switching to a different commit should change the pin");
+
+  // Verify the overlay is clean (no writes through FUSE)
+  assert_eq!(job.daemon.inspect().overlay.entries, 0, "clean switch leaves no overlay rows");
 }

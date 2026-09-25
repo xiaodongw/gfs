@@ -229,8 +229,9 @@ async fn a_bare_push_never_fans_out_to_branches_the_caller_is_not_on() {
     // `--dry-run` still resolves the refspec, which is the whole question here,
     // and needs no credential because nothing is transmitted.
     let (_, dry_run) = git_in(&ws, &["push", "--dry-run"]);
-    let config = std::fs::read_to_string(ws.join(".git/config")).unwrap();
-    (dry_run, config)
+    // GFS-specific settings are in .git/gfs/config now, included by .git/config
+    let gfs_config = std::fs::read_to_string(ws.join(".git/gfs/config")).unwrap();
+    (dry_run, gfs_config)
   })
   .await;
 

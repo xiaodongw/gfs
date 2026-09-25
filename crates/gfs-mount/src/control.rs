@@ -60,9 +60,21 @@ pub enum Request {
   /// work lives in the reserved namespace and ADR 0006 forbids naming that as a
   /// revision. The CLI resolves the branch through the gateway and sends what it
   /// resolved to; `branch` travels alongside only so reports can name it.
+  ///
+  /// In local mode, `selector` can be a branch name or a revision expression,
+  /// and the daemon resolves it locally. `create` and `start_point` are used
+  /// for `gfs switch -c` in local mode; they are ignored in server mode.
   Switch {
     selector: String,
     branch: Option<String>,
+    /// In local mode, create a new branch with this name instead of switching to an existing one.
+    /// Ignored in server mode.
+    #[serde(default)]
+    create: Option<String>,
+    /// In local mode, the starting point for creating a new branch (defaults to current HEAD).
+    /// Ignored in server mode.
+    #[serde(default)]
+    start_point: Option<String>,
   },
   /// What the workspace has changed, from the journal alone.
   Status,

@@ -503,7 +503,34 @@ pub fn seed_git_dir(spec: &SeedSpec<'_>) -> Result<(), gfs_types::error::GfsErro
     mount = facts.mount_id.as_str(),
     generation = facts.generation,
   ));
-  write_atomic(&dir.join("config"), config.as_bytes()).map_err(|e| io("config", e))?;
+
+  // Write gfs-specific config to .git/gfs/config, then update .git/config to include it.
+  // This preserves any user config or branch tracking sections in .git/config.
+  let gfs_config_dir = dir.join("gfs");
+  std::fs::create_dir_all(&gfs_config_dir).map_err(|e| io("gfs config dir", e))?;
+  write_atomic(&gfs_config_dir.join("config"), config.as_bytes())
+    .map_err(|e| io("gfs config", e))?;
+
+  // Update .git/config to include .git/gfs/config if it doesn't already.
+  let config_path = dir.join("config");
+  let mut user_config = if config_path.exists() {
+    std::fs::read_to_string(&config_path).map_err(|e| io("reading existing config", e))?
+  } else {
+    String::new()
+  };
+
+  // Check if the include is already present
+  // The path is relative to the directory of the config file (.git)
+  if !user_config.contains("path = gfs/config")
+  {
+    // Add the include directive at the beginning, before any user config.
+    // This ensures that gfs config is loaded first, so user settings can override if needed.
+    // The path is relative to the .git directory where the config file lives.
+    let include = "[include]\n\tpath = gfs/config\n";
+    user_config.insert_str(0, include);
+  }
+
+  write_atomic(&config_path, user_config.as_bytes()).map_err(|e| io("config", e))?;
 
   write_packed_refs(dir, facts).map_err(|e| io("packed-refs", e))?;
 
@@ -751,9 +778,10 @@ mod tests {
       "a ref the seeded refspec cannot refresh is left out"
     );
     // The upstream that makes `git status -sb` print ahead/behind.
-    let config = std::fs::read_to_string(git.join("config")).unwrap();
-    assert!(config.contains("[branch \"main\"]"), "{config}");
-    assert!(config.contains("merge = refs/heads/main"), "{config}");
+    // This is in the gfs config file now.
+    let gfs_config = std::fs::read_to_string(git.join("gfs/config")).unwrap();
+    assert!(gfs_config.contains("[branch \"main\"]"), "{gfs_config}");
+    assert!(gfs_config.contains("merge = refs/heads/main"), "{gfs_config}");
   }
 
   #[test]
@@ -868,12 +896,18 @@ mod tests {
 
     let alternates = std::fs::read_to_string(git.join("objects/info/alternates")).unwrap();
     assert_eq!(alternates, "../gfs/objects\n");
-    let config = std::fs::read_to_string(git.join("config")).unwrap();
+
+    // Check user config for include directive
+    let user_config = std::fs::read_to_string(git.join("config")).unwrap();
     assert!(
-      !config.contains("worktree"),
-      "no location dependence:\n{config}"
+      !user_config.contains("worktree"),
+      "no location dependence:\n{user_config}"
     );
-    assert!(config.contains("checkStat = minimal"));
+    assert!(user_config.contains("[include]"), "config should include gfs config");
+
+    // Check gfs config for gfs-specific settings
+    let gfs_config = std::fs::read_to_string(git.join("gfs/config")).unwrap();
+    assert!(gfs_config.contains("checkStat = minimal"));
   }
 
   #[test]

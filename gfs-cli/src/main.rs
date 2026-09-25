@@ -1686,6 +1686,10 @@ async fn main() -> Result<()> {
         bail!("the daemon answered an inspect request with something else");
       };
 
+      // In local mode, the daemon handles branch resolution. In server mode,
+      // we resolve through the gateway.
+      let is_local_mode = report.local_clone.is_some();
+
       // Ask about the workspace *before* creating anything on the gateway.
       //
       // `CreateBranch` is durable and the daemon's own clean-workspace check
@@ -1712,36 +1716,56 @@ async fn main() -> Result<()> {
         }
       }
 
-      let mut client = connect_repository(&cli).await?;
-      let created = if *create {
-        Some(
-          client
-            .create_branch(authed(
-              &cli,
-              v1::CreateBranchRequest {
-                repository_id: report.repository_id.clone(),
-                branch: branch.clone(),
-                // Defaults to what this view is pinned to, so `-c` branches
-                // from where the caller is standing, as `git switch -c` does.
-                start_point: start_point.clone().unwrap_or_else(|| report.commit.clone()),
-                authorization: None,
-              },
-            )?)
-            .await?
-            .into_inner(),
-        )
+      // In local mode, pass the branch name and creation parameters to the daemon.
+      // In server mode, resolve the branch through the gateway and pass the commit.
+      let (selector, work_branch, create_in_daemon, start_point_in_daemon) = if is_local_mode {
+        if *create {
+          // In local mode, the daemon creates the branch. Pass it in the request.
+          (
+            branch.clone(),
+            Some(branch.clone()),
+            Some(branch.clone()),
+            start_point.clone(),
+          )
+        } else {
+          // In local mode, the daemon resolves the branch name.
+          (branch.clone(), None, None, None)
+        }
       } else {
-        None
-      };
+        // In server mode, resolve through the gateway as before.
+        let mut client = connect_repository(&cli).await?;
+        let created = if *create {
+          Some(
+            client
+              .create_branch(authed(
+                &cli,
+                v1::CreateBranchRequest {
+                  repository_id: report.repository_id.clone(),
+                  branch: branch.clone(),
+                  // Defaults to what this view is pinned to, so `-c` branches
+                  // from where the caller is standing, as `git switch -c` does.
+                  start_point: start_point
+                    .clone()
+                    .unwrap_or_else(|| report.commit.clone()),
+                  authorization: None,
+                },
+              )?)
+              .await?
+              .into_inner(),
+          )
+        } else {
+          None
+        };
 
-      // The view is re-pinned to a *commit*, not to the branch name: ADR 0006
-      // forbids naming the reserved namespace as a revision, and a work branch
-      // lives there. The branch travels alongside so reports can name it.
-      let (selector, work_branch) = match &created {
-        Some(response) => (response.commit_oid.clone(), Some(branch.clone())),
-        // Without `-c` this is an ordinary revision, so the daemon resolves it
-        // itself and the view is not on a work branch.
-        None => (branch.clone(), None),
+        // The view is re-pinned to a *commit*, not to the branch name: ADR 0006
+        // forbids naming the reserved namespace as a revision, and a work branch
+        // lives there. The branch travels alongside so reports can name it.
+        match &created {
+          Some(response) => (response.commit_oid.clone(), Some(branch.clone()), None, None),
+          // Without `-c` this is an ordinary revision, so the daemon resolves it
+          // itself and the view is not on a work branch.
+          None => (branch.clone(), None, None, None),
+        }
       };
 
       let Response::Refresh(refresh) = call(
@@ -1749,6 +1773,8 @@ async fn main() -> Result<()> {
         &Request::Switch {
           selector,
           branch: work_branch,
+          create: create_in_daemon,
+          start_point: start_point_in_daemon,
         },
       )?
       else {

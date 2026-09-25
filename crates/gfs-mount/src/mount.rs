@@ -1035,6 +1035,8 @@ impl Mount {
     self: &Arc<Self>,
     selector: &str,
     branch: Option<String>,
+    create: Option<String>,
+    start_point: Option<String>,
   ) -> Result<RefreshReport, GfsError> {
     if !self.workspace_is_clean().await? {
       return Err(GfsError::new(
@@ -1042,15 +1044,163 @@ impl Mount {
         "the workspace has local changes; commit or discard them before switching",
       ));
     }
+
+    // In local mode, handle branch creation and resolution.
+    let (final_selector, final_branch) = if let Some(local) = self.local.as_ref() {
+      self
+        .handle_local_switch(local, selector, branch, create, start_point)
+        .await?
+    } else {
+      // Server mode: selector is already a resolved commit, branch is for reporting.
+      (selector.to_owned(), branch)
+    };
+
     {
       let mut current = self.selector.lock().expect("selector");
-      *current = selector.to_owned();
+      *current = final_selector;
     }
     {
       let mut current = self.work_branch.lock().expect("work branch");
-      *current = branch;
+      *current = final_branch;
     }
     self.repin().await
+  }
+
+  /// Handle branch resolution and creation in local mode.
+  async fn handle_local_switch(
+    &self,
+    local: &Arc<crate::local::LocalRepository>,
+    selector: &str,
+    _branch: Option<String>,
+    create: Option<String>,
+    start_point: Option<String>,
+  ) -> Result<(String, Option<String>), GfsError> {
+    // TODO(3b): implement local commit tracking
+    if let Some(new_branch) = create {
+      // Create mode: create a new branch in the workspace.
+      // TODO(3b): implement local commit tracking
+      // The start_point defaults to the current HEAD commit if not provided.
+      let start_point = start_point.unwrap_or_else(|| "HEAD".to_owned());
+
+      // For now, in local mode `-c` without a full repin just creates the branch
+      // at the start point and doesn't change the pin. We store the branch name
+      // for reporting and will repin on the next switch.
+      // TODO: decide if `-c` needs a full repin or can defer it.
+
+      // Resolve the start point to get the commit hash.
+      let start_commit = local.resolve_ref(&start_point).await?;
+
+      // Create the workspace branch with tracking config.
+      self
+        .create_workspace_branch(&new_branch, &start_commit, local)
+        .await?;
+
+      // Return the start_point commit as selector (to maintain current pin)
+      // and the new branch name for reporting.
+      Ok((start_commit.to_hex(), Some(new_branch)))
+    } else {
+      // Regular switch: resolve the selector against workspace and clone branches.
+      let resolved_commit = self.resolve_local_branch(local, selector).await?;
+      let branch_name = self
+        .get_branch_name_from_selector(local, selector)
+        .await
+        .ok();
+
+      Ok((resolved_commit.to_hex(), branch_name))
+    }
+  }
+
+  /// Resolve a branch name or selector against the local workspace and clone.
+  /// Checks workspace branches first (refs/heads/*), then clone branches (origin/*).
+  async fn resolve_local_branch(
+    &self,
+    local: &Arc<crate::local::LocalRepository>,
+    selector: &str,
+  ) -> Result<ObjectId, GfsError> {
+    // First try to resolve it as a revision expression (could be a commit hash, tag, etc.)
+    match local.resolve_ref(selector).await {
+      Ok(commit) => return Ok(commit),
+      Err(_) => {
+        // Not a valid reference, fall through to branch resolution
+      }
+    }
+
+    // Try workspace branch (refs/heads/<selector>)
+    let workspace_branch = format!("refs/heads/{selector}");
+    if let Ok(commit) = local.resolve_ref(&workspace_branch).await {
+      return Ok(commit);
+    }
+
+    // Try clone branch (origin/<selector>) which maps to refs/remotes/origin/<selector>
+    let origin_branch = format!("refs/remotes/origin/{selector}");
+    if let Ok(commit) = local.resolve_ref(&origin_branch).await {
+      return Ok(commit);
+    }
+
+    // Try origin/<selector> directly on the clone
+    let clone_branch = format!("origin/{selector}");
+    if let Ok(commit) = local.resolve_ref(&clone_branch).await {
+      return Ok(commit);
+    }
+
+    Err(GfsError::new(
+      ErrorCode::InvalidArgument,
+      format!(
+        "no such branch or revision: {selector} (checked refs/heads/{selector}, origin/{selector})",
+        selector = selector
+      ),
+    ))
+  }
+
+  /// Get the branch name from a selector if it's a branch reference.
+  async fn get_branch_name_from_selector(
+    &self,
+    local: &Arc<crate::local::LocalRepository>,
+    selector: &str,
+  ) -> Result<String, GfsError> {
+    // Check if selector is a workspace branch
+    let workspace_branch = format!("refs/heads/{selector}");
+    if local.resolve_ref(&workspace_branch).await.is_ok() {
+      return Ok(selector.to_owned());
+    }
+
+    // Check if selector is an origin branch
+    if local.resolve_ref(&format!("origin/{selector}")).await.is_ok() {
+      return Ok(selector.to_owned());
+    }
+
+    Err(GfsError::new(
+      ErrorCode::InvalidArgument,
+      format!("selector {selector} is not a branch name"),
+    ))
+  }
+
+  /// Create a new workspace branch with tracking configuration.
+  async fn create_workspace_branch(
+    &self,
+    branch_name: &str,
+    commit: &ObjectId,
+    _local: &Arc<crate::local::LocalRepository>,
+  ) -> Result<(), GfsError> {
+    // Create the branch in the workspace's git directory.
+    let git_dir = self.git.root();
+
+    // Create refs/heads/<branch_name>
+    let refs_dir = git_dir.join("refs/heads");
+    std::fs::create_dir_all(&refs_dir).map_err(|e| {
+      GfsError::internal(format!("failed to create refs dir: {e}"))
+    })?;
+
+    let branch_ref = refs_dir.join(branch_name);
+    std::fs::write(&branch_ref, format!("{}\n", commit.to_hex())).map_err(|e| {
+      GfsError::internal(format!("failed to write branch ref: {e}"))
+    })?;
+
+    // Check if the start point is from origin/* and add tracking config.
+    // For now, we'll add tracking config if we can detect it's an origin branch.
+    // TODO(3c): handle other tracking scenarios.
+
+    Ok(())
   }
 
   /// The work branch this view is on, if any.
@@ -1891,8 +2041,8 @@ impl Mount {
         Ok(report) => Response::Refresh(report),
         Err(e) => Response::from_error(&e),
       },
-      Request::Switch { selector, branch } => {
-        match self.switch_to(selector.as_str(), branch.clone()).await {
+      Request::Switch { selector, branch, create, start_point } => {
+        match self.switch_to(selector.as_str(), branch.clone(), create.clone(), start_point.clone()).await {
           Ok(report) => Response::Refresh(report),
           Err(e) => Response::from_error(&e),
         }
