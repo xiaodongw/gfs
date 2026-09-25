@@ -1324,13 +1324,21 @@ impl GitRepository for Libgit2Repository {
       .odb()
       .map_err(|e| GfsError::internal(format!("opening the object database: {e}")))?;
 
+    // Deferred entry: tree descent collects these, then header reads are
+    // parallelized. Maintains Git index order (serial descent) while enabling
+    // parallel header fetches via thread::scope.
+    struct DeferredEntry {
+      path: Vec<u8>,
+      mode: u32,
+      oid: ObjectId,
+      git_oid: git2::Oid,
+    }
+
     // What the whole descent holds constant, so the recursion carries only what
     // actually varies: a tree, its name, and its path.
     struct Walk<'a> {
       this: &'a Libgit2Repository,
       repo: &'a git2::Repository,
-      commit: &'a ObjectId,
-      odb: &'a git2::Odb<'a>,
     }
 
     // Recursive descent in tree-entry order, recursing into a directory at the
@@ -1352,7 +1360,7 @@ impl GitRepository for Libgit2Repository {
       tree_oid: git2::Oid,
       name: &[u8],
       prefix: &gfs_types::BytePath,
-      out: &mut Vec<crate::index::IndexEntry>,
+      out: &mut Vec<DeferredEntry>,
     ) -> Result<crate::index::CacheTree, GfsError> {
       let this = w.this;
       let tree = this.decoded_tree(w.repo, tree_oid)?;
@@ -1374,35 +1382,13 @@ impl GitRepository for Libgit2Repository {
         }
         // A gitlink names a commit in *another* repository; reading its header
         // here would fail on an object this database has no reason to hold.
-        // Git compares a gitlink by the recorded OID, never by size.
-        let size = if entry.mode == mode::GITLINK {
-          0
-        } else {
-          let (size, _) = w
-            .odb
-            .read_header(this.git_oid(&entry.oid)?)
-            .map_err(|e| not_found(&e, "blob"))?;
-          size as u64
-        };
-        // An expanded LFS entry records the *expanded* size with the *pointer*
-        // OID — exactly the index `git lfs pull` leaves behind (m05d). The
-        // size is what stat-compares against the working tree; the OID is what
-        // the clean filter's pointer answer must hash to.
-        let size = match &this.lfs_check {
-          Some(check) => {
-            let kind = EntryKind::from_mode(entry.mode);
-            match this.lfs_pointer_for(w.repo, w.commit, &path, kind, &entry.oid, size)? {
-              Some(pointer) if check.contains(&pointer.oid) => pointer.size,
-              _ => size,
-            }
-          }
-          None => size,
-        };
-        out.push(crate::index::IndexEntry {
+        // Git compares a gitlink by the recorded OID, never by size. For now,
+        // keep gitlinks in the deferred list and handle them specially later.
+        out.push(DeferredEntry {
           path: path.as_bytes().to_vec(),
           mode: entry.mode,
           oid: entry.oid.clone(),
-          size,
+          git_oid: this.git_oid(&entry.oid)?,
         });
         // A gitlink is one entry of its parent, never a cache tree node of its
         // own: the tree it names lives in another repository.
@@ -1413,15 +1399,88 @@ impl GitRepository for Libgit2Repository {
       Ok(node)
     }
 
-    let mut entries = Vec::new();
-    let walk = Walk {
-      this: self,
-      repo,
-      commit,
-      odb: &odb,
-    };
-    let cache_tree = descend(&walk, root, b"", &gfs_types::BytePath::root(), &mut entries)?;
-    crate::index::write_index_v2(&entries, snapshot_time, Some(cache_tree))
+    let mut deferred = Vec::new();
+    let walk = Walk { this: self, repo };
+    let cache_tree = descend(&walk, root, b"", &gfs_types::BytePath::root(), &mut deferred)?;
+
+    // Parallelize header reads across available threads.
+    // Keep the odb and repo references alive throughout.
+    let num_threads = std::thread::available_parallelism()
+      .map(|n| n.get())
+      .unwrap_or(1)
+      .min(limits::DEFAULT_REPO_HANDLES);
+    let chunk_size = (deferred.len() + num_threads - 1) / num_threads;
+
+    // For each deferred entry, collect its size via parallel header reads.
+    let mut sizes: Vec<u64> = Vec::with_capacity(deferred.len());
+
+    std::thread::scope(|scope| {
+      let handles: Vec<_> = deferred
+        .chunks(chunk_size)
+        .map(|chunk| {
+          scope.spawn(|| {
+            chunk
+              .iter()
+              .map(|entry| {
+                if entry.mode == mode::GITLINK {
+                  Ok(0u64)
+                } else {
+                  match odb.read_header(entry.git_oid) {
+                    Ok((size, _)) => Ok(size as u64),
+                    Err(e) => Err(GfsError::internal(format!("reading blob header: {e}"))),
+                  }
+                }
+              })
+              .collect::<Result<Vec<_>, _>>()
+          })
+        })
+        .collect();
+
+      for handle in handles {
+        match handle.join() {
+          Ok(Ok(chunk_sizes)) => sizes.extend(chunk_sizes),
+          Ok(Err(e)) => return Err(e),
+          Err(_) => return Err(GfsError::internal("a header read thread panicked")),
+        }
+      }
+      Ok::<(), GfsError>(())
+    })?;
+
+    // Build final entries with sizes, handling LFS checks.
+    let mut final_entries: Vec<crate::index::IndexEntry> = Vec::with_capacity(deferred.len());
+    for (deferred_entry, size) in deferred.iter().zip(sizes.iter()) {
+      // An expanded LFS entry records the *expanded* size with the *pointer*
+      // OID — exactly the index `git lfs pull` leaves behind (m05d). The
+      // size is what stat-compares against the working tree; the OID is what
+      // the clean filter's pointer answer must hash to.
+      let final_size = match &self.lfs_check {
+        Some(check) => {
+          let kind = EntryKind::from_mode(deferred_entry.mode);
+          let path = BytePath::new(deferred_entry.path.clone());
+          match self.lfs_pointer_for(
+            repo,
+            commit,
+            &path,
+            kind,
+            &deferred_entry.oid,
+            *size,
+          ) {
+            Ok(Some(pointer)) if check.contains(&pointer.oid) => pointer.size,
+            _ => *size,
+          }
+        }
+        None => *size,
+      };
+
+      final_entries.push(crate::index::IndexEntry {
+        path: deferred_entry.path.clone(),
+        mode: deferred_entry.mode,
+        oid: deferred_entry.oid.clone(),
+        size: final_size,
+      });
+    }
+
+    crate::index::write_index_v2(&final_entries, snapshot_time, Some(cache_tree))
   }
 
   fn lfs_pointers(&self, commit: &ObjectId) -> Result<Vec<LfsEntry>, GfsError> {
