@@ -1862,6 +1862,92 @@ impl Gfs {
       .forget(record.ino, 1);
     attr
   }
+
+  /// Try to convert a settled content file to a blob reference. Called in the
+  /// background after a descriptor is released. This is a best-effort operation:
+  /// if the file has changed or the blob doesn't exist, it's simply not converted.
+  async fn try_convert_to_blob_reference(
+    &self,
+    content_id: u64,
+    entry: &OverlayEntry,
+  ) -> Result<(), String> {
+    // Don't convert if the content is not Local (already converted or base-only).
+    let Some(local_id) = entry.content.local_id() else {
+      return Ok(());
+    };
+
+    if local_id != content_id {
+      return Ok(());
+    }
+
+    // Get the overlay and content store reference.
+    let overlay = self.overlay();
+    let store = overlay.content_store();
+    let content_path = store.path_of(content_id).to_path_buf();
+    let entry_size = entry.size;
+    let entry_base = entry.base.clone();
+    let entry_path = entry.path.clone();
+
+    // Hash the file as a Git blob using the pinned commit's hash algorithm.
+    let pinned = self.pinned();
+    let algorithm = pinned.client.binding().algorithm;
+
+    let blob_oid = tokio::task::spawn_blocking(move || {
+      let mut file =
+        std::fs::File::open(&content_path).map_err(|e| format!("failed to open content file: {e}"))?;
+      use gfs_overlay::hash;
+      hash::blob_oid_of_file(algorithm, &mut file, entry_size)
+        .map_err(|e| format!("failed to hash content: {e}"))
+    })
+    .await
+    .map_err(|e| format!("hashing task failed: {e}"))?
+    .map_err(|e| e.to_string())?;
+
+    // Check if the blob exists in the repository. In server mode, this returns
+    // false; in local mode, it queries the object store.
+    let has_blob = pinned
+      .client
+      .has_blob(&blob_oid)
+      .await
+      .unwrap_or(false);
+
+    if !has_blob {
+      return Ok(());
+    }
+
+    // Try to convert the content to a blob reference. This is safe to do because:
+    // 1. The content_id still points to the same entry (checked in the overlay)
+    // 2. The content is no longer dirty (we just settled it)
+    // 3. The file's size and mtime matched what we recorded
+    // 4. The blob exists in the repository
+    let blob_oid_clone = blob_oid.clone();
+    let overlay_clone = Arc::clone(&overlay);
+    let conversion_result = self
+      .mutation(move || {
+        overlay_clone.convert_to_blob_reference(content_id, &blob_oid_clone, entry_base.as_ref())
+      })
+      .await;
+
+    match conversion_result {
+      Ok(Some((_converted_entry, freed_content_id))) => {
+        // Free the content file now that the journal row has been updated.
+        // This must happen after the journal is committed to maintain the
+        // ordering invariant: published content before the row that names it.
+        let _ = store.remove(freed_content_id);
+        tracing::debug!(
+          path = %entry_path.escaped(),
+          oid = %blob_oid.to_hex(),
+          "converted to blob reference"
+        );
+        Ok(())
+      }
+      Ok(None) => {
+        // Conversion didn't happen (content changed, or already converted).
+        Ok(())
+      }
+      Err(e) => Err(e.to_string()),
+    }
+  }
 }
 
 /// Refuse a component longer than `NAME_MAX` on the way *in*.
@@ -2846,7 +2932,24 @@ impl Filesystem for GfsFilesystem {
             {
               Ok(Some(entry)) => {
                 let path = entry.path.clone();
-                fs.republish(&path, entry);
+                fs.republish(&path, entry.clone());
+
+                // In the background, try to convert the content to a blob
+                // reference if the bytes match an existing blob in the repository.
+                // Skip this if zero_message_open is on (the spike disables release
+                // callbacks entirely).
+                if !fs.config.zero_message_open {
+                  let fs_clone = Arc::clone(&fs);
+                  let entry_clone = entry.clone();
+                  tokio::spawn(async move {
+                    if let Err(e) = fs_clone
+                      .try_convert_to_blob_reference(content_id, &entry_clone)
+                      .await
+                    {
+                      tracing::debug!(error = %e, "converting to blob reference failed (expected in server mode)");
+                    }
+                  });
+                }
               }
               Ok(None) => {}
               Err(e) => tracing::warn!(error = %e, "settling a written file's row failed"),

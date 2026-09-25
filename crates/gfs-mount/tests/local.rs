@@ -302,3 +302,4 @@ async fn a_prewarmed_local_mount_inflates_the_tree_in_the_background() {
   let content = on_fs(move || std::fs::read(&readme).unwrap()).await;
   assert_eq!(content, b"# basic\n");
 }
+

@@ -36,7 +36,7 @@ Each step is done by one subagent, sequentially (steps 1 and 2 both touch the
 overlay journal), and each ends with a build, the smoke tests, a measurement
 on universe with a private daemon, and a commit on `main`.
 
-**Step 1 — delta fsmonitor answers** (complete)
+**Step 1 — delta fsmonitor answers** (complete: commit df5d53b)
 * Token `gfs:<generation>:<instance>:<sequence>`. The instance is this opening
   of the overlay (a counter in the journal's `meta`, bumped by every
   `Overlay::open`); the sequence counts mutations in the instance.
@@ -117,6 +117,27 @@ on universe with a private daemon, and a commit on `main`.
   gitstatusd) cannot read the mandatory `link` extension.
 * **Staged changes block `gfs switch` in v1**: the re-seeded index would drop
   them silently otherwise.
+
+* **Content::Base reused for arbitrary blobs in local mode.** When written
+  content matches an existing blob in the object store, the row's Content::Local
+  is converted to Content::Base(oid) with the blob's oid, even if the blob is not
+  from the current path in the commit. This works because LocalSource.serves_blobs_in_memory()
+  is true, so the mount's open_blob path calls read_blob_shared(oid, "") directly
+  without resolving through the tree. In server mode, has_blob() returns false,
+  so conversion only happens for blobs equal to the base (same path, same oid, same mode),
+  which are served through the normal tree resolution path.
+
+* **Blob conversion is background, no stamping.** After settle_content or settle_all,
+  a separate async task hashes the file, checks if the blob exists, and calls
+  convert_to_blob_reference. The conversion commits to the journal without stamping
+  the path or advancing the fsmonitor sequence, since the bytes and stat data are
+  unchanged. This is safe because the content_id is checked against the current row
+  to ensure the file hasn't been deleted or replaced since hashing.
+
+* **Metadata is preserved on conversion.** When a row is converted from Content::Local
+  to Content::Base, the ino, size, mtime, ctime, and mode are kept unchanged. This
+  matches Git's expectations for stat data: build tools must never see an mtime go
+  backwards, and Git records the stat data at checkout.
 
 ## Details
 

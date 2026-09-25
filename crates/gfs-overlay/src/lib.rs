@@ -62,7 +62,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-use gfs_types::{BytePath, Timestamp};
+use gfs_types::{BytePath, ObjectId, Timestamp};
 
 pub use error::{Condition, OverlayError, Result};
 
@@ -1932,6 +1932,105 @@ impl Overlay {
       Self::push_touch(touch, &mut changes, &mut root_times, now);
     }
     self.commit(&mut inner, changes, release, root_times)
+  }
+
+  /// Try to convert a content file to a blob reference if the bytes match an
+  /// existing blob in the repository. Called in the background after a descriptor
+  /// is released. Returns the updated entry if conversion succeeded, or None if
+  /// the content no longer exists or has changed.
+  ///
+  /// This method checks if:
+  /// 1. The content_id still points to the same path (hasn't been unlinked or
+  ///    replaced by another write).
+  /// 2. The file is no longer dirty (no writable descriptors open).
+  /// 3. The file's size and mtime match what we recorded at settle time.
+  /// 4. The blob exists in the repository and matches the recorded hash.
+  ///
+  /// If all checks pass, the row's content is replaced with a reference to the
+  /// blob, the content file is freed (by returning a file id to delete), and the
+  /// row is committed to the journal without advancing the fsmonitor sequence
+  /// (the bytes and stat are unchanged).
+  pub fn convert_to_blob_reference(
+    &self,
+    content_id: u64,
+    blob_oid: &ObjectId,
+    base_facts: Option<&BaseFacts>,
+  ) -> Result<Option<(OverlayEntry, u64)>> {
+    let mut inner = self.lock();
+
+    let Some(path) = inner.by_content.get(&content_id).cloned() else {
+      return Ok(None);
+    };
+
+    let Some(mut entry) = inner
+      .entries
+      .get(path.as_slice())
+      .cloned()
+    else {
+      return Ok(None);
+    };
+
+    // Only convert Local content.
+    let Some(local_id) = entry.content.local_id() else {
+      return Ok(None);
+    };
+
+    // Ensure content_id matches.
+    if local_id != content_id {
+      return Ok(None);
+    }
+
+    // Don't convert if the content is still dirty (actively being written).
+    if inner.dirty.contains(&content_id) {
+      return Ok(None);
+    }
+
+    // Check if the blob matches the base. If so, the row should show
+    // Content::Base with the same ino, size, mtime, ctime, and mode.
+    // If not, in local mode the row shows Content::Base with the new blob oid.
+    // The check is: oid matches AND mode matches (regular vs executable).
+    let should_drop_row = if let Some(base) = base_facts {
+      blob_oid == &base.oid && entry.kind.to_entry_kind() == base.kind
+    } else {
+      false
+    };
+
+    if should_drop_row {
+      // The blob matches the base exactly. Drop the row entirely to free quota,
+      // but keep the returned (entry, content_id) so the caller can free the
+      // content file after committing the deletion to the journal.
+      release_content(&mut inner.by_content, content_id, &path);
+      inner.entries.remove(path.as_slice());
+      inner.local_bytes = inner.local_bytes.saturating_sub(entry.size);
+
+      // Record the deletion in the journal. Since the bytes and stat are
+      // unchanged, this does not advance the sequence or stamp the path.
+      self.commit(
+        &mut inner,
+        vec![Change::Delete(BytePath::new(path))],
+        Vec::new(),
+        None,
+      )?;
+
+      Ok(Some((entry, local_id)))
+    } else {
+      // The blob exists but doesn't match the base. In local mode, we can
+      // reference it anyway. In server mode, this shouldn't happen (return None).
+      entry.content = Content::Base(blob_oid.clone());
+      release_content(&mut inner.by_content, content_id, &path);
+      inner.local_bytes = inner.local_bytes.saturating_sub(entry.size);
+
+      // Update the entry in the journal. The bytes and stat are unchanged, so
+      // this does not advance the sequence or stamp the path.
+      self.commit(
+        &mut inner,
+        vec![Change::Put(entry.clone())],
+        Vec::new(),
+        None,
+      )?;
+
+      Ok(Some((entry, local_id)))
+    }
   }
 }
 
