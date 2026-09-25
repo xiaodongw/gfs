@@ -1327,6 +1327,7 @@ impl GitRepository for Libgit2Repository {
     // Deferred entry: tree descent collects these, then header reads are
     // parallelized. Maintains Git index order (serial descent) while enabling
     // parallel header fetches via thread::scope.
+    #[derive(Clone)]
     struct DeferredEntry {
       path: Vec<u8>,
       mode: u32,
@@ -1403,29 +1404,40 @@ impl GitRepository for Libgit2Repository {
     let walk = Walk { this: self, repo };
     let cache_tree = descend(&walk, root, b"", &gfs_types::BytePath::root(), &mut deferred)?;
 
-    // Parallelize header reads across available threads.
-    // Keep the odb and repo references alive throughout.
+    // Parallelize header reads: each thread checks out its own pool handle,
+    // so libgit2's single-threaded odb can be used safely by each thread
+    // independently without contention.
     let num_threads = std::thread::available_parallelism()
       .map(|n| n.get())
       .unwrap_or(1)
-      .min(limits::DEFAULT_REPO_HANDLES);
+      .min(self.pool.max_handles());
     let chunk_size = (deferred.len() + num_threads - 1) / num_threads;
+    let pool = Arc::clone(&self.pool);
 
-    // For each deferred entry, collect its size via parallel header reads.
     let mut sizes: Vec<u64> = Vec::with_capacity(deferred.len());
 
     std::thread::scope(|scope| {
       let handles: Vec<_> = deferred
         .chunks(chunk_size)
-        .map(|chunk| {
-          scope.spawn(|| {
-            chunk
+        .enumerate()
+        .map(|(_, chunk)| {
+          let pool_clone = Arc::clone(&pool);
+          let chunk_vec: Vec<_> = chunk.to_vec();
+          scope.spawn(move || {
+            // Each thread checks out its own handle from the pool
+            let pooled = pool_clone.checkout()?;
+            let repo_thread: &git2::Repository = &pooled;
+            let odb_thread = repo_thread
+              .odb()
+              .map_err(|e| GfsError::internal(format!("opening the object database: {e}")))?;
+
+            chunk_vec
               .iter()
               .map(|entry| {
                 if entry.mode == mode::GITLINK {
                   Ok(0u64)
                 } else {
-                  match odb.read_header(entry.git_oid) {
+                  match odb_thread.read_header(entry.git_oid) {
                     Ok((size, _)) => Ok(size as u64),
                     Err(e) => Err(GfsError::internal(format!("reading blob header: {e}"))),
                   }

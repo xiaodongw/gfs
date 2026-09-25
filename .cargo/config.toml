@@ -1,0 +1,31 @@
+net.git-fetch-with-cli = true
+# The proxy is slower than hitting crates.io directly, so allow more retries
+# to handle transient timeouts during dependency resolution.
+net.retry = 5
+
+[http]
+# The default 30s timeout is too short for the proxy under concurrent load.
+# The proxy fetches from upstream on cache misses, which can take several
+# seconds when many crates are being resolved simultaneously.
+# Note: Cargo defaults to HTTP/2 multiplexing, but the nginx ingress in front
+# of the proxy doesn't negotiate HTTP/2 (ALPN fails), so Cargo falls back to
+# parallel HTTP/1.1 connections — each paying a full TLS handshake.
+# If you still experience network failures, you can disable parallel
+# connections by setting multiplexing = false. This makes resolution
+# sequential (slower but more reliable).
+# multiplexing = false
+timeout = 120
+
+# Route crates.io registry lookups through the age-filtering proxy.
+# This filters out crate versions published less than 7 days ago as a
+# supply chain security measure. Downloads still go directly to the
+# static.crates.io CDN.
+[source.crates-io]
+replace-with = "databricks-proxy"
+
+[source.databricks-proxy]
+registry = "sparse+https://crates-proxy.cloud.databricks.com/"
+
+[registries]
+databricks-proxy  = { index = "sparse+https://crates-proxy.cloud.databricks.com/" }
+

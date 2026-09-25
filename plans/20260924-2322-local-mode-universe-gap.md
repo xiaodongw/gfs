@@ -39,16 +39,19 @@ the full zero-message-open refactor.
 * Measure the 51k-file read, `rg`, `find` cold and warm. Decision rule: a warm
   read under ~1 s continues the effort; otherwise local mode stays a harness.
 
-**Phase 2 — make local-mode create fast** (in progress)
+**Phase A — make local-mode create fast** (complete)
 * Trim `refs/prefetch/*` from `visible_ref_targets`: skip the ~100k hidden
   prefetch namespace that git maintenance hides from decorations. Check object
   type cheaply before expensive `find_tag` so commits are never tag-looked-up.
   Cuts visible_ref_targets time by ~75%.
-* Per-commit index cache: build the tree-descent index once and reuse it on
-  future mounts of the same commit via .git/gfs/indices/<commit-oid>. Survives
-  across mounts and even survives clones copied to other machines. Measured
-  on universe: cold 9.1 s (no regression), warm 0.47 s (80x faster).
-* Parallel index build (deprioritized): too complex with lifetime/order constraints.
+* Per-commit index cache (host-side): build the tree-descent index once and
+  reuse it on future mounts via ~/.cache/gfs/indices/<repo-id>/<commit-oid>.
+  LRU eviction keeps 8 most recent indices. Survives clones copied to other
+  machines. Crash-safe writes with SHA-1 verification. Hardlink-or-copy into
+  workspace's .git/index. Measured on universe: cold ~10 s, warm 0.6 s (16x faster).
+* Parallel index build: deferred tree descent emits entries with sizes
+  collected in parallel. Each thread checks out its own pool handle to avoid
+  libgit2 thread-safety issues. Maintains Git's byte-wise path ordering.
 * Blob size reuse (deferred): needs investigation into whether stock git carries
   sizes forward between indices, which would require a lookup layer.
 * Index size investigation (deferred): gfs index is 205 MiB vs git's 121 MiB
@@ -58,9 +61,8 @@ the full zero-message-open refactor.
 `git status` (seed `FSMN` and `UNTR`), the full zero-message-open refactor
 (including zero-message `opendir`), profiling warm `git status` and commit.
 
-Phases 0 and 1 were built as planned. Phase 2 partially built (items 1 and 2 done).
-One addition to phase 0 was measured and not kept: a larger listing cache for
-local mode (see Decisions).
+Phases 0, 1, and A were built as planned. One addition to phase 0 was measured
+and not kept: a larger listing cache for local mode (see Decisions).
 
 ## Decisions
 
@@ -95,15 +97,17 @@ local mode (see Decisions).
   object type cheaply before expensive `find_tag` cuts that function by ~75%.
   No correctness impact: git itself hides refs/prefetch from decorations and
   `for-each-ref` output unless explicitly asked.
-* **Per-commit index cache, not per-workspace.** The index is a function of only
-  the commit and snapshot_time. Caching at the commit level means reuse across
-  workspaces of the same clone and survives clones copied to other machines (the
-  OID space is immutable). The cache is stored in the clone's .git/gfs/indices/
-  directory (persistent state the clone already has). A future phase that wants
-  per-workspace index content (seeding FSMN/UNTR fsmonitor ident with the
-  worktree path) will need per-workspace copies, but a 0.1–0.15 s copy is still
-  better than a full 9 s rebuild. Caching survives workspace deletions and mount
-  reorders.
+* **Per-commit index cache, host-side, not per-clone.** The index is a function
+  of only the commit and snapshot_time. Caching at the commit level means reuse
+  across workspaces and clones (OID space is immutable). Stored in
+  ~/.cache/gfs/indices/<repo-id>/<commit-oid> (host state, not clone), with
+  LRU eviction keeping 8 most recent per repository. Respects XDG_CACHE_HOME.
+  Crash-safe writes: temp file + fsync + rename. SHA-1 verification on read
+  (git index format trailer). Per-clone cache location (vs all clones' cache
+  in one place) chosen for cache-locality in future: a per-workspace copy
+  (0.1–0.15 s) is better than a 10 s rebuild, and per-workspace indices may be
+  needed when seeding UNTR's worktree-ident. Hardlink into workspace .git/index
+  when on same filesystem (no copy); cross-filesystem fallback to copy.
 
 ## Details
 
@@ -134,15 +138,20 @@ local mode (see Decisions).
 * The spike's unopened reads of `.git` and overlay files reopen the file per
   request on the FUSE thread; fine for measuring the pinned tree, wrong for
   anything else.
-* **Phase 2 results, universe local mode mount** (after refs skip + index cache):
+* **Phase A results, universe local mode mount** (refs skip + host-side cache +
+  parallel header reads):
   
-  | | baseline (before) | after opt 1 | after opt 1+2 |
-  |---|---|---|---|
-  | create (first mount, cache miss) | 7.5–11 s | ~9 s | ~9.1 s |
-  | create (repeat, cache hit) | N/A | N/A | ~0.5 s |
-  | speedup on warm | N/A | N/A | **18–20x** |
+  | | baseline (before Phase A) | after Phase A |
+  |---|---|---|
+  | create (first mount, cache miss) | 7.5–11 s | ~10.0 s (3 runs: 10.56, 9.94, 10.01 s) |
+  | create (repeat, cache hit) | N/A | ~0.62 s |
+  | speedup on warm | N/A | **16–17x** |
+  | cache location | N/A | ~/.cache/gfs/indices/<repo-id>/ |
+  | cache bound | N/A | 8 most recent indices/repo |
   
-  Opt 1 (skip refs/prefetch) has minimal impact on mount time (refs are only
-  looked up when needed). Opt 2 (index cache) provides the dramatic speedup
-  on repeat mounts. The cold-mount time remains ~9 s because other operations
-  (`visible_ref_targets`, packed-refs write) dominate now, not index building.
+  Cold-mount time is similar to baseline; parallel header reads with separate
+  pool handles show no significant speedup over serial (threading overhead ≈
+  performance gain from parallelism). Warm-mount reuse via hardlink/copy is
+  the primary improvement: 16x faster than rebuilding. Cache is host-side
+  (respect for ADR 0013: only anchor ref written to clone). Byte-identical
+  indices verified across multiple builds (SHA-1 trailer checksummed).
