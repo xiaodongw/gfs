@@ -208,15 +208,6 @@ pub trait SnapshotSource: Send + Sync + std::fmt::Debug {
   /// them; every other source has nothing to drop.
   fn forget_blob(&self, _oid: &ObjectId) {}
 
-  /// Check if a blob with the given object ID exists in this source's
-  /// repository. Used in local mode to detect when written content matches
-  /// an existing blob and can be replaced with a reference.
-  /// Returns `false` by default, indicating the source does not support
-  /// arbitrary blob existence checks (e.g., server mode).
-  async fn has_blob(&self, _oid: &ObjectId) -> Result<bool, GfsError> {
-    Ok(false)
-  }
-
   async fn read_blob_shared(
     &self,
     oid: &ObjectId,

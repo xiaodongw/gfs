@@ -294,6 +294,10 @@ pub struct FsStats {
   pub hydration_refusals: u64,
   pub copy_ups: u64,
   pub copy_up_bytes: u64,
+  /// Local copies replaced by a reference to the identical base blob after
+  /// their last writer closed (a checkout back to the pinned commit).
+  #[serde(default)]
+  pub base_references: u64,
   pub errors: u64,
 }
 
@@ -411,6 +415,25 @@ pub struct Backing {
 enum BackingKey {
   Blob(String),
   Content(u64),
+}
+
+/// A writer registered for the length of one mutation that does not go
+/// through a descriptor -- `truncate(2)`, `fallocate` -- released on drop.
+struct WriteClaim {
+  overlay: Arc<Overlay>,
+  id: u64,
+}
+
+impl WriteClaim {
+  fn new(overlay: Arc<Overlay>, id: u64) -> Self {
+    Self { overlay, id }
+  }
+}
+
+impl Drop for WriteClaim {
+  fn drop(&mut self) {
+    self.overlay.writer_closed(self.id);
+  }
 }
 
 #[derive(Debug)]
@@ -1394,6 +1417,7 @@ impl Gfs {
         let Some(id) = entry.content.local_id() else {
           return reply.error(Errno::EIO);
         };
+        let _claim = WriteClaim::new(self.overlay(), id);
         match self.overlay().content_store().open_write(id) {
           Ok(file) => {
             let overlay = self.overlay();
@@ -1500,41 +1524,63 @@ impl Gfs {
   /// `truncating` is the `O_TRUNC` case PLAN.md M3.2 calls out: a caller
   /// replacing a whole file must not pay to download the version it is throwing
   /// away.
+  ///
+  /// Registers a writer on the content it returns (see
+  /// [`gfs_overlay::Overlay::begin_write`]); the caller releases it with
+  /// `writer_closed` when it is done writing -- at `release` for a descriptor,
+  /// through a [`WriteClaim`] for a one-shot mutation.
   async fn copy_up(&self, record: &Record, truncating: bool) -> Result<OverlayEntry, GfsError> {
     let path = record.path.clone();
     let overlay = self.overlay();
     let ino = record.ino;
 
-    // Already local: nothing to do, and nothing to fetch to find that out.
-    if let Node::Overlay(entry) = &record.node {
-      if entry.content.local_id().is_some() {
-        if truncating && entry.size > 0 {
-          let target = path.clone();
-          return self
-            .mutation(move || overlay.truncate(&target, 0))
-            .await
-            .map_err(overlay_as_service_error);
+    // Already local: nothing to fetch. Asked of the overlay, not of the
+    // record, which may predate the row becoming a blob reference.
+    if let Some(entry) = overlay.begin_write(&path) {
+      if truncating && entry.size > 0 {
+        let id = entry.content.local_id();
+        let target = path.clone();
+        let truncated = self
+          .mutation({
+            let overlay = Arc::clone(&overlay);
+            move || overlay.truncate(&target, 0)
+          })
+          .await
+          .map_err(overlay_as_service_error);
+        if truncated.is_err() {
+          if let Some(id) = id {
+            overlay.writer_closed(id);
+          }
         }
-        return Ok((**entry).clone());
+        return truncated;
       }
+      return Ok(entry);
     }
 
-    let (base, source_oid) = match &record.node {
-      Node::Overlay(entry) => (entry.base.clone(), entry.content.base_oid().cloned()),
-      Node::Base(entry) => (base_facts(entry), Some(entry.oid.clone())),
+    let (base, source_oid) = match (overlay.get(&path), &record.node) {
+      (Some(row), _) if row.present => (row.base.clone(), row.content.base_oid().cloned()),
+      (_, Node::Overlay(entry)) => (entry.base.clone(), entry.content.base_oid().cloned()),
+      (_, Node::Base(entry)) => (base_facts(entry), Some(entry.oid.clone())),
       // Passthrough and projection entries never copy up: `.git` writes go to
       // the real disk, and the projection is read-only.
-      Node::Git(_) | Node::Odb(_) => {
+      (_, Node::Git(_) | Node::Odb(_)) => {
         return Err(GfsError::invalid("the .git subtree has no overlay"))
       }
     };
 
     if truncating {
       let target = path.clone();
-      return self
-        .mutation(move || overlay.materialize(&target, base, ino, Source::Empty))
+      let materialized = self
+        .mutation({
+          let overlay = Arc::clone(&overlay);
+          move || overlay.materialize(&target, base, ino, Source::Empty)
+        })
         .await
-        .map_err(overlay_as_service_error);
+        .map_err(overlay_as_service_error)?;
+      if let Some(id) = materialized.content.local_id() {
+        overlay.writer_opened(id);
+      }
+      return Ok(materialized);
     }
 
     let Some(oid) = source_oid else {
@@ -1550,19 +1596,26 @@ impl Gfs {
       s.copy_up_bytes += size;
     });
     let target = path.clone();
-    self
-      .blocking(move || match blob {
-        OpenedBlob::File(file) => {
-          let mut reader = std::io::BufReader::new(file);
-          overlay.materialize(&target, base, ino, Source::Reader(&mut reader))
-        }
-        OpenedBlob::Memory(bytes) => {
-          let mut reader = std::io::Cursor::new(bytes.as_slice());
-          overlay.materialize(&target, base, ino, Source::Reader(&mut reader))
+    let materialized = self
+      .blocking({
+        let overlay = Arc::clone(&overlay);
+        move || match blob {
+          OpenedBlob::File(file) => {
+            let mut reader = std::io::BufReader::new(file);
+            overlay.materialize(&target, base, ino, Source::Reader(&mut reader))
+          }
+          OpenedBlob::Memory(bytes) => {
+            let mut reader = std::io::Cursor::new(bytes.as_slice());
+            overlay.materialize(&target, base, ino, Source::Reader(&mut reader))
+          }
         }
       })
       .await
-      .map_err(overlay_as_service_error)
+      .map_err(overlay_as_service_error)?;
+    if let Some(id) = materialized.content.local_id() {
+      overlay.writer_opened(id);
+    }
+    Ok(materialized)
   }
 
   // -------------------------------------------------------------------------
@@ -1846,6 +1899,67 @@ impl Gfs {
     }
   }
 
+  /// A written file whose last writer just closed: if its bytes turned out to
+  /// be the pinned commit's blob at the same path -- what a `git checkout`
+  /// back to the pinned branch writes, file after file -- replace the copy with
+  /// a reference to that blob (ADR 0017's overlay, plan 20260925-2220 step 2).
+  ///
+  /// In the background, off every FUSE thread: the hash reads the whole file.
+  /// Only a file whose size already matches the base's is hashed, which is
+  /// what keeps an ordinary edit from paying for it.
+  fn reference_base_later(self: &Arc<Self>, entry: OverlayEntry) {
+    if self.config.zero_message_open {
+      return;
+    }
+    let (Some(id), Some(base)) = (entry.content.local_id(), entry.base.as_ref()) else {
+      return;
+    };
+    if entry.renamed_from.is_some()
+      || !matches!(entry.kind, OverlayKind::Regular | OverlayKind::Executable)
+      || entry.size != base.size
+    {
+      return;
+    }
+    let fs = Arc::clone(self);
+    tokio::spawn(async move {
+      let overlay = fs.overlay();
+      let algorithm = fs.pinned().client.binding().algorithm;
+      let file = overlay.content_store().path_of(id).to_path_buf();
+      let size = entry.size;
+      let hashed = tokio::task::spawn_blocking(move || {
+        let mut file = std::fs::File::open(file)
+          .map_err(|e| gfs_overlay::OverlayError::io(format!("reopening content: {e}")))?;
+        gfs_overlay::hash::blob_oid_of_file(algorithm, &mut file, size)
+      })
+      .await;
+      let Ok(Ok(oid)) = hashed else {
+        return;
+      };
+      if entry.base.as_ref().map(|b| &b.oid) != Some(&oid) {
+        return;
+      }
+      let referenced = fs
+        .mutation({
+          let overlay = Arc::clone(&overlay);
+          let entry = entry.clone();
+          move || overlay.reference_base(id, &entry, &oid)
+        })
+        .await;
+      match referenced {
+        Ok(Some(row)) => {
+          // The record first, then the file: a reader that picked up the old
+          // row before this still finds the copy it names.
+          let path = row.path.clone();
+          fs.republish(&path, row);
+          overlay.release_copy(id);
+          fs.bump(|s| s.base_references += 1);
+        }
+        Ok(None) => {}
+        Err(e) => tracing::debug!(error = %e, "referencing a base blob failed"),
+      }
+    });
+  }
+
   fn republish(&self, path: &BytePath, entry: OverlayEntry) -> FileAttr {
     let record = self
       .inodes
@@ -1861,92 +1975,6 @@ impl Gfs {
       .expect("inode table")
       .forget(record.ino, 1);
     attr
-  }
-
-  /// Try to convert a settled content file to a blob reference. Called in the
-  /// background after a descriptor is released. This is a best-effort operation:
-  /// if the file has changed or the blob doesn't exist, it's simply not converted.
-  async fn try_convert_to_blob_reference(
-    &self,
-    content_id: u64,
-    entry: &OverlayEntry,
-  ) -> Result<(), String> {
-    // Don't convert if the content is not Local (already converted or base-only).
-    let Some(local_id) = entry.content.local_id() else {
-      return Ok(());
-    };
-
-    if local_id != content_id {
-      return Ok(());
-    }
-
-    // Get the overlay and content store reference.
-    let overlay = self.overlay();
-    let store = overlay.content_store();
-    let content_path = store.path_of(content_id).to_path_buf();
-    let entry_size = entry.size;
-    let entry_base = entry.base.clone();
-    let entry_path = entry.path.clone();
-
-    // Hash the file as a Git blob using the pinned commit's hash algorithm.
-    let pinned = self.pinned();
-    let algorithm = pinned.client.binding().algorithm;
-
-    let blob_oid = tokio::task::spawn_blocking(move || {
-      let mut file =
-        std::fs::File::open(&content_path).map_err(|e| format!("failed to open content file: {e}"))?;
-      use gfs_overlay::hash;
-      hash::blob_oid_of_file(algorithm, &mut file, entry_size)
-        .map_err(|e| format!("failed to hash content: {e}"))
-    })
-    .await
-    .map_err(|e| format!("hashing task failed: {e}"))?
-    .map_err(|e| e.to_string())?;
-
-    // Check if the blob exists in the repository. In server mode, this returns
-    // false; in local mode, it queries the object store.
-    let has_blob = pinned
-      .client
-      .has_blob(&blob_oid)
-      .await
-      .unwrap_or(false);
-
-    if !has_blob {
-      return Ok(());
-    }
-
-    // Try to convert the content to a blob reference. This is safe to do because:
-    // 1. The content_id still points to the same entry (checked in the overlay)
-    // 2. The content is no longer dirty (we just settled it)
-    // 3. The file's size and mtime matched what we recorded
-    // 4. The blob exists in the repository
-    let blob_oid_clone = blob_oid.clone();
-    let overlay_clone = Arc::clone(&overlay);
-    let conversion_result = self
-      .mutation(move || {
-        overlay_clone.convert_to_blob_reference(content_id, &blob_oid_clone, entry_base.as_ref())
-      })
-      .await;
-
-    match conversion_result {
-      Ok(Some((_converted_entry, freed_content_id))) => {
-        // Free the content file now that the journal row has been updated.
-        // This must happen after the journal is committed to maintain the
-        // ordering invariant: published content before the row that names it.
-        let _ = store.remove(freed_content_id);
-        tracing::debug!(
-          path = %entry_path.escaped(),
-          oid = %blob_oid.to_hex(),
-          "converted to blob reference"
-        );
-        Ok(())
-      }
-      Ok(None) => {
-        // Conversion didn't happen (content changed, or already converted).
-        Ok(())
-      }
-      Err(e) => Err(e.to_string()),
-    }
   }
 }
 
@@ -2465,7 +2493,10 @@ impl Filesystem for GfsFilesystem {
                 fs.republish(&record.path, entry);
                 fs.kernel_or_local(&reply, ino.0, id, file, true)
               }
-              Err(e) => return reply.error(errno_of_overlay(&e)),
+              Err(e) => {
+                fs.overlay().writer_closed(id);
+                return reply.error(errno_of_overlay(&e));
+              }
             }
           }
           Err(e) => {
@@ -2632,6 +2663,8 @@ impl Filesystem for GfsFilesystem {
       let Some(id) = entry.content.local_id() else {
         return reply.error(Errno::EIO);
       };
+      // Released with the descriptor, at `release`.
+      fs.overlay().writer_opened(id);
 
       let record = fs
         .inodes
@@ -2907,6 +2940,13 @@ impl Filesystem for GfsFilesystem {
                 fs.settle_writer(writer).await;
                 fs.remove_writer(writer.ino);
                 fs.release_backing(backing);
+                fs.overlay().writer_closed(writer.content_id);
+                if let Some(entry) = fs
+                  .record(writer.ino)
+                  .and_then(|record| fs.overlay().get(&record.path))
+                {
+                  fs.reference_base_later(entry);
+                }
               }
               drop(state);
               fs.inodes.lock().expect("inode table").close(ino.0);
@@ -2926,30 +2966,18 @@ impl Filesystem for GfsFilesystem {
           let content_id = *content_id;
           self.spawn(async move {
             let overlay = fs.overlay();
-            match fs
-              .mutation(move || overlay.settle_content(content_id))
-              .await
-            {
+            let settled = fs
+              .mutation({
+                let overlay = Arc::clone(&overlay);
+                move || overlay.settle_content(content_id)
+              })
+              .await;
+            overlay.writer_closed(content_id);
+            match settled {
               Ok(Some(entry)) => {
                 let path = entry.path.clone();
                 fs.republish(&path, entry.clone());
-
-                // In the background, try to convert the content to a blob
-                // reference if the bytes match an existing blob in the repository.
-                // Skip this if zero_message_open is on (the spike disables release
-                // callbacks entirely).
-                if !fs.config.zero_message_open {
-                  let fs_clone = Arc::clone(&fs);
-                  let entry_clone = entry.clone();
-                  tokio::spawn(async move {
-                    if let Err(e) = fs_clone
-                      .try_convert_to_blob_reference(content_id, &entry_clone)
-                      .await
-                    {
-                      tracing::debug!(error = %e, "converting to blob reference failed (expected in server mode)");
-                    }
-                  });
-                }
+                fs.reference_base_later(entry);
               }
               Ok(None) => {}
               Err(e) => tracing::warn!(error = %e, "settling a written file's row failed"),
@@ -3627,10 +3655,13 @@ impl Filesystem for GfsFilesystem {
       if let Some(size) = size {
         // Truncating to zero replaces the whole file, so the old bytes are never
         // fetched. Any other size needs them.
-        match fs.copy_up(&record, size == 0).await {
-          Ok(_) => {}
+        let _claim = match fs.copy_up(&record, size == 0).await {
+          Ok(entry) => entry
+            .content
+            .local_id()
+            .map(|id| WriteClaim::new(fs.overlay(), id)),
           Err(e) => return reply.error(errno_of(&e)),
-        }
+        };
         let overlay = fs.overlay();
         let path = record.path.clone();
         if let Err(e) = fs.mutation(move || overlay.truncate(&path, size)).await {
@@ -3973,9 +4004,13 @@ impl Filesystem for GfsFilesystem {
           Err(errno) => reply.error(errno),
         };
       }
-      if let Err(e) = fs.copy_up(&record, false).await {
-        return reply.error(errno_of(&e));
-      }
+      let _claim = match fs.copy_up(&record, false).await {
+        Ok(entry) => entry
+          .content
+          .local_id()
+          .map(|id| WriteClaim::new(fs.overlay(), id)),
+        Err(e) => return reply.error(errno_of(&e)),
+      };
       let wanted = offset.saturating_add(length);
       let current = fs.overlay().get(&record.path).map(|e| e.size).unwrap_or(0);
       if wanted <= current {

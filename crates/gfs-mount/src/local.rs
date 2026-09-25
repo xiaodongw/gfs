@@ -326,28 +326,6 @@ impl LocalRepository {
       .insert(key, Arc::clone(&bytes));
     Ok(bytes)
   }
-
-  /// Check if a blob with the given OID exists in this repository's object store.
-  pub async fn has_blob(&self, oid: &ObjectId) -> Result<bool, GfsError> {
-    let oid_hex = oid.to_hex();
-    let clone = self.clone.clone();
-    tokio::task::spawn_blocking(move || {
-      let repo = git2::Repository::open(&clone)
-        .map_err(|e| GfsError::internal(format!("failed to open repository: {}", e)))?;
-      let odb = repo
-        .odb()
-        .map_err(|e| GfsError::internal(format!("failed to open object database: {}", e)))?;
-      let oid = git2::Oid::from_str(&oid_hex)
-        .map_err(|e| GfsError::internal(format!("invalid object id: {}", e)))?;
-      odb
-        .read_header(oid)
-        .map(|_| true)
-        .map_err(|_| GfsError::not_found("blob not found"))
-        .or_else(|_| Ok(false))
-    })
-    .await
-    .map_err(|e| GfsError::internal(format!("failed to check blob existence: {}", e)))?
-  }
 }
 
 /// What pinning a selector produced.
@@ -647,10 +625,6 @@ impl SnapshotSource for LocalSource {
     tokio::task::spawn_blocking(move || scan(&repo, &commit, &query, entries, max_results, started))
       .await
       .map_err(|e| GfsError::internal(format!("the local search task failed: {e}")))?
-  }
-
-  async fn has_blob(&self, oid: &ObjectId) -> Result<bool, GfsError> {
-    self.repo.has_blob(oid).await
   }
 
   async fn renew_mount(&self, _mount_id: &MountId) -> Result<Timestamp, GfsError> {

@@ -245,6 +245,11 @@ struct Inner {
   dirty: HashSet<u64>,
   /// Content ids published since the last [`Overlay::sync`], not yet fsynced.
   unsynced: HashSet<u64>,
+  /// Content ids someone is writing, with how many writers: every writable
+  /// descriptor, and a truncate or allocate in flight. A content file with a
+  /// writer is never replaced by a blob reference ([`Overlay::reference_base`]),
+  /// because the writer would go on writing into a file nothing names.
+  writers: HashMap<u64, usize>,
   /// Committed transactions since this process opened the overlay. The
   /// fsmonitor token carries it so the token advances when the filesystem
   /// changes, which is what the v2 protocol asks of it. Initialized to 0 at
@@ -410,6 +415,7 @@ impl Overlay {
         instance_id,
         dirty: HashSet::new(),
         unsynced: HashSet::new(),
+        writers: HashMap::new(),
         stamps: HashMap::new(),
       }),
       store,
@@ -517,6 +523,7 @@ impl Overlay {
     inner.sequence = 0;
     inner.stamps.clear();
     inner.dirty.clear();
+    inner.writers.clear();
     inner.unsynced.clear();
     let _ = self.store.sweep(&HashSet::new());
     Ok(())
@@ -720,13 +727,30 @@ impl Overlay {
     release: Vec<u64>,
     root_times: Option<(Timestamp, Timestamp)>,
   ) -> Result<()> {
+    self.commit_with(inner, changes, release, root_times, true)
+  }
+
+  /// [`Overlay::commit`], optionally without telling fsmonitor. Only for a
+  /// transaction nothing can observe -- the bytes, the stat data, and the name
+  /// all stay what they were -- where a stamp would cost Git an `lstat`, an
+  /// untracked-cache invalidation, and an index rewrite for nothing.
+  fn commit_with(
+    &self,
+    inner: &mut Inner,
+    changes: Vec<Change>,
+    release: Vec<u64>,
+    root_times: Option<(Timestamp, Timestamp)>,
+    stamp: bool,
+  ) -> Result<()> {
     // What this transaction does to the vanished set, decided before it is
     // applied so the journal writes both halves together.
     let delta = crate::journal::VanishedDelta::of(&changes);
     let overflow = inner.vanished_overflow
       || inner.vanished.len() + delta.gone.len() > crate::journal::VANISHED_LIMIT;
     // Increment the sequence first so the rows are stamped with the new sequence.
-    inner.sequence += 1;
+    if stamp {
+      inner.sequence += 1;
+    }
     let current_sequence = inner.sequence;
     inner.journal.apply(
       &changes,
@@ -748,7 +772,9 @@ impl Overlay {
       }
       for path in &delta.gone {
         // Stamp the path as it enters vanished.
-        inner.stamps.insert(path.clone(), current_sequence);
+        if stamp {
+          inner.stamps.insert(path.clone(), current_sequence);
+        }
         inner.vanished.insert(path.clone());
       }
     }
@@ -756,7 +782,9 @@ impl Overlay {
       match change {
         Change::Put(entry) => {
           // Stamp this path as modified.
-          inner.stamps.insert(entry.path.as_bytes().to_vec(), current_sequence);
+          if stamp {
+            inner.stamps.insert(entry.path.as_bytes().to_vec(), current_sequence);
+          }
           if let Some(previous) = inner.entries.get(entry.path.as_bytes()) {
             if let Some(id) = previous.content.local_id() {
               inner.local_bytes = inner.local_bytes.saturating_sub(previous.size);
@@ -782,7 +810,9 @@ impl Overlay {
         }
         Change::Delete(path) => {
           // Stamp this path as modified.
-          inner.stamps.insert(path.as_bytes().to_vec(), current_sequence);
+          if stamp {
+            inner.stamps.insert(path.as_bytes().to_vec(), current_sequence);
+          }
           if let Some(previous) = inner.entries.remove(path.as_bytes()) {
             if let Some(id) = previous.content.local_id() {
               inner.local_bytes = inner.local_bytes.saturating_sub(previous.size);
@@ -1403,6 +1433,104 @@ impl Overlay {
     self.settle_locked(&mut inner, content_id)
   }
 
+  /// Register a writer on `path`'s content, if the row holds a local copy,
+  /// and return the row. One lock for both, so a concurrent
+  /// [`Overlay::reference_base`] either sees the writer or has already turned
+  /// the row into a reference -- in which case this answers `None` and the
+  /// caller copies up afresh. Every registration is paired with
+  /// [`Overlay::writer_closed`].
+  pub fn begin_write(&self, path: &BytePath) -> Option<OverlayEntry> {
+    let mut inner = self.lock();
+    let entry = inner
+      .entries
+      .get(path.as_bytes())
+      .filter(|e| e.present)
+      .cloned()?;
+    let id = entry.content.local_id()?;
+    *inner.writers.entry(id).or_default() += 1;
+    Some(entry)
+  }
+
+  /// Register a writer on a content id just created for it. Nothing can
+  /// reference a content id before its first writer closes, so no race.
+  pub fn writer_opened(&self, content_id: u64) {
+    *self.lock().writers.entry(content_id).or_default() += 1;
+  }
+
+  /// The writer registered by [`Overlay::begin_write`] or
+  /// [`Overlay::writer_opened`] is done.
+  pub fn writer_closed(&self, content_id: u64) {
+    let mut inner = self.lock();
+    if let Some(count) = inner.writers.get_mut(&content_id) {
+      *count -= 1;
+      if *count == 0 {
+        inner.writers.remove(&content_id);
+      }
+    }
+  }
+
+  /// Replace a local copy whose bytes are the pinned commit's blob at the
+  /// same path with a reference to that blob, keeping everything else about
+  /// the row -- inode number, size, mode, and times, which Git recorded at
+  /// checkout and which a build tool must never see move backwards.
+  ///
+  /// `hashed` is the row as it was when its content was hashed to `oid`. The
+  /// swap happens only if nothing changed since: the row still names the
+  /// content id, with the same size and times, is not dirty, and has no
+  /// writer. The row then means exactly what a base row after `chmod` or a
+  /// metadata-only change means (`Content::Base`), which every reader of the
+  /// overlay already handles.
+  ///
+  /// Committed without a stamp and without advancing the sequence: nothing a
+  /// reader can observe changes. Returns the new row; the caller republishes
+  /// it and then releases the content file with [`Overlay::release_copy`], in
+  /// that order, so that no reader holding the old row finds the file gone.
+  pub fn reference_base(
+    &self,
+    content_id: u64,
+    hashed: &OverlayEntry,
+    oid: &ObjectId,
+  ) -> Result<Option<OverlayEntry>> {
+    let mut inner = self.lock();
+    let Some(entry) = inner.entries.get(hashed.path.as_bytes()).cloned() else {
+      return Ok(None);
+    };
+    let unchanged = entry.present
+      && entry.content.local_id() == Some(content_id)
+      && entry.size == hashed.size
+      && entry.mtime == hashed.mtime
+      && entry.ctime == hashed.ctime
+      && entry.renamed_from.is_none()
+      && entry.base.as_ref().is_some_and(|b| &b.oid == oid)
+      && !inner.dirty.contains(&content_id)
+      && !inner.writers.contains_key(&content_id);
+    if !unchanged {
+      return Ok(None);
+    }
+    let referenced = OverlayEntry {
+      content: Content::Base(oid.clone()),
+      ..entry
+    };
+    self.commit_with(
+      &mut inner,
+      vec![Change::Put(referenced.clone())],
+      Vec::new(),
+      None,
+      false,
+    )?;
+    Ok(Some(referenced))
+  }
+
+  /// Remove a content file [`Overlay::reference_base`] stopped naming.
+  pub fn release_copy(&self, content_id: u64) {
+    let mut inner = self.lock();
+    if inner.by_content.contains_key(&content_id) {
+      return;
+    }
+    inner.unsynced.remove(&content_id);
+    let _ = self.store.remove(content_id);
+  }
+
   /// Commit the row for content written through the daemon: the release of a
   /// descriptor the daemon served writes for. Cheap when nothing was written.
   /// `None` when no row names the content any more (unlinked while open).
@@ -1932,105 +2060,6 @@ impl Overlay {
       Self::push_touch(touch, &mut changes, &mut root_times, now);
     }
     self.commit(&mut inner, changes, release, root_times)
-  }
-
-  /// Try to convert a content file to a blob reference if the bytes match an
-  /// existing blob in the repository. Called in the background after a descriptor
-  /// is released. Returns the updated entry if conversion succeeded, or None if
-  /// the content no longer exists or has changed.
-  ///
-  /// This method checks if:
-  /// 1. The content_id still points to the same path (hasn't been unlinked or
-  ///    replaced by another write).
-  /// 2. The file is no longer dirty (no writable descriptors open).
-  /// 3. The file's size and mtime match what we recorded at settle time.
-  /// 4. The blob exists in the repository and matches the recorded hash.
-  ///
-  /// If all checks pass, the row's content is replaced with a reference to the
-  /// blob, the content file is freed (by returning a file id to delete), and the
-  /// row is committed to the journal without advancing the fsmonitor sequence
-  /// (the bytes and stat are unchanged).
-  pub fn convert_to_blob_reference(
-    &self,
-    content_id: u64,
-    blob_oid: &ObjectId,
-    base_facts: Option<&BaseFacts>,
-  ) -> Result<Option<(OverlayEntry, u64)>> {
-    let mut inner = self.lock();
-
-    let Some(path) = inner.by_content.get(&content_id).cloned() else {
-      return Ok(None);
-    };
-
-    let Some(mut entry) = inner
-      .entries
-      .get(path.as_slice())
-      .cloned()
-    else {
-      return Ok(None);
-    };
-
-    // Only convert Local content.
-    let Some(local_id) = entry.content.local_id() else {
-      return Ok(None);
-    };
-
-    // Ensure content_id matches.
-    if local_id != content_id {
-      return Ok(None);
-    }
-
-    // Don't convert if the content is still dirty (actively being written).
-    if inner.dirty.contains(&content_id) {
-      return Ok(None);
-    }
-
-    // Check if the blob matches the base. If so, the row should show
-    // Content::Base with the same ino, size, mtime, ctime, and mode.
-    // If not, in local mode the row shows Content::Base with the new blob oid.
-    // The check is: oid matches AND mode matches (regular vs executable).
-    let should_drop_row = if let Some(base) = base_facts {
-      blob_oid == &base.oid && entry.kind.to_entry_kind() == base.kind
-    } else {
-      false
-    };
-
-    if should_drop_row {
-      // The blob matches the base exactly. Drop the row entirely to free quota,
-      // but keep the returned (entry, content_id) so the caller can free the
-      // content file after committing the deletion to the journal.
-      release_content(&mut inner.by_content, content_id, &path);
-      inner.entries.remove(path.as_slice());
-      inner.local_bytes = inner.local_bytes.saturating_sub(entry.size);
-
-      // Record the deletion in the journal. Since the bytes and stat are
-      // unchanged, this does not advance the sequence or stamp the path.
-      self.commit(
-        &mut inner,
-        vec![Change::Delete(BytePath::new(path))],
-        Vec::new(),
-        None,
-      )?;
-
-      Ok(Some((entry, local_id)))
-    } else {
-      // The blob exists but doesn't match the base. In local mode, we can
-      // reference it anyway. In server mode, this shouldn't happen (return None).
-      entry.content = Content::Base(blob_oid.clone());
-      release_content(&mut inner.by_content, content_id, &path);
-      inner.local_bytes = inner.local_bytes.saturating_sub(entry.size);
-
-      // Update the entry in the journal. The bytes and stat are unchanged, so
-      // this does not advance the sequence or stamp the path.
-      self.commit(
-        &mut inner,
-        vec![Change::Put(entry.clone())],
-        Vec::new(),
-        None,
-      )?;
-
-      Ok(Some((entry, local_id)))
-    }
   }
 }
 

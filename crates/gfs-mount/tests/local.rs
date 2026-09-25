@@ -303,3 +303,121 @@ async fn a_prewarmed_local_mount_inflates_the_tree_in_the_background() {
   assert_eq!(content, b"# basic\n");
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_checkout_back_to_the_pinned_commit_leaves_no_copies_behind() {
+  // A stock `git checkout` writes every differing file through the mount.
+  // Going back to the pinned commit writes the base's own bytes again, and
+  // once each file's last writer closes the copy gives way to a reference to
+  // the base blob: no quota held, same stat, same bytes.
+  let clone_dir = tempfile::tempdir().unwrap();
+  let clone = clone_dir.path().join("clone");
+  Job::clone_fixture("basic", &clone);
+  let job = Job::local_from(&clone, "main", tempfile::tempdir().unwrap()).await;
+  let ws = job.workspace.clone();
+
+  let settle = |job: &Job| {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+      let report = job.daemon.inspect();
+      if report.overlay.local_bytes == 0 || std::time::Instant::now() > deadline {
+        return report;
+      }
+      std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+  };
+
+  // The same bytes over a base file.
+  let before = on_fs({
+    let ws = ws.clone();
+    move || {
+      use std::os::unix::fs::MetadataExt;
+      std::fs::write(ws.join("README.md"), b"# basic\n").unwrap();
+      let m = std::fs::metadata(ws.join("README.md")).unwrap();
+      (m.ino(), m.len(), m.mtime(), m.mtime_nsec())
+    }
+  })
+  .await;
+  let report = tokio::task::block_in_place(|| settle(&job));
+  assert_eq!(report.overlay.local_bytes, 0, "{:?}", report.overlay);
+  assert!(report.stats.base_references >= 1, "{:?}", report.stats);
+  let (after, bytes) = on_fs({
+    let ws = ws.clone();
+    move || {
+      use std::os::unix::fs::MetadataExt;
+      let m = std::fs::metadata(ws.join("README.md")).unwrap();
+      (
+        (m.ino(), m.len(), m.mtime(), m.mtime_nsec()),
+        std::fs::read(ws.join("README.md")).unwrap(),
+      )
+    }
+  })
+  .await;
+  assert_eq!(after, before, "the reference keeps the stat Git recorded");
+  assert_eq!(bytes, b"# basic\n");
+
+  // A write after that copies up again, from the blob.
+  let appended = on_fs({
+    let ws = ws.clone();
+    move || {
+      use std::io::Write;
+      let mut f = std::fs::OpenOptions::new()
+        .append(true)
+        .open(ws.join("README.md"))
+        .unwrap();
+      f.write_all(b"more\n").unwrap();
+      drop(f);
+      std::fs::read(ws.join("README.md")).unwrap()
+    }
+  })
+  .await;
+  assert_eq!(appended, b"# basic\nmore\n");
+  assert!(job.daemon.inspect().overlay.local_bytes > 0);
+
+  // A checkout away and back.
+  let plain = |ws: &std::path::Path| {
+    git_in(
+      ws,
+      &[
+        "-c",
+        "core.fsmonitor=false",
+        "-c",
+        "core.untrackedCache=false",
+        "status",
+        "--porcelain",
+      ],
+    )
+    .1
+  };
+  let status = on_fs({
+    let ws = ws.clone();
+    move || {
+      assert!(git_in(&ws, &["checkout", "-q", "--", "README.md"]).0);
+      let (ok, out) = git_in(&ws, &["checkout", "-q", "v1.0"]);
+      assert!(ok, "{out}");
+      assert_eq!(
+        std::fs::read(ws.join("src/main.rs")).unwrap(),
+        b"fn main() { println!(\"hi\"); }\n"
+      );
+      let (ok, out) = git_in(&ws, &["checkout", "-q", "main"]);
+      assert!(ok, "{out}");
+      git_in(&ws, &["status", "--porcelain"]).1
+    }
+  })
+  .await;
+  assert_eq!(status, "", "back on the pinned commit, nothing to report");
+  let report = tokio::task::block_in_place(|| settle(&job));
+  assert_eq!(report.overlay.local_bytes, 0, "{:?}", report.overlay);
+  let (status, oracle, main_rs) = on_fs({
+    let ws = ws.clone();
+    move || {
+      (
+        git_in(&ws, &["status", "--porcelain"]).1,
+        plain(&ws),
+        std::fs::read(ws.join("src/main.rs")).unwrap(),
+      )
+    }
+  })
+  .await;
+  assert_eq!(status, oracle);
+  assert_eq!(main_rs, b"fn main() { println!(\"bye\"); }\n");
+}

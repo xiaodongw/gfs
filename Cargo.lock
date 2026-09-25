@@ -652,7 +652,6 @@ dependencies = [
  "gfs-service",
  "gfs-test",
  "gfs-types",
- "git2",
  "http",
  "http-body-util",
  "hyper",

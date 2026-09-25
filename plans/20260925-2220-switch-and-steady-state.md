@@ -36,7 +36,7 @@ Each step is done by one subagent, sequentially (steps 1 and 2 both touch the
 overlay journal), and each ends with a build, the smoke tests, a measurement
 on universe with a private daemon, and a commit on `main`.
 
-**Step 1 — delta fsmonitor answers** (complete: commit df5d53b)
+**Step 1 — delta fsmonitor answers** (complete)
 * Token `gfs:<generation>:<instance>:<sequence>`. The instance is this opening
   of the overlay (a counter in the journal's `meta`, bumped by every
   `Overlay::open`); the sequence counts mutations in the instance.
@@ -52,14 +52,22 @@ on universe with a private daemon, and a commit on `main`.
   rescan only for another generation or a vanished overflow, as before.
 * Smoke test `gfs-fuse/tests/fsmonitor.rs::the_answer_is_a_delta_and_a_quiet_status_rewrites_nothing`.
 
-**Step 2 — blob references instead of copies**
-* On settle (release/sync) of a content file, off the FUSE thread: hash it as
-  a Git blob; if the clone's object store has that blob, turn the row into a
-  blob reference and free the content file; if the reference equals the pinned
-  commit's entry at that path (oid and mode), drop the row entirely.
-* Blob-referenced rows cost no overlay quota.
-* Target: switching away and back leaves 0 rows / ~0 bytes; the quota failure
-  above does not reproduce.
+**Step 2 — blob references instead of copies** (complete, narrowed)
+* When the last writer of a content file closes and the file's size equals
+  the base's, hash it in the background; if it is the pinned commit's blob at
+  the same path, the row becomes `Content::Base(oid)` (the existing
+  "metadata diverged, bytes did not" row) keeping its inode number, size,
+  mode and times, and the copy is freed. Committed without a stamp or a
+  sequence bump, so fsmonitor and Git see nothing.
+* Writers are counted in the overlay: `copy_up` registers one against the
+  row the overlay holds now (not the inode record, which a conversion can
+  make stale), `create` registers its new content, `release` and the
+  one-shot `truncate`/`fallocate` paths release theirs. A copy with a writer,
+  a dirty row, or a size/time that moved since the hash is never replaced.
+  The inode record is republished before the copy is removed.
+* Local mode's default overlay quota is 32 GiB (server mounts keep 1 GiB).
+* Not built: references to blobs other than the base's (see Decisions).
+* Smoke test `crates/gfs-mount/tests/local.rs::a_checkout_back_to_the_pinned_commit_leaves_no_copies_behind`.
 
 **Step 3 — `gfs switch` for local mode**
 * No gateway connection in local mode.
@@ -98,6 +106,25 @@ on universe with a private daemon, and a commit on `main`.
   lets the stamps be a plain in-memory map, with no SQL on the hook's path.
   The cumulative answer is what this replaces.
 
+* **Only the base's own blob is referenced, for now.** The first version
+  (f2cf7f2, reverted) referenced any blob the clone had through
+  `Content::Base`. Every reader of a `Content::Base` row takes it to mean "the
+  pinned commit's bytes at this path (or `renamed_from`)": search re-homes the
+  server's result for that path instead of searching the bytes, so a row
+  naming another blob would search the wrong content. It also left the inode
+  record naming a deleted copy, removed the copy under a writer that reopened
+  the file, and did not check that the file was unchanged since the hash.
+  Referencing arbitrary blobs needs its own variant, handled by search,
+  export, the commit plan and the read paths; until then a checkout to
+  another branch keeps copies, and the larger local quota is what keeps a
+  stock `git switch` from hitting `EDQUOT`.
+* **A kept row, not a dropped one.** Dropping the row would put the path back
+  on the base's inode number and snapshot time: Git recorded the checkout's
+  stat data, and a build tool must never see an mtime move backwards.
+* **32 GiB local quota.** The 1 GiB default is a server-job budget; in local
+  mode the overlay shares the disk the clone is on, and one stock switch
+  between universe branches writes 0.8–1.3 GB.
+
 * **`gfs switch` replaces `git switch`; it does not run before it.** Re-pinning
   first and then running `git switch` fails: the index still describes the old
   commit while the files show the new one, so Git sees every differing path as
@@ -118,27 +145,6 @@ on universe with a private daemon, and a commit on `main`.
 * **Staged changes block `gfs switch` in v1**: the re-seeded index would drop
   them silently otherwise.
 
-* **Content::Base reused for arbitrary blobs in local mode.** When written
-  content matches an existing blob in the object store, the row's Content::Local
-  is converted to Content::Base(oid) with the blob's oid, even if the blob is not
-  from the current path in the commit. This works because LocalSource.serves_blobs_in_memory()
-  is true, so the mount's open_blob path calls read_blob_shared(oid, "") directly
-  without resolving through the tree. In server mode, has_blob() returns false,
-  so conversion only happens for blobs equal to the base (same path, same oid, same mode),
-  which are served through the normal tree resolution path.
-
-* **Blob conversion is background, no stamping.** After settle_content or settle_all,
-  a separate async task hashes the file, checks if the blob exists, and calls
-  convert_to_blob_reference. The conversion commits to the journal without stamping
-  the path or advancing the fsmonitor sequence, since the bytes and stat data are
-  unchanged. This is safe because the content_id is checked against the current row
-  to ensure the file hasn't been deleted or replaced since hashing.
-
-* **Metadata is preserved on conversion.** When a row is converted from Content::Local
-  to Content::Base, the ino, size, mtime, ctime, and mode are kept unchanged. This
-  matches Git's expectations for stat data: build tools must never see an mtime go
-  backwards, and Git records the stat data at checkout.
-
 ## Details
 
 * **Step 1 results, universe** (fresh private workspace, 3 edited or new
@@ -156,6 +162,24 @@ on universe with a private daemon, and a commit on `main`.
   `overlay::a_row_left_behind_by_an_unsettled_write_is_corrected_from_its_content_file`.
   A daemon restart is not covered by a test (the harness has no restart);
   by construction it yields a full answer.
+
+* **Step 2 results, universe** (fresh private workspace on `master`, stock
+  `git switch` each time; every status matched the uncached answer, 200
+  switched files re-hashed to their index blob, `gfs status` clean):
+
+  | step | before | after |
+  |---|---|---|
+  | switch to `universe-goofys-grpc` (24.5k files) | 14.6 s, 822 MB | 14.0 s, 822 MB |
+  | back to `master` | 17.2 s, 881 MB held | 19.0 s, **0 bytes** held |
+  | to `xiaodong-wang_data/uc-fuse-grpc-s2s` (~50k) | 62 s, quota hit, 5 233 files missing | **27 s**, 1.33 GB, nothing missing |
+  | back to `master` | — | 32 s, **0 bytes** |
+  | status after the last switch | — | 10.0 s once, then 1.9 s |
+
+  Rows stay (68 658 after the last round trip) as zero-byte references.
+* Tests: `gfs-mount` and `gfs-fuse` run whole (`--no-fail-fast`): only the
+  known `mutations::a_recreated_directory_does_not_show_the_base_children_it_replaced`
+  and `prefetch::reading_a_directory_through_fetches_the_rest_of_it` fail;
+  `gfs-overlay`: only the known `overlay::a_row_left_behind_by_an_unsettled_write_is_corrected_from_its_content_file`.
 
 * Traces and probes: `GIT_TRACE2_PERF` on `git status` / `git switch` in a
   private workspace (`GFS_HOST_SOCKET=/tmp/gfsb/host.sock`, workspace

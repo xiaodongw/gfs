@@ -179,8 +179,12 @@ enum Command {
     allow_other: bool,
     #[arg(long, default_value_t = 8 * 1024 * 1024 * 1024)]
     cache_quota: u64,
-    #[arg(long, default_value_t = 1024 * 1024 * 1024)]
-    overlay_quota: u64,
+    /// Bytes of local content the workspace may hold. Defaults to 1 GiB for a
+    /// server mount, 32 GiB in local mode: there the overlay shares the disk
+    /// the clone already lives on, and a stock `git switch` between monorepo
+    /// branches writes gigabytes through it.
+    #[arg(long)]
+    overlay_quota: Option<u64>,
     /// Run the daemon in this terminal instead of in the background.
     #[arg(long)]
     foreground: bool,
@@ -898,6 +902,11 @@ fn do_mount(cli: &Cli, args: MountArgs) -> Result<()> {
   Ok(())
 }
 
+/// `gfs mount --overlay-quota`'s default for a server mount.
+const SERVER_OVERLAY_QUOTA: u64 = 1024 * 1024 * 1024;
+/// And for local mode; see the flag's help for why it is larger.
+const LOCAL_OVERLAY_QUOTA: u64 = 32 * 1024 * 1024 * 1024;
+
 struct MountArgs {
   repo: String,
   /// Local mode: the clone to mount from, absolutized before it crosses the
@@ -1361,7 +1370,11 @@ async fn main() -> Result<()> {
             cache_dir: cache_dir.clone(),
             allow_other: *allow_other,
             cache_quota: *cache_quota,
-            overlay_quota: *overlay_quota,
+            overlay_quota: overlay_quota.unwrap_or(if local.is_some() {
+              LOCAL_OVERLAY_QUOTA
+            } else {
+              SERVER_OVERLAY_QUOTA
+            }),
             foreground: *foreground,
             timeout_seconds: *timeout_seconds,
             writeback_cache: *writeback_cache,
