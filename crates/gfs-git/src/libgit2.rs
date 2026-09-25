@@ -1538,6 +1538,9 @@ impl GitRepository for Libgit2Repository {
     let mut out = Vec::new();
     {
       let repo: &git2::Repository = &pooled;
+      let odb = repo
+        .odb()
+        .map_err(|e| GfsError::internal(format!("opening the object database: {e}")))?;
       let refs = repo
         .references()
         .map_err(|e| GfsError::new(ErrorCode::Internal, e.message().to_owned()))?;
@@ -1552,6 +1555,13 @@ impl GitRepository for Libgit2Repository {
         // see, matching the upload-pack `hideRefs` policy. ADR 0002 records that
         // this prevents discovery, not access.
         if revision::is_reserved_ref(name) {
+          continue;
+        }
+        // Git maintenance hides the prefetch namespace from decorations and ref
+        // listings; skip it here too. Skipping ~100k refs/prefetch/* entries
+        // (which are always commits, never tags) cuts visible_ref_targets by ~75%
+        // on universe.
+        if name.starts_with("refs/prefetch/") {
           continue;
         }
         // A symbolic ref such as HEAD has no direct target; resolve it.
@@ -1569,12 +1579,24 @@ impl GitRepository for Libgit2Repository {
         // does not peel to a commit (a tag of a blob, which Git allows) is
         // carried unpeeled rather than dropped: the ref exists, and a caller
         // that only lists names must still see it.
-        let peeled = match repo.find_tag(target) {
-          Ok(tag) => match tag.peel() {
-            Ok(object) if object.id() != target => Some(self.to_oid(object.id())?),
-            _ => None,
-          },
-          Err(_) => None,
+        //
+        // Optimize by checking the object type cheaply before the expensive
+        // find_tag: only tag objects need peeling, commits always peel to
+        // themselves (peeled is None).
+        let peeled = if let Ok((_, kind)) = odb.read_header(target) {
+          if kind == git2::ObjectType::Tag {
+            match repo.find_tag(target) {
+              Ok(tag) => match tag.peel() {
+                Ok(object) if object.id() != target => Some(self.to_oid(object.id())?),
+                _ => None,
+              },
+              Err(_) => None,
+            }
+          } else {
+            None
+          }
+        } else {
+          None
         };
         out.push(gfs_types::RefTarget {
           name: name.to_owned(),

@@ -91,6 +91,7 @@ pub struct LocalRepository {
   clone: PathBuf,
   repository_id: RepositoryId,
   objects: PathBuf,
+  index_cache_dir: PathBuf,
   repo: AsyncRepository,
   blobs: Mutex<BlobMemory>,
 }
@@ -116,10 +117,24 @@ impl LocalRepository {
     let repo = Libgit2Repository::open(&clone, limits::DEFAULT_REPO_HANDLES, TREE_CACHE_BYTES)?;
     let objects = repo.objects_directory()?;
     let repository_id = repository_id_for(&clone);
+
+    // Index cache lives in the clone's .git/gfs/indices directory, so it
+    // persists across mounts of the same clone and survives clones copied to
+    // different machines (as long as the OID space doesn't change, which it won't
+    // for a fixed commit).
+    let index_cache_dir = clone.join(".git/gfs/indices");
+    if let Err(e) = std::fs::create_dir_all(&index_cache_dir) {
+      tracing::warn!(
+        "failed to create index cache dir {}: {e}",
+        index_cache_dir.display()
+      );
+    }
+
     Ok(Arc::new(LocalRepository {
       clone,
       repository_id,
       objects,
+      index_cache_dir,
       repo: AsyncRepository::new(Arc::new(repo), limits::DEFAULT_REPO_HANDLES),
       blobs: Mutex::new(BlobMemory::new(BLOB_MEMORY_BYTES)),
     }))
@@ -178,6 +193,40 @@ impl LocalRepository {
       ref_name: resolved.ref_name,
       snapshot_time: resolved.snapshot_time,
     })
+  }
+
+  /// Build or retrieve a cached index for a commit.
+  ///
+  /// Indices are cached on disk keyed by commit OID. On first build they're
+  /// saved; on future builds they're reused. The cache survives across mounts
+  /// of the same clone and even survives clones copied to another machine
+  /// (since the OID space is immutable).
+  pub async fn cached_index(
+    &self,
+    commit: &ObjectId,
+    snapshot_time: Timestamp,
+  ) -> Result<Vec<u8>, GfsError> {
+    let commit_hex = commit.to_hex();
+    let cache_path = self.index_cache_dir.join(&commit_hex);
+
+    // Check if the index is already cached.
+    if let Ok(bytes) = std::fs::read(&cache_path) {
+      tracing::debug!("reusing cached index for {}", &commit_hex);
+      return Ok(bytes);
+    }
+
+    // Build the index.
+    let index = self
+      .repo
+      .index_for_commit(commit.clone(), snapshot_time)
+      .await?;
+
+    // Try to cache it for next time. Failure doesn't fail the mount.
+    if let Err(e) = std::fs::write(&cache_path, &index) {
+      tracing::debug!("failed to write index cache for {}: {e}", &commit_hex);
+    }
+
+    Ok(index)
   }
 
   /// A blob's bytes, inflated once and shared.
@@ -389,8 +438,7 @@ impl SnapshotSource for LocalSource {
   async fn commit_index(&self, commit: &ObjectId) -> Result<Vec<u8>, GfsError> {
     self
       .repo
-      .repo
-      .index_for_commit(commit.clone(), self.binding.snapshot_time)
+      .cached_index(commit, self.binding.snapshot_time)
       .await
   }
 
