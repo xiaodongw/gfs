@@ -162,6 +162,79 @@ fn verify_cache_tree(
   Ok(())
 }
 
+/// A minimal EWAH bitmap encoding for the fsmonitor extension.
+///
+/// EWAH serialization format (from ewah/ewah_io.c):
+/// 1. 32-bit bit_size: total number of bits
+/// 2. 32-bit word_count: number of 64-bit words in buffer
+/// 3. word_count * 8 bytes: the bitmap buffer
+/// 4. 32-bit rlw_pos: position of RLE word in buffer
+///
+/// For an all-zero bitmap (all entries valid), we write no buffer words:
+/// bit_size=num_entries, word_count=0, no buffer, rlw_pos=0.
+pub fn minimal_ewah_bitmap(num_entries: usize) -> Vec<u8> {
+  let mut bitmap = Vec::with_capacity(12);
+  bitmap.extend_from_slice(&(num_entries as u32).to_be_bytes()); // bit_size
+  bitmap.extend_from_slice(&0u32.to_be_bytes()); // word_count = 0
+  // (no buffer words since word_count is 0)
+  bitmap.extend_from_slice(&0u32.to_be_bytes()); // rlw_pos = 0
+  bitmap
+}
+
+/// Append fsmonitor extension (FSMN) to index bytes and recompute SHA-1.
+///
+/// The FSMN extension marks which index entries are NOT valid according to
+/// fsmonitor. By seeding with all entries marked as valid, the first `git status`
+/// can skip re-lstat'ing every file and instead rely on the fsmonitor hook
+/// to tell it what changed.
+pub fn append_fsmonitor_extension(
+  index_bytes: &[u8],
+  num_entries: usize,
+  token: &str,
+) -> Result<Vec<u8>, GfsError> {
+  if index_bytes.len() < 20 {
+    return Err(GfsError::internal("index too short to remove trailer"));
+  }
+  // Remove the SHA-1 trailer
+  let mut out = index_bytes[..index_bytes.len() - 20].to_vec();
+
+  // Write FSMN extension
+  out.extend_from_slice(b"FSMN");
+  let mut fsmn_body = Vec::new();
+  fsmn_body.extend_from_slice(&2u32.to_be_bytes()); // version 2
+  fsmn_body.extend_from_slice(token.as_bytes());
+  fsmn_body.push(0); // null-terminated token
+  let bitmap = minimal_ewah_bitmap(num_entries);
+  fsmn_body.extend_from_slice(&(bitmap.len() as u32).to_be_bytes());
+  fsmn_body.extend_from_slice(&bitmap);
+  out.extend_from_slice(&(fsmn_body.len() as u32).to_be_bytes());
+  out.extend_from_slice(&fsmn_body);
+
+  // Recompute SHA-1 trailer
+  let digest = Sha1::digest(&out);
+  out.extend_from_slice(&digest);
+  Ok(out)
+}
+
+/// Append the Untracked Cache extension (UNTR) to index bytes and recompute SHA-1.
+///
+/// The untracked cache reduces the cost of `git status` by caching which
+/// directories have been scanned for untracked files. When seeded at mount time,
+/// the first `git status` can skip the readdir walk and use the cache.
+///
+/// This is complex to seed correctly (it requires precise directory stat data),
+/// so it is disabled for now. See the plan for details.
+#[allow(dead_code)]
+fn append_untracked_cache_extension(
+  _index_bytes: &[u8],
+  _num_entries: usize,
+) -> Result<Vec<u8>, GfsError> {
+  // TODO: implement UNTR extension seeding when needed
+  Err(GfsError::internal(
+    "UNTR extension seeding not yet implemented",
+  ))
+}
+
 /// Serialize entries into a version-2 index file, with an optional cache tree.
 ///
 /// Entries must arrive in Git's index order: byte-wise by path. The tree walk
