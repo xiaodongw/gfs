@@ -237,15 +237,14 @@ impl LocalRepository {
     &self.objects
   }
 
-  /// Pin a selector: resolve it, anchor the commit in the clone, and build the
-  /// source that reads through it.
-  /// Resolve a reference or revision expression to a commit.
-  pub async fn resolve_ref(&self, selector: &str) -> Result<ObjectId, GfsError> {
+  /// What a revision expression names in the clone, without pinning it.
+  pub async fn resolve(&self, selector: &str) -> Result<ObjectId, GfsError> {
     let expression = RevisionExpression::parse(selector, HashAlgorithm::Sha1)?;
-    let resolved = self.repo.resolve_expression(expression).await?;
-    Ok(resolved.commit)
+    Ok(self.repo.resolve_expression(expression).await?.commit)
   }
 
+  /// Pin a selector: resolve it, anchor the commit in the clone, and build the
+  /// source that reads through it.
   pub async fn pin(
     self: &Arc<Self>,
     selector: &str,

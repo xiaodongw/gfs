@@ -205,8 +205,6 @@ async fn switching_to_another_commit_changes_what_already_cached_paths_read() {
     .call(Request::Switch {
       selector: "v1.0".to_owned(),
       branch: None,
-      create: None,
-      start_point: None,
     })
     .await
   else {
@@ -296,8 +294,6 @@ async fn a_file_edited_back_to_its_original_bytes_does_not_block_a_switch() {
     .call(Request::Switch {
       selector: "v1.0".to_owned(),
       branch: None,
-      create: None,
-      start_point: None,
     })
     .await
   else {

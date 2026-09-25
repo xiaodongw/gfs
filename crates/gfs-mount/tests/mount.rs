@@ -116,7 +116,6 @@ async fn the_git_dir_is_the_real_seeded_one_served_back_through_the_mount() {
   let (names, head, config, json, alternates) = on_fs(move || {
     let names = read_dir_names(&git);
     let head = std::fs::read(git.join("HEAD")).unwrap();
-    // User config includes the gfs config
     let config = std::fs::read_to_string(git.join("config")).unwrap();
     let json = std::fs::read(git.join("gfs.json")).unwrap();
     let alternates = std::fs::read_to_string(git.join("objects/info/alternates")).unwrap();
@@ -138,10 +137,7 @@ async fn the_git_dir_is_the_real_seeded_one_served_back_through_the_mount() {
     assert!(names.contains(&required.to_owned()), "{names:?}");
   }
   assert_eq!(head, b"ref: refs/heads/main\n");
-  assert!(config.contains("[include]"), "config should include gfs config");
-  // GFS-specific settings are in gfs/config
-  let gfs_config = std::fs::read_to_string(mount.join(".git/gfs/config")).unwrap();
-  assert!(gfs_config.contains("repositoryformatversion = 0"));
+  assert!(config.contains("repositoryformatversion = 0"));
   // Relative, so the folder can travel (ADR 0011).
   assert_eq!(alternates, "../gfs/objects\n");
 

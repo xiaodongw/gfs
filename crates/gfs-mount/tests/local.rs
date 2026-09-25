@@ -4,7 +4,6 @@
 //! real `git clone` of a fixture. The host these run through is pointed at a
 //! closed port, so anything that reached for a server would fail loudly.
 
-use gfs_mount::control::{Request, Response};
 use gfs_mount::search::SearchRequest;
 use gfs_search::SearchOutcome;
 use gfs_test::mount::{on_fs, Job};
@@ -424,50 +423,115 @@ async fn a_checkout_back_to_the_pinned_commit_leaves_no_copies_behind() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn gfs_switch_resolves_branches_in_local_mode() {
-  // In local mode, `gfs switch` should resolve branches against the workspace
-  // and the clone without gateway contact.
+async fn gfs_switch_moves_a_local_view_between_branches_without_a_checkout() {
+  // `gfs switch` does what `git switch` does to `.git` -- HEAD, the branch,
+  // its upstream, the index -- and re-pins the view instead of writing the
+  // difference through the mount, so the overlay stays empty.
+  use gfs_mount::control::{Request, Response};
   let clone_dir = tempfile::tempdir().unwrap();
   let clone = clone_dir.path().join("clone");
   Job::clone_fixture("basic", &clone);
-
-  // Create a local branch in the clone to test switching to it
-  git_in(&clone, &["branch", "old", "v1.0"]);
-
+  assert!(git_in(&clone, &["branch", "old", "v1.0"]).0);
   let job = Job::local_from(&clone, "main", tempfile::tempdir().unwrap()).await;
   let ws = job.workspace.clone();
 
-  // Initial state: on main
-  let initial_main_rs = on_fs({
-    let ws = ws.clone();
-    move || std::fs::read(ws.join("src/main.rs")).unwrap()
-  })
-  .await;
-  assert_eq!(initial_main_rs, b"fn main() { println!(\"bye\"); }\n");
-
-  // Switch to the clone-only branch "old" (which doesn't exist in workspace yet)
-  use gfs_mount::control::Request;
-  let Response::Refresh(refresh) = job
-    .call(Request::Switch {
-      selector: "old".to_owned(),
-      branch: None,
-      create: None,
-      start_point: None,
-    })
-    .await
-  else {
-    panic!("expected a refresh");
+  let refused = |request: Request| {
+    let socket = job.socket();
+    async move {
+      let response = on_fs(move || gfs_mount::control::call(&socket, &request).unwrap()).await;
+      matches!(response, Response::Error { .. })
+    }
   };
-
-  // After switching, verify the workspace shows the v1.0 content
-  let after_switch_main_rs = on_fs({
+  let switch = |target: &str, create: bool, detach: bool| Request::Switch {
+    selector: target.to_owned(),
+    branch: None,
+    create,
+    start_point: None,
+    detach,
+  };
+  let oracle = |ws: &std::path::Path| {
+    git_in(
+      ws,
+      &[
+        "-c",
+        "core.fsmonitor=false",
+        "-c",
+        "core.untrackedCache=false",
+        "status",
+        "--porcelain",
+      ],
+    )
+    .1
+  };
+  let look = |ws: std::path::PathBuf| {
+    on_fs(move || {
+      (
+        std::fs::read_to_string(ws.join(".git/HEAD")).unwrap(),
+        std::fs::read(ws.join("src/main.rs")).unwrap(),
+        git_in(&ws, &["status", "--porcelain"]).1,
+        oracle(&ws),
+        git_in(&ws, &["branch", "-vv"]).1,
+      )
+    })
+  };
+  on_fs({
     let ws = ws.clone();
-    move || std::fs::read(ws.join("src/main.rs")).unwrap()
+    move || assert!(git_in(&ws, &["config", "user.name", "someone"]).0)
   })
   .await;
-  assert_eq!(after_switch_main_rs, b"fn main() { println!(\"hi\"); }\n");
-  assert!(!refresh.unchanged, "switching to a different commit should change the pin");
 
-  // Verify the overlay is clean (no writes through FUSE)
-  assert_eq!(job.daemon.inspect().overlay.entries, 0, "clean switch leaves no overlay rows");
+  // A branch only the clone has: created here, tracking origin/old.
+  let Response::Refresh(report) = job.call(switch("old", false, false)).await else {
+    panic!("switch refused");
+  };
+  assert!(!report.unchanged);
+  let (head, main_rs, status, plain, branches) = look(ws.clone()).await;
+  assert_eq!(head, "ref: refs/heads/old\n");
+  assert_eq!(main_rs, b"fn main() { println!(\"hi\"); }\n");
+  assert_eq!(status, "");
+  assert_eq!(status, plain);
+  assert!(branches.contains("[origin/old]"), "{branches}");
+  assert_eq!(job.daemon.inspect().overlay.entries, 0);
+
+  // A new branch where HEAD is: only HEAD moves.
+  let Response::Refresh(report) = job.call(switch("new", true, false)).await else {
+    panic!("switch -c refused");
+  };
+  assert!(report.unchanged);
+  let (head, _, status, plain, _) = look(ws.clone()).await;
+  assert_eq!(head, "ref: refs/heads/new\n");
+  assert_eq!(status, plain);
+  assert!(refused(switch("new", true, false)).await, "an existing branch");
+
+  // Back to the workspace's own main; everything Git and the user wrote in
+  // `.git/config` survived the re-pins.
+  let Response::Refresh(_) = job.call(switch("main", false, false)).await else {
+    panic!("switch back refused");
+  };
+  let (head, main_rs, status, plain, branches) = look(ws.clone()).await;
+  assert_eq!(head, "ref: refs/heads/main\n");
+  assert_eq!(main_rs, b"fn main() { println!(\"bye\"); }\n");
+  assert_eq!(status, plain);
+  assert!(branches.contains("[origin/main]"), "{branches}");
+  assert!(branches.contains("[origin/old]"), "{branches}");
+  assert!(branches.contains(" new "), "{branches}");
+  let name = on_fs({
+    let ws = ws.clone();
+    move || git_in(&ws, &["config", "user.name"]).1
+  })
+  .await;
+  assert_eq!(name.trim(), "someone");
+
+  // A dirty workspace is refused and nothing moves.
+  on_fs({
+    let ws = ws.clone();
+    move || std::fs::write(ws.join("README.md"), b"edited\n").unwrap()
+  })
+  .await;
+  assert!(refused(switch("old", false, false)).await, "a dirty workspace");
+  let (head, _, _, _, _) = look(ws.clone()).await;
+  assert_eq!(head, "ref: refs/heads/main\n");
+
+  // Not a branch: refused, with the way to get there.
+  assert!(refused(switch("v1.0", false, false)).await, "a tag is not a branch");
 }

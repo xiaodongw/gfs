@@ -564,6 +564,7 @@ impl Mount {
       preserve_local_head: local_commits.is_some(),
       workspace: Some(&config.workspace),
       instance_id: overlay.instance_id(),
+      track_upstream: true,
     })?;
     let fs = Gfs::new(
       Arc::clone(&resolved.pin.client),
@@ -892,6 +893,12 @@ impl Mount {
   /// so it is bounded and reported rather than designed away. Invalidation is
   /// bounded by the paths the job actually touched, not by the size of the tree.
   async fn repin(self: &Arc<Self>) -> Result<RefreshReport, GfsError> {
+    self.repin_with(false).await
+  }
+
+  /// [`Mount::repin`], optionally giving the branch it lands on an upstream
+  /// (`gfs switch` onto a branch taken from the clone, as `git switch` does).
+  async fn repin_with(self: &Arc<Self>, track_upstream: bool) -> Result<RefreshReport, GfsError> {
     // Held across the whole operation, so two switches cannot interleave and
     // leave the filesystem on one commit with `mount.json` naming another.
     let _serialized = self.repinning.lock().await;
@@ -923,8 +930,19 @@ impl Mount {
       }
     }
 
-    let resolved = resolve_pin(&self.config, self.local.as_ref(), &selector, next_epoch).await?;
+    let mut resolved = resolve_pin(&self.config, self.local.as_ref(), &selector, next_epoch).await?;
     let commit = resolved.pin.commit.clone();
+    // A local-mode switch pins a commit and names the branch separately: the
+    // branch may exist only in the workspace, where the clone cannot resolve
+    // it. Server mode's work branch lives in the reserved namespace and never
+    // becomes `HEAD`'s ref.
+    if self.local.is_some() {
+      if let Some(branch) = self.work_branch() {
+        let name = format!("refs/heads/{branch}");
+        resolved.facts.ref_name = Some(name.clone());
+        resolved.pin.ref_name = Some(name);
+      }
+    }
 
     // Re-seed HEAD, the branch ref, and the index to the new pin. The index
     // fetch is the only network dependency; failing the switch here leaves the
@@ -938,6 +956,7 @@ impl Mount {
       preserve_local_head: false,
       workspace: Some(&self.config.workspace),
       instance_id: self.overlay.instance_id(),
+      track_upstream,
     })?;
 
     // The one overlay, re-pointed in place. One SQLite transaction, so a
@@ -1035,8 +1054,6 @@ impl Mount {
     self: &Arc<Self>,
     selector: &str,
     branch: Option<String>,
-    create: Option<String>,
-    start_point: Option<String>,
   ) -> Result<RefreshReport, GfsError> {
     if !self.workspace_is_clean().await? {
       return Err(GfsError::new(
@@ -1044,163 +1061,167 @@ impl Mount {
         "the workspace has local changes; commit or discard them before switching",
       ));
     }
-
-    // In local mode, handle branch creation and resolution.
-    let (final_selector, final_branch) = if let Some(local) = self.local.as_ref() {
-      self
-        .handle_local_switch(local, selector, branch, create, start_point)
-        .await?
-    } else {
-      // Server mode: selector is already a resolved commit, branch is for reporting.
-      (selector.to_owned(), branch)
-    };
-
     {
       let mut current = self.selector.lock().expect("selector");
-      *current = final_selector;
+      *current = selector.to_owned();
     }
     {
       let mut current = self.work_branch.lock().expect("work branch");
-      *current = final_branch;
+      *current = branch;
     }
     self.repin().await
   }
 
-  /// Handle branch resolution and creation in local mode.
-  async fn handle_local_switch(
-    &self,
-    local: &Arc<crate::local::LocalRepository>,
-    selector: &str,
-    _branch: Option<String>,
-    create: Option<String>,
-    start_point: Option<String>,
-  ) -> Result<(String, Option<String>), GfsError> {
-    // TODO(3b): implement local commit tracking
-    if let Some(new_branch) = create {
-      // Create mode: create a new branch in the workspace.
-      // TODO(3b): implement local commit tracking
-      // The start_point defaults to the current HEAD commit if not provided.
-      let start_point = start_point.unwrap_or_else(|| "HEAD".to_owned());
-
-      // For now, in local mode `-c` without a full repin just creates the branch
-      // at the start point and doesn't change the pin. We store the branch name
-      // for reporting and will repin on the next switch.
-      // TODO: decide if `-c` needs a full repin or can defer it.
-
-      // Resolve the start point to get the commit hash.
-      let start_commit = local.resolve_ref(&start_point).await?;
-
-      // Create the workspace branch with tracking config.
+  /// `gfs switch` in local mode: what `git switch` does to `.git`, without
+  /// the checkout (plan 20260925-2220 step 3a).
+  ///
+  /// `target` is a branch: the workspace's own (`refs/heads/<target>`) first,
+  /// then the clone's, which becomes a workspace branch tracking
+  /// `origin/<target>` -- `git switch`'s guess. With `create` it is a new
+  /// branch at `start_point` (default `HEAD`); with `detach`, any revision.
+  ///
+  /// When the target is the commit `HEAD` is already on, nothing is re-pinned:
+  /// the index and the working tree already describe it, so only `HEAD` moves.
+  /// That is also why `-c` works over local edits and local commits, as it
+  /// does in Git. Anything else is a re-pin, which needs a clean overlay and no
+  /// local commits for now.
+  pub async fn switch_local(
+    self: &Arc<Self>,
+    target: &str,
+    create: bool,
+    start_point: Option<&str>,
+    detach: bool,
+  ) -> Result<RefreshReport, GfsError> {
+    let local = Arc::clone(
       self
-        .create_workspace_branch(&new_branch, &start_commit, local)
-        .await?;
+        .local
+        .as_ref()
+        .ok_or_else(|| GfsError::invalid("not a local-mode workspace"))?,
+    );
+    // Held across the whole operation, as `repin` holds it: two switches must
+    // not interleave their ref writes.
+    let serialized = self.repinning.lock().await;
+    let git_dir = self.git.root().to_path_buf();
+    let head = crate::gitdir::local_head(&git_dir);
 
-      // Return the start_point commit as selector (to maintain current pin)
-      // and the new branch name for reporting.
-      Ok((start_commit.to_hex(), Some(new_branch)))
+    // Where to go: the commit, the branch `HEAD` will name, whether the
+    // branch still has to be created, and the upstream it gets.
+    let (commit, branch, create_ref, upstream) = if detach {
+      (local.resolve(target).await?.to_hex(), None, false, None)
+    } else if create {
+      check_branch_name(target)?;
+      if workspace_branch(&git_dir, target).is_some() {
+        return Err(GfsError::new(
+          ErrorCode::Conflict,
+          format!("a branch named '{target}' already exists"),
+        ));
+      }
+      match start_point {
+        None => {
+          let head = head
+            .clone()
+            .ok_or_else(|| GfsError::internal("the workspace has no readable HEAD"))?;
+          (head, Some(target.to_owned()), true, None)
+        }
+        Some(point) => {
+          let (commit, upstream) = resolve_start_point(&local, &git_dir, point).await?;
+          (commit, Some(target.to_owned()), true, upstream)
+        }
+      }
+    } else if let Some(commit) = workspace_branch(&git_dir, target) {
+      (commit, Some(target.to_owned()), false, None)
+    } else if let Ok(commit) = local.resolve(&format!("refs/heads/{target}")).await {
+      (
+        commit.to_hex(),
+        Some(target.to_owned()),
+        true,
+        Some(target.to_owned()),
+      )
     } else {
-      // Regular switch: resolve the selector against workspace and clone branches.
-      let resolved_commit = self.resolve_local_branch(local, selector).await?;
-      let branch_name = self
-        .get_branch_name_from_selector(local, selector)
-        .await
-        .ok();
+      let hint = if local.resolve(target).await.is_ok() {
+        format!("'{target}' is not a branch; `gfs switch --detach {target}` switches to it")
+      } else {
+        format!("invalid reference: {target}")
+      };
+      return Err(GfsError::new(ErrorCode::NotFound, hint));
+    };
 
-      Ok((resolved_commit.to_hex(), branch_name))
+    let (epoch, pinned) = {
+      let current = self.current.lock().expect("current pin");
+      (current.epoch, current.commit.clone())
+    };
+    let pinned_hex = pinned.to_hex();
+
+    if head.as_deref() == Some(commit.as_str()) {
+      // Only `HEAD` moves.
+      if create_ref {
+        write_branch_ref(&git_dir, target, &commit)?;
+      }
+      if let (Some(branch), Some(upstream)) = (&branch, &upstream) {
+        add_branch_upstream(&git_dir, branch, upstream)?;
+      }
+      let head_line = match &branch {
+        Some(branch) => format!("ref: refs/heads/{branch}\n"),
+        None => format!("{commit}\n"),
+      };
+      std::fs::write(git_dir.join("HEAD"), head_line)
+        .map_err(|e| GfsError::internal(format!("writing HEAD: {e}")))?;
+      *self.work_branch.lock().expect("work branch") = branch.clone();
+      self.current.lock().expect("current pin").ref_name =
+        branch.as_ref().map(|b| format!("refs/heads/{b}"));
+      self.persist()?;
+      return Ok(RefreshReport {
+        previous_generation: epoch,
+        generation: epoch,
+        previous_commit: pinned.to_qualified(),
+        commit: pinned.to_qualified(),
+        unchanged: true,
+      });
     }
-  }
 
-  /// Resolve a branch name or selector against the local workspace and clone.
-  /// Checks workspace branches first (refs/heads/*), then clone branches (origin/*).
-  async fn resolve_local_branch(
-    &self,
-    local: &Arc<crate::local::LocalRepository>,
-    selector: &str,
-  ) -> Result<ObjectId, GfsError> {
-    // First try to resolve it as a revision expression (could be a commit hash, tag, etc.)
-    match local.resolve_ref(selector).await {
-      Ok(commit) => return Ok(commit),
-      Err(_) => {
-        // Not a valid reference, fall through to branch resolution
+    // A re-pin. The checks `repin` makes too, made here first so a refused
+    // switch creates no branch.
+    // TODO(3c): switch after local commits.
+    if head.as_deref().is_some_and(|h| h != pinned_hex) {
+      return Err(GfsError::new(
+        ErrorCode::FailedPrecondition,
+        "the workspace has local commits; `gfs switch` cannot carry them to another \
+         commit yet -- push them (`git push origin HEAD`) and switch, or use `git switch`",
+      ));
+    }
+    // TODO(3b): carry edits whose paths are the same in both commits.
+    if !self.workspace_is_clean().await? {
+      return Err(GfsError::new(
+        ErrorCode::FailedPrecondition,
+        "the workspace has local changes; commit or discard them before `gfs switch`, \
+         or use `git switch`, which carries them file by file",
+      ));
+    }
+    if create_ref {
+      write_branch_ref(&git_dir, target, &commit)?;
+    }
+    if let (Some(branch), Some(upstream)) = (&branch, &upstream) {
+      if upstream != branch {
+        add_branch_upstream(&git_dir, branch, upstream)?;
       }
     }
-
-    // Try workspace branch (refs/heads/<selector>)
-    let workspace_branch = format!("refs/heads/{selector}");
-    if let Ok(commit) = local.resolve_ref(&workspace_branch).await {
-      return Ok(commit);
+    let previous = (
+      self.selector.lock().expect("selector").clone(),
+      self.work_branch(),
+    );
+    *self.selector.lock().expect("selector") = commit.clone();
+    *self.work_branch.lock().expect("work branch") = branch.clone();
+    drop(serialized);
+    let track = upstream.as_deref().is_some() && upstream == branch;
+    let repinned = self.repin_with(track).await;
+    if repinned.is_err() {
+      *self.selector.lock().expect("selector") = previous.0;
+      *self.work_branch.lock().expect("work branch") = previous.1;
+      if create_ref {
+        let _ = std::fs::remove_file(git_dir.join("refs/heads").join(target));
+      }
     }
-
-    // Try clone branch (origin/<selector>) which maps to refs/remotes/origin/<selector>
-    let origin_branch = format!("refs/remotes/origin/{selector}");
-    if let Ok(commit) = local.resolve_ref(&origin_branch).await {
-      return Ok(commit);
-    }
-
-    // Try origin/<selector> directly on the clone
-    let clone_branch = format!("origin/{selector}");
-    if let Ok(commit) = local.resolve_ref(&clone_branch).await {
-      return Ok(commit);
-    }
-
-    Err(GfsError::new(
-      ErrorCode::InvalidArgument,
-      format!(
-        "no such branch or revision: {selector} (checked refs/heads/{selector}, origin/{selector})",
-        selector = selector
-      ),
-    ))
-  }
-
-  /// Get the branch name from a selector if it's a branch reference.
-  async fn get_branch_name_from_selector(
-    &self,
-    local: &Arc<crate::local::LocalRepository>,
-    selector: &str,
-  ) -> Result<String, GfsError> {
-    // Check if selector is a workspace branch
-    let workspace_branch = format!("refs/heads/{selector}");
-    if local.resolve_ref(&workspace_branch).await.is_ok() {
-      return Ok(selector.to_owned());
-    }
-
-    // Check if selector is an origin branch
-    if local.resolve_ref(&format!("origin/{selector}")).await.is_ok() {
-      return Ok(selector.to_owned());
-    }
-
-    Err(GfsError::new(
-      ErrorCode::InvalidArgument,
-      format!("selector {selector} is not a branch name"),
-    ))
-  }
-
-  /// Create a new workspace branch with tracking configuration.
-  async fn create_workspace_branch(
-    &self,
-    branch_name: &str,
-    commit: &ObjectId,
-    _local: &Arc<crate::local::LocalRepository>,
-  ) -> Result<(), GfsError> {
-    // Create the branch in the workspace's git directory.
-    let git_dir = self.git.root();
-
-    // Create refs/heads/<branch_name>
-    let refs_dir = git_dir.join("refs/heads");
-    std::fs::create_dir_all(&refs_dir).map_err(|e| {
-      GfsError::internal(format!("failed to create refs dir: {e}"))
-    })?;
-
-    let branch_ref = refs_dir.join(branch_name);
-    std::fs::write(&branch_ref, format!("{}\n", commit.to_hex())).map_err(|e| {
-      GfsError::internal(format!("failed to write branch ref: {e}"))
-    })?;
-
-    // Check if the start point is from origin/* and add tracking config.
-    // For now, we'll add tracking config if we can detect it's an origin branch.
-    // TODO(3c): handle other tracking scenarios.
-
-    Ok(())
+    repinned
   }
 
   /// The work branch this view is on, if any.
@@ -2041,8 +2062,21 @@ impl Mount {
         Ok(report) => Response::Refresh(report),
         Err(e) => Response::from_error(&e),
       },
-      Request::Switch { selector, branch, create, start_point } => {
-        match self.switch_to(selector.as_str(), branch.clone(), create.clone(), start_point.clone()).await {
+      Request::Switch {
+        selector,
+        branch,
+        create,
+        start_point,
+        detach,
+      } => {
+        let switched = if self.local.is_some() {
+          self
+            .switch_local(&selector, create, start_point.as_deref(), detach)
+            .await
+        } else {
+          self.switch_to(selector.as_str(), branch.clone()).await
+        };
+        match switched {
           Ok(report) => Response::Refresh(report),
           Err(e) => Response::from_error(&e),
         }
@@ -2592,6 +2626,80 @@ fn migrate_legacy_state(workspace: &Path, legacy: &Path) {
     workspace = %workspace.display(),
     "adopted a pre-ADR-0011 state directory into the workspace"
   );
+}
+
+/// The commit a workspace branch points at, loose or packed.
+fn workspace_branch(git_dir: &std::path::Path, name: &str) -> Option<String> {
+  let refname = format!("refs/heads/{name}");
+  if let Ok(loose) = std::fs::read_to_string(git_dir.join(&refname)) {
+    return Some(loose.trim().to_owned());
+  }
+  let packed = std::fs::read_to_string(git_dir.join("packed-refs")).ok()?;
+  packed.lines().find_map(|line| {
+    let (target, name) = line.split_once(' ')?;
+    (name == refname).then(|| target.to_owned())
+  })
+}
+
+fn write_branch_ref(git_dir: &std::path::Path, name: &str, commit: &str) -> Result<(), GfsError> {
+  let path = git_dir.join("refs/heads").join(name);
+  let io = |e: std::io::Error| GfsError::internal(format!("writing refs/heads/{name}: {e}"));
+  if let Some(parent) = path.parent() {
+    std::fs::create_dir_all(parent).map_err(io)?;
+  }
+  std::fs::write(&path, format!("{commit}\n")).map_err(io)
+}
+
+/// `branch.<branch>` tracking `origin/<upstream>`, in the user's `.git/config`
+/// where Git would put it -- unless the branch already has a section.
+fn add_branch_upstream(git_dir: &std::path::Path, branch: &str, upstream: &str) -> Result<(), GfsError> {
+  let path = git_dir.join("config");
+  let io = |e: std::io::Error| GfsError::internal(format!("updating .git/config: {e}"));
+  let mut config = std::fs::read_to_string(&path).map_err(io)?;
+  let before = config.len();
+  crate::gitdir::add_upstream(&mut config, branch, upstream);
+  if config.len() != before {
+    std::fs::write(&path, config).map_err(io)?;
+  }
+  Ok(())
+}
+
+/// Git's rules for a branch name, from Git itself.
+fn check_branch_name(name: &str) -> Result<(), GfsError> {
+  let ok = std::process::Command::new("git")
+    .args(["check-ref-format", "--branch", name])
+    .env_remove("GIT_DIR")
+    .stdin(std::process::Stdio::null())
+    .stdout(std::process::Stdio::null())
+    .stderr(std::process::Stdio::null())
+    .status()
+    .map(|s| s.success())
+    .unwrap_or(false);
+  // `--branch` also accepts `@{-1}` and friends, which name no new branch.
+  if ok && !name.starts_with('@') && !name.starts_with('-') {
+    Ok(())
+  } else {
+    Err(GfsError::invalid(format!("'{name}' is not a valid branch name")))
+  }
+}
+
+/// `gfs switch -c <new> <start_point>`: a workspace branch, `origin/<x>` (which
+/// the new branch then tracks, as `branch.autoSetupMerge` does), or any
+/// revision the clone resolves.
+async fn resolve_start_point(
+  local: &crate::local::LocalRepository,
+  git_dir: &std::path::Path,
+  point: &str,
+) -> Result<(String, Option<String>), GfsError> {
+  if let Some(commit) = workspace_branch(git_dir, point) {
+    return Ok((commit, None));
+  }
+  if let Some(upstream) = point.strip_prefix("origin/") {
+    if let Ok(commit) = local.resolve(&format!("refs/heads/{upstream}")).await {
+      return Ok((commit.to_hex(), Some(upstream.to_owned())));
+    }
+  }
+  Ok((local.resolve(point).await?.to_hex(), None))
 }
 
 /// `gfs:<generation>:<instance>:<sequence>`, or `None` for anything else --

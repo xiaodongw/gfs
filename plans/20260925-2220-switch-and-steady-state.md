@@ -70,20 +70,33 @@ on universe with a private daemon, and a commit on `main`.
 * Smoke test `crates/gfs-mount/tests/local.rs::a_checkout_back_to_the_pinned_commit_leaves_no_copies_behind`.
 
 **Step 3 — `gfs switch` for local mode**
-* No gateway connection in local mode.
-* `gfs switch <branch>`: a workspace branch, or a clone branch (created as a
-  local branch tracking `origin/<branch>`, as `git switch` does).
-* `gfs switch -c <new> [--start-point]`: a local branch in the workspace's
-  `.git`.
-* Local edits are carried when the path's entry is identical in the old and
-  new commit; otherwise refuse and name the conflicting paths. Staged changes:
-  refuse in v1.
-* The local source also reads the workspace's own objects, so commits made in
-  the workspace can be pinned.
-* Re-pin after a stock `git commit` (to the new `HEAD`, dropping rows equal to
-  the new tree), so `gfs switch` works after committing.
-* Target: switch to a 24.5k-file-away branch in ~1.6 s (index cached) / ~6 s
-  (miss), 0 overlay rows, first status ~4 s.
+
+*3a (complete): a clean workspace.*
+* The CLI forwards to the daemon in local mode (no gateway); `Request::Switch`
+  carries `create`, `start_point`, `detach`.
+* `gfs switch <b>`: the workspace's `refs/heads/<b>` (loose or packed), else
+  the clone's branch, which becomes a workspace branch tracking `origin/<b>`;
+  a revision that is not a branch is refused with the `--detach` hint.
+  `gfs switch -c <new> [--start-point <p>]` (`origin/<x>` start points track
+  `<x>`), `gfs switch --detach <rev>`.
+* When the target is the commit `HEAD` is already on (`-c` at `HEAD`, two
+  branches at one commit), only `HEAD` moves: no re-pin, no index, and it
+  works over local edits and local commits as in Git. Otherwise the view is
+  re-pinned to the commit, with the branch name kept beside it (the clone
+  cannot resolve a workspace-only branch); `repin` puts it on `HEAD`.
+* `.git/config` is the user's; gfs's settings moved to `.git/gfs/config`,
+  included from it. The pinned branch's upstream is added to `.git/config`
+  once, when it has no section. `packed-refs` keeps branches Git packed.
+* Refused for now, before anything is written: local edits (3b) and local
+  commits (3c), with the way out in the message.
+* Smoke test `crates/gfs-mount/tests/local.rs::gfs_switch_moves_a_local_view_between_branches_without_a_checkout`.
+
+*3b (pending): carry unstaged edits whose paths are identical in both commits;
+refuse naming the rest; refuse staged changes.*
+
+*3c (pending): switch after a stock `git commit` -- the local source also reads
+the workspace's objects, and the view adopts the new `HEAD` without discarding
+uncommitted edits.*
 
 **Step 4 — steer users, and measure the stock path**
 * A `post-checkout` hook that prints one line after a stock branch checkout
@@ -124,6 +137,30 @@ on universe with a private daemon, and a commit on `main`.
 * **32 GiB local quota.** The 1 GiB default is a server-job budget; in local
   mode the overlay shares the disk the clone is on, and one stock switch
   between universe branches writes 0.8–1.3 GB.
+
+* **3a: the subagent's version (2645c7c) was reverted.** It resolved
+  "workspace branches" against the clone, pinned the commit hash so `HEAD`
+  ended up detached with no branch or upstream, and put the config include
+  at the top of an old-format `.git/config`, where the stale settings after it
+  would override the fresh ones.
+* **`.git/config` is Git's and the user's, gfs's settings are included.** The
+  seed used to rewrite the whole file on every repin, which discarded every
+  `git config`, `git branch -u` and `git switch` tracking section. A file
+  without the include is taken as one gfs wrote before the split and
+  replaced once. `core.repositoryformatversion`/`core.bare` stay in
+  `.git/config`: Git reads the repository format before following includes.
+  Alternatives: parse and merge the old file (a config parser for a one-time
+  migration), or keep rewriting and re-add known sections (loses everything
+  else).
+* **The pin is a commit, the branch travels beside it.** A workspace branch
+  can exist only in the workspace, where the clone cannot resolve it by name;
+  resolving by name would also pick the clone's newer commit for a branch the
+  workspace already has, which `git switch` never does. So the selector is the
+  commit and `gfs refresh` after a local switch changes nothing; moving a
+  branch to its upstream's newer commit is `git fetch` + `git merge` territory.
+* **Same commit, no re-pin.** `git switch -c` and a switch between two
+  branches on one commit touch only `HEAD` in Git; so here, which also keeps
+  them working over local edits and local commits.
 
 * **`gfs switch` replaces `git switch`; it does not run before it.** Re-pinning
   first and then running `git switch` fails: the index still describes the old
@@ -180,6 +217,23 @@ on universe with a private daemon, and a commit on `main`.
   known `mutations::a_recreated_directory_does_not_show_the_base_children_it_replaced`
   and `prefetch::reading_a_directory_through_fetches_the_rest_of_it` fail;
   `gfs-overlay`: only the known `overlay::a_row_left_behind_by_an_unsettled_write_is_corrected_from_its_content_file`.
+
+* **Step 3a results, universe** (fresh private workspace on `master`; each
+  switch left 0 overlay rows, `HEAD` on the branch with its `origin/<b>`
+  upstream, `git status` empty; 100 changed files re-hashed to `HEAD`'s blobs;
+  the uncached status matched):
+
+  | | stock `git switch` | `gfs switch` | first status after (stock / gfs) | then |
+  |---|---|---|---|---|
+  | to `universe-goofys-grpc` (24.5k files) | 14.0–14.6 s | **6.3 s** (index built) | 18.3 / **3.7 s** | 1.9–2.0 s |
+  | back to `master` | 17.2–19.0 s | **1.15 s** (index cached) | 8.1 / **3.7 s** | 2.0 s |
+  | to `xiaodong-wang_data/uc-fuse-grpc-s2s` (~50k) | 27–62 s | **4.3 s** (index built) | 11.9 / **3.7 s** | 1.9 s |
+  | `-c tmp-branch` | — | 0.00 s | — | — |
+
+* Tests: `gfs-mount`, `gfs-fuse`, `gfs-overlay`, `gfs-cli` run whole
+  (`--no-fail-fast`): only the known
+  `overlay::a_row_left_behind_by_an_unsettled_write_is_corrected_from_its_content_file`
+  fails (the two known `mutations`/`prefetch` failures passed this run).
 
 * Traces and probes: `GIT_TRACE2_PERF` on `git status` / `git switch` in a
   private workspace (`GFS_HOST_SOCKET=/tmp/gfsb/host.sock`, workspace

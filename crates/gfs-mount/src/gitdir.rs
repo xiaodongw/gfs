@@ -153,6 +153,11 @@ pub struct SeedSpec<'a> {
   /// The instance ID for this overlay. Used in the fsmonitor token to distinguish
   /// this process instance from previous ones.
   pub instance_id: u64,
+  /// Give the pinned branch an upstream (`origin/<branch>`) in `.git/config`
+  /// when it has none and the upstream has that branch -- what `git clone`
+  /// and `git switch <remote branch>` do. Off for a branch created with
+  /// `gfs switch -c`, which Git would leave without one.
+  pub track_upstream: bool,
 }
 
 /// What [`gfs_git::index::with_workspace_caches`] needs about this workspace,
@@ -355,10 +360,10 @@ pub fn seed_git_dir(spec: &SeedSpec<'_>) -> Result<(), gfs_types::error::GfsErro
   // infers the parent directory — and an absolute worktree path here would
   // break the copied-folder story the relative alternates exists for.
   let mut config = String::from(
-    "[core]\n\
-     \trepositoryformatversion = 0\n\
+    "# Written by gfs on every seed; included from `.git/config`, which is\n\
+     # yours. A setting there overrides the same one here.\n\
+     [core]\n\
      \tfilemode = true\n\
-     \tbare = false\n\
      \tautocrlf = false\n\
      \tlogallrefupdates = false\n\
      # A shipped index's dev/ino/uid/gid cannot match this host; comparing them\n\
@@ -449,21 +454,6 @@ pub fn seed_git_dir(spec: &SeedSpec<'_>) -> Result<(), gfs_types::error::GfsErro
       url = facts.http_endpoint.trim_end_matches('/'),
       repository = facts.repository_id.as_str(),
     ));
-    // The pinned branch's upstream. Without it `git status -sb` prints a bare
-    // `## main` — no `...origin/main`, no ahead/behind — because a branch with
-    // no configured upstream has nothing to count against, which reads as "this
-    // repository does not know where it came from".
-    if let Some(branch) = facts
-      .ref_name
-      .as_deref()
-      .and_then(|n| n.strip_prefix("refs/heads/"))
-    {
-      config.push_str(&format!(
-        "[branch \"{branch}\"]\n\
-         \tremote = origin\n\
-         \tmerge = refs/heads/{branch}\n"
-      ));
-    }
   }
   if facts.work_ref_root.is_none() {
     if let Some(clone) = &facts.local_clone {
@@ -479,17 +469,6 @@ pub fn seed_git_dir(spec: &SeedSpec<'_>) -> Result<(), gfs_types::error::GfsErro
          \tdefault = simple\n",
         url = clone.display(),
       ));
-      if let Some(branch) = facts
-        .ref_name
-        .as_deref()
-        .and_then(|n| n.strip_prefix("refs/heads/"))
-      {
-        config.push_str(&format!(
-          "[branch \"{branch}\"]\n\
-           \tremote = origin\n\
-           \tmerge = refs/heads/{branch}\n"
-        ));
-      }
     }
   }
   config.push_str(&format!(
@@ -503,34 +482,10 @@ pub fn seed_git_dir(spec: &SeedSpec<'_>) -> Result<(), gfs_types::error::GfsErro
     mount = facts.mount_id.as_str(),
     generation = facts.generation,
   ));
-
-  // Write gfs-specific config to .git/gfs/config, then update .git/config to include it.
-  // This preserves any user config or branch tracking sections in .git/config.
-  let gfs_config_dir = dir.join("gfs");
-  std::fs::create_dir_all(&gfs_config_dir).map_err(|e| io("gfs config dir", e))?;
-  write_atomic(&gfs_config_dir.join("config"), config.as_bytes())
-    .map_err(|e| io("gfs config", e))?;
-
-  // Update .git/config to include .git/gfs/config if it doesn't already.
-  let config_path = dir.join("config");
-  let mut user_config = if config_path.exists() {
-    std::fs::read_to_string(&config_path).map_err(|e| io("reading existing config", e))?
-  } else {
-    String::new()
-  };
-
-  // Check if the include is already present
-  // The path is relative to the directory of the config file (.git)
-  if !user_config.contains("path = gfs/config")
-  {
-    // Add the include directive at the beginning, before any user config.
-    // This ensures that gfs config is loaded first, so user settings can override if needed.
-    // The path is relative to the .git directory where the config file lives.
-    let include = "[include]\n\tpath = gfs/config\n";
-    user_config.insert_str(0, include);
-  }
-
-  write_atomic(&config_path, user_config.as_bytes()).map_err(|e| io("config", e))?;
+  std::fs::create_dir_all(dir.join(crate::passthrough::STATE_SUBDIR))
+    .map_err(|e| io("gfs dir", e))?;
+  write_atomic(&dir.join(GFS_CONFIG), config.as_bytes()).map_err(|e| io("gfs config", e))?;
+  write_user_config(dir, facts, spec.track_upstream).map_err(|e| io("config", e))?;
 
   write_packed_refs(dir, facts).map_err(|e| io("packed-refs", e))?;
 
@@ -552,6 +507,82 @@ pub fn seed_git_dir(spec: &SeedSpec<'_>) -> Result<(), gfs_types::error::GfsErro
   // resolving the `.git` file.
   write_atomic(&dir.join("gfs.json"), &gfs_json(facts)).map_err(|e| io("gfs.json", e))?;
   Ok(())
+}
+
+/// The configuration gfs owns, relative to the git dir. Rewritten on every
+/// seed; `.git/config` includes it and is otherwise left to Git and the user.
+pub const GFS_CONFIG: &str = "gfs/config";
+
+/// The line that makes `.git/config` a gfs workspace's: Git resolves a
+/// relative include path against the including file's directory.
+const GFS_CONFIG_INCLUDE: &str = "[include]\n\tpath = gfs/config\n";
+
+/// `.git/config` belongs to Git and the user, as in any repository:
+/// `git config`, `git branch -u` and `git switch` write here, and a repin must
+/// not undo them. gfs's own settings live in [`GFS_CONFIG`], included first
+/// so anything written here overrides them.
+///
+/// Written whole only when it does not include [`GFS_CONFIG`] yet -- a new
+/// workspace, or one seeded before the split, whose file gfs wrote entirely
+/// and whose settings now live in the included file. After that the only
+/// change is an upstream for the pinned branch, when `track_upstream` asks
+/// for one, the branch has no section yet, and the upstream has the branch.
+///
+/// `core.repositoryformatversion` and `core.bare` stay in this file: Git reads
+/// the repository format from it before it follows any include.
+fn write_user_config(
+  dir: &std::path::Path,
+  facts: &GitDirFacts,
+  track_upstream: bool,
+) -> Result<(), std::io::Error> {
+  let path = dir.join("config");
+  let existing = std::fs::read_to_string(&path).ok();
+  let mut config = match existing.as_deref() {
+    Some(text) if text.contains(GFS_CONFIG_INCLUDE) => text.to_owned(),
+    _ => format!("[core]\n\trepositoryformatversion = 0\n\tbare = false\n{GFS_CONFIG_INCLUDE}"),
+  };
+  let has_remote = facts.local_clone.is_some() || facts.work_ref_root.is_some();
+  if let Some(branch) = facts
+    .ref_name
+    .as_deref()
+    .and_then(|n| n.strip_prefix("refs/heads/"))
+  {
+    let upstream_has_it = facts.refs.as_ref().is_none_or(|refs| {
+      refs
+        .iter()
+        .any(|r| r.name.strip_prefix("refs/heads/") == Some(branch))
+    });
+    if track_upstream && has_remote && upstream_has_it {
+      // Without it `git status -sb` prints a bare `## main` — no
+      // `...origin/main`, no ahead/behind — because a branch with no
+      // configured upstream has nothing to count against.
+      add_upstream(&mut config, branch, branch);
+    }
+  }
+  if existing.as_deref() != Some(config.as_str()) {
+    write_atomic(&path, config.as_bytes())?;
+  }
+  Ok(())
+}
+
+/// Append `branch.<branch>.remote = origin` and `.merge = refs/heads/<upstream>`
+/// unless the branch already has a section, which is Git's or the user's.
+pub(crate) fn add_upstream(config: &mut String, branch: &str, upstream: &str) {
+  let header = format!("[branch \"{}\"]", escape_subsection(branch));
+  if config.lines().any(|line| line.trim() == header) {
+    return;
+  }
+  if !config.is_empty() && !config.ends_with('\n') {
+    config.push('\n');
+  }
+  config.push_str(&format!(
+    "{header}\n\tremote = origin\n\tmerge = refs/heads/{upstream}\n"
+  ));
+}
+
+/// A config subsection name, quoted the way Git reads it back.
+fn escape_subsection(name: &str) -> String {
+  name.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
 /// Write the pinned ref view as `packed-refs`.
@@ -600,6 +631,26 @@ fn write_packed_refs(dir: &std::path::Path, facts: &GitDirFacts) -> Result<(), s
       r.target.to_hex(),
       r.peeled.as_ref().map(ObjectId::to_hex),
     ));
+  }
+  // The agent's own branches, when `git pack-refs` moved them here: they are
+  // not the pinned view's to rewrite, and dropping them loses a branch.
+  if let Ok(previous) = std::fs::read_to_string(dir.join("packed-refs")) {
+    let mut kept: Option<usize> = None;
+    for line in previous.lines() {
+      if let Some(peeled) = line.strip_prefix('^') {
+        if let Some(i) = kept {
+          lines[i].2 = Some(peeled.to_owned());
+        }
+        continue;
+      }
+      kept = None;
+      if let Some((target, name)) = line.split_once(' ') {
+        if name.starts_with("refs/heads/") {
+          lines.push((name.to_owned(), target.to_owned(), None));
+          kept = Some(lines.len() - 1);
+        }
+      }
+    }
   }
   // Sorted because the header claims it, and Git binary-searches a file that
   // claims it.
@@ -753,6 +804,7 @@ mod tests {
       preserve_local_head: false,
       workspace: None,
       instance_id: 0,
+      track_upstream: true,
     })
     .unwrap();
 
@@ -778,10 +830,9 @@ mod tests {
       "a ref the seeded refspec cannot refresh is left out"
     );
     // The upstream that makes `git status -sb` print ahead/behind.
-    // This is in the gfs config file now.
-    let gfs_config = std::fs::read_to_string(git.join("gfs/config")).unwrap();
-    assert!(gfs_config.contains("[branch \"main\"]"), "{gfs_config}");
-    assert!(gfs_config.contains("merge = refs/heads/main"), "{gfs_config}");
+    let config = std::fs::read_to_string(git.join("config")).unwrap();
+    assert!(config.contains("[branch \"main\"]"), "{config}");
+    assert!(config.contains("merge = refs/heads/main"), "{config}");
   }
 
   #[test]
@@ -798,6 +849,7 @@ mod tests {
       preserve_local_head: false,
       workspace: None,
       instance_id: 0,
+      track_upstream: true,
     })
     .unwrap();
     let before = std::fs::read_to_string(git.join("packed-refs")).unwrap();
@@ -811,6 +863,7 @@ mod tests {
       preserve_local_head: false,
       workspace: None,
       instance_id: 0,
+      track_upstream: true,
     })
     .unwrap();
     assert_eq!(
@@ -840,6 +893,7 @@ mod tests {
       preserve_local_head: false,
       workspace: None,
       instance_id: 0,
+      track_upstream: true,
     })
     .unwrap();
 
@@ -855,6 +909,7 @@ mod tests {
       preserve_local_head: false,
       workspace: None,
       instance_id: 0,
+      track_upstream: true,
     })
     .unwrap();
 
@@ -891,23 +946,19 @@ mod tests {
       preserve_local_head: false,
       workspace: None,
       instance_id: 0,
+      track_upstream: true,
     })
     .unwrap();
 
     let alternates = std::fs::read_to_string(git.join("objects/info/alternates")).unwrap();
     assert_eq!(alternates, "../gfs/objects\n");
-
-    // Check user config for include directive
-    let user_config = std::fs::read_to_string(git.join("config")).unwrap();
+    let config = std::fs::read_to_string(git.join("config")).unwrap()
+      + &std::fs::read_to_string(git.join(GFS_CONFIG)).unwrap();
     assert!(
-      !user_config.contains("worktree"),
-      "no location dependence:\n{user_config}"
+      !config.contains("worktree"),
+      "no location dependence:\n{config}"
     );
-    assert!(user_config.contains("[include]"), "config should include gfs config");
-
-    // Check gfs config for gfs-specific settings
-    let gfs_config = std::fs::read_to_string(git.join("gfs/config")).unwrap();
-    assert!(gfs_config.contains("checkStat = minimal"));
+    assert!(config.contains("checkStat = minimal"));
   }
 
   #[test]
@@ -921,6 +972,7 @@ mod tests {
       preserve_local_head: false,
       workspace: None,
       instance_id: 0,
+      track_upstream: true,
     })
     .unwrap();
     assert_eq!(
@@ -941,6 +993,7 @@ mod tests {
       preserve_local_head: false,
       workspace: None,
       instance_id: 0,
+      track_upstream: true,
     })
     .unwrap();
     assert_eq!(
@@ -963,6 +1016,7 @@ mod tests {
       preserve_local_head: false,
       workspace: None,
       instance_id: 0,
+      track_upstream: true,
     })
     .unwrap();
     let local = "cd".repeat(20);
@@ -975,6 +1029,7 @@ mod tests {
       preserve_local_head: true,
       workspace: None,
       instance_id: 0,
+      track_upstream: true,
     })
     .unwrap();
     assert_eq!(
@@ -1008,6 +1063,7 @@ mod tests {
       preserve_local_head: false,
       workspace: None,
       instance_id: 0,
+      track_upstream: true,
     })
     .unwrap();
     assert_eq!(seeded_commit(&git).unwrap(), "ab".repeat(20));

@@ -307,6 +307,7 @@ impl Mount {
       preserve_local_head: false,
       workspace: None,
       instance_id: 0,
+      track_upstream: true,
     })
     .unwrap();
     let handle = Arc::new(GitDirHandle::open(&real_git).unwrap());
