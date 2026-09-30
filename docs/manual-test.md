@@ -699,6 +699,32 @@ touch "$(printf 'b%.0s' $(seq 1 250))"    # File name too long
 touch short                               # still works at the same depth
 ```
 
+## Local mode: switching branches
+
+In a `gfs mount --local` workspace, `gfs switch` replaces `git switch`:
+
+```sh
+gfs switch other-branch      # a clone branch becomes a workspace branch tracking origin/other-branch
+gfs switch -c my-change      # at HEAD: only HEAD moves
+gfs switch --detach v1.0
+```
+
+Worth checking by hand:
+
+- **Edits travel by Git's rule.** Edit a file both branches agree on and
+  create an untracked file, then `gfs switch` to the other branch: both
+  are there, and `git status` shows exactly them. Edit a file the branches
+  disagree on: the switch is refused, naming it, and `HEAD` has not moved.
+  `git add` anything: refused until `git restore --staged`.
+- **Local commits stay on their branch.** `git commit` on `my-change`,
+  `gfs switch main`, `gfs switch my-change`: the commit is back, pinned.
+  `git -C <clone> cat-file -t <sha>` shows it was copied into the clone.
+- **A stock `git switch` still works**, and after one that wrote a thousand
+  files or more it prints the `gfs switch` that would have re-pinned
+  instead. `gfs switch` back afterwards frees the overlay's copies.
+- **Timings** are in the host log: every re-pin logs a `re-pinned` line
+  with its phases (`host.log` beside the host socket).
+
 ## Teardown
 
 Ctrl+C in the terminal running `scripts/dev-server.sh`. That unmounts every

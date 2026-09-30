@@ -414,6 +414,25 @@ pub fn seed_git_dir(spec: &SeedSpec<'_>) -> Result<(), gfs_types::error::GfsErro
        commit its content"
     );
   }
+  if facts.local_clone.is_some() {
+    // A stock branch checkout writes every differing file through the mount
+    // (tens of thousands between universe branches, ~400 us each) where
+    // `gfs switch` re-pins; say so once it has happened. A config hook, not
+    // `.git/hooks/post-checkout`: a global `core.hooksPath` (Databricks sets
+    // one) makes Git skip the repository's hooks directory, while config
+    // hooks run beside it (measured on Git 2.54); a Git without them ignores
+    // the section.
+    let hint = dir.join("hooks/gfs-post-checkout");
+    std::fs::write(&hint, POST_CHECKOUT_HINT).map_err(|e| io("post-checkout hint", e))?;
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&hint, std::fs::Permissions::from_mode(0o755))
+      .map_err(|e| io("post-checkout hint", e))?;
+    config.push_str(
+      "[hook \"gfs-switch-hint\"]\n\
+       \tevent = post-checkout\n\
+       \tcommand = .git/hooks/gfs-post-checkout\n",
+    );
+  }
   config.push_str(
     "# `repack -a` without `-l` copies every borrowed object out of the\n\
      # projection -- 6.6 GiB on linux, measured. Maintenance is an operator\n\
@@ -421,7 +440,12 @@ pub fn seed_git_dir(spec: &SeedSpec<'_>) -> Result<(), gfs_types::error::GfsErro
      [gc]\n\
      \tauto = 0\n\
      [maintenance]\n\
-     \tauto = false\n",
+     \tauto = false\n\
+     # A stock branch checkout writes through FUSE; parallel workers took one\n\
+     # of 161k files on universe from 93 s to 77 s. 32 were no faster: the\n\
+     # rest is serial unlinks and lstats in the main process.\n\
+     [checkout]\n\
+     \tworkers = 8\n",
   );
   if facts.work_ref_root.is_some() {
     // The push path (ADR 0009's receive-pack surface). Branches push to real
@@ -512,6 +536,20 @@ pub fn seed_git_dir(spec: &SeedSpec<'_>) -> Result<(), gfs_types::error::GfsErro
 /// The configuration gfs owns, relative to the git dir. Rewritten on every
 /// seed; `.git/config` includes it and is otherwise left to Git and the user.
 pub const GFS_CONFIG: &str = "gfs/config";
+
+/// The `post-checkout` hint (see the seed): one line on stderr after a
+/// branch checkout that moved `HEAD` to another commit and wrote at least a
+/// thousand files, naming the `gfs switch` that would have re-pinned instead.
+/// Informational: it always exits 0, so it cannot fail a checkout.
+const POST_CHECKOUT_HINT: &str = r#"#!/bin/sh
+# Written by gfs on every seed. See `gfs switch --help`.
+[ "$3" = 1 ] && [ "$1" != "$2" ] || exit 0
+n=$(git diff-tree -r --no-renames --name-only "$1" "$2" 2>/dev/null | wc -l)
+[ "$n" -ge 1000 ] || exit 0
+to=$(git symbolic-ref --short -q HEAD) || to="--detach $2"
+echo "gfs: this checkout wrote $n files through the mount; 'gfs switch $to' re-pins the view instead, without writing them (about 2 s)" >&2
+exit 0
+"#;
 
 /// The line that makes `.git/config` a gfs workspace's: Git resolves a
 /// relative include path against the including file's directory.

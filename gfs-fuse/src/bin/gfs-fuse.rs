@@ -81,6 +81,9 @@ async fn main() -> Result<()> {
       tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
     )
+    // stderr: a spawned host's stdout is /dev/null and its stderr is
+    // `host.log`, which otherwise never received a line.
+    .with_writer(std::io::stderr)
     .init();
 
   let args = Args::parse();

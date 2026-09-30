@@ -216,6 +216,44 @@ after ADR 0017, of which the one journal transaction is 30 µs and the two
 round trips about 65 µs; the rest is daemon CPU in the `create` and
 `release` paths, which wants a CPU profile rather than another lever.
 
+## Branch switches in local mode (2026-09-30)
+
+On `~/universe`: 1.33M files, a 236 MB index, kernel 5.4, a 32-core box
+under memory pressure (0 GB free). Private workspace over the clone, the
+branches 24k–161k files apart. Every `git status` was compared with
+`git -c core.fsmonitor=false -c core.untrackedCache=false status`; all
+matched. Plan `plans/20260925-2220-switch-and-steady-state.md` has every
+run.
+
+| | time |
+| --- | ---: |
+| stock `git switch`, 161k files differ | 93 s, 2.2 GB of overlay |
+| the same with `checkout.workers=8` (now seeded) | 77 s |
+| `gfs switch`, target index cached | 1.3–2.5 s |
+| `gfs switch`, target index built (first pin of a commit) | 4–13 s |
+| `gfs switch` carrying a few uncommitted edits | 2.5 s |
+| `gfs switch` over 60k modified rows | 5.0 s |
+| `gfs switch` right after a stock `git commit` | 2.0 s |
+| `gfs switch` back after a stock switch (112k rows judged against `HEAD`) | 13–19 s, copies freed |
+| a refusal (conflicting edit, or something staged) | 0.4 s |
+| `git status` with nothing new | 1.9–2.2 s, no index write |
+| first `git status` after a `gfs switch` | 3.6–4.8 s |
+
+Where a re-pin's time goes, from the host log's `re-pinned` line
+(`resolve_ms`, `index_ms`, `seed_and_rebind_ms`, `invalidate_ms`): with the
+index cached, about 0.2 s resolving, 0.2–0.9 s reading the index, 0.7 s
+seeding `.git` and rebinding the overlay, and 4–5 µs per name the kernel
+had cached (1.3 s for 300k). A switch right after a whole-tree walk (an
+uncached `git status`) took 6–12 s, almost all of it in resolving: the
+walk had pushed the clone's 752 MB pack index and 14 MB `packed-refs` out
+of the page cache, and 20 s later the same step took 0.24 s.
+
+A stock checkout's time is not in writing files (1.2 s of 78 s in
+`GIT_TRACE2_PERF`, 7 s in tree traversal); the other ~66 s of
+`unpack_trees` is untraced serial work in the main process, which checkout
+workers do not parallelize -- most likely unlinking the 95k files the
+target lacks, one FUSE round trip each (not measured separately).
+
 ## Reading a result
 
 - Columns are single runs; treat differences under about 10 % on the

@@ -145,13 +145,22 @@ on universe with a private daemon, and a commit on `main`.
   (`Gfs::outlast_negative_entries`), at most 1 s and only after a miss.
 * Smoke test `gfs-fuse/tests/fsmonitor.rs::gfs_switch_leaves_local_commits_on_their_branch`.
 
-**Step 4 — steer users, and measure the stock path**
-* A `post-checkout` hook that prints one line after a stock branch checkout
-  (time taken, files written, and that `gfs switch` does this in ~2 s).
-* Measure `checkout.workers` for a stock switch; keep it in the seeded config
-  only if it helps.
-* Docs: `README`, the manual test guide, and `docs/performance.md` say to use
-  `gfs switch` in a workspace and record the new numbers.
+**Step 4 — steer users, and measure the stock path** (complete)
+* A `post-checkout` hint, local mode only: `.git/hooks/gfs-post-checkout`,
+  registered as a config hook (`hook.gfs-switch-hint.event/command` in
+  `.git/gfs/config`). After a branch checkout that moved `HEAD` to another
+  commit and wrote 1 000 files or more (counted with `git diff-tree`, 2.7 s
+  for 161k, 0.24 s for a small one), one line on stderr: the count and the
+  `gfs switch` to use. It cannot know the checkout's time, so it does not
+  claim one.
+* `checkout.workers = 8` seeded: 93 → 77 s for a 161k-file stock switch; 32
+  was no faster (78.7 s).
+* Docs: README (local mode: switch with `gfs switch`), `docs/performance.md`
+  (a section with the numbers and where a re-pin's time goes), the manual
+  test guide (what to check by hand).
+* Every re-pin logs one `re-pinned` line with its phases; the host's log now
+  goes to stderr, i.e. `host.log` (it went to stdout, `/dev/null` for a
+  spawned host, so `host.log` had always been empty).
 
 ## Decisions
 
@@ -360,9 +369,18 @@ on universe with a private daemon, and a commit on `main`.
 
 * **A switch right after a full-tree walk is slow**: 9.7-11 s instead of
   1.6-5 s, each time it followed an uncached `git status` (71-74 s, which
-  looks up every one of the 1.33M paths). Likely `InodeTable::repin`
-  returning every known record for kernel invalidation, one
-  `FUSE_NOTIFY_INVAL_ENTRY` each; not verified. It predates 3b.
+  looks up every one of the 1.33M paths). The first guess -- invalidating
+  every cached name -- was wrong: the `re-pinned` log shows 1.37 s for 255k
+  names (4-5 us each), while *resolving* the pin took 6.3 s instead of
+  0.16-0.27 s. After waiting 20 s it took 0.24 s, with no prefetch running.
+  The box had 0 GB free (104 of 123 GB used); the walk's ~1.8M cached
+  dentries and inodes push the clone's 752 MB pack index and 14 MB
+  `packed-refs` out of the page cache, and libgit2 reads them back cold.
+  Not a gfs cost to fix; recorded in `docs/performance.md`.
+* **The host's memory after that walk**: 9.4 GB RSS, of which 6.9 GB is
+  file-backed (the clone's packs, mapped by libgit2, reclaimable) and
+  2.5 GB anonymous (per-path state for ~1.8M names the kernel looked up).
+  The 9.9 GB seen on the user's long-running daemon is the same shape.
 * Tests: `gfs-overlay`, `gfs-git`, `gfs-mount`, `gfs-fuse`, `gfs-cli` whole
   (`--no-fail-fast`): only the known `mutations::a_recreated_directory_does_not_show_the_base_children_it_replaced`
   and `prefetch::reading_a_directory_through_fetches_the_rest_of_it` fail.

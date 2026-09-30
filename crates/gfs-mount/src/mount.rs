@@ -938,6 +938,7 @@ impl Mount {
       }
     }
 
+    let started = std::time::Instant::now();
     let mut resolved = resolve_pin(&self.config, self.local.as_ref(), &selector, next_epoch).await?;
     let commit = resolved.pin.commit.clone();
     // A local-mode switch pins a commit and names the branch separately: the
@@ -956,7 +957,9 @@ impl Mount {
     // fetch is the only network dependency; failing the switch here leaves the
     // old pin fully intact, which is the same guarantee resolve_pin's ordering
     // already gives.
+    let resolved_at = started.elapsed();
     let index = resolved.pin.client.commit_index(&commit).await?;
+    let indexed_at = started.elapsed();
     crate::gitdir::seed_git_dir(&crate::gitdir::SeedSpec {
       git_dir: &git_dir_path,
       facts: &resolved.facts,
@@ -983,6 +986,7 @@ impl Mount {
       )
       .map_err(crate::fs::overlay_as_service_error)?;
 
+    let seeded_at = started.elapsed();
     let stale = self.fs.repin(
       Arc::clone(&resolved.pin.client),
       Arc::clone(&self.overlay),
@@ -994,10 +998,25 @@ impl Mount {
       std::mem::replace(&mut *current, resolved.pin)
     };
 
+    let swapped_at = started.elapsed();
+    let invalidated = stale.len();
     self.invalidate(stale).await;
+    let invalidated_at = started.elapsed();
     self.fs.outlast_negative_entries().await;
     self.persist()?;
     superseded.release().await;
+    let ms = |d: Duration| d.as_millis() as u64;
+    tracing::info!(
+      commit = %commit.to_hex(),
+      resolve_ms = ms(resolved_at),
+      index_ms = ms(indexed_at - resolved_at),
+      seed_and_rebind_ms = ms(seeded_at - indexed_at),
+      swap_ms = ms(swapped_at - seeded_at),
+      invalidate_ms = ms(invalidated_at - swapped_at),
+      invalidated,
+      total_ms = ms(started.elapsed()),
+      "re-pinned"
+    );
 
     Ok(RefreshReport {
       previous_generation: previous_epoch,

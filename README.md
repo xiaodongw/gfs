@@ -104,6 +104,18 @@ carries `CAP_SYS_ADMIN` (`sudo setcap cap_sys_admin+ep target/release/gfs-fuse`)
 the kernel reads and writes files itself through FUSE passthrough, with no
 flag needed.
 
+**Switch branches with `gfs switch`, not `git switch`.** A stock checkout
+writes every differing file through the mount: 93 s and 2.2 GB of overlay
+for a 161k-file switch on a 1.3M-file monorepo. `gfs switch <branch>` (and
+`-c <new>`, `--detach <rev>`) re-pins the view and re-seeds `.git`
+instead, in 1–5 s whatever the difference. It follows Git's rules:
+uncommitted edits travel when both commits agree on the path, the switch is
+refused naming the paths when not, staged changes are refused, and commits
+made with a stock `git commit` stay on their branch (their objects are
+copied into the clone so the view can be pinned to them). After a stock
+checkout of a thousand files or more, a hook says which `gfs switch` would
+have done it. Numbers: [docs/performance.md](docs/performance.md#branch-switches-in-local-mode-2026-09-30).
+
 What local mode does not do: expand LFS pointers (the tree shows the
 pointer files, as `GIT_LFS_SKIP_SMUDGE=1` would), or build a search index —
 `gfs rg` scans the pack in parallel instead, which is the honest answer for

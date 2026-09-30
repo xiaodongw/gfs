@@ -532,4 +532,21 @@ async fn gfs_switch_moves_a_local_view_between_branches_without_a_checkout() {
 
   // Not a branch: refused, with the way to get there.
   assert!(refused(switch("v1.0", false, false)).await, "a tag is not a branch");
+
+  // A stock checkout gets the hint hook; a small one stays quiet (the hint
+  // starts at a thousand files written).
+  let (hook, stock) = on_fs({
+    let ws = ws.clone();
+    move || {
+      (
+        git_in(&ws, &["config", "hook.gfs-switch-hint.event"]).1
+          + &git_in(&ws, &["config", "checkout.workers"]).1,
+        git_in(&ws, &["switch", "old"]),
+      )
+    }
+  })
+  .await;
+  assert_eq!(hook, "post-checkout\n8\n");
+  assert!(stock.0, "{}", stock.1);
+  assert!(!stock.1.contains("gfs switch"), "{}", stock.1);
 }
