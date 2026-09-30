@@ -142,6 +142,9 @@ async fn head_means_the_pin_after_the_view_moves() {
     .call(Request::Switch {
       selector: older.clone(),
       branch: None,
+      create: false,
+      start_point: None,
+      detach: false,
     })
     .await
   else {
