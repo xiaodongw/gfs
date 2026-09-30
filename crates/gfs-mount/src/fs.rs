@@ -631,6 +631,10 @@ pub struct Gfs {
   dirs: Mutex<HashMap<u64, Arc<tokio::sync::Mutex<DirState>>>>,
   files: Mutex<HashMap<u64, Arc<FileState>>>,
   next_handle: AtomicU64,
+  /// When a name in the merged view was last answered as absent. The kernel
+  /// keeps that answer for `negative_ttl` and a re-pin has no record of the
+  /// name to invalidate, so [`Gfs::outlast_negative_entries`] waits it out.
+  last_negative: Mutex<Option<std::time::Instant>>,
   /// Shared rather than owned: a prefetch runs after the call that triggered it
   /// has returned, and what it fetched still belongs in this mount's counters.
   stats: Arc<Mutex<FsStats>>,
@@ -689,6 +693,7 @@ impl Gfs {
       dirs: Mutex::new(HashMap::new()),
       files: Mutex::new(HashMap::new()),
       next_handle: AtomicU64::new(1),
+      last_negative: Mutex::new(None),
       stats: Arc::new(Mutex::new(FsStats::default())),
       budget: Arc::new(budget),
       passthrough: AtomicU8::new(PASSTHROUGH_UNAVAILABLE),
@@ -763,6 +768,21 @@ impl Gfs {
 
   pub fn stats(&self) -> FsStats {
     *self.stats.lock().expect("fs stats")
+  }
+
+  /// Wait until every negative entry the kernel may hold from before a
+  /// re-pin has expired. A name absent in the old commit and present in the
+  /// new one would otherwise stay invisible for up to `negative_ttl` -- long
+  /// enough for a `git status` right after `gfs switch` to miss a directory
+  /// and, with fsmonitor trusting the index, say nothing about it. Called
+  /// after the swap, so a miss answered during it is covered too.
+  pub async fn outlast_negative_entries(&self) {
+    let last = *self.last_negative.lock().expect("last negative");
+    if let Some(remaining) =
+      last.and_then(|at| self.config.negative_ttl.checked_sub(at.elapsed()))
+    {
+      tokio::time::sleep(remaining).await;
+    }
   }
 
   /// What the hydration budget has admitted and refused.
@@ -2294,6 +2314,7 @@ impl Filesystem for GfsFilesystem {
         }
         Ok(None) => {
           fs.bump(|s| s.negative_lookups += 1);
+          *fs.last_negative.lock().expect("last negative") = Some(std::time::Instant::now());
           // A negative entry with a TTL, which is what an immutable commit
           // permits: the kernel stops asking. Signalled by inode zero, the
           // low-level FUSE convention -- `reply.error(ENOENT)` would be correct

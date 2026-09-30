@@ -114,9 +114,36 @@ on universe with a private daemon, and a commit on `main`.
   (in `gfs-fuse` because the hook binary is only installed there; without
   the stamps Git hides the carried edit and the test fails).
 
-*3c (pending): switch after a stock `git commit` -- the local source also reads
-the workspace's objects, and the view adopts the new `HEAD` without discarding
-uncommitted edits.*
+*3c (complete): switch after a stock `git commit`.*
+* Every `gfs switch` first copies the workspace's own objects (loose, and
+  packs by name) into the clone (`LocalRepository::import_objects`), so a
+  commit made here resolves, pins and is anchored there like any other:
+  `gfs switch <branch with local commits>`, `--detach <local sha>`, and
+  start points all work.
+* The local-commit refusal is gone for `gfs switch`; the commits stay on
+  their branch (the seed writes only the target branch's ref). `gfs refresh`
+  still refuses.
+* Staged changes are judged against `HEAD`: the index's cache-tree root
+  equal to `HEAD^{tree}` (always, right after `git commit`) settles it
+  without an index for `HEAD`; otherwise the entry comparison of 3b, with
+  `HEAD`'s index built if no pin has it.
+* `plan_carry` judges each row against `HEAD` (`h`) rather than the pin: a
+  row whose bytes and mode are `HEAD`'s (an edit since committed, hashed
+  only when `HEAD` changed the path since the pin) is clean -- kept as a blob
+  reference (copy freed) where the target agrees, else replaced by the
+  target's version; a directory the commit added, holding all its files, is
+  treated as a tracked one, so it goes when the target lacks it and nothing
+  untracked is left in it. With `HEAD` at the pin the rules are 3b's.
+* Refused: a path where `HEAD` differs from the pin but the working tree was
+  never written (`git reset --soft`), since carrying it would need the pin's
+  bytes copied into the overlay.
+* Found on the way, fixed for every re-pin: the kernel keeps a negative
+  entry for `negative_ttl` (1 s) and a re-pin has no record of the name to
+  invalidate, so a path absent in the old commit stayed invisible for up to
+  a second after the switch -- and a `git status` then, trusting fsmonitor,
+  said nothing about it. The re-pin now waits out the last negative answer
+  (`Gfs::outlast_negative_entries`), at most 1 s and only after a miss.
+* Smoke test `gfs-fuse/tests/fsmonitor.rs::gfs_switch_leaves_local_commits_on_their_branch`.
 
 **Step 4 — steer users, and measure the stock path**
 * A `post-checkout` hook that prints one line after a stock branch checkout
@@ -205,6 +232,24 @@ uncommitted edits.*
   opaque, as `mkdir` makes them: a non-opaque directory with no base asks the
   target for a listing it does not have, `readdir` gets `ENOENT`, and glibc
   reports an empty directory.
+* **3c: local commits are copied into the clone, not read beside it.** The
+  alternative was adding the workspace's object directory to the clone's
+  in-process libgit2 odb. It would leave the clone's disk untouched, but the
+  lease anchor (`refs/gfs/mounts/<id>`) would then name an object the clone
+  lacks, and the clone's own `git gc`/`fsck` fail on such a ref. Copying is
+  what `git push` into the clone would do: additive, content-addressed, kept
+  alive by the anchor while pinned and pruned by the clone's `gc` after.
+  Everything in the workspace's own `objects` is copied, not only what is
+  reachable from its commits: they are loose (`gc.auto=0`) and few, and a
+  reachability walk would need the clone's tree for every edge.
+* **3c: edits are judged against `HEAD`, the pin is left as it is.** Git's
+  rule is about `HEAD`, not the commit gfs happens to serve, so a committed
+  edit is clean. An explicit "adopt `HEAD`" re-pin after each commit was
+  considered (a `post-commit` hook): it would keep the pin at `HEAD`, but cost
+  an index build and move every base file's mtime on every commit, which a
+  build tool reads as "everything changed". Deferring to the next switch pays
+  once, when the view is moving anyway.
+
 * **Local-mode only.** `switch_to` (server mode) still refuses a dirty
   workspace; server mode has no `.git` of its own to re-seed per branch.
 
@@ -294,6 +339,25 @@ uncommitted edits.*
   | back, same rows, no full walk before it | 2.55 s | status matches |
   | repeated switches, few rows | 1.6-1.8 s | |
 
+* **Step 3c results, universe** (2026-09-30, master at `6e49f8e`; fresh
+  private workspace; `gfs switch -c gfs-3c-probe`, a stock `git commit` of a
+  `.bazelrc` edit and a new two-level directory, then an uncommitted
+  `README.md` edit and `docs/OWNERS` deletion; every status matched the
+  uncached one):
+
+  | | time | result |
+  |---|---|---|
+  | `git commit` (with the user's global Databricks hooks) | 3.2 s | |
+  | to universe-goofys-grpc | 4.75 s | 2 rows kept; `.bazelrc` is the target's, the new directory gone; status 3.6 s, then 1.9 s |
+  | back to the probe branch (its local commit pinned, index built) | 12.6 s, after an uncached walk | `.bazelrc` and the directory are the commit's; status 4.8 s, then 2.1 s |
+  | repeated | 1.3-2.1 s | |
+  | a switch straight after another commit | 2.0 s | cache-tree settles "nothing staged" |
+  | refused: staged `README.md` | 0.38 s | |
+
+  The clone gained 13 loose objects (the probe commits); its refs were
+  unchanged afterwards and nothing names the objects, so its `gc` prunes
+  them.
+
 * **A switch right after a full-tree walk is slow**: 9.7-11 s instead of
   1.6-5 s, each time it followed an uncached `git status` (71-74 s, which
   looks up every one of the 1.33M paths). Likely `InodeTable::repin`
@@ -306,6 +370,9 @@ uncommitted edits.*
   `workspace_git::a_bare_push_never_fans_out_to_branches_the_caller_is_not_on`
   failing (reading only `.git/config`); fixed in ec13b50 and 990196a. 3a's
   "whole suites pass" above was wrong.
+* 3c tests: the same suites whole; failing are the known `mutations`,
+  `prefetch` and `overlay` ones and `faults::a_deleted_base_directory_recreated_and_refilled_stays_consistent`,
+  which also fails on main (2 of 2 runs) and passed 1 of 2 with 3c.
 
 * Traces and probes: `GIT_TRACE2_PERF` on `git status` / `git switch` in a
   private workspace (`GFS_HOST_SOCKET=/tmp/gfsb/host.sock`, workspace

@@ -309,6 +309,11 @@ pub trait GitRepository: Send + Sync + std::fmt::Debug {
   /// preparing the next commit on a branch cost its diff rather than its tree.
   fn diff_commits(&self, from: &ObjectId, to: &ObjectId) -> Result<Vec<TreeDelta>, GfsError>;
 
+  /// Every path whose entry differs between two commits' trees, whatever its
+  /// mode: both sides of a change, in diff order. Directories are not listed,
+  /// only what is under them.
+  fn changed_paths(&self, from: &ObjectId, to: &ObjectId) -> Result<Vec<BytePath>, GfsError>;
+
   /// The same two trees, rendered for a reader rather than for a manifest.
   ///
   /// Distinct from [`GitRepository::diff_commits`] in what it is *for*, which is
@@ -725,6 +730,14 @@ impl AsyncRepository {
     to: ObjectId,
   ) -> Result<Vec<TreeDelta>, GfsError> {
     self.run(move |r| r.diff_commits(&from, &to)).await
+  }
+
+  pub async fn changed_paths(
+    &self,
+    from: ObjectId,
+    to: ObjectId,
+  ) -> Result<Vec<BytePath>, GfsError> {
+    self.run(move |r| r.changed_paths(&from, &to)).await
   }
 
   pub async fn visible_refs(&self) -> Result<Vec<(String, ObjectId)>, GfsError> {

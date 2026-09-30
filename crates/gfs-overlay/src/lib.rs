@@ -203,13 +203,16 @@ pub struct Carry {
 
 /// One kept row: its path, what the new commit has there, whether the new
 /// commit's children show through it (a directory), and whether Git must be
-/// told about it.
+/// told about it. `rehome` is set when the row's bytes are the new commit's
+/// blob at its own path (an edit since committed): the row becomes a
+/// reference to it and its copy is freed, unless a writer still holds it.
 #[derive(Clone, Debug)]
 pub struct Carried {
   pub path: BytePath,
   pub base: Option<BaseFacts>,
   pub opaque: bool,
   pub report: bool,
+  pub rehome: Option<ObjectId>,
 }
 
 /// What a mutation does to its parent directory's timestamps, decided while the
@@ -556,11 +559,22 @@ impl Overlay {
             "the workspace changed while the switch was being planned; try again",
           ));
         };
-        kept.push(OverlayEntry {
+        let mut kept_entry = OverlayEntry {
           base: row.base.clone(),
           opaque: row.opaque,
           ..entry.clone()
-        });
+        };
+        if let Some(oid) = &row.rehome {
+          let written = entry
+            .content
+            .local_id()
+            .is_some_and(|id| inner.writers.get(&id).is_some_and(|n| *n > 0));
+          if !written {
+            kept_entry.content = Content::Base(oid.clone());
+            kept_entry.renamed_from = None;
+          }
+        }
+        kept.push(kept_entry);
         if row.report {
           report.push(row.path.as_bytes().to_vec());
         }

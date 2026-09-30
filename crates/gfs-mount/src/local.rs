@@ -259,6 +259,60 @@ impl LocalRepository {
       .collect()
   }
 
+  /// A commit as a pin of it would see it: its tree and snapshot time.
+  pub async fn revision(
+    &self,
+    commit: &ObjectId,
+  ) -> Result<gfs_types::ResolvedRevision, GfsError> {
+    let expression = RevisionExpression::parse(&commit.to_hex(), HashAlgorithm::Sha1)?;
+    self.repo.resolve_expression(expression).await
+  }
+
+  /// Every path whose entry differs between two commits.
+  pub async fn changed_paths(
+    &self,
+    from: &ObjectId,
+    to: &ObjectId,
+  ) -> Result<Vec<BytePath>, GfsError> {
+    self.repo.changed_paths(from.clone(), to.clone()).await
+  }
+
+  /// Every non-directory path under `root` in a commit.
+  pub async fn files_under(
+    &self,
+    commit: &ObjectId,
+    root: &BytePath,
+  ) -> Result<Vec<BytePath>, GfsError> {
+    Ok(
+      self
+        .repo
+        .walk_paths(commit.clone(), root.clone())
+        .await?
+        .into_iter()
+        .filter(|(_, mode)| *mode != gfs_types::mode::DIRECTORY)
+        .map(|(path, _)| path)
+        .collect(),
+    )
+  }
+
+  /// Copy the objects a workspace wrote itself -- its commits, trees and
+  /// blobs, which only its own `objects` holds (everything else it borrows
+  /// from this clone through `objects/info/alternates`) -- into the clone,
+  /// so a commit made in the workspace can be resolved, pinned and anchored
+  /// here like any other. Returns how many files were copied.
+  ///
+  /// Additive and content-addressed, as `git push` into the clone would be:
+  /// loose objects byte for byte, packs by name, each renamed into place so
+  /// a reader never sees half a file. The lease anchor keeps what a pin
+  /// needs; anything else is the clone's `git gc` to prune.
+  pub async fn import_objects(&self, workspace_objects: PathBuf) -> Result<u64, GfsError> {
+    let clone = self.objects.clone();
+    tokio::task::spawn_blocking(move || import_objects(&workspace_objects, &clone))
+      .await
+      .map_err(|e| GfsError::internal(format!("the object import failed: {e}")))?
+      .map_err(|e| GfsError::internal(format!("importing the workspace's objects: {e}")))
+  }
+
   /// Pin a selector: resolve it, anchor the commit in the clone, and build the
   /// source that reads through it.
   pub async fn pin(
@@ -348,6 +402,68 @@ impl LocalRepository {
       .insert(key, Arc::clone(&bytes));
     Ok(bytes)
   }
+}
+
+/// [`LocalRepository::import_objects`]: every loose object and pack in
+/// `from` that `to` does not have by name.
+fn import_objects(from: &Path, to: &Path) -> std::io::Result<u64> {
+  fn hex(name: &str, len: usize) -> bool {
+    name.len() == len && name.bytes().all(|b| b.is_ascii_hexdigit())
+  }
+  fn copy_into_place(src: &Path, dest: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = dest.with_file_name(format!(
+      "tmp_gfs_import_{}_{}",
+      std::process::id(),
+      dest.file_name().and_then(|n| n.to_str()).unwrap_or("object")
+    ));
+    std::fs::copy(src, &tmp)?;
+    std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o444))?;
+    std::fs::rename(&tmp, dest)
+  }
+  let mut copied = 0;
+  let Ok(entries) = std::fs::read_dir(from) else {
+    return Ok(0);
+  };
+  for entry in entries {
+    let entry = entry?;
+    let name = entry.file_name();
+    let Some(name) = name.to_str() else { continue };
+    if hex(name, 2) {
+      for object in std::fs::read_dir(entry.path())? {
+        let object = object?;
+        let file = object.file_name();
+        let Some(file) = file.to_str() else { continue };
+        let dest = to.join(name).join(file);
+        if !hex(file, 38) || dest.exists() {
+          continue;
+        }
+        std::fs::create_dir_all(to.join(name))?;
+        copy_into_place(&object.path(), &dest)?;
+        copied += 1;
+      }
+    } else if name == "pack" {
+      for pack in std::fs::read_dir(entry.path())? {
+        let pack = pack?.path();
+        if pack.extension().and_then(|e| e.to_str()) != Some("pack") {
+          continue;
+        }
+        let index = pack.with_extension("idx");
+        let (Some(pack_name), Some(index_name)) = (pack.file_name(), index.file_name()) else {
+          continue;
+        };
+        let dest_index = to.join("pack").join(index_name);
+        if !index.is_file() || dest_index.exists() {
+          continue;
+        }
+        // The pack before its index: Git and libgit2 find packs by index.
+        copy_into_place(&pack, &to.join("pack").join(pack_name))?;
+        copy_into_place(&index, &dest_index)?;
+        copied += 2;
+      }
+    }
+  }
+  Ok(copied)
 }
 
 /// What pinning a selector produced.

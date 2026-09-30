@@ -362,6 +362,54 @@ pub fn first_staged_difference(a: &[u8], b: &[u8]) -> Result<Option<Vec<u8>>, Gf
   }
 }
 
+/// The tree the index stages, when Git has recorded it: the root of a valid
+/// cache tree (`TREE`), with no conflict or intent-to-add entries, which the
+/// cache tree does not describe. `None` means unknown, not "differs".
+///
+/// Git invalidates the cache tree along every path whose entry it changes and
+/// `git commit` rebuilds it, so right after a commit this is the commit's
+/// tree, and an index whose root still equals `HEAD^{tree}` stages nothing --
+/// without building an index for `HEAD` to compare with.
+pub fn staged_tree(index: &[u8]) -> Result<Option<[u8; 20]>, GfsError> {
+  let mut cursor = EntryCursor::new(index)?;
+  while let Some((stage, _, _, intent_to_add)) = cursor.next()? {
+    if stage != 0 || intent_to_add {
+      return Ok(None);
+    }
+  }
+  let mut pos = cursor.pos;
+  // Extensions until the trailing checksum: a signature, a length, a body.
+  while pos + 8 + 20 <= index.len() {
+    let signature = &index[pos..pos + 4];
+    let len = u32::from_be_bytes(index[pos + 4..pos + 8].try_into().expect("4 bytes")) as usize;
+    let body = index.get(pos + 8..pos + 8 + len).ok_or_else(|| {
+      GfsError::new(ErrorCode::FailedPrecondition, "the index is truncated")
+    })?;
+    if signature == b"TREE" {
+      // The root first: an empty path, NUL, "<entry count> <subtrees>\n",
+      // and the tree ID only when the count is not -1 (invalid).
+      let Some(rest) = body.strip_prefix(b"\0") else {
+        return Ok(None);
+      };
+      let Some(line_end) = rest.iter().position(|b| *b == b'\n') else {
+        return Ok(None);
+      };
+      let count = std::str::from_utf8(&rest[..line_end])
+        .ok()
+        .and_then(|line| line.split(' ').next())
+        .and_then(|count| count.parse::<i64>().ok());
+      return Ok(match count {
+        Some(count) if count >= 0 => rest
+          .get(line_end + 1..line_end + 21)
+          .and_then(|oid| oid.try_into().ok()),
+        _ => None,
+      });
+    }
+    pos += 8 + len;
+  }
+  Ok(None)
+}
+
 /// What an entry stages, apart from its path: stage, mode, object ID, and
 /// whether it is intent-to-add.
 type Staged = (u16, u32, [u8; 20], bool);

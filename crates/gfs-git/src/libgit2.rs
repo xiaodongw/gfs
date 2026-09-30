@@ -1161,6 +1161,32 @@ impl GitRepository for Libgit2Repository {
     Ok(out)
   }
 
+  fn changed_paths(&self, from: &ObjectId, to: &ObjectId) -> Result<Vec<BytePath>, GfsError> {
+    let pooled = self.checkout()?;
+    let repo: &git2::Repository = &pooled;
+    let tree_of = |commit: &ObjectId| -> Result<git2::Tree<'_>, GfsError> {
+      let id = self.find_commit(repo, self.git_oid(commit)?)?.tree_id();
+      repo.find_tree(id).map_err(|e| not_found(&e, "tree"))
+    };
+    let (old_tree, new_tree) = (tree_of(from)?, tree_of(to)?);
+    let mut opts = git2::DiffOptions::new();
+    opts.include_typechange(true);
+    let diff = repo
+      .diff_tree_to_tree(Some(&old_tree), Some(&new_tree), Some(&mut opts))
+      .map_err(|e| not_found(&e, "tree diff"))?;
+    let mut out = Vec::new();
+    for delta in diff.deltas() {
+      for file in [delta.old_file(), delta.new_file()] {
+        if let Some(path) = file.path_bytes() {
+          if out.last().is_none_or(|last: &BytePath| last.as_bytes() != path) {
+            out.push(BytePath::new(path.to_vec()));
+          }
+        }
+      }
+    }
+    Ok(out)
+  }
+
   fn diff(&self, request: &DiffRequest) -> Result<DiffOutput, GfsError> {
     let pooled = self.checkout()?;
     let repo: &git2::Repository = &pooled;

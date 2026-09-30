@@ -523,3 +523,156 @@ async fn gfs_switch_carries_edits_the_two_commits_agree_on() {
   })
   .await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn gfs_switch_leaves_local_commits_on_their_branch() {
+  // A stock `git commit` moves HEAD past the pin. `gfs switch` judges edits
+  // against HEAD, as Git does: what was committed is clean and takes the
+  // target's version; what was not is carried. The commits stay on their
+  // branch, and switching back to it pins them.
+  install_hook_on_path();
+  use gfs_mount::control::{Request, Response};
+  let clone_dir = tempfile::tempdir().unwrap();
+  let clone = clone_dir.path().join("clone");
+  Job::clone_fixture("basic", &clone);
+  let job = Job::local_from(&clone, "main", tempfile::tempdir().unwrap()).await;
+  let ws = job.workspace.clone();
+
+  let switch = |target: &str, create: bool, detach: bool| {
+    let socket = job.socket();
+    let request = Request::Switch {
+      selector: target.to_owned(),
+      branch: None,
+      create,
+      start_point: None,
+      detach,
+    };
+    async move {
+      let response = on_fs(move || gfs_mount::control::call(&socket, &request).unwrap()).await;
+      match response {
+        Response::Error { message, .. } => Some(message),
+        _ => None,
+      }
+    }
+  };
+  let run = |args: &'static [&'static str]| {
+    let ws = ws.clone();
+    on_fs(move || {
+      let (ok, out) = git_in(&ws, args);
+      assert!(ok, "git {args:?}: {out}");
+      out
+    })
+  };
+  let fs = |f: fn(&std::path::Path)| {
+    let ws = ws.clone();
+    on_fs(move || f(&ws))
+  };
+  let statuses = || {
+    let ws = ws.clone();
+    on_fs(move || {
+      let cached = git_in(&ws, &["status", "--porcelain"]).1;
+      let plain = git_in(
+        &ws,
+        &[
+          "-c",
+          "core.fsmonitor=false",
+          "-c",
+          "core.untrackedCache=false",
+          "status",
+          "--porcelain",
+        ],
+      )
+      .1;
+      (cached, plain)
+    })
+  };
+  run(&["config", "user.name", "someone"]).await;
+  run(&["config", "user.email", "someone@example.com"]).await;
+  run(&["status", "--porcelain"]).await;
+
+  // Commit on a branch of our own: an edit and a new directory.
+  assert_eq!(switch("feature-x", true, false).await, None);
+  fs(|ws| {
+    std::fs::write(ws.join("src/main.rs"), b"fn main() { feature(); }\n").unwrap();
+    std::fs::create_dir(ws.join("feat")).unwrap();
+    std::fs::write(ws.join("feat/one.rs"), b"pub fn one() {}\n").unwrap();
+  })
+  .await;
+  run(&["add", "-A"]).await;
+  run(&["commit", "-qm", "feature one"]).await;
+  let feature = run(&["rev-parse", "HEAD"]).await.trim().to_owned();
+  // Uncommitted on top: an edit main agrees on, and an untracked file.
+  fs(|ws| {
+    std::fs::write(ws.join("README.md"), b"edited\n").unwrap();
+    std::fs::write(ws.join("notes.txt"), b"todo\n").unwrap();
+  })
+  .await;
+
+  // Away to main: the committed edit and directory give way to main's tree;
+  // the uncommitted ones come along.
+  assert_eq!(switch("main", false, false).await, None);
+  let (cached, plain) = statuses().await;
+  assert_eq!(cached, plain);
+  assert_eq!(cached, " M README.md\n?? notes.txt\n");
+  fs(|ws| {
+    assert_eq!(
+      std::fs::read(ws.join("src/main.rs")).unwrap(),
+      b"fn main() { println!(\"bye\"); }\n"
+    );
+    assert!(!ws.join("feat").exists());
+    assert_eq!(std::fs::read(ws.join("README.md")).unwrap(), b"edited\n");
+  })
+  .await;
+  assert_eq!(run(&["rev-parse", "feature-x"]).await.trim(), feature);
+  let (ok, _) = git_in(&clone, &["cat-file", "-e", &feature]);
+  assert!(ok, "the commit was copied into the clone");
+
+  // And back: the branch's own commit is pinned, edits still carried.
+  assert_eq!(switch("feature-x", false, false).await, None);
+  let (cached, plain) = statuses().await;
+  assert_eq!(cached, plain);
+  assert_eq!(cached, " M README.md\n?? notes.txt\n");
+  fs(|ws| {
+    assert_eq!(
+      std::fs::read(ws.join("src/main.rs")).unwrap(),
+      b"fn main() { feature(); }\n"
+    );
+    assert_eq!(std::fs::read(ws.join("feat/one.rs")).unwrap(), b"pub fn one() {}\n");
+  })
+  .await;
+
+  // A second commit, then an uncommitted edit to a path main changes:
+  // refused, nothing moves.
+  fs(|ws| std::fs::write(ws.join("feat/two.rs"), b"pub fn two() {}\n").unwrap()).await;
+  run(&["add", "feat/two.rs"]).await;
+  run(&["commit", "-qm", "feature two"]).await;
+  fs(|ws| std::fs::write(ws.join("src/main.rs"), b"fn main() { dirty(); }\n").unwrap()).await;
+  let message = switch("main", false, false).await.expect("a conflict is refused");
+  assert!(message.contains("src/main.rs"), "{message}");
+  assert!(!message.contains("feat/"), "{message}");
+  assert_eq!(
+    run(&["symbolic-ref", "HEAD"]).await.trim(),
+    "refs/heads/feature-x"
+  );
+
+  // Staged changes after a commit are refused too.
+  run(&["checkout", "--", "src/main.rs"]).await;
+  run(&["add", "README.md"]).await;
+  let message = switch("main", false, false).await.expect("staged changes are refused");
+  assert!(message.contains("staged"), "{message}");
+  run(&["restore", "--staged", "README.md"]).await;
+
+  // A local commit by hash, from the other branch.
+  assert_eq!(switch("main", false, false).await, None);
+  let feature_ref = feature.clone();
+  assert_eq!(switch(&feature_ref, false, true).await, None);
+  let (cached, plain) = statuses().await;
+  assert_eq!(cached, plain);
+  assert_eq!(cached, " M README.md\n?? notes.txt\n");
+  fs(|ws| {
+    assert!(ws.join("feat/one.rs").exists());
+    assert!(!ws.join("feat/two.rs").exists());
+  })
+  .await;
+  assert_eq!(run(&["rev-parse", "HEAD"]).await.trim(), feature);
+}
