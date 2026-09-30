@@ -354,3 +354,172 @@ async fn the_answer_is_a_delta_and_a_quiet_status_rewrites_nothing() {
   assert_eq!(quiet, plain);
   assert!(!rewritten, "a status with nothing new must not rewrite the index");
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn gfs_switch_carries_edits_the_two_commits_agree_on() {
+  // Git's rule: a local change travels when its path is the same in both
+  // commits; otherwise the switch is refused and nothing moves. `main` and
+  // `old` (v1.0) agree on README.md and src/lib/; they differ on
+  // src/main.rs, src/new.rs (main only), and docs/guide.md (old only).
+  install_hook_on_path();
+  use gfs_mount::control::{Request, Response};
+  let clone_dir = tempfile::tempdir().unwrap();
+  let clone = clone_dir.path().join("clone");
+  Job::clone_fixture("basic", &clone);
+  assert!(git_in(&clone, &["branch", "old", "v1.0"]).0);
+  // `deep` adds a/b/c.txt: a two-level directory main does not have.
+  std::fs::create_dir_all(clone.join("a/b")).unwrap();
+  std::fs::write(clone.join("a/b/c.txt"), b"c\n").unwrap();
+  for args in [
+    &["switch", "-q", "-c", "deep"][..],
+    &["add", "a"],
+    &["-c", "user.name=t", "-c", "user.email=t@example.com", "commit", "-qm", "deep"],
+    &["switch", "-q", "main"],
+  ] {
+    let (ok, out) = git_in(&clone, args);
+    assert!(ok, "{out}");
+  }
+  let job = Job::local_from(&clone, "main", tempfile::tempdir().unwrap()).await;
+  let ws = job.workspace.clone();
+  let config = std::fs::read_to_string(ws.join(".git/gfs/config")).unwrap();
+  assert!(config.contains("fsmonitor"), "the hook must be answering:\n{config}");
+
+  let refusal = |target: &str| {
+    let socket = job.socket();
+    let request = Request::Switch {
+      selector: target.to_owned(),
+      branch: None,
+      create: false,
+      start_point: None,
+      detach: false,
+    };
+    async move {
+      let response = on_fs(move || gfs_mount::control::call(&socket, &request).unwrap()).await;
+      match response {
+        Response::Error { message, .. } => Some(message),
+        _ => None,
+      }
+    }
+  };
+  let run = |args: &'static [&'static str]| {
+    let ws = ws.clone();
+    on_fs(move || git_in(&ws, args))
+  };
+  let fs = |f: fn(&std::path::Path)| {
+    let ws = ws.clone();
+    on_fs(move || f(&ws))
+  };
+  let statuses = || {
+    let ws = ws.clone();
+    on_fs(move || {
+      let cached = git_in(&ws, &["status", "--porcelain"]).1;
+      let plain = git_in(
+        &ws,
+        &[
+          "-c",
+          "core.fsmonitor=false",
+          "-c",
+          "core.untrackedCache=false",
+          "status",
+          "--porcelain",
+        ],
+      )
+      .1;
+      (cached, plain)
+    })
+  };
+  // Seed the untracked cache and the fsmonitor token as a user's shell would.
+  run(&["status", "--porcelain"]).await;
+
+  // An untracked file where `old` tracks one: refused, nothing moves.
+  fs(|ws| {
+    std::fs::write(ws.join("README.md"), b"edited\n").unwrap();
+    std::fs::write(ws.join("docs/guide.md"), b"mine\n").unwrap_or_else(|_| {
+      std::fs::create_dir(ws.join("docs")).unwrap();
+      std::fs::write(ws.join("docs/guide.md"), b"mine\n").unwrap();
+    });
+  })
+  .await;
+  let message = refusal("old").await.expect("an untracked conflict is refused");
+  assert!(message.contains("docs/guide.md"), "{message}");
+  assert!(!message.contains("README.md"), "{message}");
+  assert_eq!(
+    run(&["symbolic-ref", "HEAD"]).await.1.trim(),
+    "refs/heads/main"
+  );
+
+  // A change to a path `old` does not have: refused too.
+  fs(|ws| {
+    std::fs::remove_file(ws.join("docs/guide.md")).unwrap();
+    std::fs::write(ws.join("src/new.rs"), b"changed\n").unwrap();
+  })
+  .await;
+  let message = refusal("old").await.expect("a changed path is refused");
+  assert!(message.contains("src/new.rs"), "{message}");
+
+  // Staged changes would be lost with the index: refused until unstaged.
+  fs(|ws| {
+    std::fs::remove_file(ws.join("src/new.rs")).unwrap();
+    std::fs::write(ws.join("notes.txt"), b"todo\n").unwrap();
+    std::fs::write(ws.join("src/lib/extra.rs"), b"pub fn extra() {}\n").unwrap();
+    std::fs::remove_file(ws.join("src/lib/util.rs")).unwrap();
+  })
+  .await;
+  assert!(run(&["add", "notes.txt"]).await.0);
+  let message = refusal("old").await.expect("staged changes are refused");
+  assert!(message.contains("staged"), "{message}");
+  assert!(run(&["restore", "--staged", "notes.txt"]).await.0);
+
+  // Now it goes: the edit, the deletion, and the new files come along; the
+  // deletion of src/new.rs, which `old` does not have either, is gone.
+  let (before, _) = statuses().await;
+  assert!(before.contains(" D src/new.rs"), "{before}");
+  assert_eq!(refusal("old").await, None);
+  let (cached, plain) = statuses().await;
+  assert_eq!(cached, plain);
+  for line in [" M README.md", " D src/lib/util.rs", "?? notes.txt", "?? src/lib/extra.rs"] {
+    assert!(cached.contains(line), "{line} missing from:\n{cached}");
+  }
+  assert!(!cached.contains("src/new.rs"), "{cached}");
+  fs(|ws| {
+    assert_eq!(std::fs::read(ws.join("README.md")).unwrap(), b"edited\n");
+    assert_eq!(
+      std::fs::read(ws.join("src/main.rs")).unwrap(),
+      b"fn main() { println!(\"hi\"); }\n"
+    );
+    assert_eq!(std::fs::read(ws.join("docs/guide.md")).unwrap(), b"guide\n");
+    assert!(!ws.join("src/new.rs").exists());
+    assert!(!ws.join("src/lib/util.rs").exists());
+  })
+  .await;
+  // A quiet status afterwards agrees too: the carried paths were reported once.
+  let (cached, plain) = statuses().await;
+  assert_eq!(cached, plain);
+
+  // And back: the same edits, over main's files.
+  assert_eq!(refusal("main").await, None);
+  let (cached, plain) = statuses().await;
+  assert_eq!(cached, plain);
+  for line in [" M README.md", " D src/lib/util.rs", "?? notes.txt", "?? src/lib/extra.rs"] {
+    assert!(cached.contains(line), "{line} missing from:\n{cached}");
+  }
+  fs(|ws| {
+    assert_eq!(std::fs::read(ws.join("src/new.rs")).unwrap(), b"pub fn added() {}\n");
+    assert!(!ws.join("docs/guide.md").exists());
+  })
+  .await;
+
+  // An untracked file under directories only `deep` has: switching away
+  // keeps it, and the directories it needs, as Git does.
+  assert_eq!(refusal("deep").await, None);
+  fs(|ws| std::fs::write(ws.join("a/b/x.txt"), b"x\n").unwrap()).await;
+  assert_eq!(refusal("main").await, None);
+  let (cached, plain) = statuses().await;
+  assert_eq!(cached, plain);
+  assert!(cached.contains("?? a/"), "{cached}");
+  fs(|ws| {
+    assert_eq!(std::fs::read(ws.join("a/b/x.txt")).unwrap(), b"x\n");
+    assert!(!ws.join("a/b/c.txt").exists());
+  })
+  .await;
+}

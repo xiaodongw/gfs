@@ -190,6 +190,28 @@ impl Parent {
   }
 }
 
+/// The rows a re-pin keeps ([`Overlay::rebind`]), planned against the
+/// overlay at `sequence`, and the directories it creates for them: a kept
+/// path's directories the new commit does not have, with the inode number
+/// each is to have.
+#[derive(Clone, Debug, Default)]
+pub struct Carry {
+  pub rows: Vec<Carried>,
+  pub directories: Vec<(BytePath, u64)>,
+  pub sequence: u64,
+}
+
+/// One kept row: its path, what the new commit has there, whether the new
+/// commit's children show through it (a directory), and whether Git must be
+/// told about it.
+#[derive(Clone, Debug)]
+pub struct Carried {
+  pub path: BytePath,
+  pub base: Option<BaseFacts>,
+  pub opaque: bool,
+  pub report: bool,
+}
+
 /// What a mutation does to its parent directory's timestamps, decided while the
 /// transaction is being assembled.
 enum ParentTouch {
@@ -498,7 +520,8 @@ impl Overlay {
     inner.journal.sync()
   }
 
-  /// Point this overlay at a new base commit, discarding every edit.
+  /// Point this overlay at a new base commit, discarding every edit except
+  /// what `carry` keeps.
   ///
   /// The repin path (ADR 0011): the overlay lives at one place for the life
   /// of the mount, its SQLite connection opened before the workspace was
@@ -509,23 +532,92 @@ impl Overlay {
   /// Descriptors still open on discarded content keep reading — they hold the
   /// file, not the name — which is the same property `Pin::release` relied on
   /// when a superseded overlay was a directory to delete.
-  pub fn rebind(&self, binding: &Binding) -> Result<()> {
+  ///
+  /// A carried row keeps everything but its base facts and opacity, which
+  /// the plan decides against the new commit; its content file, writers, and
+  /// inode number stay. Carried rows marked `report`, and the directories
+  /// made for them, are stamped at sequence 1, so the fsmonitor token the
+  /// re-seeded index starts from (`:0`) names them: that index describes the
+  /// new commit, and Git must `lstat` what differs from it. Refused when the
+  /// overlay moved since the carry was planned.
+  pub fn rebind(&self, binding: &Binding, carry: Option<&Carry>) -> Result<()> {
     let mut inner = self.lock();
-    inner.journal.rebind(binding)?;
+    let mut kept = Vec::new();
+    let mut report = Vec::new();
+    if let Some(carry) = carry {
+      if inner.sequence != carry.sequence {
+        return Err(OverlayError::invalid(
+          "the workspace changed while the switch was being planned; try again",
+        ));
+      }
+      for row in &carry.rows {
+        let Some(entry) = inner.entries.get(row.path.as_bytes()) else {
+          return Err(OverlayError::invalid(
+            "the workspace changed while the switch was being planned; try again",
+          ));
+        };
+        kept.push(OverlayEntry {
+          base: row.base.clone(),
+          opaque: row.opaque,
+          ..entry.clone()
+        });
+        if row.report {
+          report.push(row.path.as_bytes().to_vec());
+        }
+      }
+      for (path, ino) in &carry.directories {
+        let ino = Self::adopt_ino(&mut inner, *ino);
+        let now = self.next_time(&mut inner);
+        kept.push(OverlayEntry {
+          path: path.clone(),
+          present: true,
+          kind: OverlayKind::Directory,
+          // As `mkdir` makes one: there is no base listing to merge.
+          opaque: true,
+          ino,
+          content: Content::None,
+          symlink_target: None,
+          size: 0,
+          mtime: now,
+          ctime: now,
+          renamed_from: None,
+          base: None,
+        });
+        report.push(path.as_bytes().to_vec());
+      }
+    }
+    let root_times = if kept.is_empty() { None } else { inner.root_times };
+    inner.journal.rebind(binding, &kept, root_times)?;
     inner.entries.clear();
     inner.children.clear();
     inner.by_content.clear();
     inner.local_bytes = 0;
+    for entry in kept {
+      inner
+        .children
+        .entry(entry.parent().into_bytes())
+        .or_default()
+        .insert(entry.name());
+      if let Some(id) = entry.content.local_id() {
+        inner.local_bytes = inner.local_bytes.saturating_add(entry.size);
+        inner.by_content.insert(id, entry.path.as_bytes().to_vec());
+      }
+      inner.entries.insert(entry.path.as_bytes().to_vec(), entry);
+    }
+    let live: HashSet<u64> = inner.by_content.keys().copied().collect();
     inner.vanished.clear();
     inner.vanished_overflow = false;
-    inner.root_times = None;
-    // Reset sequence to 0 and clear stamps for the new binding.
-    inner.sequence = 0;
+    inner.root_times = root_times;
     inner.stamps.clear();
+    inner.sequence = u64::from(!report.is_empty());
+    for path in report {
+      inner.stamps.insert(path, 1);
+    }
+    // The journal now holds exactly the rows memory holds.
     inner.dirty.clear();
-    inner.writers.clear();
-    inner.unsynced.clear();
-    let _ = self.store.sweep(&HashSet::new());
+    inner.writers.retain(|id, _| live.contains(id));
+    inner.unsynced.retain(|id| live.contains(id));
+    let _ = self.store.sweep(&live);
     Ok(())
   }
 

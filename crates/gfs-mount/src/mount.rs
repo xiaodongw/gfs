@@ -893,12 +893,17 @@ impl Mount {
   /// so it is bounded and reported rather than designed away. Invalidation is
   /// bounded by the paths the job actually touched, not by the size of the tree.
   async fn repin(self: &Arc<Self>) -> Result<RefreshReport, GfsError> {
-    self.repin_with(false).await
+    self.repin_with(false, None).await
   }
 
   /// [`Mount::repin`], optionally giving the branch it lands on an upstream
-  /// (`gfs switch` onto a branch taken from the clone, as `git switch` does).
-  async fn repin_with(self: &Arc<Self>, track_upstream: bool) -> Result<RefreshReport, GfsError> {
+  /// (`gfs switch` onto a branch taken from the clone, as `git switch` does),
+  /// and keeping the overlay rows `carry` names instead of discarding them.
+  async fn repin_with(
+    self: &Arc<Self>,
+    track_upstream: bool,
+    carry: Option<gfs_overlay::Carry>,
+  ) -> Result<RefreshReport, GfsError> {
     // Held across the whole operation, so two switches cannot interleave and
     // leave the filesystem on one commit with `mount.json` naming another.
     let _serialized = self.repinning.lock().await;
@@ -961,14 +966,18 @@ impl Mount {
 
     // The one overlay, re-pointed in place. One SQLite transaction, so a
     // crash leaves either the old binding with its rows or the new one with
-    // none; the callers already decided the rows are disposable (`switch` and
-    // `refresh` refused a dirty workspace, `commit` made them durable).
+    // only the carried ones; the callers already decided the rest are
+    // disposable (`switch` and `refresh` refused a dirty workspace or planned
+    // what to carry, `commit` made them durable).
     self
       .overlay
-      .rebind(&Binding {
-        repository_id: self.config.repository_id.as_str().to_owned(),
-        base_commit: commit.to_qualified(),
-      })
+      .rebind(
+        &Binding {
+          repository_id: self.config.repository_id.as_str().to_owned(),
+          base_commit: commit.to_qualified(),
+        },
+        carry.as_ref(),
+      )
       .map_err(crate::fs::overlay_as_service_error)?;
 
     let stale = self.fs.repin(
@@ -1083,8 +1092,8 @@ impl Mount {
   /// When the target is the commit `HEAD` is already on, nothing is re-pinned:
   /// the index and the working tree already describe it, so only `HEAD` moves.
   /// That is also why `-c` works over local edits and local commits, as it
-  /// does in Git. Anything else is a re-pin, which needs a clean overlay and no
-  /// local commits for now.
+  /// does in Git. Anything else is a re-pin, which needs nothing staged and no
+  /// local commits for now, and carries the edits [`Mount::plan_carry`] keeps.
   pub async fn switch_local(
     self: &Arc<Self>,
     target: &str,
@@ -1189,14 +1198,21 @@ impl Mount {
          commit yet -- push them (`git push origin HEAD`) and switch, or use `git switch`",
       ));
     }
-    // TODO(3b): carry edits whose paths are the same in both commits.
-    if !self.workspace_is_clean().await? {
+    // The re-seeded index describes the target, so anything staged would be
+    // dropped; edits are carried where the two commits agree on the path.
+    if let Some(path) = self.staged_difference(&local, &pinned).await? {
       return Err(GfsError::new(
         ErrorCode::FailedPrecondition,
-        "the workspace has local changes; commit or discard them before `gfs switch`, \
-         or use `git switch`, which carries them file by file",
+        format!(
+          "the index has staged changes ({}); commit them, or unstage them with \
+           `git restore --staged .`, before `gfs switch`",
+          String::from_utf8_lossy(&path)
+        ),
       ));
     }
+    let target_oid = ObjectId::from_hex(pinned.algorithm(), &commit)
+      .map_err(|e| GfsError::internal(format!("unparseable target commit: {e}")))?;
+    let carry = self.plan_carry(&local, &pinned, &target_oid, target).await?;
     if create_ref {
       write_branch_ref(&git_dir, target, &commit)?;
     }
@@ -1213,7 +1229,7 @@ impl Mount {
     *self.work_branch.lock().expect("work branch") = branch.clone();
     drop(serialized);
     let track = upstream.as_deref().is_some() && upstream == branch;
-    let repinned = self.repin_with(track).await;
+    let repinned = self.repin_with(track, carry).await;
     if repinned.is_err() {
       *self.selector.lock().expect("selector") = previous.0;
       *self.work_branch.lock().expect("work branch") = previous.1;
@@ -1222,6 +1238,289 @@ impl Mount {
       }
     }
     repinned
+  }
+
+  /// The first path the workspace's index stages differently from `pinned`,
+  /// the commit `HEAD` is on. Compared with the index gfs seeds for that
+  /// commit, which is exactly what an unstaged index holds.
+  async fn staged_difference(
+    &self,
+    local: &crate::local::LocalRepository,
+    pinned: &ObjectId,
+  ) -> Result<Option<Vec<u8>>, GfsError> {
+    let snapshot_time = self.current.lock().expect("current pin").snapshot_time;
+    let pristine = local.cached_index(pinned, snapshot_time).await?;
+    let path = self.git.root().join("index");
+    tokio::task::spawn_blocking(move || {
+      let workspace = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        // No index stages the deletion of every path.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Some(b"index".to_vec())),
+        Err(e) => return Err(GfsError::internal(format!("reading the index: {e}"))),
+      };
+      gfs_git::index::first_staged_difference(&workspace, &pristine)
+    })
+    .await
+    .map_err(|e| GfsError::internal(format!("the index comparison failed: {e}")))?
+  }
+
+  /// Which overlay rows survive a re-pin from `from` to `to`, or the refusal
+  /// naming the ones that cannot (plan 20260925-2220 step 3b).
+  ///
+  /// Git's rule for `git switch`: a local change is carried when the path is
+  /// the same in both commits, and the switch is refused when it is not. Per
+  /// row, against what `to` has at its path:
+  ///
+  /// * a row whose bytes and mode are still its base's (only its times moved,
+  ///   what a stock checkout back leaves) is kept if the path is unchanged
+  ///   and otherwise dropped: the target's file replaces it, as Git would;
+  /// * a base directory adopted for its times is kept over any directory at
+  ///   the path, with the new tree as its base; where `to` has no directory it
+  ///   becomes a created one if something carried is under it, else dropped;
+  ///   a directory created here where `to` has one becomes that one;
+  /// * a deletion of what `to` does not have either is dropped;
+  /// * anything else -- an edit, a deletion, a new file or directory, a
+  ///   rename (both names) -- needs `to` to have exactly what the row's base
+  ///   was, so the row still describes the same change. New files need `to`
+  ///   to have nothing there. A kept path's directories that `to` does not
+  ///   have are made; one that is a file in `to` is a conflict.
+  async fn plan_carry(
+    &self,
+    local: &crate::local::LocalRepository,
+    from: &ObjectId,
+    to: &ObjectId,
+    target: &str,
+  ) -> Result<Option<gfs_overlay::Carry>, GfsError> {
+    use std::collections::{BTreeSet, HashMap, HashSet};
+
+    use gfs_overlay::{BaseFacts, Carried, Content};
+    use gfs_types::{BytePath, EntryKind, TreeEntryInfo};
+
+    // The sequence before the rows: a mutation in between moves it, and the
+    // rebind then refuses the plan.
+    let sequence = self.overlay.sequence();
+    let rows = self.overlay.entries();
+    if rows.is_empty() {
+      return Ok(None);
+    }
+    let by_path: HashMap<&[u8], &gfs_overlay::OverlayEntry> =
+      rows.iter().map(|r| (r.path.as_bytes(), r)).collect();
+
+    // Every row's path, a present row's directories, and a rename's source.
+    let mut wanted: BTreeSet<BytePath> = BTreeSet::new();
+    let mut sources: BTreeSet<BytePath> = BTreeSet::new();
+    for row in &rows {
+      wanted.insert(row.path.clone());
+      if row.present {
+        for dir in gfs_overlay::ancestors_of(&row.path) {
+          if !dir.is_empty() {
+            wanted.insert(dir);
+          }
+        }
+      }
+      if let Some(source) = &row.renamed_from {
+        wanted.insert(source.clone());
+        sources.insert(source.clone());
+      }
+    }
+    let wanted: Vec<BytePath> = wanted.into_iter().collect();
+    let found = local.entries_at(to, wanted.clone()).await?;
+    let next: HashMap<&[u8], Option<&TreeEntryInfo>> = wanted
+      .iter()
+      .map(|p| p.as_bytes())
+      .zip(found.iter().map(Option::as_ref))
+      .collect();
+    let sources: Vec<BytePath> = sources.into_iter().collect();
+    let before = local.entries_at(from, sources.clone()).await?;
+
+    let facts = |info: &TreeEntryInfo| BaseFacts {
+      oid: info.oid.clone(),
+      kind: info.kind,
+      size: info.size,
+    };
+    let same = |base: Option<&BaseFacts>, info: Option<&TreeEntryInfo>| match (base, info) {
+      (None, None) => true,
+      (Some(base), Some(info)) => base.oid == info.oid && base.kind == info.kind,
+      _ => false,
+    };
+    let at = |path: &BytePath| next.get(path.as_bytes()).copied().flatten();
+
+    let mut conflicts: Vec<String> = Vec::new();
+    let mut kept: Vec<Carried> = Vec::new();
+    // Adopted directories `to` does not have: kept only if something is.
+    let mut orphans: Vec<&gfs_overlay::OverlayEntry> = Vec::new();
+    for row in &rows {
+      let there = at(&row.path);
+      let name = String::from_utf8_lossy(row.path.as_bytes()).into_owned();
+      let times_only = row.present
+        && !row.kind.is_dir()
+        && row.renamed_from.is_none()
+        && row.base.as_ref().is_some_and(|base| {
+          row.content == Content::Base(base.oid.clone())
+            && gfs_overlay::OverlayKind::from_entry_kind(base.kind) == Some(row.kind)
+        });
+      let adopted_dir = row.present
+        && row.kind.is_dir()
+        && !row.opaque
+        && row
+          .base
+          .as_ref()
+          .is_some_and(|base| base.kind == EntryKind::Directory);
+      if times_only {
+        if same(row.base.as_ref(), there) {
+          kept.push(Carried {
+            path: row.path.clone(),
+            base: row.base.clone(),
+            opaque: row.opaque,
+            report: false,
+          });
+        }
+      } else if adopted_dir {
+        match there {
+          Some(info) if info.kind == EntryKind::Directory => kept.push(Carried {
+            path: row.path.clone(),
+            base: Some(facts(info)),
+            opaque: false,
+            report: false,
+          }),
+          None => orphans.push(row),
+          Some(_) => conflicts.push(format!("{name} (not a directory on {target})")),
+        }
+      } else if row.present
+        && row.kind.is_dir()
+        && row.base.is_none()
+        && there.is_some_and(|info| info.kind == EntryKind::Directory)
+      {
+        // A directory made here that `to` tracks: it becomes that directory,
+        // its files showing through; what was made in it is checked path by
+        // path. Git keeps no directories, so it would do the same.
+        kept.push(Carried {
+          path: row.path.clone(),
+          base: there.map(facts),
+          opaque: false,
+          report: true,
+        });
+      } else if !row.present && there.is_none() {
+        // Deleted here and absent there: nothing left to carry.
+      } else if !same(row.base.as_ref(), there) {
+        conflicts.push(match (&row.base, there) {
+          (None, Some(_)) => format!("{name} (untracked here, tracked on {target})"),
+          _ => format!("{name} (changed locally and on {target})"),
+        });
+      } else if let Some(source) = &row.renamed_from {
+        let index = sources.binary_search(source).expect("looked up");
+        let was = before[index].as_ref();
+        let is = at(source);
+        let unchanged = match (was, is) {
+          (None, None) => true,
+          (Some(a), Some(b)) => a.oid == b.oid && a.kind == b.kind,
+          _ => false,
+        };
+        if unchanged {
+          kept.push(Carried {
+            path: row.path.clone(),
+            base: row.base.clone(),
+            opaque: row.opaque,
+            report: true,
+          });
+        } else {
+          conflicts.push(format!(
+            "{name} (renamed from {}, which {target} changes)",
+            String::from_utf8_lossy(source.as_bytes())
+          ));
+        }
+      } else {
+        kept.push(Carried {
+          path: row.path.clone(),
+          base: row.base.clone(),
+          opaque: row.opaque,
+          report: true,
+        });
+      }
+    }
+
+    // An orphaned directory stays, as a created one, when a kept row is under
+    // it: Git leaves a directory that still holds untracked files.
+    let under_kept: HashSet<Vec<u8>> = kept
+      .iter()
+      .filter(|c| by_path.get(c.path.as_bytes()).is_some_and(|r| r.present))
+      .flat_map(|c| gfs_overlay::ancestors_of(&c.path))
+      .map(BytePath::into_bytes)
+      .collect();
+    for row in orphans {
+      if under_kept.contains(row.path.as_bytes()) {
+        kept.push(Carried {
+          path: row.path.clone(),
+          base: None,
+          // No base listing to merge any more, as for a `mkdir`.
+          opaque: true,
+          report: true,
+        });
+      }
+    }
+
+    // Every kept path's directories exist in the new view: directories in
+    // `to`, kept rows, or directories made for them, as Git leaves a directory
+    // that still holds untracked files.
+    let kept_paths: HashSet<&[u8]> = kept.iter().map(|c| c.path.as_bytes()).collect();
+    let mut made: BTreeSet<BytePath> = BTreeSet::new();
+    let mut missing: BTreeSet<String> = BTreeSet::new();
+    for carried in &kept {
+      if !by_path.get(carried.path.as_bytes()).is_some_and(|r| r.present) {
+        continue;
+      }
+      for dir in gfs_overlay::ancestors_of(&carried.path) {
+        if dir.is_empty() || kept_paths.contains(dir.as_bytes()) || made.contains(&dir) {
+          continue;
+        }
+        match at(&dir) {
+          Some(info) if info.kind == EntryKind::Directory => {}
+          None => {
+            made.insert(dir);
+          }
+          Some(_) => {
+            missing.insert(format!(
+              "{} (its directory {} is a file on {target})",
+              String::from_utf8_lossy(carried.path.as_bytes()),
+              String::from_utf8_lossy(dir.as_bytes())
+            ));
+            break;
+          }
+        }
+      }
+    }
+    conflicts.extend(missing);
+
+    if !conflicts.is_empty() {
+      conflicts.sort();
+      let shown = conflicts.len().min(20);
+      let mut message = format!(
+        "your local changes to these paths would be overwritten by switching to {target}:\n"
+      );
+      for line in &conflicts[..shown] {
+        message.push_str(&format!("  {line}\n"));
+      }
+      if conflicts.len() > shown {
+        message.push_str(&format!("  ... and {} more\n", conflicts.len() - shown));
+      }
+      message.push_str(
+        "commit or discard them before `gfs switch`, or use `git switch`, which merges \
+         them file by file",
+      );
+      return Err(GfsError::new(ErrorCode::FailedPrecondition, message));
+    }
+    let directories = made
+      .into_iter()
+      .map(|dir| {
+        let ino = self.fs.number_for(&dir);
+        (dir, ino)
+      })
+      .collect();
+    Ok(Some(gfs_overlay::Carry {
+      rows: kept,
+      directories,
+      sequence,
+    }))
   }
 
   /// The work branch this view is on, if any.

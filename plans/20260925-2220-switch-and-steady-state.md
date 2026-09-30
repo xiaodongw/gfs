@@ -87,12 +87,32 @@ on universe with a private daemon, and a commit on `main`.
 * `.git/config` is the user's; gfs's settings moved to `.git/gfs/config`,
   included from it. The pinned branch's upstream is added to `.git/config`
   once, when it has no section. `packed-refs` keeps branches Git packed.
-* Refused for now, before anything is written: local edits (3b) and local
-  commits (3c), with the way out in the message.
+* Refused for now, before anything is written: local edits (lifted by 3b)
+  and local commits (3c), with the way out in the message.
 * Smoke test `crates/gfs-mount/tests/local.rs::gfs_switch_moves_a_local_view_between_branches_without_a_checkout`.
 
-*3b (pending): carry unstaged edits whose paths are identical in both commits;
-refuse naming the rest; refuse staged changes.*
+*3b (complete): carry unstaged edits, Git's rule.*
+* Staged changes are refused: the workspace index is compared entry by entry
+  (path, stage, mode, oid, intent-to-add; versions 2-4) with the index gfs
+  seeds for the pinned commit (`gfs_git::index::first_staged_difference`).
+* Every overlay row is checked against the target commit
+  (`Mount::plan_carry`) before anything is written: a row whose bytes and
+  mode are still its base's is kept if the path is unchanged, else dropped
+  (the target's file replaces it); an adopted directory takes the target's
+  tree as its base; a created directory where the target has one becomes it;
+  a deletion of a path the target lacks too is dropped; any other row (edit,
+  deletion, new file, rename and its source) needs the target to have exactly
+  the row's base. A kept path's directories the target lacks are created,
+  opaque, under the inode numbers the kernel already has. Anything else is a
+  conflict: the refusal lists up to 20 paths with the reason.
+* `Overlay::rebind` takes the plan and keeps those rows (content files,
+  writers, inode numbers) in the same journal transaction that rebinds, and
+  stamps the reported ones at sequence 1, so the re-seeded index's token
+  (`:0`) makes Git `lstat` exactly them. A mutation between planning and the
+  rebind moves the sequence and the switch is refused ("try again").
+* Smoke test `gfs-fuse/tests/fsmonitor.rs::gfs_switch_carries_edits_the_two_commits_agree_on`
+  (in `gfs-fuse` because the hook binary is only installed there; without
+  the stamps Git hides the carried edit and the test fails).
 
 *3c (pending): switch after a stock `git commit` -- the local source also reads
 the workspace's objects, and the view adopts the new `HEAD` without discarding
@@ -161,6 +181,32 @@ uncommitted edits.*
 * **Same commit, no re-pin.** `git switch -c` and a switch between two
   branches on one commit touch only `HEAD` in Git; so here, which also keeps
   them working over local edits and local commits.
+
+* **3b done directly, not by a subagent.** Steps 1, 2 and 3a each had their
+  subagent version reverted and rewritten, so the user was asked; 3b was
+  implemented and verified in the main session.
+* **Carry by Git's rule, decided per overlay row, not per changed path.** The
+  row already records the base it diverged from, so "same in both commits"
+  is one batched lookup of each row's path in the target (plus directories
+  and rename sources), not a tree diff of two 1.3M-file commits. Rows that
+  only moved times (what a stock checkout back leaves, step 2) are dropped
+  where the target differs rather than blocking the switch, which is what
+  Git does with an unmodified file. Alternatives: a tree diff between the
+  commits intersected with the rows (cost scales with the diff, 122k paths
+  between master and universe-goofys-grpc), or refusing any dirty overlay
+  (3a's behaviour).
+* **Staged changes are refused, not carried.** Carrying them means writing
+  the target's index with the staged entries merged in -- Git's three-way
+  index merge. Refusing costs 0.37 s on universe and loses nothing.
+* **Missing directories are made rather than refused.** Git keeps a
+  directory that holds untracked files when the target drops it; the first
+  version refused, and the stress run hit it immediately (untracked files
+  under directories only master has). Made and orphaned directories are
+  opaque, as `mkdir` makes them: a non-opaque directory with no base asks the
+  target for a listing it does not have, `readdir` gets `ENOENT`, and glibc
+  reports an empty directory.
+* **Local-mode only.** `switch_to` (server mode) still refuses a dirty
+  workspace; server mode has no `.git` of its own to re-seed per branch.
 
 * **`gfs switch` replaces `git switch`; it does not run before it.** Re-pinning
   first and then running `git switch` fails: the index still describes the old
@@ -234,6 +280,32 @@ uncommitted edits.*
   (`--no-fail-fast`): only the known
   `overlay::a_row_left_behind_by_an_unsettled_write_is_corrected_from_its_content_file`
   fails (the two known `mutations`/`prefetch` failures passed this run).
+
+* **Step 3b results, universe** (2026-09-30; the clone's master had moved to
+  `02c5a7e`, 122k files from universe-goofys-grpc; fresh private workspace;
+  every status compared with the uncached one, all identical):
+
+  | | time | result |
+  |---|---|---|
+  | refused: `.bazelrc` edited, differs on target | 0.42 s | names the path, `HEAD` unmoved |
+  | refused: `README.md` staged | 0.37 s | names the path |
+  | switch carrying an edit, a deletion, 3 untracked files | 2.47 s | 6 rows kept; first status 3.7 s, then 2.2 s; 100 switched files hash to `HEAD` |
+  | switch with 60k touched rows (30k same on both, 30k not) + edits + an untracked file 4 levels under directories the target lacks | 5.0 s | 30 006 rows kept, the 30k differing dropped (sampled: 43 hash to the target, 57 gone); status 3.8 s, then 2.2 s |
+  | back, same rows, no full walk before it | 2.55 s | status matches |
+  | repeated switches, few rows | 1.6-1.8 s | |
+
+* **A switch right after a full-tree walk is slow**: 9.7-11 s instead of
+  1.6-5 s, each time it followed an uncached `git status` (71-74 s, which
+  looks up every one of the 1.33M paths). Likely `InodeTable::repin`
+  returning every known record for kernel invalidation, one
+  `FUSE_NOTIFY_INVAL_ENTRY` each; not verified. It predates 3b.
+* Tests: `gfs-overlay`, `gfs-git`, `gfs-mount`, `gfs-fuse`, `gfs-cli` whole
+  (`--no-fail-fast`): only the known `mutations::a_recreated_directory_does_not_show_the_base_children_it_replaced`
+  and `prefetch::reading_a_directory_through_fetches_the_rest_of_it` fail.
+  3a had left `history` and `lifecycle` not compiling and
+  `workspace_git::a_bare_push_never_fans_out_to_branches_the_caller_is_not_on`
+  failing (reading only `.git/config`); fixed in ec13b50 and 990196a. 3a's
+  "whole suites pass" above was wrong.
 
 * Traces and probes: `GIT_TRACE2_PERF` on `git status` / `git switch` in a
   private workspace (`GFS_HOST_SOCKET=/tmp/gfsb/host.sock`, workspace

@@ -243,6 +243,22 @@ impl LocalRepository {
     Ok(self.repo.resolve_expression(expression).await?.commit)
   }
 
+  /// What a commit has at each path, `None` where it has nothing. Unlike
+  /// [`SnapshotSource::batch_get_entry`], a failed lookup is an error, not an
+  /// absence: `gfs switch` decides what to carry from these answers.
+  pub async fn entries_at(
+    &self,
+    commit: &ObjectId,
+    paths: Vec<BytePath>,
+  ) -> Result<Vec<Option<TreeEntryInfo>>, GfsError> {
+    self
+      .repo
+      .batch_entries(commit.clone(), paths)
+      .await?
+      .into_iter()
+      .collect()
+  }
+
   /// Pin a selector: resolve it, anchor the commit in the clone, and build the
   /// source that reads through it.
   pub async fn pin(

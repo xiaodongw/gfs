@@ -860,7 +860,7 @@ impl Gfs {
   /// Taken before the journal row is written so the row can record it: a row
   /// whose number disagreed with the live table would make the path change
   /// identity after a daemon restart for no reason.
-  fn number_for(&self, path: &BytePath) -> u64 {
+  pub(crate) fn number_for(&self, path: &BytePath) -> u64 {
     self
       .inodes
       .lock()

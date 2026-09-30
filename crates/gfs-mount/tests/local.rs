@@ -435,12 +435,20 @@ async fn gfs_switch_moves_a_local_view_between_branches_without_a_checkout() {
   let job = Job::local_from(&clone, "main", tempfile::tempdir().unwrap()).await;
   let ws = job.workspace.clone();
 
-  let refused = |request: Request| {
+  // The refusal's message, or `None` when the request was not refused.
+  let refusal = |request: Request| {
     let socket = job.socket();
     async move {
       let response = on_fs(move || gfs_mount::control::call(&socket, &request).unwrap()).await;
-      matches!(response, Response::Error { .. })
+      match response {
+        Response::Error { message, .. } => Some(message),
+        _ => None,
+      }
     }
+  };
+  let refused = |request: Request| {
+    let refusal = refusal(request);
+    async move { refusal.await.is_some() }
   };
   let switch = |target: &str, create: bool, detach: bool| Request::Switch {
     selector: target.to_owned(),
@@ -521,16 +529,6 @@ async fn gfs_switch_moves_a_local_view_between_branches_without_a_checkout() {
   })
   .await;
   assert_eq!(name.trim(), "someone");
-
-  // A dirty workspace is refused and nothing moves.
-  on_fs({
-    let ws = ws.clone();
-    move || std::fs::write(ws.join("README.md"), b"edited\n").unwrap()
-  })
-  .await;
-  assert!(refused(switch("old", false, false)).await, "a dirty workspace");
-  let (head, _, _, _, _) = look(ws.clone()).await;
-  assert_eq!(head, "ref: refs/heads/main\n");
 
   // Not a branch: refused, with the way to get there.
   assert!(refused(switch("v1.0", false, false)).await, "a tag is not a branch");

@@ -335,6 +335,123 @@ pub fn with_workspace_caches(index: &[u8], caches: &WorkspaceCaches<'_>) -> Opti
   Some(out)
 }
 
+/// The first path whose staged state differs between two index files, `None`
+/// when they stage the same thing.
+///
+/// Compares what `git diff --cached` would: path, stage, mode, and object ID,
+/// plus intent-to-add (`git add -N`), which stages an empty placeholder. Stat
+/// data, assume-unchanged and skip-worktree bits, and every extension are
+/// ignored -- `git status` rewrites those without staging anything. Reads
+/// versions 2 to 4, since Git keeps whatever version the file already has and
+/// `index.version` or `feature.manyFiles` can move it.
+pub fn first_staged_difference(a: &[u8], b: &[u8]) -> Result<Option<Vec<u8>>, GfsError> {
+  let mut a = EntryCursor::new(a)?;
+  let mut b = EntryCursor::new(b)?;
+  loop {
+    match (a.next()?, b.next()?) {
+      (None, None) => return Ok(None),
+      (Some(_), None) => return Ok(Some(a.path.clone())),
+      (None, Some(_)) => return Ok(Some(b.path.clone())),
+      (Some(left), Some(right)) => {
+        if left != right || a.path != b.path {
+          let first = if a.path <= b.path { &a.path } else { &b.path };
+          return Ok(Some(first.clone()));
+        }
+      }
+    }
+  }
+}
+
+/// What an entry stages, apart from its path: stage, mode, object ID, and
+/// whether it is intent-to-add.
+type Staged = (u16, u32, [u8; 20], bool);
+
+/// Walks an index file's entries in order, keeping the current path (version
+/// 4 compresses each path against the one before it).
+struct EntryCursor<'a> {
+  bytes: &'a [u8],
+  version: u32,
+  remaining: usize,
+  pos: usize,
+  path: Vec<u8>,
+}
+
+impl<'a> EntryCursor<'a> {
+  fn new(bytes: &'a [u8]) -> Result<Self, GfsError> {
+    let malformed = || GfsError::new(ErrorCode::FailedPrecondition, "the index is not a Git index");
+    if bytes.len() < 12 || &bytes[..4] != b"DIRC" {
+      return Err(malformed());
+    }
+    let version = u32::from_be_bytes(bytes[4..8].try_into().map_err(|_| malformed())?);
+    if !(2..=4).contains(&version) {
+      return Err(GfsError::new(
+        ErrorCode::FailedPrecondition,
+        format!("index version {version} is not supported"),
+      ));
+    }
+    let remaining = u32::from_be_bytes(bytes[8..12].try_into().map_err(|_| malformed())?) as usize;
+    Ok(EntryCursor {
+      bytes,
+      version,
+      remaining,
+      pos: 12,
+      path: Vec::new(),
+    })
+  }
+
+  fn next(&mut self) -> Result<Option<Staged>, GfsError> {
+    if self.remaining == 0 {
+      return Ok(None);
+    }
+    self.remaining -= 1;
+    let truncated = || GfsError::new(ErrorCode::FailedPrecondition, "the index is truncated");
+    let start = self.pos;
+    let fixed = self.bytes.get(start..start + 62).ok_or_else(truncated)?;
+    let mode = u32::from_be_bytes(fixed[24..28].try_into().expect("4 bytes"));
+    let oid: [u8; 20] = fixed[40..60].try_into().expect("20 bytes");
+    let flags = u16::from_be_bytes(fixed[60..62].try_into().expect("2 bytes"));
+    let mut pos = start + 62;
+    let mut intent_to_add = false;
+    if flags & 0x4000 != 0 {
+      let extended = self.bytes.get(pos..pos + 2).ok_or_else(truncated)?;
+      intent_to_add = u16::from_be_bytes(extended.try_into().expect("2 bytes")) & 0x2000 != 0;
+      pos += 2;
+    }
+    let stage = (flags >> 12) & 3;
+    if self.version == 4 {
+      // A varint of bytes to drop from the previous path, then the rest,
+      // NUL-terminated, with no padding.
+      let mut strip = 0usize;
+      loop {
+        let byte = *self.bytes.get(pos).ok_or_else(truncated)?;
+        pos += 1;
+        strip = (strip << 7) | (byte & 127) as usize;
+        if byte & 128 == 0 {
+          break;
+        }
+        strip += 1;
+      }
+      let rest = self.bytes.get(pos..).ok_or_else(truncated)?;
+      let len = rest.iter().position(|b| *b == 0).ok_or_else(truncated)?;
+      let keep = self.path.len().checked_sub(strip).ok_or_else(truncated)?;
+      self.path.truncate(keep);
+      self.path.extend_from_slice(&rest[..len]);
+      self.pos = pos + len + 1;
+    } else {
+      let rest = self.bytes.get(pos..).ok_or_else(truncated)?;
+      let len = match (flags & 0xFFF) as usize {
+        0xFFF => rest.iter().position(|b| *b == 0).ok_or_else(truncated)?,
+        len => len,
+      };
+      self.path.clear();
+      self.path.extend_from_slice(rest.get(..len).ok_or_else(truncated)?);
+      // Padded with one to eight NULs to a multiple of eight from the start.
+      self.pos = start + (pos - start + len) / 8 * 8 + 8;
+    }
+    Ok(Some((stage, mode, oid, intent_to_add)))
+  }
+}
+
 /// The blob ID Git gives `content`, as `git hash-object` would.
 pub fn blob_id(content: &[u8]) -> [u8; 20] {
   let mut hasher = Sha1::new();

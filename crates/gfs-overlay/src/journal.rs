@@ -225,16 +225,32 @@ impl Journal {
   /// This is what a repin uses (ADR 0011): the overlay directory and its
   /// SQLite connection live for the whole mount — opened before the workspace
   /// is mounted over, never reopened through it — and only the binding moves.
-  pub fn rebind(&self, binding: &Binding) -> Result<()> {
+  /// Bind the journal to a new base commit, keeping only `keep`'s rows and
+  /// the given root times, in one transaction.
+  pub fn rebind(
+    &self,
+    binding: &Binding,
+    keep: &[OverlayEntry],
+    root_times: Option<(Timestamp, Timestamp)>,
+  ) -> Result<()> {
     self.conn.execute_batch("BEGIN IMMEDIATE;").map_err(db)?;
     let result = (|| {
       self.conn.execute("DELETE FROM entries", []).map_err(db)?;
+      for entry in keep {
+        insert_entry(&self.conn, entry)?;
+      }
       // A new generation is a full rescan for the fsmonitor hook whatever this
       // set held, so carrying it across would only make the first answer of the
       // new pin name paths that belong to the old one.
       self.conn.execute("DELETE FROM vanished", []).map_err(db)?;
       self.set_meta("vanished_overflow", "0")?;
-      self.set_meta("root_mtime", "")?;
+      match root_times {
+        Some((mtime, ctime)) => {
+          self.set_meta("root_mtime", &format_time(mtime))?;
+          self.set_meta("root_ctime", &format_time(ctime))?;
+        }
+        None => self.set_meta("root_mtime", "")?,
+      }
       self.set_meta("repository_id", &binding.repository_id)?;
       self.set_meta("base_commit", &binding.base_commit)?;
       Ok(())
@@ -395,33 +411,7 @@ impl Journal {
     let tx = self.conn.transaction().map_err(db)?;
     for change in changes {
       match change {
-        Change::Put(entry) => {
-          let row = Row::of(entry);
-          tx.prepare_cached(INSERT)
-            .map_err(db)?
-            .execute(rusqlite::params![
-              row.path,
-              row.parent,
-              row.present,
-              row.kind,
-              row.opaque,
-              row.ino,
-              row.content_kind,
-              row.content_id,
-              row.content_oid,
-              row.symlink_target,
-              row.size,
-              row.mtime_secs,
-              row.mtime_nanos,
-              row.ctime_secs,
-              row.ctime_nanos,
-              row.renamed_from,
-              row.base_oid,
-              row.base_mode,
-              row.base_size,
-            ])
-            .map_err(db)?;
-        }
+        Change::Put(entry) => insert_entry(&tx, entry)?,
         Change::Delete(path) => {
           tx.prepare_cached("DELETE FROM entries WHERE path = ?1")
             .map_err(db)?
@@ -592,6 +582,36 @@ const INSERT: &str = "INSERT OR REPLACE INTO entries (path, parent, present, kin
    content_kind, content_id, content_oid, symlink_target, size, mtime_secs, mtime_nanos, \
    ctime_secs, ctime_nanos, renamed_from, base_oid, base_mode, base_size) \
    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)";
+
+fn insert_entry(conn: &rusqlite::Connection, entry: &OverlayEntry) -> Result<()> {
+  let row = Row::of(entry);
+  conn
+    .prepare_cached(INSERT)
+    .map_err(db)?
+    .execute(rusqlite::params![
+      row.path,
+      row.parent,
+      row.present,
+      row.kind,
+      row.opaque,
+      row.ino,
+      row.content_kind,
+      row.content_id,
+      row.content_oid,
+      row.symlink_target,
+      row.size,
+      row.mtime_secs,
+      row.mtime_nanos,
+      row.ctime_secs,
+      row.ctime_nanos,
+      row.renamed_from,
+      row.base_oid,
+      row.base_mode,
+      row.base_size,
+    ])
+    .map_err(db)?;
+  Ok(())
+}
 
 /// `<secs>.<nanos>`, so the meta table stays human-readable text.
 fn format_time(t: Timestamp) -> String {
