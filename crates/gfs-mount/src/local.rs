@@ -246,17 +246,41 @@ impl LocalRepository {
   /// What a commit has at each path, `None` where it has nothing. Unlike
   /// [`SnapshotSource::batch_get_entry`], a failed lookup is an error, not an
   /// absence: `gfs switch` decides what to carry from these answers.
+  ///
+  /// A large batch is split across the repository's handles and looked up
+  /// in parallel: after a stock checkout a switch asks for 200k paths in
+  /// each of two commits, 3.2 s on one handle.
   pub async fn entries_at(
     &self,
     commit: &ObjectId,
     paths: Vec<BytePath>,
   ) -> Result<Vec<Option<TreeEntryInfo>>, GfsError> {
-    self
-      .repo
-      .batch_entries(commit.clone(), paths)
-      .await?
-      .into_iter()
-      .collect()
+    const PARALLEL_FROM: usize = 4096;
+    let chunk = if paths.len() < PARALLEL_FROM {
+      paths.len().max(1)
+    } else {
+      paths.len().div_ceil(limits::DEFAULT_REPO_HANDLES)
+    };
+    let mut lookups = tokio::task::JoinSet::new();
+    for (index, part) in paths.chunks(chunk).enumerate() {
+      let repo = self.repo.clone();
+      let (commit, part) = (commit.clone(), part.to_vec());
+      lookups.spawn(async move { (index, repo.batch_entries(commit, part).await) });
+    }
+    let mut parts = Vec::new();
+    while let Some(joined) = lookups.join_next().await {
+      let (index, found) =
+        joined.map_err(|e| GfsError::internal(format!("a tree lookup failed: {e}")))?;
+      parts.push((index, found?));
+    }
+    parts.sort_by_key(|(index, _)| *index);
+    let mut out = Vec::with_capacity(paths.len());
+    for (_, part) in parts {
+      for found in part {
+        out.push(found?);
+      }
+    }
+    Ok(out)
   }
 
   /// A commit as a pin of it would see it: its tree and snapshot time.

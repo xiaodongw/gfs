@@ -88,6 +88,16 @@ impl Node {
     }
   }
 
+  /// A directory, the one kind that can have anything under it.
+  pub fn is_dir(&self) -> bool {
+    match self {
+      Node::Base(entry) => matches!(entry.kind, EntryKind::Directory | EntryKind::Gitlink),
+      Node::Overlay(entry) => entry.kind.is_dir(),
+      Node::Git(meta) => meta.kind == fuser::FileType::Directory,
+      Node::Odb(node) => node.is_dir(),
+    }
+  }
+
   pub fn preferred_ino(&self) -> Option<u64> {
     match self {
       Node::Overlay(entry) => Some(entry.ino),
@@ -214,16 +224,37 @@ impl InodeTable {
   /// node behind each one: the record still holds whatever the path *used* to be
   /// backed by, and a moved directory whose record still says "base entry" makes
   /// `opendir` page a base listing that no longer describes it.
+  ///
+  /// Only a directory has names under it, so only a directory's rename walks
+  /// the table: a file's -- every lockfile Git commits into place, every
+  /// editor's save -- moves one name. The walk was once taken for both, and
+  /// with a million names numbered it cost more than the rename.
   pub fn rename_subtree(&mut self, from: &BytePath, to: &BytePath) -> Vec<(u64, BytePath)> {
-    let moving: Vec<(Vec<u8>, u64)> = self
+    let from_bytes = from.as_bytes();
+    let may_have_children = self
       .by_path
-      .iter()
-      .filter(|(path, _)| {
-        let path = BytePath::new((*path).clone());
-        gfs_overlay::is_within(&path, from)
-      })
-      .map(|(path, ino)| (path.clone(), *ino))
-      .collect();
+      .get(from_bytes)
+      .and_then(|ino| self.records.get(ino))
+      .is_none_or(|record| record.node.is_dir());
+    let moving: Vec<(Vec<u8>, u64)> = if may_have_children {
+      self
+        .by_path
+        .iter()
+        .filter(|(path, _)| {
+          path.as_slice() == from_bytes
+            || (path.len() > from_bytes.len()
+              && path[from_bytes.len()] == b'/'
+              && path.starts_with(from_bytes))
+        })
+        .map(|(path, ino)| (path.clone(), *ino))
+        .collect()
+    } else {
+      self
+        .by_path
+        .get(from_bytes)
+        .map(|ino| vec![(from_bytes.to_vec(), *ino)])
+        .unwrap_or_default()
+    };
     let mut moved = Vec::new();
     for (path, ino) in moving {
       let mut target = to.as_bytes().to_vec();

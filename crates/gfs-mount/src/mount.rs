@@ -1054,16 +1054,29 @@ impl Mount {
     let count = entries.len();
     let _ = tokio::task::spawn_blocking(move || {
       use std::os::unix::ffi::OsStrExt;
-      for entry in entries {
-        // The dentry first, then the inode's pages: with `KEEP_CACHE` and
-        // `CACHE_DIR` the kernel may hold the old commit's bytes or listing
-        // under an inode number the same path keeps across the re-pin.
-        let _ = notifier.inval_entry(
-          fuser::INodeNo(entry.parent),
-          std::ffi::OsStr::from_bytes(&entry.name),
-        );
-        let _ = notifier.inval_inode(fuser::INodeNo(entry.ino), 0, 0);
-      }
+      // On several threads: each notification is a synchronous round trip
+      // into the kernel, and after a stock checkout a re-pin sends 560k of
+      // them (2.3 s on one thread on universe).
+      let threads = if count < 10_000 { 1 } else { 8 };
+      let chunk = count.div_ceil(threads).max(1);
+      std::thread::scope(|scope| {
+        for part in entries.chunks(chunk) {
+          let notifier = notifier.clone();
+          scope.spawn(move || {
+            for entry in part {
+              // The dentry first, then the inode's pages: with `KEEP_CACHE`
+              // and `CACHE_DIR` the kernel may hold the old commit's bytes or
+              // listing under an inode number the same path keeps across the
+              // re-pin.
+              let _ = notifier.inval_entry(
+                fuser::INodeNo(entry.parent),
+                std::ffi::OsStr::from_bytes(&entry.name),
+              );
+              let _ = notifier.inval_inode(fuser::INodeNo(entry.ino), 0, 0);
+            }
+          });
+        }
+      });
     })
     .await;
     tracing::debug!(entries = count, "invalidated cached names after a re-pin");
@@ -1349,27 +1362,17 @@ impl Mount {
 
     // The sequence before the rows: a mutation in between moves it, and the
     // rebind then refuses the plan.
+    let started = std::time::Instant::now();
     let sequence = self.overlay.sequence();
     let rows = self.overlay.entries();
     let adopting = from != head;
     let mut conflicts: Vec<String> = Vec::new();
 
-    if adopting {
-      for path in local.changed_paths(from, head).await? {
-        if matches!(self.overlay.resolve(&path), Resolution::Base) {
-          conflicts.push(format!(
-            "{} (differs between HEAD and the working tree, which was never written \
-             here: `git restore {0}` makes it HEAD's)",
-            String::from_utf8_lossy(path.as_bytes())
-          ));
-        }
-      }
-    }
-    if rows.is_empty() {
-      return refuse_or(conflicts, target, None);
-    }
     let by_path: HashMap<&[u8], &gfs_overlay::OverlayEntry> =
       rows.iter().map(|r| (r.path.as_bytes(), r)).collect();
+    if rows.is_empty() && !adopting {
+      return Ok(None);
+    }
 
     // Every row's path, a present row's directories, and a rename's source.
     let mut wanted: BTreeSet<BytePath> = BTreeSet::new();
@@ -1389,14 +1392,52 @@ impl Mount {
       }
     }
     let wanted: Vec<BytePath> = wanted.into_iter().collect();
-    let found = local.entries_at(to, wanted.clone()).await?;
+    let sources: Vec<BytePath> = sources.into_iter().collect();
+    let row_paths: Vec<BytePath> = if adopting {
+      rows.iter().map(|r| r.path.clone()).collect()
+    } else {
+      Vec::new()
+    };
+    let prepared_at = started.elapsed();
+    // Independent, so at once: the pin-to-HEAD diff alone is 3 s after a
+    // stock checkout on universe, and each lookup about as long.
+    let changed = async {
+      if adopting {
+        local.changed_paths(from, head).await
+      } else {
+        Ok(Vec::new())
+      }
+    };
+    let (changed, found, before, found_in_head) = tokio::try_join!(
+      changed,
+      local.entries_at(to, wanted.clone()),
+      local.entries_at(from, sources.clone()),
+      local.entries_at(head, row_paths),
+    )?;
+    for path in changed {
+      // A path with a row is the rows' business below; only one without can
+      // be served from the pin unwritten. After a stock checkout that is
+      // almost none of them, and the check takes the overlay's lock.
+      if by_path.contains_key(path.as_bytes()) {
+        continue;
+      }
+      if matches!(self.overlay.resolve(&path), Resolution::Base) {
+        conflicts.push(format!(
+          "{} (differs between HEAD and the working tree, which was never written \
+           here: `git restore {0}` makes it HEAD's)",
+          String::from_utf8_lossy(path.as_bytes())
+        ));
+      }
+    }
+    let diffed_at = started.elapsed();
+    if rows.is_empty() {
+      return refuse_or(conflicts, target, None);
+    }
     let next: HashMap<&[u8], Option<&TreeEntryInfo>> = wanted
       .iter()
       .map(|p| p.as_bytes())
       .zip(found.iter().map(Option::as_ref))
       .collect();
-    let sources: Vec<BytePath> = sources.into_iter().collect();
-    let before = local.entries_at(from, sources.clone()).await?;
 
     let facts = |info: &TreeEntryInfo| BaseFacts {
       oid: info.oid.clone(),
@@ -1406,11 +1447,9 @@ impl Mount {
     // What `head` has at each row's path: the row's own base when `head` is
     // the pin.
     let heads: HashMap<&[u8], Option<BaseFacts>> = if adopting {
-      let paths: Vec<BytePath> = rows.iter().map(|r| r.path.clone()).collect();
-      let found = local.entries_at(head, paths).await?;
       rows
         .iter()
-        .zip(found)
+        .zip(found_in_head)
         .map(|(r, info)| (r.path.as_bytes(), info.as_ref().map(facts)))
         .collect()
     } else {
@@ -1420,6 +1459,7 @@ impl Mount {
         .collect()
     };
     let head_at = |row: &gfs_overlay::OverlayEntry| heads[row.path.as_bytes()].clone();
+    let looked_up_at = started.elapsed();
 
     // The bytes of a copied file whose path `head` changed since the pin, to
     // tell a committed edit from one made after the commit.
@@ -1439,19 +1479,39 @@ impl Mount {
       .collect();
     let hashed: HashMap<Vec<u8>, ObjectId> = {
       let overlay = Arc::clone(&self.overlay);
+      // On several threads: 82k files, 2.2 GB, after a stock checkout on
+      // universe took 5.7 s on one.
       tokio::task::spawn_blocking(move || {
-        to_hash
-          .into_iter()
-          .filter_map(|row| {
-            let mut file = overlay.open_content(&row).ok()?;
-            let oid = gfs_overlay::hash::blob_oid_of_file(algorithm, &mut file, row.size).ok()?;
-            Some((row.path.as_bytes().to_vec(), oid))
-          })
-          .collect()
+        let threads = std::thread::available_parallelism().map_or(4, |n| n.get().min(16));
+        let chunk = to_hash.len().div_ceil(threads).max(1);
+        std::thread::scope(|scope| {
+          let workers: Vec<_> = to_hash
+            .chunks(chunk)
+            .map(|part| {
+              let overlay = &overlay;
+              scope.spawn(move || {
+                part
+                  .iter()
+                  .filter_map(|row| {
+                    let mut file = overlay.open_content(row).ok()?;
+                    let oid =
+                      gfs_overlay::hash::blob_oid_of_file(algorithm, &mut file, row.size).ok()?;
+                    Some((row.path.as_bytes().to_vec(), oid))
+                  })
+                  .collect::<Vec<_>>()
+              })
+            })
+            .collect();
+          workers
+            .into_iter()
+            .flat_map(|worker| worker.join().expect("a hashing thread panicked"))
+            .collect()
+        })
       })
       .await
       .map_err(|e| GfsError::internal(format!("hashing the workspace's edits failed: {e}")))?
     };
+    let hashed_at = started.elapsed();
 
     let same = |base: Option<&BaseFacts>, info: Option<&TreeEntryInfo>| match (base, info) {
       (None, None) => true,
@@ -1629,6 +1689,19 @@ impl Mount {
     }
     conflicts.extend(missing);
 
+    let ms = |d: Duration| d.as_millis() as u64;
+    tracing::info!(
+      rows = rows.len(),
+      hashed = hashed.len(),
+      kept = kept.len(),
+      conflicts = conflicts.len(),
+      prepare_ms = ms(prepared_at),
+      diff_and_lookup_ms = ms(diffed_at - prepared_at),
+      index_rows_ms = ms(looked_up_at - diffed_at),
+      hash_ms = ms(hashed_at - looked_up_at),
+      classify_ms = ms(started.elapsed() - hashed_at),
+      "planned the carry"
+    );
     let directories = made
       .into_iter()
       .map(|dir| {

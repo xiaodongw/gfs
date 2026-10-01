@@ -162,6 +162,27 @@ on universe with a private daemon, and a commit on `main`.
   goes to stderr, i.e. `host.log` (it went to stdout, `/dev/null` for a
   spawned host, so `host.log` had always been empty).
 
+**Follow-ups (complete)** -- profiled on universe, a stock switch of 161k
+files and `gfs switch` back after it:
+* Stock checkout 88-93 s → 53 s. `perf` on the daemon: 44% of its CPU was
+  `Overlay::remove` scanning every row for each `rmdir` (and the rename
+  paths did the same for every rename). Now a range of the sorted row map
+  (`rows_under`). `Status` checked each directory whiteout against every
+  row (quadratic); now a binary search. The inode table walked, with an
+  allocation per entry, every name it had ever numbered on every rename --
+  including each lockfile Git renames in `.git` -- and now walks only for a
+  directory. What is left is per-operation: ~130 us of daemon CPU per
+  unlink of a base file (a whiteout row, the parent's times, the journal
+  transaction), spread over allocation, SQLite and lookups with no hotspot.
+* `gfs switch` back 19.3 s → 10.5 s. The planner logs `planned the carry`
+  with its phases. Hashing the stock checkout's 82k copies runs on up to 16
+  threads (5.7 → 0.4 s); tree lookups are split across the repository's 8
+  handles and run concurrently with the pin-to-`HEAD` diff (6.8 → 4.2 s);
+  changed paths that have a row skip the overlay lookup; kernel
+  invalidation runs on 8 threads (4.1 → 1.5 us per name); and the dropped
+  copies (2.2 GB) are deleted by a background thread after the rebind
+  instead of under the overlay lock (seed and rebind 3.2 → 1.1 s).
+
 ## Decisions
 
 * **Delta stamps live in memory, with an instance in the token.** Tried

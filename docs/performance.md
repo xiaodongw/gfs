@@ -229,12 +229,13 @@ run.
 | --- | ---: |
 | stock `git switch`, 161k files differ | 93 s, 2.2 GB of overlay |
 | the same with `checkout.workers=8` (now seeded) | 77 s |
+| the same after the directory-scan fixes | 53 s |
 | `gfs switch`, target index cached | 1.3–2.5 s |
 | `gfs switch`, target index built (first pin of a commit) | 4–13 s |
 | `gfs switch` carrying a few uncommitted edits | 2.5 s |
 | `gfs switch` over 60k modified rows | 5.0 s |
 | `gfs switch` right after a stock `git commit` | 2.0 s |
-| `gfs switch` back after a stock switch (112k rows judged against `HEAD`) | 13–19 s, copies freed |
+| `gfs switch` back after a stock switch (208k rows judged against `HEAD`) | 10.5 s, copies freed (was 19 s) |
 | a refusal (conflicting edit, or something staged) | 0.4 s |
 | `git status` with nothing new | 1.9–2.2 s, no index write |
 | first `git status` after a `gfs switch` | 3.6–4.8 s |
@@ -248,11 +249,18 @@ uncached `git status`) took 6–12 s, almost all of it in resolving: the
 walk had pushed the clone's 752 MB pack index and 14 MB `packed-refs` out
 of the page cache, and 20 s later the same step took 0.24 s.
 
-A stock checkout's time is not in writing files (1.2 s of 78 s in
-`GIT_TRACE2_PERF`, 7 s in tree traversal); the other ~66 s of
-`unpack_trees` is untraced serial work in the main process, which checkout
-workers do not parallelize -- most likely unlinking the 95k files the
-target lacks, one FUSE round trip each (not measured separately).
+A stock checkout's time is not in writing files (1.2 s in
+`GIT_TRACE2_PERF`, 7 s in tree traversal). Most of the rest was the daemon:
+`perf` put 44% of its CPU in a scan of every overlay row on each `rmdir`,
+now a range lookup (93 → 53 s with the workers). What remains is per
+operation: Git issues 148k unlinks, 22k rmdirs and over a million
+`lstat`s, and an unlink of a base file costs about 130 us of daemon CPU
+(the whiteout row, the parent's times, one journal transaction).
+
+`gfs switch` after a stock checkout logs a `planned the carry` line:
+judging 208k rows against `HEAD` is 4.2 s of tree diff and lookups (run
+concurrently), 0.4 s hashing 82k copies on 16 threads, and 0.3 s
+classifying; the re-pin then frees the 2.2 GB of copies in the background.
 
 ## Reading a result
 

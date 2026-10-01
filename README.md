@@ -105,7 +105,7 @@ the kernel reads and writes files itself through FUSE passthrough, with no
 flag needed.
 
 **Switch branches with `gfs switch`, not `git switch`.** A stock checkout
-writes every differing file through the mount: 93 s and 2.2 GB of overlay
+writes every differing file through the mount: 53 s and 2.2 GB of overlay
 for a 161k-file switch on a 1.3M-file monorepo. `gfs switch <branch>` (and
 `-c <new>`, `--detach <rev>`) re-pins the view and re-seeds `.git`
 instead, in 1–5 s whatever the difference. It follows Git's rules:

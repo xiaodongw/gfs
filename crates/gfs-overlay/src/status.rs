@@ -129,9 +129,14 @@ impl Overlay {
           .as_ref()
           .is_some_and(|base| base.kind.is_dir_like())
         {
+          // Rows are in path order, so anything under `dir/` is found by
+          // binary search, not by a scan of every row for every directory.
+          let mut prefix = entry.path.as_bytes().to_vec();
+          prefix.push(b'/');
+          let first = rows.partition_point(|other| other.path.as_bytes() < prefix.as_slice());
           if !rows
-            .iter()
-            .any(|other| other.path != entry.path && crate::is_within(&other.path, &entry.path))
+            .get(first)
+            .is_some_and(|other| other.path.as_bytes().starts_with(&prefix))
           {
             status.directory_deletions.push(entry.path.clone());
           }
