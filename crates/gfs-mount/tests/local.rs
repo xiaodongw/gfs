@@ -83,25 +83,39 @@ async fn a_local_mount_presents_the_clone_commit_without_a_server() {
   );
   assert!(!projection, "local mode presents no projection");
 
-  // Stock Git over the workspace: clean, with history, with the clone as
-  // `origin`, and the pinned commit anchored in the clone.
+  // Stock Git over the workspace: clean, with history, with the clone's own
+  // remotes (so a push goes where the clone's would), the clone itself as
+  // `local`, and the pinned commit anchored in the clone.
   let head = git_in(&clone, &["rev-parse", "HEAD"]).1.trim().to_owned();
-  let (status, log, origin, anchors) = on_fs({
+  let clone_origin = git_in(&clone, &["remote", "get-url", "origin"]).1;
+  let (status, log, remotes, refs, anchors) = on_fs({
     let ws = ws.clone();
     let clone = clone.clone();
     move || {
       (
-        git_in(&ws, &["status", "--porcelain"]),
+        git_in(&ws, &["status", "--porcelain", "--branch"]),
         git_in(&ws, &["log", "-1", "--format=%H"]),
-        git_in(&ws, &["remote", "get-url", "origin"]),
+        git_in(&ws, &["remote", "get-url", "origin"]).1
+          + &git_in(&ws, &["remote", "get-url", "local"]).1,
+        git_in(&ws, &["rev-parse", "origin/main", "local/main"]),
         git_in(&clone, &["for-each-ref", "refs/gfs/mounts/"]),
       )
     }
   })
   .await;
-  assert!(status.0 && status.1.trim().is_empty(), "{}", status.1);
+  assert!(status.0, "{}", status.1);
+  assert_eq!(
+    status.1, "## main...origin/main\n",
+    "clean, tracking what the clone's main tracks"
+  );
   assert_eq!(log.1.trim(), head, "{}", log.1);
-  assert_eq!(origin.1.trim(), clone.to_str().unwrap(), "{}", origin.1);
+  assert_eq!(
+    remotes,
+    format!("{}{}\n", clone_origin, clone.display()),
+    "origin is the clone's origin, local is the clone"
+  );
+  assert!(refs.0, "{}", refs.1);
+  assert_eq!(refs.1, format!("{head}\n{head}\n"));
   assert!(
     anchors.1.contains(&head) && anchors.1.contains(&report.mount_id),
     "the pin is anchored in the clone: {}",
@@ -136,7 +150,8 @@ async fn a_local_mount_presents_the_clone_commit_without_a_server() {
     gfs_search::ExecutionStatus::Complete
   );
 
-  // Edit, commit with stock Git, push back into the clone over the filesystem.
+  // Edit, commit with stock Git, push back into the clone over the filesystem
+  // by its `local` remote.
   let (edit, add, commit, push, landed) = on_fs({
     let ws = ws.clone();
     let clone = clone.clone();
@@ -152,7 +167,7 @@ async fn a_local_mount_presents_the_clone_commit_without_a_server() {
       let commit = git_in(&ws, &["commit", "-q", "-m", "local edit"]);
       let push = git_in(
         &ws,
-        &["push", "-q", "origin", "HEAD:refs/heads/from-workspace"],
+        &["push", "-q", "local", "HEAD:refs/heads/from-workspace"],
       );
       let landed = git_in(&clone, &["show", "from-workspace:NOTES.md"]);
       (edit, add, commit, push, landed)
@@ -488,7 +503,8 @@ async fn gfs_switch_moves_a_local_view_between_branches_without_a_checkout() {
   })
   .await;
 
-  // A branch only the clone has: created here, tracking origin/old.
+  // A branch only the clone has, never pushed: created here with no
+  // upstream, as a worktree of the clone would see it.
   let Response::Refresh(report) = job.call(switch("old", false, false)).await else {
     panic!("switch refused");
   };
@@ -498,8 +514,34 @@ async fn gfs_switch_moves_a_local_view_between_branches_without_a_checkout() {
   assert_eq!(main_rs, b"fn main() { println!(\"hi\"); }\n");
   assert_eq!(status, "");
   assert_eq!(status, plain);
-  assert!(branches.contains("[origin/old]"), "{branches}");
+  let old_line = |branches: &str| {
+    branches
+      .lines()
+      .find(|l| l.get(2..).is_some_and(|l| l.starts_with("old ")))
+      .map(str::to_owned)
+      .unwrap_or_default()
+  };
+  assert!(!old_line(&branches).contains('['), "{branches}");
   assert_eq!(job.daemon.inspect().overlay.entries, 0);
+
+  // A branch from the clone's branch by its remote-tracking name: it tracks
+  // `local/old`, by the `local` refspec, as `git switch -c` would.
+  let Response::Refresh(_) = job
+    .call(Request::Switch {
+      selector: "topic".to_owned(),
+      branch: None,
+      create: true,
+      start_point: Some("local/old".to_owned()),
+      detach: false,
+    })
+    .await
+  else {
+    panic!("switch -c from local/old refused");
+  };
+  let (head, _, status, plain, branches) = look(ws.clone()).await;
+  assert_eq!(head, "ref: refs/heads/topic\n");
+  assert_eq!(status, plain);
+  assert!(branches.contains("[local/old]"), "{branches}");
 
   // A new branch where HEAD is: only HEAD moves.
   let Response::Refresh(report) = job.call(switch("new", true, false)).await else {
@@ -509,7 +551,10 @@ async fn gfs_switch_moves_a_local_view_between_branches_without_a_checkout() {
   let (head, _, status, plain, _) = look(ws.clone()).await;
   assert_eq!(head, "ref: refs/heads/new\n");
   assert_eq!(status, plain);
-  assert!(refused(switch("new", true, false)).await, "an existing branch");
+  assert!(
+    refused(switch("new", true, false)).await,
+    "an existing branch"
+  );
 
   // Back to the workspace's own main; everything Git and the user wrote in
   // `.git/config` survived the re-pins.
@@ -521,7 +566,8 @@ async fn gfs_switch_moves_a_local_view_between_branches_without_a_checkout() {
   assert_eq!(main_rs, b"fn main() { println!(\"bye\"); }\n");
   assert_eq!(status, plain);
   assert!(branches.contains("[origin/main]"), "{branches}");
-  assert!(branches.contains("[origin/old]"), "{branches}");
+  assert!(!old_line(&branches).contains('['), "{branches}");
+  assert!(branches.contains("[local/old]"), "{branches}");
   assert!(branches.contains(" new "), "{branches}");
   let name = on_fs({
     let ws = ws.clone();
@@ -531,7 +577,10 @@ async fn gfs_switch_moves_a_local_view_between_branches_without_a_checkout() {
   assert_eq!(name.trim(), "someone");
 
   // Not a branch: refused, with the way to get there.
-  assert!(refused(switch("v1.0", false, false)).await, "a tag is not a branch");
+  assert!(
+    refused(switch("v1.0", false, false)).await,
+    "a tag is not a branch"
+  );
 
   // A stock checkout gets the hint hook; a small one stays quiet (the hint
   // starts at a thousand files written).

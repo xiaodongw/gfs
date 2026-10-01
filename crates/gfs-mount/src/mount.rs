@@ -1121,8 +1121,8 @@ impl Mount {
   /// the checkout (plan 20260925-2220 step 3a).
   ///
   /// `target` is a branch: the workspace's own (`refs/heads/<target>`) first,
-  /// then the clone's, which becomes a workspace branch tracking
-  /// `origin/<target>` -- `git switch`'s guess. With `create` it is a new
+  /// then the clone's, which becomes a workspace branch tracking what the
+  /// clone's tracks, as in a worktree of the clone. With `create` it is a new
   /// branch at `start_point` (default `HEAD`); with `detach`, any revision.
   ///
   /// When the target is the commit `HEAD` is already on, nothing is re-pinned:
@@ -1154,9 +1154,16 @@ impl Mount {
     local.import_objects(git_dir.join("objects")).await?;
 
     // Where to go: the commit, the branch `HEAD` will name, whether the
-    // branch still has to be created, and the upstream it gets.
-    let (commit, branch, create_ref, upstream) = if detach {
-      (local.resolve(target).await?.to_hex(), None, false, None)
+    // branch still has to be created, the upstream it gets, and whether that
+    // is the clone's branch's own (which the re-seed then writes).
+    let (commit, branch, create_ref, upstream, track) = if detach {
+      (
+        local.resolve(target).await?.to_hex(),
+        None,
+        false,
+        None,
+        false,
+      )
     } else if create {
       check_branch_name(target)?;
       if workspace_branch(&git_dir, target).is_some() {
@@ -1170,21 +1177,23 @@ impl Mount {
           let head = head
             .clone()
             .ok_or_else(|| GfsError::internal("the workspace has no readable HEAD"))?;
-          (head, Some(target.to_owned()), true, None)
+          (head, Some(target.to_owned()), true, None, false)
         }
         Some(point) => {
           let (commit, upstream) = resolve_start_point(&local, &git_dir, point).await?;
-          (commit, Some(target.to_owned()), true, upstream)
+          (commit, Some(target.to_owned()), true, upstream, false)
         }
       }
     } else if let Some(commit) = workspace_branch(&git_dir, target) {
-      (commit, Some(target.to_owned()), false, None)
+      (commit, Some(target.to_owned()), false, None, false)
     } else if let Ok(commit) = local.resolve(&format!("refs/heads/{target}")).await {
+      let upstream = crate::gitdir::CloneRemotes::read(local.clone_path()).upstream(target);
       (
         commit.to_hex(),
         Some(target.to_owned()),
         true,
-        Some(target.to_owned()),
+        upstream,
+        true,
       )
     } else {
       let hint = if local.resolve(target).await.is_ok() {
@@ -1258,10 +1267,8 @@ impl Mount {
     if create_ref {
       write_branch_ref(&git_dir, target, &commit)?;
     }
-    if let (Some(branch), Some(upstream)) = (&branch, &upstream) {
-      if upstream != branch {
-        add_branch_upstream(&git_dir, branch, upstream)?;
-      }
+    if let (Some(branch), Some(upstream), false) = (&branch, &upstream, track) {
+      add_branch_upstream(&git_dir, branch, upstream)?;
     }
     let previous = (
       self.selector.lock().expect("selector").clone(),
@@ -1270,7 +1277,6 @@ impl Mount {
     *self.selector.lock().expect("selector") = commit.clone();
     *self.work_branch.lock().expect("work branch") = branch.clone();
     drop(serialized);
-    let track = upstream.as_deref().is_some() && upstream == branch;
     let repinned = self.repin_with(track, carry, true).await;
     if repinned.is_err() {
       *self.selector.lock().expect("selector") = previous.0;
@@ -3150,9 +3156,14 @@ fn refuse_or<T>(mut conflicts: Vec<String>, target: &str, plan: T) -> Result<T, 
 }
 
 fn workspace_branch(git_dir: &std::path::Path, name: &str) -> Option<String> {
-  let refname = format!("refs/heads/{name}");
-  if let Ok(loose) = std::fs::read_to_string(git_dir.join(&refname)) {
-    return Some(loose.trim().to_owned());
+  workspace_ref(git_dir, &format!("refs/heads/{name}"))
+}
+
+/// A ref's commit in the workspace, loose or packed; `None` for a symbolic
+/// one.
+fn workspace_ref(git_dir: &std::path::Path, refname: &str) -> Option<String> {
+  if let Ok(loose) = std::fs::read_to_string(git_dir.join(refname)) {
+    return (!loose.starts_with("ref: ")).then(|| loose.trim().to_owned());
   }
   let packed = std::fs::read_to_string(git_dir.join("packed-refs")).ok()?;
   packed.lines().find_map(|line| {
@@ -3170,9 +3181,13 @@ fn write_branch_ref(git_dir: &std::path::Path, name: &str, commit: &str) -> Resu
   std::fs::write(&path, format!("{commit}\n")).map_err(io)
 }
 
-/// `branch.<branch>` tracking `origin/<upstream>`, in the user's `.git/config`
-/// where Git would put it -- unless the branch already has a section.
-fn add_branch_upstream(git_dir: &std::path::Path, branch: &str, upstream: &str) -> Result<(), GfsError> {
+/// `branch.<branch>` tracking `upstream`, in the user's `.git/config` where
+/// Git would put it -- unless the branch already has a section.
+fn add_branch_upstream(
+  git_dir: &std::path::Path,
+  branch: &str,
+  upstream: &crate::gitdir::Upstream,
+) -> Result<(), GfsError> {
   let path = git_dir.join("config");
   let io = |e: std::io::Error| GfsError::internal(format!("updating .git/config: {e}"));
   let mut config = std::fs::read_to_string(&path).map_err(io)?;
@@ -3203,21 +3218,23 @@ fn check_branch_name(name: &str) -> Result<(), GfsError> {
   }
 }
 
-/// `gfs switch -c <new> <start_point>`: a workspace branch, `origin/<x>` (which
-/// the new branch then tracks, as `branch.autoSetupMerge` does), or any
-/// revision the clone resolves.
+/// `gfs switch -c <new> <start_point>`: a workspace branch, a remote-tracking
+/// ref such as `origin/<x>` or `local/<x>` (which the new branch then tracks,
+/// as `branch.autoSetupMerge` does), or any revision the clone resolves.
+/// Remote-tracking refs are read in the workspace, where `git fetch` moves
+/// them; the switch has already copied the objects they name into the clone.
 async fn resolve_start_point(
   local: &crate::local::LocalRepository,
   git_dir: &std::path::Path,
   point: &str,
-) -> Result<(String, Option<String>), GfsError> {
+) -> Result<(String, Option<crate::gitdir::Upstream>), GfsError> {
   if let Some(commit) = workspace_branch(git_dir, point) {
     return Ok((commit, None));
   }
-  if let Some(upstream) = point.strip_prefix("origin/") {
-    if let Ok(commit) = local.resolve(&format!("refs/heads/{upstream}")).await {
-      return Ok((commit.to_hex(), Some(upstream.to_owned())));
-    }
+  let tracking = format!("refs/remotes/{point}");
+  if let Some(commit) = workspace_ref(git_dir, &tracking) {
+    let upstream = crate::gitdir::CloneRemotes::read(local.clone_path()).tracking(&tracking);
+    return Ok((commit, upstream));
   }
   Ok((local.resolve(point).await?.to_hex(), None))
 }
@@ -3271,6 +3288,7 @@ mod tests {
     std::fs::create_dir_all(legacy.join("overlay/1")).unwrap();
     std::fs::write(legacy.join("overlay/1/overlay.sqlite"), b"old").unwrap();
     std::fs::create_dir_all(legacy.join("overlay/2")).unwrap();
+
     std::fs::write(legacy.join("overlay/2/overlay.sqlite"), b"live").unwrap();
     std::fs::write(legacy.join("mount.json"), b"{}").unwrap();
 
@@ -3288,4 +3306,3 @@ mod tests {
     assert!(!legacy.exists(), "the legacy directory is gone");
   }
 }
-

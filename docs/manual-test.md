@@ -704,12 +704,20 @@ touch short                               # still works at the same depth
 In a `gfs mount --local` workspace, `gfs switch` replaces `git switch`:
 
 ```sh
-gfs switch other-branch      # a clone branch becomes a workspace branch tracking origin/other-branch
+gfs switch other-branch      # a clone branch becomes a workspace branch tracking what the clone's tracks
 gfs switch -c my-change      # at HEAD: only HEAD moves
+gfs switch -c fix origin/x   # from a remote-tracking ref, which the branch then tracks
 gfs switch --detach v1.0
 ```
 
 Worth checking by hand:
+
+- **Remotes are the clone's.** `git remote -v` lists the clone's remotes
+  under their own names, plus `local`, which is the clone itself.
+  `git push origin HEAD` (or `git pp`) goes where it would from the clone;
+  `git push local HEAD:<b>` lands the work in the clone. `git branch -r`
+  shows the clone's remote-tracking refs as they are and its branches as
+  `local/*`.
 
 - **Edits travel by Git's rule.** Edit a file both branches agree on and
   create an untracked file, then `gfs switch` to the other branch: both

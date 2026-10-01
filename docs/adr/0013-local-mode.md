@@ -61,10 +61,17 @@ In local mode:
   on as many threads as the pool has handles, reading straight from the pack.
   No index, so no `SNAPSHOT_BUILDING`; coverage and truncation are reported
   exactly as the server reports them.
-- **The clone is `origin`.** `git fetch` and `git push origin HEAD:<branch>`
-  move work between the workspace and the clone over the filesystem. Git
-  refuses a push onto the clone's checked-out branch, which is the right
-  refusal.
+- **The clone's remotes are the workspace's, and the clone is `local`.**
+  *(Amended 2026-10-01; this first said "the clone is `origin`".)* Every
+  `remote.*` setting in the clone's config is copied into the workspace on
+  each seed, as a `git worktree` of the clone would see it, so `git push
+  origin` and every tool built on it reach the host the clone pushes to. The
+  clone itself is the added remote `local`: `git push local HEAD:<branch>`
+  lands work there over the filesystem, and Git refuses a push onto the
+  clone's checked-out branch, which is the right refusal. The ref view
+  follows: the clone's remote-tracking refs go in as they are, its branches
+  as `local/*`, and a branch taken from the clone tracks what the clone's
+  branch tracks — nothing, if it was never pushed.
 
 What does not change: the listing cache and walk detector, the overlay and
 its journal, the fsmonitor hook, the LFS filter driver, `gfs status`, the
@@ -118,6 +125,18 @@ shim. The two hooks the daemon installs are not shims and stay:
   home; if query latency on a real monorepo turns out to matter, the index
   build in `gfs-service` can move down into `gfs-search` and both sources can
   share it.
+- **The clone as `origin`**, which is what this ADR first decided. A push
+  then landed in the clone, a second hop from the host the change was for,
+  and in use that hop was taken by hand: a change committed in a workspace
+  was carried as a patch into another checkout to reach GitHub, leaving the
+  same change under two SHAs. A workspace stands in for a worktree, and a
+  worktree pushes where its clone does.
+- **Make the workspace a real `git worktree` of the clone** (a `.git` file
+  into `<clone>/.git/worktrees/<id>`), so branches are shared outright.
+  Rejected for now: gfs's own settings (fsmonitor, the LFS filter,
+  `checkStat`) would have to move to per-worktree config, and the
+  workspace's ref writes would land in the clone, the same objection as the
+  next item.
 - **Make the workspace's `.git/objects` a symlink into the clone**, so commits
   land there directly. Rejected: it makes the workspace's writes the clone's
   problem and the `alternates` line already gives Git the read side for free;

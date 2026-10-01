@@ -934,7 +934,7 @@ fn print_report(report: &gfs_mount::control::MountReport) {
   println!("workspace  {}", report.workspace);
   println!("repository {}", report.repository_id);
   if let Some(clone) = &report.local_clone {
-    println!("origin     local {clone}");
+    println!("clone      {clone} (remote `local`)");
   }
   // The pinned commit, shown because it is the thing that matters: the branch
   // name was only a selector, and PLAN.md M2.1 requires the CLI to show it.

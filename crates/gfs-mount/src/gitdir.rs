@@ -44,7 +44,8 @@ pub struct GitDirFacts {
   /// Every ref the repository shows this credential, fetched once at pin time.
   ///
   /// Written as `packed-refs`: tags verbatim, branches as
-  /// `refs/remotes/origin/*`. `None` means the call did not answer — an older
+  /// `refs/remotes/origin/*` (in local mode, the clone's remote-tracking refs
+  /// verbatim and its branches as `local/*`). `None` means the call did not answer — an older
   /// server, or a transient failure on a repin — and the seed then leaves
   /// whatever is on disk alone rather than deleting a good ref view because one
   /// request failed.
@@ -153,9 +154,10 @@ pub struct SeedSpec<'a> {
   /// The instance ID for this overlay. Used in the fsmonitor token to distinguish
   /// this process instance from previous ones.
   pub instance_id: u64,
-  /// Give the pinned branch an upstream (`origin/<branch>`) in `.git/config`
-  /// when it has none and the upstream has that branch -- what `git clone`
-  /// and `git switch <remote branch>` do. Off for a branch created with
+  /// Give the pinned branch an upstream in `.git/config` when it has none --
+  /// `origin/<branch>` when the gateway has that branch, what `git clone` and
+  /// `git switch <remote branch>` do; in local mode, the clone's branch's own
+  /// upstream, what a worktree would see. Off for a branch created with
   /// `gfs switch -c`, which Git would leave without one.
   pub track_upstream: bool,
 }
@@ -479,21 +481,19 @@ pub fn seed_git_dir(spec: &SeedSpec<'_>) -> Result<(), gfs_types::error::GfsErro
       repository = facts.repository_id.as_str(),
     ));
   }
-  if facts.work_ref_root.is_none() {
-    if let Some(clone) = &facts.local_clone {
-      // Local mode: the clone is `origin`, over the filesystem, so `git fetch`
-      // and `git push origin <branch>` move work between the workspace and
-      // the clone with no credential and no gateway. Git refuses a push onto
-      // the clone's checked-out branch by default, which is the right refusal.
-      config.push_str(&format!(
-        "[remote \"origin\"]\n\
-         \turl = {url}\n\
-         \tfetch = +refs/heads/*:refs/remotes/origin/*\n\
-         [push]\n\
-         \tdefault = simple\n",
-        url = clone.display(),
-      ));
-    }
+  // Local mode: the clone's remotes, so `git push origin` reaches the host the
+  // clone pushes to, and the clone itself as `local` (see [`CloneRemotes`]).
+  let clone_remotes = match (&facts.work_ref_root, &facts.local_clone) {
+    (None, Some(clone)) => Some(CloneRemotes::read(clone)),
+    _ => None,
+  };
+  if let Some(remotes) = &clone_remotes {
+    config.push_str(
+      "# The clone's remotes, as a worktree of it sees them; `local` is the\n\
+       # clone. Re-read from the clone on every seed.\n",
+    );
+    config.push_str(&remotes.config_sections());
+    config.push_str("[push]\n\tdefault = simple\n");
   }
   config.push_str(&format!(
     "[gfs]\n\
@@ -509,9 +509,10 @@ pub fn seed_git_dir(spec: &SeedSpec<'_>) -> Result<(), gfs_types::error::GfsErro
   std::fs::create_dir_all(dir.join(crate::passthrough::STATE_SUBDIR))
     .map_err(|e| io("gfs dir", e))?;
   write_atomic(&dir.join(GFS_CONFIG), config.as_bytes()).map_err(|e| io("gfs config", e))?;
-  write_user_config(dir, facts, spec.track_upstream).map_err(|e| io("config", e))?;
+  write_user_config(dir, facts, clone_remotes.as_ref(), spec.track_upstream)
+    .map_err(|e| io("config", e))?;
 
-  write_packed_refs(dir, facts).map_err(|e| io("packed-refs", e))?;
+  write_packed_refs(dir, facts, clone_remotes.as_ref()).map_err(|e| io("packed-refs", e))?;
 
   if let Some(index) = spec.index {
     // With the fsmonitor hook in place, the first `git status` can start
@@ -536,6 +537,239 @@ pub fn seed_git_dir(spec: &SeedSpec<'_>) -> Result<(), gfs_types::error::GfsErro
 /// The configuration gfs owns, relative to the git dir. Rewritten on every
 /// seed; `.git/config` includes it and is otherwise left to Git and the user.
 pub const GFS_CONFIG: &str = "gfs/config";
+
+/// The remote a local-mode workspace reaches its clone by, over the
+/// filesystem. The clone's own remotes keep their names, `origin` included.
+pub const LOCAL_REMOTE: &str = "local";
+
+/// A branch's upstream, as `branch.<name>.remote` and `.merge` say it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Upstream {
+  pub remote: String,
+  /// The full ref name on the remote.
+  pub merge: String,
+}
+
+/// The clone's remotes and branch upstreams: what a `git worktree` of it
+/// would see, and what a local-mode workspace copies (ADR 0013).
+///
+/// A workspace stands in for a worktree, and a worktree pushes where its
+/// clone pushes. Seeding the clone itself as `origin` instead made `git push`
+/// and every tool built on it land the work in the clone, a second hop away
+/// from the host the change was for. Read on every seed, so a remote changed
+/// in the clone reaches the workspace at its next re-pin.
+#[derive(Clone, Debug, Default)]
+pub struct CloneRemotes {
+  /// Every remote with its settings, in the order Git listed them (`fetch`
+  /// repeats).
+  remotes: Vec<(String, Vec<(String, String)>)>,
+  /// The sectionless ones, `remote.pushDefault` and `branch.autoSetupMerge`
+  /// among them: section, variable, value.
+  sectionless: Vec<(&'static str, String, String)>,
+  /// Every branch with both `remote` and `merge` set.
+  upstreams: Vec<(String, Upstream)>,
+  /// Whether [`LOCAL_REMOTE`] is the clone, added here, rather than a remote
+  /// of the clone's that happens to have the name.
+  local_added: bool,
+}
+
+impl CloneRemotes {
+  /// Read from the clone's own config file. Never fails: a clone Git cannot
+  /// read the config of still gets its [`LOCAL_REMOTE`].
+  pub fn read(clone: &std::path::Path) -> Self {
+    let output = std::process::Command::new("git")
+      .arg("-C")
+      .arg(clone)
+      .args([
+        "config",
+        "--local",
+        "--includes",
+        "--null",
+        "--get-regexp",
+        "^(remote|branch)\\.",
+      ])
+      .env_remove("GIT_DIR")
+      .env_remove("GIT_CONFIG")
+      .env_remove("GIT_CONFIG_PARAMETERS")
+      .stdin(std::process::Stdio::null())
+      .stderr(std::process::Stdio::null())
+      .output();
+    let text = match output {
+      Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout).into_owned(),
+      // Exit 1 is "no such key": a clone with no remotes.
+      Ok(out) if out.status.code() == Some(1) => String::new(),
+      result => {
+        tracing::warn!(
+          clone = %clone.display(),
+          status = ?result.map(|out| out.status).map_err(|e| e.to_string()),
+          "the clone's remotes are unreadable; the workspace gets only `{LOCAL_REMOTE}`"
+        );
+        String::new()
+      }
+    };
+    Self::parse(clone, &text)
+  }
+
+  fn parse(clone: &std::path::Path, text: &str) -> Self {
+    let mut remotes: Vec<(String, Vec<(String, String)>)> = Vec::new();
+    let mut sectionless = Vec::new();
+    let mut branches: std::collections::BTreeMap<&str, (Option<&str>, Option<&str>)> =
+      std::collections::BTreeMap::new();
+    // `--null`: the key, a newline, the value, a NUL; a key set with no value
+    // has no newline, and means true.
+    for entry in text.split('\0').filter(|e| !e.is_empty()) {
+      let (key, value) = entry.split_once('\n').unwrap_or((entry, "true"));
+      // Subsection names keep their dots (`branch.a.b/c.remote`); the
+      // variable is the last component.
+      if let Some(rest) = key.strip_prefix("remote.") {
+        let Some((name, var)) = rest.rsplit_once('.') else {
+          sectionless.push(("remote", rest.to_owned(), value.to_owned()));
+          continue;
+        };
+        let setting = (var.to_owned(), value.to_owned());
+        match remotes.iter_mut().find(|(n, _)| n == name) {
+          Some((_, settings)) => settings.push(setting),
+          None => remotes.push((name.to_owned(), vec![setting])),
+        }
+      } else if let Some(rest) = key.strip_prefix("branch.") {
+        let Some((name, var)) = rest.rsplit_once('.') else {
+          sectionless.push(("branch", rest.to_owned(), value.to_owned()));
+          continue;
+        };
+        let slot = branches.entry(name).or_default();
+        match var {
+          "remote" => slot.0 = Some(value),
+          "merge" => slot.1 = Some(value),
+          _ => {}
+        }
+      }
+    }
+    let local_added = !remotes.iter().any(|(n, _)| n == LOCAL_REMOTE);
+    if local_added {
+      // Pushing here lands work in the clone, and Git refuses a push onto
+      // the clone's checked-out branch, which is the right refusal.
+      remotes.push((
+        LOCAL_REMOTE.to_owned(),
+        vec![
+          ("url".to_owned(), clone.display().to_string()),
+          (
+            "fetch".to_owned(),
+            format!("+refs/heads/*:refs/remotes/{LOCAL_REMOTE}/*"),
+          ),
+        ],
+      ));
+    } else {
+      tracing::warn!(
+        clone = %clone.display(),
+        "the clone has its own `{LOCAL_REMOTE}` remote; the workspace reaches the clone by no remote"
+      );
+    }
+    let upstreams = branches
+      .into_iter()
+      .filter_map(|(name, slot)| {
+        let (Some(remote), Some(merge)) = slot else {
+          return None;
+        };
+        // `.` is the clone's own branches, which the workspace calls `local`.
+        let remote = match remote {
+          "." if local_added => LOCAL_REMOTE,
+          "." => return None,
+          remote => remote,
+        };
+        let upstream = Upstream {
+          remote: remote.to_owned(),
+          merge: merge.to_owned(),
+        };
+        Some((name.to_owned(), upstream))
+      })
+      .collect();
+    Self {
+      remotes,
+      sectionless,
+      upstreams,
+      local_added,
+    }
+  }
+
+  /// The clone's upstream for `branch`, if it has one. A branch the clone
+  /// never pushed has none, here as in a worktree.
+  pub fn upstream(&self, branch: &str) -> Option<Upstream> {
+    self
+      .upstreams
+      .iter()
+      .find(|(name, _)| name == branch)
+      .map(|(_, upstream)| upstream.clone())
+  }
+
+  /// The upstream a branch started from the remote-tracking ref `tracking`
+  /// gets, by the fetch refspec that writes it -- `branch.autoSetupMerge`.
+  pub fn tracking(&self, tracking: &str) -> Option<Upstream> {
+    self.remotes.iter().find_map(|(remote, settings)| {
+      settings
+        .iter()
+        .filter(|(var, _)| var == "fetch")
+        .find_map(|(_, refspec)| {
+          let (src, dst) = refspec
+            .strip_prefix('+')
+            .unwrap_or(refspec)
+            .split_once(':')?;
+          let merge = match dst.split_once('*') {
+            Some((prefix, suffix)) => {
+              let middle = tracking.strip_prefix(prefix)?.strip_suffix(suffix)?;
+              src.replacen('*', middle, 1)
+            }
+            None if dst == tracking => src.to_owned(),
+            None => return None,
+          };
+          Some(Upstream {
+            remote: remote.clone(),
+            merge,
+          })
+        })
+    })
+  }
+
+  /// The `[remote]` sections, each value reading back as the clone's did.
+  fn config_sections(&self) -> String {
+    let mut out = String::new();
+    for (section, var, value) in &self.sectionless {
+      out.push_str(&format!("[{section}]\n\t{var} = {}\n", config_value(value)));
+    }
+    for (name, settings) in &self.remotes {
+      out.push_str(&format!("[remote \"{}\"]\n", escape_subsection(name)));
+      for (var, value) in settings {
+        out.push_str(&format!("\t{var} = {}\n", config_value(value)));
+      }
+    }
+    out
+  }
+
+  /// What the clone's ref `name` is called in the workspace: tags as they
+  /// are, remote-tracking refs as they are, the clone's branches under
+  /// [`LOCAL_REMOTE`]. `None` for anything the workspace does not carry.
+  fn workspace_ref(&self, name: &str) -> Option<String> {
+    if name.starts_with("refs/tags/") {
+      return Some(name.to_owned());
+    }
+    if let Some(branch) = name.strip_prefix("refs/heads/") {
+      return self
+        .local_added
+        .then(|| format!("refs/remotes/{LOCAL_REMOTE}/{branch}"));
+    }
+    if name.starts_with("refs/remotes/") {
+      // `<remote>/HEAD` is symbolic in the clone and no fetch refreshes it;
+      // a remote-tracking ref under the added `local` would collide with
+      // the clone's branches.
+      let shadowed = self.local_added
+        && name
+          .strip_prefix("refs/remotes/")
+          .and_then(|rest| rest.strip_prefix(LOCAL_REMOTE))
+          .is_some_and(|rest| rest.starts_with('/'));
+      return (!name.ends_with("/HEAD") && !shadowed).then(|| name.to_owned());
+    }
+    None
+  }
+}
 
 /// The `post-checkout` hint (see the seed): one line on stderr after a
 /// branch checkout that moved `HEAD` to another commit and wrote at least a
@@ -564,13 +798,16 @@ const GFS_CONFIG_INCLUDE: &str = "[include]\n\tpath = gfs/config\n";
 /// workspace, or one seeded before the split, whose file gfs wrote entirely
 /// and whose settings now live in the included file. After that the only
 /// change is an upstream for the pinned branch, when `track_upstream` asks
-/// for one, the branch has no section yet, and the upstream has the branch.
+/// for one, the branch has no section yet, and there is an upstream: the
+/// gateway's branch of the same name, or in local mode whatever the clone's
+/// branch tracks.
 ///
 /// `core.repositoryformatversion` and `core.bare` stay in this file: Git reads
 /// the repository format from it before it follows any include.
 fn write_user_config(
   dir: &std::path::Path,
   facts: &GitDirFacts,
+  clone_remotes: Option<&CloneRemotes>,
   track_upstream: bool,
 ) -> Result<(), std::io::Error> {
   let path = dir.join("config");
@@ -579,22 +816,31 @@ fn write_user_config(
     Some(text) if text.contains(GFS_CONFIG_INCLUDE) => text.to_owned(),
     _ => format!("[core]\n\trepositoryformatversion = 0\n\tbare = false\n{GFS_CONFIG_INCLUDE}"),
   };
-  let has_remote = facts.local_clone.is_some() || facts.work_ref_root.is_some();
   if let Some(branch) = facts
     .ref_name
     .as_deref()
     .and_then(|n| n.strip_prefix("refs/heads/"))
+    .filter(|_| track_upstream)
   {
-    let upstream_has_it = facts.refs.as_ref().is_none_or(|refs| {
-      refs
-        .iter()
-        .any(|r| r.name.strip_prefix("refs/heads/") == Some(branch))
-    });
-    if track_upstream && has_remote && upstream_has_it {
+    let upstream = match clone_remotes {
+      Some(remotes) => remotes.upstream(branch),
+      None => {
+        let upstream_has_it = facts.refs.as_ref().is_none_or(|refs| {
+          refs
+            .iter()
+            .any(|r| r.name.strip_prefix("refs/heads/") == Some(branch))
+        });
+        (facts.work_ref_root.is_some() && upstream_has_it).then(|| Upstream {
+          remote: "origin".to_owned(),
+          merge: format!("refs/heads/{branch}"),
+        })
+      }
+    };
+    if let Some(upstream) = upstream {
       // Without it `git status -sb` prints a bare `## main` — no
       // `...origin/main`, no ahead/behind — because a branch with no
       // configured upstream has nothing to count against.
-      add_upstream(&mut config, branch, branch);
+      add_upstream(&mut config, branch, &upstream);
     }
   }
   if existing.as_deref() != Some(config.as_str()) {
@@ -603,9 +849,9 @@ fn write_user_config(
   Ok(())
 }
 
-/// Append `branch.<branch>.remote = origin` and `.merge = refs/heads/<upstream>`
-/// unless the branch already has a section, which is Git's or the user's.
-pub(crate) fn add_upstream(config: &mut String, branch: &str, upstream: &str) {
+/// Append `branch.<branch>.remote` and `.merge` unless the branch already has
+/// a section, which is Git's or the user's.
+pub(crate) fn add_upstream(config: &mut String, branch: &str, upstream: &Upstream) {
   let header = format!("[branch \"{}\"]", escape_subsection(branch));
   if config.lines().any(|line| line.trim() == header) {
     return;
@@ -614,13 +860,30 @@ pub(crate) fn add_upstream(config: &mut String, branch: &str, upstream: &str) {
     config.push('\n');
   }
   config.push_str(&format!(
-    "{header}\n\tremote = origin\n\tmerge = refs/heads/{upstream}\n"
+    "{header}\n\tremote = {}\n\tmerge = {}\n",
+    config_value(&upstream.remote),
+    config_value(&upstream.merge),
   ));
 }
 
 /// A config subsection name, quoted the way Git reads it back.
 fn escape_subsection(name: &str) -> String {
   name.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+/// A config value as Git writes one: bare unless a comment character, an
+/// escape, or edge whitespace would change how it reads back.
+fn config_value(value: &str) -> String {
+  let plain = !value.contains(['"', '\\', '#', ';', '\n', '\t']) && value.trim() == value;
+  if plain {
+    return value.to_owned();
+  }
+  let escaped = value
+    .replace('\\', "\\\\")
+    .replace('"', "\\\"")
+    .replace('\n', "\\n")
+    .replace('\t', "\\t");
+  format!("\"{escaped}\"")
 }
 
 /// Write the pinned ref view as `packed-refs`.
@@ -648,16 +911,30 @@ fn escape_subsection(name: &str) -> String {
 /// nothing else, and a ref the configuration cannot refresh is a ref that goes
 /// stale silently.
 ///
+/// Local mode maps by the same rules onto the clone's remotes
+/// ([`CloneRemotes::workspace_ref`]): its remote-tracking refs are what its
+/// remotes had at its last fetch, so they go in as they are, and its own
+/// branches are `local`'s.
+///
 /// Rewritten on every seed, so a ref deleted locally comes back on the next
 /// repin. That is the same "pinned view" contract `HEAD` and the index already
 /// have.
-fn write_packed_refs(dir: &std::path::Path, facts: &GitDirFacts) -> Result<(), std::io::Error> {
+fn write_packed_refs(
+  dir: &std::path::Path,
+  facts: &GitDirFacts,
+  clone_remotes: Option<&CloneRemotes>,
+) -> Result<(), std::io::Error> {
   let Some(refs) = facts.refs.as_ref() else {
     return Ok(());
   };
   let mut lines: Vec<(String, String, Option<String>)> = Vec::with_capacity(refs.len());
   for r in refs {
-    let name = if let Some(tag) = r.name.strip_prefix("refs/tags/") {
+    let name = if let Some(remotes) = clone_remotes {
+      match remotes.workspace_ref(&r.name) {
+        Some(name) => name,
+        None => continue,
+      }
+    } else if let Some(tag) = r.name.strip_prefix("refs/tags/") {
       format!("refs/tags/{tag}")
     } else if let Some(branch) = r.name.strip_prefix("refs/heads/") {
       format!("refs/remotes/origin/{branch}")
